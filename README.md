@@ -400,4 +400,4 @@ requests. Optional integration tests are enabled with environment variables:
 
 ## License
 
-MIT.
+[MIT](./LICENSE).
