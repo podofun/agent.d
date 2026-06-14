@@ -1,0 +1,11 @@
+[package]
+name = "agentd-memory"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+redb.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

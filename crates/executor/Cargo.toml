@@ -1,0 +1,29 @@
+[package]
+name = "agentd-executor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agentd-ai.workspace = true
+agentd-mcp.workspace = true
+agentd-permissions.workspace = true
+agentd-runners.workspace = true
+agentd-services.workspace = true
+agentd-skills.workspace = true
+agentd-trace.workspace = true
+agentd-types.workspace = true
+arc-swap = "1.7"
+async-trait.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+toml_edit = "0.22"
+tracing.workspace = true
+
+[dev-dependencies]
+agentd-scripting.workspace = true
+agentd-secrets.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+toml.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,16 @@
+[package]
+name = "agentd-ws"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+futures-util = { workspace = true, features = ["std", "sink"] }
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "sync", "macros", "rt-multi-thread", "time"] }
+tokio-tungstenite = { workspace = true, features = ["connect", "rustls-tls-webpki-roots"] }
+url.workspace = true
+
+[dev-dependencies]
+futures-util = { workspace = true, features = ["std", "sink"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }

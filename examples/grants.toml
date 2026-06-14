@@ -1,0 +1,52 @@
+# 5-layer permission engine grants.
+#   tool ∩ action.requires ∩ runner.allowed_actions
+#                          ∩ interface.allowed_actions
+#                          ∩ policy
+#   = Decision. Default-deny.
+#
+# A tool's manifest `requires` is NEVER self-granting. This file is the
+# only source of grants.
+
+# Per-tool grants. Tool name matches the `agentd.tool{name="..."}` in your
+# init.lua. Permission slugs are `domain[:specifier]` and support
+# wildcards on the specifier (e.g. `net:*`, `fs.write:/tmp/**`).
+
+# Lets the bundled git tool run the `git` binary. The slug is `shell.exec:<bin>`
+# where <bin> is the first arg to `ctx.shell(...)` — here the bare name "git",
+# not a full path. This is what makes `agentctl call git.status` work.
+[tool.git]
+granted = ["shell.exec:git"]
+
+# [tool.site]
+# granted = ["fs.write:/tmp/agentd-smoke/site/**"]
+
+# Per-runner action allowlist. Empty = no constraint at this layer.
+#
+# [runner.backend_reviewer]
+# allowed_actions = ["git.diff", "git.status", "github.comment_pr"]
+
+# Per-interface action allowlist. Empty = no constraint.
+#
+# [interface.telegram]
+# allowed_actions = ["git.status"]
+
+# Package approval. A package (installed via `agentctl packages install`)
+# declares its permissions in its own package.toml. This single entry approves
+# the WHOLE package: the declared permission set inherits to every tool/runner/
+# service it registers (all auto-prefixed `acme/...`). Without this entry the
+# package contributes zero grants (default-deny). You can still hand-narrow a
+# single component by writing an explicit `[tool."acme/git"]` etc. below — an
+# explicit entry always wins over the package's inherited default.
+#
+# [package.acme]
+# trusted = true
+
+# Final policy layer (denylist).
+#
+# [policy]
+# deny_actions = ["shell.exec"]
+# deny_permissions = []
+# Actions whose `confirm = true` gate is pre-approved (promoted to Allow).
+# An operator "allow forever" on a confirm action via `agentctl grants listen`
+# appends here automatically; you may also hand-edit it.
+# auto_confirm = []

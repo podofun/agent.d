@@ -1,0 +1,16 @@
+# Reference package manifest. A package DECLARES the permissions it wants here;
+# it never self-grants. The operator approves the whole package once with a
+# single `[package.acme] trusted = true` in grants.toml, which inherits this
+# permission set to every tool/action/runner/service the package registers
+# (all auto-prefixed `acme/...`).
+
+[package]
+name = "acme"
+version = "0.1.0"
+entry = "main.lua"
+
+# One flat set, inherited by everything acme registers.
+permissions = [
+  "net:api.acme.com",
+  "shell.exec:git",
+]
