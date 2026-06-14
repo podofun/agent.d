@@ -1,0 +1,35 @@
+[package]
+name = "agentd-scripting"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agentd-ai.workspace = true
+agentd-fs.workspace = true
+agentd-http.workspace = true
+agentd-memory.workspace = true
+agentd-permissions.workspace = true
+agentd-packages.workspace = true
+agentd-runners.workspace = true
+agentd-secrets.workspace = true
+agentd-services.workspace = true
+agentd-shell.workspace = true
+agentd-skills.workspace = true
+agentd-types.workspace = true
+agentd-ws.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+mlua = { workspace = true, features = ["serialize"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+walkdir = "2.5.0"
+
+[dev-dependencies]
+futures-util = { workspace = true, features = ["std", "sink"] }
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-tungstenite.workspace = true

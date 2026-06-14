@@ -1,0 +1,36 @@
+# agentd daemon config. CLI flags + env vars override.
+# Drop a copy of this at $XDG_CONFIG_HOME/agentd/config.toml and edit.
+
+[daemon]
+# WebSocket + HTTP /health bind address.
+addr = "127.0.0.1:7777"
+# JSONL trace sink path. `~` expands to your home directory.
+trace_file = "~/.local/state/agentd/trace.jsonl"
+# tracing-subscriber filter.
+# Examples: "info", "agentd_executor=debug,info", "trace".
+log_level = "info"
+# Bearer token clients must present on the /ws handshake. If omitted (and
+# no_auth is false), the daemon mints one at startup and writes it to
+# ~/.local/state/agentd/token, which agentctl reads automatically.
+# token = "paste-a-long-random-string"
+# Set true to disable /ws auth entirely (any local client may connect).
+# /health is always open regardless. Also opens /control.
+no_auth = false
+# Bearer token for the privileged /control plane (operator management +
+# interactive permission approvals). Distinct from `token` so a public-token
+# holder can never reach control. If omitted (and no_auth is false), the daemon
+# mints one at startup and writes it to ~/.local/state/agentd/admin-token,
+# which `agentctl grants listen` reads automatically.
+# admin_token = "paste-a-different-long-random-string"
+# How long (ms) an escalated permission request waits for an operator verdict
+# before failing closed (deny). Default 120000.
+approval_timeout_ms = 120000
+
+[runtime]
+# Lua entry point. Absolute path or `~/...`.
+init = "~/.config/agentd/init.lua"
+# Tool-use loop cap per runner call (ExecutorOwned providers).
+max_turns = 16
+# NOTE: reserved. Setting this to true today emits a warning and is
+# otherwise ignored.
+yolo = false

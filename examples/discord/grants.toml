@@ -1,0 +1,25 @@
+[tool.discord]
+granted = [
+  "net:gateway.discord.gg",
+  "net:discord.com",
+  "secret:discord_token",
+]
+
+[service.discord_gateway]
+granted = [
+  "net:gateway.discord.gg",
+  "net:discord.com",
+  "secret:discord_token",
+]
+
+[service.discord_handler]
+granted = [
+  "ai:openai",
+  "net:discord.com",
+  "memory.read:discord/**",
+  "memory.write:discord/**",
+]
+allowed_actions = ["discord.send"]
+
+[runner.discord_chat]
+allowed_actions = []

@@ -1,0 +1,12 @@
+[package]
+name = "agentd-approvals"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agentd-types.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }

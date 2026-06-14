@@ -1,0 +1,13 @@
+[package]
+name = "agentd-packages"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agentd-permissions.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
