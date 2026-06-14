@@ -1,0 +1,13 @@
+[package]
+name = "agentd-trace"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agentd-types.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+chrono = { version = "0.4.44", default-features = false, features = ["clock", "serde"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["full"] }

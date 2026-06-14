@@ -1,0 +1,84 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/types",
+    "crates/trace",
+    "crates/secrets",
+    "crates/ai",
+    "crates/permissions",
+    "crates/approvals",
+    "crates/runners",
+    "crates/packages",
+    "crates/services",
+    "crates/shell",
+    "crates/skills",
+    "crates/memory",
+    "crates/fs",
+    "crates/http",
+    "crates/codex",
+    "crates/mcp",
+    "crates/ws",
+    "crates/cli",
+    "crates/scripting",
+    "crates/executor",
+    "crates/api",
+    "crates/daemon",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+rust-version = "1.85"
+license = "MIT"
+authors = ["MrFoo"]
+description = "Portable AI runtime — a small Rust daemon plus Lua userland for tools, runners, memory, auth, and permissions across any model or interface."
+
+[workspace.dependencies]
+# Local crates — paths so members can use `dep.workspace = true` without version churn.
+agentd-ai          = { path = "crates/ai" }
+agentd-api         = { path = "crates/api" }
+agentd-approvals   = { path = "crates/approvals" }
+agentd-executor    = { path = "crates/executor" }
+agentd-fs          = { path = "crates/fs" }
+agentd-http        = { path = "crates/http" }
+agentd-mcp         = { path = "crates/mcp" }
+agentd-memory      = { path = "crates/memory" }
+agentd-packages    = { path = "crates/packages" }
+agentd-permissions = { path = "crates/permissions" }
+agentd-runners     = { path = "crates/runners" }
+agentd-scripting   = { path = "crates/scripting" }
+agentd-secrets     = { path = "crates/secrets" }
+agentd-services    = { path = "crates/services" }
+agentd-shell       = { path = "crates/shell" }
+agentd-skills      = { path = "crates/skills" }
+agentd-trace       = { path = "crates/trace" }
+agentd-types       = { path = "crates/types" }
+agentd-ws          = { path = "crates/ws" }
+agentd-cli         = { path = "crates/cli" }
+agentd-codex       = { path = "crates/codex" }
+daemon             = { path = "crates/daemon" }
+
+# Third-party used by >1 crate. Single-crate deps live in the crate's own Cargo.toml.
+anyhow             = "1.0.102"
+async-trait        = "0.1.89"
+clap               = { version = "4.6.1", features = ["derive", "env"] }
+dirs               = "6.0.0"
+futures-util       = { version = "0.3.32", default-features = false }
+getrandom          = "0.3"
+mlua               = { version = "0.11.6", features = ["lua54", "vendored", "send"] }
+redb               = "4"
+reqwest            = { version = "0.13.3", default-features = false }
+serde              = { version = "1.0.228", features = ["derive"] }
+serde_json         = "1.0.149"
+thiserror          = "2.0.18"
+tokio              = { version = "1.52.3" }
+toml               = "0.9"
+tokio-tungstenite  = { version = "0.29.0", default-features = false }
+tracing            = "0.1.44"
+url                = "2.5.8"
+
+# Dev / test infra shared across crates.
+hyper              = { version = "1.9.0", features = ["server", "http1"] }
+hyper-util         = { version = "0.1.20", features = ["tokio", "server", "http1"] }
+http-body-util     = "0.1.3"
+tempfile           = "3.27.0"

@@ -1,0 +1,10 @@
+[package]
+name = "agentd-shell"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-multi-thread"] }

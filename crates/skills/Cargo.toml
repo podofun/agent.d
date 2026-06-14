@@ -1,0 +1,13 @@
+[package]
+name = "agentd-skills"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+walkdir = "2.5.0"
+
+[dev-dependencies]
+tempfile.workspace = true

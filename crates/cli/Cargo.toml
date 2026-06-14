@@ -1,0 +1,22 @@
+[package]
+name = "agentd-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "agentctl"
+path = "src/main.rs"
+
+[dependencies]
+agentd-packages.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tempfile.workspace = true
+dirs.workspace = true
+futures-util = { workspace = true, features = ["std", "sink"] }
+reqwest = { workspace = true, features = ["rustls", "gzip"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "sync"] }
+tokio-tungstenite = { workspace = true, features = ["connect", "rustls-tls-webpki-roots"] }
+url.workspace = true

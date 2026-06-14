@@ -1,0 +1,10 @@
+[package]
+name = "agentd-permissions"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml = "1.1.2"

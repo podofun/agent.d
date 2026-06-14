@@ -1,0 +1,35 @@
+[package]
+name = "daemon"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "daemon"
+path = "src/main.rs"
+
+[dependencies]
+agentd-ai.workspace = true
+agentd-api.workspace = true
+agentd-approvals.workspace = true
+agentd-executor.workspace = true
+agentd-memory.workspace = true
+agentd-packages.workspace = true
+agentd-permissions.workspace = true
+agentd-runners.workspace = true
+agentd-scripting.workspace = true
+agentd-secrets.workspace = true
+agentd-skills.workspace = true
+agentd-trace.workspace = true
+agentd-types.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+toml.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile.workspace = true

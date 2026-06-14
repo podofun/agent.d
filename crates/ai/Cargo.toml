@@ -1,0 +1,30 @@
+[package]
+name = "agentd-ai"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agentd-codex.workspace = true
+agentd-http.workspace = true
+agentd-permissions.workspace = true
+agentd-secrets.workspace = true
+agentd-types.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-multi-thread", "fs"] }
+tracing.workspace = true
+
+[dev-dependencies]
+agentd-mcp.workspace = true
+agentd-permissions.workspace = true
+agentd-types.workspace = true
+async-trait.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
