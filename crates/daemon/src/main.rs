@@ -18,8 +18,16 @@ use tracing_subscriber::EnvFilter;
 mod config;
 use config::{Cli, Config};
 
+fn main() -> Result<()> {
+    // If this process was re-exec'd as the in-netns network supervisor, run it
+    // and exit here — BEFORE any threads or the async runtime start (the
+    // supervisor forks the sandboxed command and must be single-threaded).
+    agentd_shell::sandbox::run_netns_supervisor_if_requested();
+    run()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run() -> Result<()> {
     let cfg = Config::resolve(Cli::parse())?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(&cfg.log_level))
