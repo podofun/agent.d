@@ -31,3 +31,25 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # The native shell sandbox has cfg-gated backends (Linux Landlock above;
+  # macOS Seatbelt and Windows AppContainer here). Build and test the shell
+  # crate on each OS so the per-platform backend compiles and its tests run on
+  # the native runner.
+  sandbox-backends:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test shell crate (sandbox backend)
+        run: cargo test -p agentd-shell
