@@ -404,7 +404,10 @@ async fn shell_child_confined_to_fs_write_grant() {
         )
         .await
         .unwrap();
-    assert_eq!(res.value["exit_code"], 0, "inside-grant write should succeed");
+    assert_eq!(
+        res.value["exit_code"], 0,
+        "inside-grant write should succeed"
+    );
     assert!(inside_path.exists(), "file inside grant must exist");
 
     // Outside the grant: Landlock denies the write, sh exits nonzero.
@@ -418,6 +421,9 @@ async fn shell_child_confined_to_fs_write_grant() {
         )
         .await
         .unwrap();
-    assert_ne!(res.value["exit_code"], 0, "outside-grant write must be denied");
+    assert_ne!(
+        res.value["exit_code"], 0,
+        "outside-grant write must be denied"
+    );
     assert!(!outside_path.exists(), "file outside grant must NOT exist");
 }
