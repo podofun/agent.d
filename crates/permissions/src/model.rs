@@ -282,4 +282,14 @@ mod tests {
         let holder = PermissionSet::empty();
         assert!(holder.covers_all(&PermissionSet::empty()));
     }
+
+    #[test]
+    fn shell_unrestricted_is_plain_slug() {
+        // The sandbox escape hatch is an ordinary, non-wildcard grant; its
+        // meaning (skip the native sandbox) lives in the shell binding, not the
+        // permission engine.
+        let held = Permission::new("shell.unrestricted");
+        assert!(held.covers(&Permission::new("shell.unrestricted")));
+        assert!(!held.covers(&Permission::new("shell.exec")));
+    }
 }
