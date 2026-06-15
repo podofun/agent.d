@@ -222,7 +222,8 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
     })
 }
 
-#[cfg(test)]
+// These exercise real unix binaries (/bin/echo, /bin/sh, ...); gated to unix.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -321,6 +322,8 @@ mod tests {
         assert!(matches!(err, ShellError::Spawn { .. }));
     }
 
+    // macOS resolves /tmp -> /private/tmp, so pin to Linux.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn respects_cwd() {
         let res = exec(ExecRequest {

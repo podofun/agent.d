@@ -421,29 +421,75 @@ async fn splice_to_proxy(fd: RawFd, proxy_addr: std::net::SocketAddr) {
 // userns probe
 // ---------------------------------------------------------------------------
 
-use nix::sched::CloneFlags;
-use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, fork};
+use std::sync::OnceLock;
 
-/// True iff an unprivileged `CLONE_NEWUSER | CLONE_NEWNET` can be created on this
-/// host. Probes by attempting it in a short-lived forked child, so the daemon's
-/// own namespaces are never affected. Never panics.
+/// True iff the FULL rootless-netns containment can actually be set up here:
+/// unshare `CLONE_NEWUSER | CLONE_NEWNET`, map uid/gid to root inside, and bring
+/// `lo` up. A shallow "can unshare" probe is not enough — some sandboxes (e.g.
+/// hardened CI runners) allow the unshare but block the uid-map-to-root or the
+/// `lo` ioctl, which the real path needs. Cached for the process lifetime.
 pub fn userns_net_supported() -> bool {
-    // SAFETY: the child does only async-signal-safe work (unshare, _exit).
-    match unsafe { fork() } {
-        Ok(ForkResult::Child) => {
-            let flags = CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET;
-            let code = if nix::sched::unshare(flags).is_ok() {
-                0
-            } else {
-                1
-            };
-            unsafe { libc::_exit(code) };
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(probe_userns_net)
+}
+
+fn probe_userns_net() -> bool {
+    // SAFETY: the forked child does only async-signal-safe work (unshare, pipe
+    // read/write, the alloc-free `bring_loopback_up`, _exit). The parent writes
+    // the child's uid/gid maps, then collects the child's verdict.
+    unsafe {
+        let mut s1 = [0i32; 2]; // child -> parent: "unshared"
+        let mut s2 = [0i32; 2]; // parent -> child: "maps written"
+        if libc::pipe(s1.as_mut_ptr()) != 0 {
+            return false;
         }
-        Ok(ForkResult::Parent { child }) => {
-            matches!(waitpid(child, None), Ok(WaitStatus::Exited(_, 0)))
+        if libc::pipe(s2.as_mut_ptr()) != 0 {
+            libc::close(s1[0]);
+            libc::close(s1[1]);
+            return false;
         }
-        Err(_) => false,
+        let uid = libc::getuid();
+        let gid = libc::getgid();
+
+        let pid = libc::fork();
+        if pid < 0 {
+            return false;
+        }
+        if pid == 0 {
+            let flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNET;
+            if libc::unshare(flags) != 0 {
+                libc::_exit(1);
+            }
+            let one = [1u8];
+            libc::write(s1[1], one.as_ptr() as *const _, 1);
+            let mut b = [0u8; 1];
+            libc::read(s2[0], b.as_mut_ptr() as *mut _, 1);
+            // Mapped to root inside the new userns now; the real path needs lo up.
+            let ok = bring_loopback_up();
+            libc::_exit(if ok { 0 } else { 1 });
+        }
+
+        // Parent.
+        libc::close(s1[1]);
+        libc::close(s2[0]);
+        let mut tmp = [0u8; 1];
+        if libc::read(s1[0], tmp.as_mut_ptr() as *mut _, 1) != 1 {
+            libc::close(s1[0]);
+            libc::close(s2[1]);
+            let mut st = 0;
+            libc::waitpid(pid, &mut st, 0);
+            return false;
+        }
+        let _ = write_file(&format!("/proc/{pid}/uid_map"), &format!("0 {uid} 1\n"));
+        let _ = write_file(&format!("/proc/{pid}/setgroups"), "deny");
+        let _ = write_file(&format!("/proc/{pid}/gid_map"), &format!("0 {gid} 1\n"));
+        let one = [1u8];
+        libc::write(s2[1], one.as_ptr() as *const _, 1);
+        libc::close(s1[0]);
+        libc::close(s2[1]);
+        let mut st = 0;
+        libc::waitpid(pid, &mut st, 0);
+        libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0
     }
 }
 
