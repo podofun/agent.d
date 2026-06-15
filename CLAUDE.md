@@ -235,6 +235,12 @@ the specifier:
 - `memory.read:discord/**`
 - `memory.write:*`
 - `ai:anthropic`
+- `shell.unrestricted`
+
+`shell.unrestricted` is a plain non-wildcard grant. Holding it makes `ctx.shell`
+skip the native shell sandbox and run the child on the host shell. The engine
+treats it as an ordinary slug; the sandbox-skip meaning is interpreted in the
+shell binding (see the native shell sandbox under `ctx.shell`).
 
 Example:
 
@@ -581,6 +587,30 @@ Required permission:
 
 The shell primitive is argv-only. Do not add a shell interpreter path for
 compound commands.
+
+#### Native shell sandbox
+
+Every `ctx.shell` child runs inside a native OS sandbox (NativeShellSandbox)
+enforced on the child process by the kernel: Landlock on Linux, `sandbox-exec`
+(Seatbelt) on macOS, AppContainer on Windows. The sandbox rules are derived from
+the execution's effective grants, so the kernel confines the child to the same
+filesystem and network the permission engine already allows.
+
+Phase 1 enforcement:
+
+- Filesystem writes: denied except under `fs.write` grants (globs collapsed to
+  the concrete ancestor directory) plus `/dev/null` scratch.
+- Filesystem reads: restricted to `fs.read` grants, the writable subtrees, and a
+  system read baseline (`/usr`, `/bin`, `/lib`, `/lib64`, `/etc`, `/opt`,
+  `/proc/self`, common `/dev` nodes) so the binary and its libraries load.
+- Network: coarse on/off. Any `net:` grant enables network; zero `net:` grants
+  block it. Per-host `net:<host>` enforcement on child processes is Phase 2
+  (network namespace + SNI proxy) and is required before the feature ships.
+
+If no enforcing backend is available on the platform, `ctx.shell` fails closed —
+it does not run the child unsandboxed. The only opt-out is the
+`shell.unrestricted` grant, which runs the child on the host shell with no
+sandbox.
 
 ### `ctx.tools`
 
