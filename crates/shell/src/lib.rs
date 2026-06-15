@@ -79,9 +79,10 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
         return Err(ShellError::SandboxUnavailable);
     }
 
-    // Host-granular network: when the policy permits network, the child is
-    // confined so the egress proxy is its only route out. Fail closed if net
-    // containment is unavailable on this platform.
+    // Host-granular network (Linux): when the policy permits network, the child
+    // is confined inside a netns whose only route out is the egress proxy. This
+    // path owns the whole spawn and returns. Fail closed if unavailable.
+    #[cfg(target_os = "linux")]
     if let Some(policy) = req.sandbox.clone()
         && !policy.unrestricted
         && policy.allow_net
@@ -92,23 +93,36 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
         let proxy = proxy::Proxy::start(policy.net_hosts.clone())
             .await
             .map_err(|e| ShellError::Sandbox(e.to_string()))?;
-        #[cfg(target_os = "linux")]
-        {
-            return sandbox::linux_net::run_contained(&req, &policy, &proxy).await;
-        }
-        // Other platforms wire proxy.addr() into their containment profile; until
-        // those land, net_supported() returns false above so this is unreachable.
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = &proxy;
-            return Err(ShellError::SandboxUnavailable);
-        }
+        return sandbox::linux_net::run_contained(&req, &policy, &proxy).await;
     }
 
-    // macOS enforces via an argv wrapper (sandbox-exec), chosen before spawn.
+    // Host-granular network (non-Linux): start the egress proxy and keep it alive
+    // for the child's lifetime; the per-OS profile (macOS Seatbelt below) locks
+    // the child to the proxy's loopback port. Fail closed if unavailable.
+    #[cfg(not(target_os = "linux"))]
+    let mut _net_proxy: Option<proxy::Proxy> = None;
+    #[cfg(not(target_os = "linux"))]
+    let mut proxy_addr: Option<std::net::SocketAddr> = None;
+    #[cfg(not(target_os = "linux"))]
+    if let Some(policy) = req.sandbox.clone()
+        && !policy.unrestricted
+        && policy.allow_net
+    {
+        if !sandbox::net_supported() {
+            return Err(ShellError::SandboxUnavailable);
+        }
+        let proxy = proxy::Proxy::start(policy.net_hosts.clone())
+            .await
+            .map_err(|e| ShellError::Sandbox(e.to_string()))?;
+        proxy_addr = Some(proxy.addr());
+        _net_proxy = Some(proxy);
+    }
+
+    // macOS enforces via an argv wrapper (sandbox-exec), chosen before spawn. The
+    // proxy address (if any) locks the child's network to the proxy port only.
     #[cfg(target_os = "macos")]
     let (bin, args): (String, Vec<String>) = match &req.sandbox {
-        Some(p) if !p.unrestricted => sandbox::wrap_argv(p, &req.bin, &req.args),
+        Some(p) if !p.unrestricted => sandbox::wrap_argv(p, proxy_addr, &req.bin, &req.args),
         _ => (req.bin.clone(), req.args.clone()),
     };
     #[cfg(not(target_os = "macos"))]
@@ -116,6 +130,24 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
 
     let mut cmd = Command::new(&bin);
     cmd.args(&args);
+
+    // Point the child at the egress proxy (cooperative path; enforcement is the
+    // OS profile that confines the child to the proxy port).
+    #[cfg(not(target_os = "linux"))]
+    if let Some(addr) = proxy_addr {
+        let p = format!("http://127.0.0.1:{}", addr.port());
+        for k in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+        ] {
+            cmd.env(k, &p);
+        }
+        cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
+    }
+
     if let Some(cwd) = &req.cwd {
         cmd.current_dir(cwd);
     }

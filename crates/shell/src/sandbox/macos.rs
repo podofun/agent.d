@@ -21,7 +21,17 @@ pub fn apply(_policy: &SandboxPolicy) -> Result<(), SandboxError> {
 
 /// Generate SBPL and return the rewritten (bin, args) running under
 /// `sandbox-exec`. Caller (exec on macOS) substitutes these for the original.
-pub fn wrap_argv(policy: &SandboxPolicy, bin: &str, args: &[String]) -> (String, Vec<String>) {
+///
+/// `proxy_addr` is the egress proxy's loopback address when host-granular net is
+/// active: the child is then allowed to reach ONLY that exact loopback port, so
+/// its only network path is the policy-enforcing proxy. When `None` and
+/// `allow_net` is false, all network is denied.
+pub fn wrap_argv(
+    policy: &SandboxPolicy,
+    proxy_addr: Option<std::net::SocketAddr>,
+    bin: &str,
+    args: &[String],
+) -> (String, Vec<String>) {
     let mut sbpl = String::from("(version 1)\n(deny default)\n(allow process-exec process-fork)\n");
 
     for r in READ_BASELINE
@@ -39,8 +49,14 @@ pub fn wrap_argv(policy: &SandboxPolicy, bin: &str, args: &[String]) -> (String,
     {
         sbpl.push_str(&format!("(allow file-write* (subpath \"{w}\"))\n"));
     }
-    if policy.allow_net {
-        sbpl.push_str("(allow network*)\n");
+    // Network is default-denied. When the egress proxy is active, allow only the
+    // exact proxy loopback port — not `localhost` broadly — so no other local
+    // listener becomes a lateral path.
+    if let Some(addr) = proxy_addr {
+        sbpl.push_str(&format!(
+            "(allow network-outbound (remote ip \"localhost:{}\"))\n",
+            addr.port()
+        ));
     }
 
     let mut new_args = vec!["-p".to_string(), sbpl, "--".to_string(), bin.to_string()];
