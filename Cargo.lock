@@ -942,6 +942,7 @@ dependencies = [
  "agentd-runners",
  "agentd-scripting",
  "agentd-secrets",
+ "agentd-shell",
  "agentd-skills",
  "agentd-trace",
  "agentd-types",

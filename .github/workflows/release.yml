@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -12,7 +13,7 @@ env:
 
 jobs:
   build:
-    if: contains(github.event.head_commit.message, '[release]')
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[release]')
     strategy:
       fail-fast: false
       matrix:
@@ -20,6 +21,9 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: agentd-x86_64-linux.tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: agentd-aarch64-macos.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: agentd-x86_64-windows.zip
@@ -38,8 +42,8 @@ jobs:
       - name: Build release binaries
         run: cargo build --release -p daemon -p agentd-cli
 
-      - name: Package (Linux)
-        if: runner.os == 'Linux'
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist
           cp target/release/daemon target/release/agentctl dist/
@@ -62,7 +66,7 @@ jobs:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
 
-  publish:
+  draft:
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -78,10 +82,17 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Publish GitHub Release
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Draft GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.version }}
-          name: agentd v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          draft: true
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: artifacts/*
