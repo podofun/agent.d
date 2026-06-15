@@ -19,6 +19,9 @@ mod backend;
 #[cfg(target_os = "macos")]
 pub use backend::wrap_argv;
 
+#[cfg(target_os = "linux")]
+pub mod linux_net;
+
 /// Apply the policy to the CURRENT process/thread (call site is the forked
 /// child via pre_exec, or the wrapper path). `unrestricted` short-circuits.
 pub fn apply(policy: &SandboxPolicy) -> Result<(), SandboxError> {
