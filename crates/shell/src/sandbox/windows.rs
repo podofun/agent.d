@@ -5,8 +5,7 @@
 //! custom `CreateProcessAsUserW` using a write-restricted token, its stdio wired
 //! to inherited pipes, and (when network is allowed) WFP filters scoped to the
 //! child's binary that block all outbound except the egress proxy's loopback
-//! port. Compile-verified on Linux via the `windows-gnu` target; enforcement is
-//! verified on the Windows CI runner.
+//! port.
 
 use crate::policy::{SandboxError, SandboxPolicy};
 
@@ -46,20 +45,20 @@ pub async fn run_contained(
 mod imp {
     use std::os::windows::ffi::OsStrExt;
 
+    use windows::Win32::Foundation::SetHandleInformation;
     use windows::Win32::Foundation::{CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS};
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
     use windows::Win32::Security::Authorization::{
-        EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT,
-        SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE,
+        SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID,
+        TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
     };
     use windows::Win32::Security::{
         ACL, AllocateAndInitializeSid, CreateRestrictedToken, DACL_SECURITY_INFORMATION,
-        DISABLE_MAX_PRIVILEGE, FreeSid, LUA_TOKEN, PSECURITY_DESCRIPTOR, PSID,
-        SECURITY_ATTRIBUTES, SECURITY_NT_AUTHORITY, SID_AND_ATTRIBUTES,
-        SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY,
-        WRITE_RESTRICTED,
+        DISABLE_MAX_PRIVILEGE, FreeSid, LUA_TOKEN, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+        SECURITY_NT_AUTHORITY, SID_AND_ATTRIBUTES, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+        TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY, WRITE_RESTRICTED,
     };
-    use windows::Win32::Foundation::{HLOCAL, LocalFree};
-    use windows::Win32::Foundation::SetHandleInformation;
     use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
     use windows::Win32::System::Pipes::CreatePipe;
     use windows::Win32::System::Threading::{
@@ -133,7 +132,8 @@ mod imp {
         let auth = SECURITY_NT_AUTHORITY;
         let mut psid = PSID::default();
         unsafe {
-            AllocateAndInitializeSid(&auth, 4, 21, r2, r3, r4, 0, 0, 0, 0, &mut psid).map_err(sb)?;
+            AllocateAndInitializeSid(&auth, 4, 21, r2, r3, r4, 0, 0, 0, 0, &mut psid)
+                .map_err(sb)?;
         }
         Ok(psid)
     }
@@ -503,7 +503,9 @@ mod net {
             let mut app_id: *mut FWP_BYTE_BLOB = std::ptr::null_mut();
             if FwpmGetAppIdFromFileName0(PCWSTR(bin_w.as_ptr()), &mut app_id) != 0 {
                 let _ = FwpmEngineClose0(engine);
-                return Err(ShellError::Sandbox("FwpmGetAppIdFromFileName0 failed".into()));
+                return Err(ShellError::Sandbox(
+                    "FwpmGetAppIdFromFileName0 failed".into(),
+                ));
             }
 
             let sublayer_key = new_guid();
