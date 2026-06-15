@@ -163,11 +163,7 @@ fn parse_extensions(exts: &[u8]) -> HostDecision {
     let mut c = Cursor::new(exts);
     let mut saw_ech = false;
 
-    loop {
-        let ext_type = match c.u16() {
-            Some(t) => t,
-            None => break, // clean end of extensions
-        };
+    while let Some(ext_type) = c.u16() {
         let ext_len = match c.u16() {
             Some(n) => n as usize,
             None => return HostDecision::NeedMore,
@@ -205,10 +201,7 @@ fn parse_sni(data: &[u8]) -> Option<String> {
     let mut lc = Cursor::new(list);
     // Entries: name_type(1) name_len(2) name.
     loop {
-        let name_type = match lc.u8() {
-            Some(t) => t,
-            None => return None,
-        };
+        let name_type = lc.u8()?;
         let name_len = lc.u16()? as usize;
         let name = lc.take(name_len)?;
         if name_type == 0 {
@@ -323,7 +316,7 @@ fn find_host_header(buf: &[u8]) -> Option<String> {
 }
 
 fn trim_cr(line: &[u8]) -> &[u8] {
-    if let Some((&b'\r', rest)) = line.split_last().map(|(l, r)| (l, r)) {
+    if let Some((&b'\r', rest)) = line.split_last() {
         rest
     } else {
         line
