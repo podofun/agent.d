@@ -7,6 +7,11 @@ pub fn is_supported() -> bool {
     std::path::Path::new("/usr/bin/sandbox-exec").exists()
 }
 
+/// Net containment uses the same Seatbelt wrapper, so support tracks `is_supported`.
+pub fn net_supported() -> bool {
+    is_supported()
+}
+
 /// Unused on macOS (wrapper model); kept for the dispatch signature parity.
 pub fn apply(_policy: &SandboxPolicy) -> Result<(), SandboxError> {
     Err(SandboxError::Apply(

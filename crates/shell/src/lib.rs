@@ -79,6 +79,32 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
         return Err(ShellError::SandboxUnavailable);
     }
 
+    // Host-granular network: when the policy permits network, the child is
+    // confined so the egress proxy is its only route out. Fail closed if net
+    // containment is unavailable on this platform.
+    if let Some(policy) = req.sandbox.clone()
+        && !policy.unrestricted
+        && policy.allow_net
+    {
+        if !sandbox::net_supported() {
+            return Err(ShellError::SandboxUnavailable);
+        }
+        let proxy = proxy::Proxy::start(policy.net_hosts.clone())
+            .await
+            .map_err(|e| ShellError::Sandbox(e.to_string()))?;
+        #[cfg(target_os = "linux")]
+        {
+            return sandbox::linux_net::run_contained(&req, &policy, &proxy).await;
+        }
+        // Other platforms wire proxy.addr() into their containment profile; until
+        // those land, net_supported() returns false above so this is unreachable.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = &proxy;
+            return Err(ShellError::SandboxUnavailable);
+        }
+    }
+
     // macOS enforces via an argv wrapper (sandbox-exec), chosen before spawn.
     #[cfg(target_os = "macos")]
     let (bin, args): (String, Vec<String>) = match &req.sandbox {

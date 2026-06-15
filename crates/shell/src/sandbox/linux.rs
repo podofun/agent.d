@@ -27,6 +27,11 @@ pub fn is_supported() -> bool {
         .is_ok()
 }
 
+/// Whether host-granular net containment (rootless netns) can be enforced here.
+pub fn net_supported() -> bool {
+    super::linux_net::userns_net_supported()
+}
+
 /// Build and enforce the ruleset on the current thread. Call from the forked
 /// child so only the child is confined.
 pub fn apply(policy: &SandboxPolicy) -> Result<(), SandboxError> {

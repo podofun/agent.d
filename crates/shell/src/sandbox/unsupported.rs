@@ -8,3 +8,7 @@ pub fn apply(_policy: &SandboxPolicy) -> Result<(), SandboxError> {
 pub fn is_supported() -> bool {
     false
 }
+
+pub fn net_supported() -> bool {
+    false
+}

@@ -174,3 +174,32 @@ async fn proxied_disallowed_host_denied() {
         r.stdout
     );
 }
+
+#[tokio::test]
+async fn net_off_blocks_all_network() {
+    if !userns_net_supported() {
+        eprintln!("userns unavailable; skipping");
+        return;
+    }
+    supervisor_env();
+    // allow_net = false routes through the Phase 1 Landlock path, which denies
+    // all TCP. Even a loopback connect must fail.
+    let upstream = echo_server().await;
+    let p = SandboxPolicy {
+        read_paths: vec![],
+        write_paths: vec![],
+        allow_net: false,
+        net_hosts: vec![],
+        unrestricted: false,
+    };
+    let script = format!("exec 3<>/dev/tcp/127.0.0.1/{upstream} && echo OPEN || echo BLOCKED");
+    let mut request = req("/bin/bash", &script);
+    request.sandbox = Some(p);
+    let r = agentd_shell::exec(request).await.unwrap();
+    assert!(
+        r.stdout.contains("BLOCKED"),
+        "net-off must block all network; got stdout={:?} stderr={:?}",
+        r.stdout,
+        r.stderr
+    );
+}

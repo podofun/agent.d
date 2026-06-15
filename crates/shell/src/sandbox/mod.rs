@@ -36,6 +36,11 @@ pub fn is_supported() -> bool {
     backend::is_supported()
 }
 
+/// Whether host-granular network containment can be enforced here.
+pub fn net_supported() -> bool {
+    backend::net_supported()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::policy::SandboxPolicy;

@@ -16,7 +16,13 @@
 use crate::policy::{SandboxError, SandboxPolicy};
 
 pub fn is_supported() -> bool {
-    // Flip to true once the AppContainer spawn path below is implemented.
+    // Flip to true once the restricted-token + firewall/WFP path is implemented.
+    false
+}
+
+/// Net containment (restricted token + sandbox user + firewall/WFP) is not yet
+/// implemented; fail closed.
+pub fn net_supported() -> bool {
     false
 }
 
