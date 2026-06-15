@@ -12,6 +12,10 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+pub mod policy;
+pub mod sandbox;
+pub use policy::{SandboxError, SandboxPolicy};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecRequest {
     /// Executable name or absolute path. Looked up via $PATH if not absolute.
@@ -27,6 +31,11 @@ pub struct ExecRequest {
     /// merged into stdout (handy for tools that mix the two).
     #[serde(default = "default_true")]
     pub separate_stderr: bool,
+    /// Native-OS sandbox policy applied to the child. `None` = no sandbox
+    /// (internal callers only; `ctx.shell` always sets `Some`). Host-derived,
+    /// never wire data, so it is skipped during (de)serialization.
+    #[serde(skip, default)]
+    pub sandbox: Option<SandboxPolicy>,
 }
 
 fn default_true() -> bool {
@@ -50,16 +59,53 @@ pub enum ShellError {
     },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("native shell sandbox unavailable; shell denied")]
+    SandboxUnavailable,
 }
 
 /// Run a command. The caller is responsible for permission checks BEFORE
 /// invoking this function. The shell crate is a primitive; gating lives in
 /// the context binding layer.
 pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
-    let mut cmd = Command::new(&req.bin);
-    cmd.args(&req.args);
+    // Fail closed: if a sandbox policy is requested but no backend can enforce
+    // it, refuse to run rather than spawn unconfined.
+    if let Some(policy) = &req.sandbox {
+        if !policy.unrestricted && !sandbox::is_supported() {
+            return Err(ShellError::SandboxUnavailable);
+        }
+    }
+
+    // macOS enforces via an argv wrapper (sandbox-exec), chosen before spawn.
+    #[cfg(target_os = "macos")]
+    let (bin, args): (String, Vec<String>) = match &req.sandbox {
+        Some(p) if !p.unrestricted => sandbox::wrap_argv(p, &req.bin, &req.args),
+        _ => (req.bin.clone(), req.args.clone()),
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (bin, args): (String, Vec<String>) = (req.bin.clone(), req.args.clone());
+
+    let mut cmd = Command::new(&bin);
+    cmd.args(&args);
     if let Some(cwd) = &req.cwd {
         cmd.current_dir(cwd);
+    }
+
+    // Linux enforces by restricting the forked child before exec.
+    #[cfg(target_os = "linux")]
+    if let Some(policy) = req.sandbox.clone() {
+        if !policy.unrestricted {
+            // `cmd` is a `tokio::process::Command` with its OWN inherent
+            // `pre_exec`; do not import `std::os::unix::process::CommandExt`.
+            // SAFETY: the closure runs in the forked child before exec. It only
+            // calls Landlock syscalls + path opens; no shared-state mutation.
+            unsafe {
+                cmd.pre_exec(move || {
+                    sandbox::apply(&policy).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
+                    })
+                });
+            }
+        }
     }
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
     if req.separate_stderr {
@@ -117,6 +163,7 @@ mod tests {
             cwd: None,
             stdin: None,
             separate_stderr: true,
+            sandbox: None,
         })
         .await
         .unwrap();
@@ -133,6 +180,7 @@ mod tests {
             cwd: None,
             stdin: None,
             separate_stderr: true,
+            sandbox: None,
         })
         .await
         .unwrap();
@@ -147,6 +195,7 @@ mod tests {
             cwd: None,
             stdin: None,
             separate_stderr: true,
+            sandbox: None,
         })
         .await
         .unwrap();
@@ -162,6 +211,7 @@ mod tests {
             cwd: None,
             stdin: None,
             separate_stderr: false,
+            sandbox: None,
         })
         .await
         .unwrap();
@@ -178,6 +228,7 @@ mod tests {
             cwd: None,
             stdin: Some("payload".into()),
             separate_stderr: true,
+            sandbox: None,
         })
         .await
         .unwrap();
@@ -192,6 +243,7 @@ mod tests {
             cwd: None,
             stdin: None,
             separate_stderr: true,
+            sandbox: None,
         })
         .await
         .unwrap_err();
@@ -206,6 +258,7 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp")),
             stdin: None,
             separate_stderr: true,
+            sandbox: None,
         })
         .await
         .unwrap();
