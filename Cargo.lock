@@ -282,6 +282,7 @@ dependencies = [
  "libc",
  "nix",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

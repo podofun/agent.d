@@ -38,12 +38,7 @@ pub fn wrap_argv(policy: &SandboxPolicy, bin: &str, args: &[String]) -> (String,
         sbpl.push_str("(allow network*)\n");
     }
 
-    let mut new_args = vec![
-        "-p".to_string(),
-        sbpl,
-        "--".to_string(),
-        bin.to_string(),
-    ];
+    let mut new_args = vec!["-p".to_string(), sbpl, "--".to_string(), bin.to_string()];
     new_args.extend(args.iter().cloned());
     ("/usr/bin/sandbox-exec".to_string(), new_args)
 }

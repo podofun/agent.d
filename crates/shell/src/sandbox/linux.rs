@@ -44,7 +44,9 @@ pub fn apply(policy: &SandboxPolicy) -> Result<(), SandboxError> {
     // unhandled so it stays unrestricted. (Best-effort: downgraded on kernels
     // without Landlock network support.)
     if !policy.allow_net {
-        ruleset = ruleset.handle_access(AccessNet::BindTcp).map_err(apply_err)?;
+        ruleset = ruleset
+            .handle_access(AccessNet::BindTcp)
+            .map_err(apply_err)?;
         ruleset = ruleset
             .handle_access(AccessNet::ConnectTcp)
             .map_err(apply_err)?;

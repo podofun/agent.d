@@ -1,6 +1,5 @@
 //! Host-side proxy behavior over real loopback TCP with a fake upstream.
 
-
 use agentd_permissions::Permission;
 use agentd_shell::proxy::Proxy;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

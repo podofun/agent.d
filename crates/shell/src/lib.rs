@@ -62,6 +62,8 @@ pub enum ShellError {
     Io(#[from] std::io::Error),
     #[error("native shell sandbox unavailable; shell denied")]
     SandboxUnavailable,
+    #[error("sandbox setup failed: {0}")]
+    Sandbox(String),
 }
 
 /// Run a command. The caller is responsible for permission checks BEFORE

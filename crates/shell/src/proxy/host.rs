@@ -95,7 +95,7 @@ fn parse_tls_client_hello(buf: &[u8]) -> HostDecision {
     // Handshake header within the record body: msg_type(1) length(3).
     let mut h = Cursor::new(rec_body);
     match h.u8() {
-        Some(0x01) => {}                                  // ClientHello
+        Some(0x01) => {} // ClientHello
         Some(_) => return HostDecision::Deny("not a client hello"),
         None => return HostDecision::NeedMore,
     }
@@ -217,7 +217,15 @@ fn parse_sni(data: &[u8]) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 const HTTP_METHODS: &[&[u8]] = &[
-    b"GET ", b"POST ", b"PUT ", b"DELETE ", b"HEAD ", b"OPTIONS ", b"PATCH ", b"TRACE ", b"CONNECT ",
+    b"GET ",
+    b"POST ",
+    b"PUT ",
+    b"DELETE ",
+    b"HEAD ",
+    b"OPTIONS ",
+    b"PATCH ",
+    b"TRACE ",
+    b"CONNECT ",
 ];
 
 fn parse_http(buf: &[u8]) -> HostDecision {
@@ -327,9 +335,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 // ---------------------------------------------------------------------------
@@ -407,31 +413,46 @@ mod tests {
     #[test]
     fn parses_sni() {
         let buf = build_client_hello("example.com");
-        assert_eq!(extract_host(&buf), HostDecision::Allow("example.com".into()));
+        assert_eq!(
+            extract_host(&buf),
+            HostDecision::Allow("example.com".into())
+        );
     }
 
     #[test]
     fn sni_lowercased() {
         let buf = build_client_hello("API.Example.COM");
-        assert_eq!(extract_host(&buf), HostDecision::Allow("api.example.com".into()));
+        assert_eq!(
+            extract_host(&buf),
+            HostDecision::Allow("api.example.com".into())
+        );
     }
 
     #[test]
     fn http_host_header() {
         let buf = b"GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
-        assert_eq!(extract_host(buf), HostDecision::Allow("api.example.com".into()));
+        assert_eq!(
+            extract_host(buf),
+            HostDecision::Allow("api.example.com".into())
+        );
     }
 
     #[test]
     fn http_host_with_port() {
         let buf = b"GET / HTTP/1.1\r\nHost: api.example.com:8443\r\n\r\n";
-        assert_eq!(extract_host(buf), HostDecision::Allow("api.example.com".into()));
+        assert_eq!(
+            extract_host(buf),
+            HostDecision::Allow("api.example.com".into())
+        );
     }
 
     #[test]
     fn http_connect() {
         let buf = b"CONNECT api.example.com:443 HTTP/1.1\r\n\r\n";
-        assert_eq!(extract_host(buf), HostDecision::Allow("api.example.com".into()));
+        assert_eq!(
+            extract_host(buf),
+            HostDecision::Allow("api.example.com".into())
+        );
     }
 
     #[test]
@@ -445,7 +466,10 @@ mod tests {
         let full = build_client_hello("example.com");
         let split = full.len() / 2;
         assert_eq!(extract_host(&full[..split]), HostDecision::NeedMore);
-        assert_eq!(extract_host(&full), HostDecision::Allow("example.com".into()));
+        assert_eq!(
+            extract_host(&full),
+            HostDecision::Allow("example.com".into())
+        );
     }
 
     #[test]
