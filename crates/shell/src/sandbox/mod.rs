@@ -25,6 +25,15 @@ pub use backend::run_contained as windows_run_contained;
 #[cfg(target_os = "linux")]
 pub mod linux_net;
 
+/// If this process was re-exec'd as the in-netns network supervisor, run it and
+/// exit. The host binary (daemon) must call this first thing in `main`, before
+/// any threads/async runtime start. No-op when not in supervisor mode or off
+/// Linux.
+pub fn run_netns_supervisor_if_requested() {
+    #[cfg(target_os = "linux")]
+    linux_net::run_supervisor_if_requested();
+}
+
 /// Apply the policy to the CURRENT process/thread (call site is the forked
 /// child via pre_exec, or the wrapper path). `unrestricted` short-circuits.
 pub fn apply(policy: &SandboxPolicy) -> Result<(), SandboxError> {
