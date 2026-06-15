@@ -1504,20 +1504,23 @@ pub(crate) fn build_sandbox_policy(grants: &PermissionSet) -> SandboxPolicy {
         };
         match domain {
             "fs.write" => {
-                if let Some(s) = spec {
-                    if s.starts_with('/') {
-                        policy.write_paths.push(concrete_ancestor(s));
-                    }
+                if let Some(s) = spec
+                    && s.starts_with('/')
+                {
+                    policy.write_paths.push(concrete_ancestor(s));
                 }
             }
             "fs.read" => {
-                if let Some(s) = spec {
-                    if s.starts_with('/') {
-                        policy.read_paths.push(concrete_ancestor(s));
-                    }
+                if let Some(s) = spec
+                    && s.starts_with('/')
+                {
+                    policy.read_paths.push(concrete_ancestor(s));
                 }
             }
-            "net" => policy.allow_net = true,
+            "net" => {
+                policy.allow_net = true;
+                policy.net_hosts.push(perm.clone());
+            }
             "shell.unrestricted" => policy.unrestricted = true,
             _ => {}
         }
@@ -2882,6 +2885,16 @@ mod sandbox_policy_tests {
         grants.insert(Permission::new("shell.unrestricted"));
         let p = build_sandbox_policy(&grants);
         assert!(p.unrestricted);
+    }
+
+    #[test]
+    fn collects_net_hosts() {
+        let mut grants = PermissionSet::empty();
+        grants.insert(Permission::new("net:api.example.com"));
+        grants.insert(Permission::new("net:*"));
+        let p = build_sandbox_policy(&grants);
+        assert!(p.allow_net);
+        assert_eq!(p.net_hosts.len(), 2);
     }
 
     #[test]

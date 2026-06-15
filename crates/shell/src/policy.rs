@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use agentd_permissions::Permission;
+
 /// Directory subtrees readable by any sandboxed child so the binary, libc, and
 /// common config can be reached. Nonexistent entries are skipped at apply time.
 pub const READ_BASELINE: &[&str] = &[
@@ -31,8 +33,13 @@ pub struct SandboxPolicy {
     pub read_paths: Vec<PathBuf>,
     /// Directory subtrees the child may write (fs.write grants; scratch added at apply).
     pub write_paths: Vec<PathBuf>,
-    /// Coarse network toggle. true iff the execution holds ANY `net:` grant.
+    /// Network master switch. true iff the execution holds ANY `net:` grant.
+    /// false = no network at all (not even the proxy).
     pub allow_net: bool,
+    /// Hosts the child may reach, as raw `net:<host>` grant slugs. The egress
+    /// proxy checks a destination with `Permission::covers`, matching ctx.http
+    /// exactly — no parallel match logic.
+    pub net_hosts: Vec<Permission>,
     /// `shell.unrestricted` escape hatch. When true the sandbox is not applied.
     pub unrestricted: bool,
 }
@@ -103,5 +110,12 @@ mod tests {
     fn concrete_ancestor_ignores_relative() {
         // Non-absolute specifiers are skipped by callers; helper returns as-is.
         assert_eq!(concrete_ancestor("relative/*"), PathBuf::from("relative"));
+    }
+
+    #[test]
+    fn net_hosts_default_empty() {
+        let p = SandboxPolicy::default();
+        assert!(p.net_hosts.is_empty());
+        assert!(!p.allow_net);
     }
 }

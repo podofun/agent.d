@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+agentd-permissions.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 thiserror.workspace = true

@@ -10,6 +10,7 @@ fn policy_writing_only(dir: &std::path::Path) -> SandboxPolicy {
         read_paths: vec![], // baseline added inside the backend
         write_paths: vec![dir.to_path_buf()],
         allow_net: false,
+        net_hosts: vec![],
         unrestricted: false,
     }
 }
@@ -80,4 +81,3 @@ async fn binary_still_runs_under_read_baseline() {
     .unwrap();
     assert_eq!(res.stdout.trim(), "alive");
 }
-
