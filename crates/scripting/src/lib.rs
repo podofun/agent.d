@@ -14,7 +14,8 @@ use agentd_permissions::{Permission, PermissionSet};
 use agentd_runners::{RunnerDef, RunnerRegistry};
 use agentd_secrets::SecretStore;
 use agentd_services::{ServiceDef, ServiceRegistry};
-use agentd_shell::{ExecRequest, exec as shell_exec};
+use agentd_shell::policy::concrete_ancestor;
+use agentd_shell::{ExecRequest, SandboxPolicy, exec as shell_exec};
 use agentd_skills::{SkillDef, SkillRegistry};
 use agentd_types::{
     ActionCall, ActionResult, CallContext, Registry, RegistryActionInfo, RegistryError,
@@ -1489,8 +1490,46 @@ fn log_at(level: tracing::Level, msg: &str) {
 
 // ---------- ctx.shell ----------
 
+/// Translate an execution's effective grants into a child-process sandbox
+/// policy. `fs.read`/`fs.write` slugs become readable/writable subtrees (globs
+/// collapsed to the concrete ancestor dir), any `net:` grant flips coarse
+/// network on, and `shell.unrestricted` opts the child out of the sandbox.
+pub(crate) fn build_sandbox_policy(grants: &PermissionSet) -> SandboxPolicy {
+    let mut policy = SandboxPolicy::default();
+    for perm in grants.iter() {
+        let slug = perm.as_str();
+        let (domain, spec) = match slug.split_once(':') {
+            Some((d, s)) => (d, Some(s)),
+            None => (slug, None),
+        };
+        match domain {
+            "fs.write" => {
+                if let Some(s) = spec
+                    && s.starts_with('/')
+                {
+                    policy.write_paths.push(concrete_ancestor(s));
+                }
+            }
+            "fs.read" => {
+                if let Some(s) = spec
+                    && s.starts_with('/')
+                {
+                    policy.read_paths.push(concrete_ancestor(s));
+                }
+            }
+            "net" => {
+                policy.allow_net = true;
+                policy.net_hosts.push(perm.clone());
+            }
+            "shell.unrestricted" => policy.unrestricted = true,
+            _ => {}
+        }
+    }
+    policy
+}
+
 fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
-    let req = parse_shell_args(lua, args)?;
+    let mut req = parse_shell_args(lua, args)?;
     // Per-binary scoping. A bare `shell.exec` grant authorizes any binary
     // (legacy/broad); a scoped `shell.exec:<bin>` (or holder wildcard like
     // `shell.exec:*`) authorizes just that binary. Allow if EITHER is held —
@@ -1509,6 +1548,16 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
             "denied at context: missing `shell.exec` or `shell.exec:{}`",
             req.bin
         )));
+    }
+
+    // Confine the child to the execution's effective filesystem/network grants.
+    // Must be attached before the request is wrapped into Op::Shell so the
+    // scheduler carries the policy through to agentd_shell::exec.
+    {
+        let active = lua
+            .app_data_ref::<ActiveContext>()
+            .ok_or_else(|| mlua::Error::external("active context missing"))?;
+        req.sandbox = Some(build_sandbox_policy(&active.effective_grants));
     }
 
     if scheduler::is_in_coroutine(lua) {
@@ -1556,6 +1605,7 @@ fn parse_shell_args(_lua: &Lua, args: MultiValue) -> mlua::Result<ExecRequest> {
                 cwd: cwd.map(Into::into),
                 stdin,
                 separate_stderr,
+                sandbox: None,
             })
         }
         Value::String(s) => {
@@ -1594,6 +1644,7 @@ fn parse_shell_args(_lua: &Lua, args: MultiValue) -> mlua::Result<ExecRequest> {
                 cwd: cwd.map(Into::into),
                 stdin,
                 separate_stderr,
+                sandbox: None,
             })
         }
         other => Err(mlua::Error::external(format!(
@@ -2806,5 +2857,54 @@ impl Registry for LuaHost {
         outcome
             .map(|_| ())
             .map_err(|e| RegistryError::Invocation(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod sandbox_policy_tests {
+    use super::build_sandbox_policy;
+    use agentd_permissions::{Permission, PermissionSet};
+    use std::path::PathBuf;
+
+    #[test]
+    fn maps_fs_and_net_grants() {
+        let mut grants = PermissionSet::empty();
+        grants.insert(Permission::new("fs.write:/allowed/**"));
+        grants.insert(Permission::new("fs.read:/data/*"));
+        grants.insert(Permission::new("net:api.example.com"));
+        let p = build_sandbox_policy(&grants);
+        assert!(p.write_paths.contains(&PathBuf::from("/allowed")));
+        assert!(p.read_paths.contains(&PathBuf::from("/data")));
+        assert!(p.allow_net);
+        assert!(!p.unrestricted);
+    }
+
+    #[test]
+    fn detects_unrestricted() {
+        let mut grants = PermissionSet::empty();
+        grants.insert(Permission::new("shell.unrestricted"));
+        let p = build_sandbox_policy(&grants);
+        assert!(p.unrestricted);
+    }
+
+    #[test]
+    fn collects_net_hosts() {
+        let mut grants = PermissionSet::empty();
+        grants.insert(Permission::new("net:api.example.com"));
+        grants.insert(Permission::new("net:*"));
+        let p = build_sandbox_policy(&grants);
+        assert!(p.allow_net);
+        assert_eq!(p.net_hosts.len(), 2);
+    }
+
+    #[test]
+    fn ignores_relative_and_non_fs_slugs() {
+        let mut grants = PermissionSet::empty();
+        grants.insert(Permission::new("fs.write:relative/path"));
+        grants.insert(Permission::new("shell.exec:git"));
+        let p = build_sandbox_policy(&grants);
+        assert!(p.write_paths.is_empty());
+        assert!(!p.allow_net);
+        assert!(!p.unrestricted);
     }
 }

@@ -12,6 +12,11 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+pub mod policy;
+pub mod proxy;
+pub mod sandbox;
+pub use policy::{SandboxError, SandboxPolicy};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecRequest {
     /// Executable name or absolute path. Looked up via $PATH if not absolute.
@@ -27,6 +32,11 @@ pub struct ExecRequest {
     /// merged into stdout (handy for tools that mix the two).
     #[serde(default = "default_true")]
     pub separate_stderr: bool,
+    /// Native-OS sandbox policy applied to the child. `None` = no sandbox
+    /// (internal callers only; `ctx.shell` always sets `Some`). Host-derived,
+    /// never wire data, so it is skipped during (de)serialization.
+    #[serde(skip, default)]
+    pub sandbox: Option<SandboxPolicy>,
 }
 
 fn default_true() -> bool {
@@ -50,16 +60,123 @@ pub enum ShellError {
     },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("native shell sandbox unavailable; shell denied")]
+    SandboxUnavailable,
+    #[error("sandbox setup failed: {0}")]
+    Sandbox(String),
 }
 
 /// Run a command. The caller is responsible for permission checks BEFORE
 /// invoking this function. The shell crate is a primitive; gating lives in
 /// the context binding layer.
 pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
-    let mut cmd = Command::new(&req.bin);
-    cmd.args(&req.args);
+    // Fail closed: if a sandbox policy is requested but no backend can enforce
+    // it, refuse to run rather than spawn unconfined.
+    if let Some(policy) = &req.sandbox
+        && !policy.unrestricted
+        && !sandbox::is_supported()
+    {
+        return Err(ShellError::SandboxUnavailable);
+    }
+
+    // Host-granular network (Linux): when the policy permits network, the child
+    // is confined inside a netns whose only route out is the egress proxy. This
+    // path owns the whole spawn and returns. Fail closed if unavailable.
+    #[cfg(target_os = "linux")]
+    if let Some(policy) = req.sandbox.clone()
+        && !policy.unrestricted
+        && policy.allow_net
+    {
+        if !sandbox::net_supported() {
+            return Err(ShellError::SandboxUnavailable);
+        }
+        let proxy = proxy::Proxy::start(policy.net_hosts.clone())
+            .await
+            .map_err(|e| ShellError::Sandbox(e.to_string()))?;
+        return sandbox::linux_net::run_contained(&req, &policy, &proxy).await;
+    }
+
+    // Host-granular network (non-Linux): start the egress proxy and keep it alive
+    // for the child's lifetime; the per-OS profile (macOS Seatbelt below) locks
+    // the child to the proxy's loopback port. Fail closed if unavailable.
+    #[cfg(not(target_os = "linux"))]
+    let mut _net_proxy: Option<proxy::Proxy> = None;
+    #[cfg(not(target_os = "linux"))]
+    let mut proxy_addr: Option<std::net::SocketAddr> = None;
+    #[cfg(not(target_os = "linux"))]
+    if let Some(policy) = req.sandbox.clone()
+        && !policy.unrestricted
+        && policy.allow_net
+    {
+        if !sandbox::net_supported() {
+            return Err(ShellError::SandboxUnavailable);
+        }
+        let proxy = proxy::Proxy::start(policy.net_hosts.clone())
+            .await
+            .map_err(|e| ShellError::Sandbox(e.to_string()))?;
+        proxy_addr = Some(proxy.addr());
+        _net_proxy = Some(proxy);
+    }
+
+    // Windows applies confinement at spawn (restricted token + WFP), not via
+    // pre_exec, so it owns the whole spawn and returns. The proxy (if any) stays
+    // alive in `_net_proxy` for the child's lifetime.
+    #[cfg(target_os = "windows")]
+    if let Some(policy) = req.sandbox.clone()
+        && !policy.unrestricted
+    {
+        return sandbox::windows_run_contained(&req, &policy, proxy_addr).await;
+    }
+
+    // macOS enforces via an argv wrapper (sandbox-exec), chosen before spawn. The
+    // proxy address (if any) locks the child's network to the proxy port only.
+    #[cfg(target_os = "macos")]
+    let (bin, args): (String, Vec<String>) = match &req.sandbox {
+        Some(p) if !p.unrestricted => sandbox::wrap_argv(p, proxy_addr, &req.bin, &req.args),
+        _ => (req.bin.clone(), req.args.clone()),
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (bin, args): (String, Vec<String>) = (req.bin.clone(), req.args.clone());
+
+    let mut cmd = Command::new(&bin);
+    cmd.args(&args);
+
+    // Point the child at the egress proxy (cooperative path; enforcement is the
+    // OS profile that confines the child to the proxy port).
+    #[cfg(not(target_os = "linux"))]
+    if let Some(addr) = proxy_addr {
+        let p = format!("http://127.0.0.1:{}", addr.port());
+        for k in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+        ] {
+            cmd.env(k, &p);
+        }
+        cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
+    }
+
     if let Some(cwd) = &req.cwd {
         cmd.current_dir(cwd);
+    }
+
+    // Linux enforces by restricting the forked child before exec.
+    #[cfg(target_os = "linux")]
+    if let Some(policy) = req.sandbox.clone()
+        && !policy.unrestricted
+    {
+        // `cmd` is a `tokio::process::Command` with its OWN inherent `pre_exec`;
+        // do not import `std::os::unix::process::CommandExt`.
+        // SAFETY: the closure runs in the forked child before exec. It only
+        // calls Landlock syscalls + path opens; no shared-state mutation.
+        unsafe {
+            cmd.pre_exec(move || {
+                sandbox::apply(&policy)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
+            });
+        }
     }
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
     if req.separate_stderr {
@@ -105,7 +222,8 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
     })
 }
 
-#[cfg(test)]
+// These exercise real unix binaries (/bin/echo, /bin/sh, ...); gated to unix.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -117,6 +235,7 @@ mod tests {
             cwd: None,
             stdin: None,
             separate_stderr: true,
+            sandbox: None,
         })
         .await
         .unwrap();
@@ -133,6 +252,7 @@ mod tests {
             cwd: None,
             stdin: None,
             separate_stderr: true,
+            sandbox: None,
         })
         .await
         .unwrap();
@@ -147,6 +267,7 @@ mod tests {
             cwd: None,
             stdin: None,
             separate_stderr: true,
+            sandbox: None,
         })
         .await
         .unwrap();
@@ -162,6 +283,7 @@ mod tests {
             cwd: None,
             stdin: None,
             separate_stderr: false,
+            sandbox: None,
         })
         .await
         .unwrap();
@@ -178,6 +300,7 @@ mod tests {
             cwd: None,
             stdin: Some("payload".into()),
             separate_stderr: true,
+            sandbox: None,
         })
         .await
         .unwrap();
@@ -192,12 +315,15 @@ mod tests {
             cwd: None,
             stdin: None,
             separate_stderr: true,
+            sandbox: None,
         })
         .await
         .unwrap_err();
         assert!(matches!(err, ShellError::Spawn { .. }));
     }
 
+    // macOS resolves /tmp -> /private/tmp, so pin to Linux.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn respects_cwd() {
         let res = exec(ExecRequest {
@@ -206,6 +332,7 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp")),
             stdin: None,
             separate_stderr: true,
+            sandbox: None,
         })
         .await
         .unwrap();

@@ -235,6 +235,12 @@ the specifier:
 - `memory.read:discord/**`
 - `memory.write:*`
 - `ai:anthropic`
+- `shell.unrestricted`
+
+`shell.unrestricted` is a plain non-wildcard grant. Holding it makes `ctx.shell`
+skip the native shell sandbox and run the child on the host shell. The engine
+treats it as an ordinary slug; the sandbox-skip meaning is interpreted in the
+shell binding (see the native shell sandbox under `ctx.shell`).
 
 Example:
 
@@ -581,6 +587,42 @@ Required permission:
 
 The shell primitive is argv-only. Do not add a shell interpreter path for
 compound commands.
+
+#### Native shell sandbox
+
+Every `ctx.shell` child runs inside a native OS sandbox (NativeShellSandbox)
+enforced on the child process: Landlock on Linux, `sandbox-exec` (Seatbelt) on
+macOS, a restricted token + firewall/WFP on Windows. The sandbox rules are
+derived from the execution's effective grants, so the OS confines the child to
+the same filesystem and network the permission engine already allows.
+
+Filesystem enforcement:
+
+- Writes: denied except under `fs.write` grants (globs collapsed to the concrete
+  ancestor directory) plus `/dev/null` scratch.
+- Reads: restricted to `fs.read` grants, the writable subtrees, and a system read
+  baseline (`/usr`, `/bin`, `/lib`, `/lib64`, `/etc`, `/opt`, `/proc/self`,
+  common `/dev` nodes) so the binary and its libraries load.
+
+Network enforcement (host-granular):
+
+- A child reaches a host iff a `net:<host>` grant covers it. Network flows
+  through an in-process egress proxy (in `agentd-shell`) that reads the
+  destination host from the TLS SNI or HTTP `Host`/`CONNECT` target (no TLS
+  termination, no MITM) and checks it with `Permission::covers`.
+- The child is confined so the proxy is its ONLY route out: on Linux a rootless
+  network namespace whose sole egress is the proxy (via an in-netns supervisor +
+  SCM_RIGHTS fd passing); on macOS Seatbelt allowing only the proxy's loopback
+  port; on Windows a sandbox user + firewall/WFP allowing only the proxy port.
+  Proxy env (`HTTP_PROXY` etc.) is a convenience for cooperating tools — the OS
+  confinement, not the env, is the enforcement boundary.
+- `allow_net` is the master switch: zero `net:` grants ⇒ no network at all.
+- IP-literal / no-SNI / encrypted ClientHello (ECH) destinations are denied.
+
+If no enforcing backend is available on the platform, `ctx.shell` fails closed —
+it does not run the child unsandboxed. The only opt-out is the
+`shell.unrestricted` grant, which runs the child on the host shell with no
+sandbox.
 
 ### `ctx.tools`
 

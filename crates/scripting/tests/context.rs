@@ -357,3 +357,73 @@ async fn tools_call_blocks_confirm_actions() {
         .unwrap_err();
     assert!(err.to_string().contains("confirmation"), "got: {err}");
 }
+
+/// End-to-end: the OS sandbox confines a ctx.shell child to its fs.write grant.
+/// Skipped when the kernel has no enforcing Landlock backend.
+#[tokio::test]
+async fn shell_child_confined_to_fs_write_grant() {
+    if !agentd_shell::sandbox::is_supported() {
+        eprintln!("native sandbox unsupported; skipping");
+        return;
+    }
+    let granted = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let inside_path = granted.path().join("ok.txt");
+    let outside_path = outside.path().join("nope.txt");
+
+    let dir = write_tools(&[(
+        "w.lua",
+        r#"
+            agentd.action{
+              name = "w.write",
+              handler = function(args, ctx)
+                return ctx.shell("/bin/sh", {"-c", "echo hi > " .. args.path})
+              end,
+            }
+        "#,
+    )]);
+    let host = LuaHost::new().unwrap();
+    host.load_dir(dir.path()).unwrap();
+
+    let write_grant = format!("fs.write:{}/**", granted.path().display());
+    let grants = PermissionSet::from_iter(["shell.exec:/bin/sh", write_grant.as_str()]);
+    let make_ctx = || CallContext {
+        caller: Caller::interface("test"),
+        effective_grants: grants.clone(),
+        call_chain: vec!["w.write".to_string()],
+    };
+
+    // Inside the grant: write succeeds.
+    let res = host
+        .call(
+            make_ctx(),
+            ActionCall {
+                action: "w.write".into(),
+                args: serde_json::json!({ "path": inside_path.display().to_string() }),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.value["exit_code"], 0,
+        "inside-grant write should succeed"
+    );
+    assert!(inside_path.exists(), "file inside grant must exist");
+
+    // Outside the grant: Landlock denies the write, sh exits nonzero.
+    let res = host
+        .call(
+            make_ctx(),
+            ActionCall {
+                action: "w.write".into(),
+                args: serde_json::json!({ "path": outside_path.display().to_string() }),
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        res.value["exit_code"], 0,
+        "outside-grant write must be denied"
+    );
+    assert!(!outside_path.exists(), "file outside grant must NOT exist");
+}
