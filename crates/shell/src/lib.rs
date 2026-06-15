@@ -13,6 +13,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 pub mod policy;
+pub mod proxy;
 pub mod sandbox;
 pub use policy::{SandboxError, SandboxPolicy};
 
@@ -69,10 +70,11 @@ pub enum ShellError {
 pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
     // Fail closed: if a sandbox policy is requested but no backend can enforce
     // it, refuse to run rather than spawn unconfined.
-    if let Some(policy) = &req.sandbox {
-        if !policy.unrestricted && !sandbox::is_supported() {
-            return Err(ShellError::SandboxUnavailable);
-        }
+    if let Some(policy) = &req.sandbox
+        && !policy.unrestricted
+        && !sandbox::is_supported()
+    {
+        return Err(ShellError::SandboxUnavailable);
     }
 
     // macOS enforces via an argv wrapper (sandbox-exec), chosen before spawn.
@@ -92,19 +94,18 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
 
     // Linux enforces by restricting the forked child before exec.
     #[cfg(target_os = "linux")]
-    if let Some(policy) = req.sandbox.clone() {
-        if !policy.unrestricted {
-            // `cmd` is a `tokio::process::Command` with its OWN inherent
-            // `pre_exec`; do not import `std::os::unix::process::CommandExt`.
-            // SAFETY: the closure runs in the forked child before exec. It only
-            // calls Landlock syscalls + path opens; no shared-state mutation.
-            unsafe {
-                cmd.pre_exec(move || {
-                    sandbox::apply(&policy).map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
-                    })
-                });
-            }
+    if let Some(policy) = req.sandbox.clone()
+        && !policy.unrestricted
+    {
+        // `cmd` is a `tokio::process::Command` with its OWN inherent `pre_exec`;
+        // do not import `std::os::unix::process::CommandExt`.
+        // SAFETY: the closure runs in the forked child before exec. It only
+        // calls Landlock syscalls + path opens; no shared-state mutation.
+        unsafe {
+            cmd.pre_exec(move || {
+                sandbox::apply(&policy)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
+            });
         }
     }
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
