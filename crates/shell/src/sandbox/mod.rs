@@ -19,6 +19,9 @@ mod backend;
 #[cfg(target_os = "macos")]
 pub use backend::wrap_argv;
 
+#[cfg(target_os = "windows")]
+pub use backend::run_contained as windows_run_contained;
+
 #[cfg(target_os = "linux")]
 pub mod linux_net;
 

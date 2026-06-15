@@ -118,6 +118,16 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
         _net_proxy = Some(proxy);
     }
 
+    // Windows applies confinement at spawn (restricted token + WFP), not via
+    // pre_exec, so it owns the whole spawn and returns. The proxy (if any) stays
+    // alive in `_net_proxy` for the child's lifetime.
+    #[cfg(target_os = "windows")]
+    if let Some(policy) = req.sandbox.clone()
+        && !policy.unrestricted
+    {
+        return sandbox::windows_run_contained(&req, &policy, proxy_addr).await;
+    }
+
     // macOS enforces via an argv wrapper (sandbox-exec), chosen before spawn. The
     // proxy address (if any) locks the child's network to the proxy port only.
     #[cfg(target_os = "macos")]
