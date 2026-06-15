@@ -65,9 +65,165 @@ pub fn bring_loopback_up() -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
+// In-netns supervisor (runs in the re-exec'd process, not a separate binary)
+
+/// If this process was re-exec'd as the netns supervisor (`AGENTD_NETNS_SUPERVISOR`
+/// env is set), run the supervisor and exit. Otherwise return immediately. The
+/// host binary (the daemon) must call this as the FIRST thing in `main`, before
+/// any threads or async runtime start — the supervisor forks the command and
+/// must be single-threaded at that point.
+pub fn run_supervisor_if_requested() {
+    if let Ok(json) = std::env::var(SUPERVISOR_ENV) {
+        let code = match serde_json::from_str::<SupervisorConfig>(&json) {
+            Ok(cfg) => supervisor::run(cfg),
+            Err(_) => 127,
+        };
+        std::process::exit(code);
+    }
+}
+
+mod supervisor {
+    use std::ffi::CString;
+    use std::os::fd::{FromRawFd, RawFd};
+
+    use nix::sys::socket::{
+        AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, SockaddrIn, bind, listen,
+        sendmsg, socket,
+    };
+    use nix::sys::wait::{WaitStatus, waitpid};
+    use nix::unistd::{ForkResult, fork};
+
+    use super::{SupervisorConfig, bring_loopback_up};
+    use crate::SandboxPolicy;
+
+    pub fn run(cfg: SupervisorConfig) -> i32 {
+        if !bring_loopback_up() {
+            eprintln!("supervisor: failed to bring lo up");
+            return 127;
+        }
+        let listener = match make_listener() {
+            Some(l) => l,
+            None => {
+                eprintln!("supervisor: failed to bind loopback listener");
+                return 127;
+            }
+        };
+        let port = match listener.local_addr() {
+            Ok(a) => a.port(),
+            Err(_) => return 127,
+        };
+
+        // SAFETY: single-threaded process (just execve'd), so the post-fork child
+        // may run normal code before its own execve.
+        let child = match unsafe { fork() } {
+            Ok(ForkResult::Child) => exec_command(&cfg, port), // never returns (`!`)
+            Ok(ForkResult::Parent { child }) => child,
+            Err(_) => return 127,
+        };
+
+        unsafe {
+            libc::close(cfg.stdout_fd);
+            libc::close(cfg.stderr_fd);
+            if cfg.stdin_fd >= 0 {
+                libc::close(cfg.stdin_fd);
+            }
+        }
+
+        listener.set_nonblocking(true).ok();
+        loop {
+            match waitpid(child, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::Exited(_, code)) => return code,
+                Ok(WaitStatus::Signaled(_, _, _)) => return 129,
+                _ => {}
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    use std::os::fd::AsRawFd;
+                    let _ = send_fd(cfg.control_fd, stream.as_raw_fd());
+                    drop(stream);
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+            }
+        }
+    }
+
+    fn make_listener() -> Option<std::net::TcpListener> {
+        let fd = socket(
+            AddressFamily::Inet,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .ok()?;
+        let addr = SockaddrIn::new(127, 0, 0, 1, 0);
+        bind(std::os::fd::AsRawFd::as_raw_fd(&fd), &addr).ok()?;
+        listen(&fd, nix::sys::socket::Backlog::new(64).unwrap()).ok()?;
+        use std::os::fd::IntoRawFd;
+        Some(unsafe { std::net::TcpListener::from_raw_fd(fd.into_raw_fd()) })
+    }
+
+    fn send_fd(control_fd: RawFd, fd: RawFd) -> nix::Result<()> {
+        let fds = [fd];
+        let cmsg = [ControlMessage::ScmRights(&fds)];
+        let iov = [std::io::IoSlice::new(b"f")];
+        sendmsg::<()>(control_fd, &iov, &cmsg, MsgFlags::empty(), None)?;
+        Ok(())
+    }
+
+    fn exec_command(cfg: &SupervisorConfig, proxy_port: u16) -> ! {
+        unsafe {
+            libc::dup2(cfg.stdout_fd, 1);
+            libc::dup2(cfg.stderr_fd, 2);
+            if cfg.stdin_fd >= 0 {
+                libc::dup2(cfg.stdin_fd, 0);
+            }
+            libc::close(cfg.stdout_fd);
+            libc::close(cfg.stderr_fd);
+            if cfg.stdin_fd >= 0 {
+                libc::close(cfg.stdin_fd);
+            }
+            libc::close(cfg.control_fd);
+        }
+
+        let proxy = format!("http://127.0.0.1:{proxy_port}");
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+        ] {
+            unsafe { std::env::set_var(key, &proxy) };
+        }
+        unsafe { std::env::set_var("NO_PROXY", "localhost,127.0.0.1,::1") };
+
+        // Phase 1 filesystem sandbox. allow_net = true so Landlock does NOT block
+        // the loopback connection to the supervisor (network governed by netns).
+        let policy = SandboxPolicy {
+            read_paths: cfg.read_paths.iter().map(Into::into).collect(),
+            write_paths: cfg.write_paths.iter().map(Into::into).collect(),
+            allow_net: true,
+            net_hosts: vec![],
+            unrestricted: false,
+        };
+        if let Err(e) = crate::sandbox::apply(&policy) {
+            eprintln!("supervisor: landlock apply failed: {e}");
+            unsafe { libc::_exit(126) };
+        }
+
+        let bin = CString::new(cfg.bin.as_str()).unwrap();
+        let mut argv: Vec<CString> = Vec::with_capacity(cfg.args.len() + 1);
+        argv.push(bin.clone());
+        for a in &cfg.args {
+            argv.push(CString::new(a.as_str()).unwrap_or_default());
+        }
+        let _ = nix::unistd::execvp(&bin, &argv);
+        eprintln!("supervisor: exec {} failed", cfg.bin);
+        unsafe { libc::_exit(127) }
+    }
+}
+
 // Host-side contained spawn
-// ---------------------------------------------------------------------------
 
 use std::ffi::CString;
 use std::io::Read;
@@ -76,16 +232,16 @@ use std::os::fd::FromRawFd;
 use crate::proxy::Proxy;
 use crate::{ExecRequest, ExecResult, SandboxPolicy, ShellError};
 
-/// Locate the supervisor binary: `AGENTD_NETNS_SUPERVISOR_BIN` override (tests),
-/// else next to the current executable.
+/// The executable to re-exec as the in-netns supervisor: an
+/// `AGENTD_NETNS_SUPERVISOR_BIN` override (tests), else this process's own binary
+/// (the daemon re-execs itself; `run_supervisor_if_requested` handles the mode).
 fn supervisor_path() -> Option<String> {
     if let Ok(p) = std::env::var("AGENTD_NETNS_SUPERVISOR_BIN") {
         return Some(p);
     }
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    let cand = dir.join("agentd-netns-supervisor");
-    cand.exists().then(|| cand.to_string_lossy().into_owned())
+    std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 fn set_cloexec(fd: RawFd, on: bool) {
@@ -417,9 +573,7 @@ async fn splice_to_proxy(fd: RawFd, proxy_addr: std::net::SocketAddr) {
     let _ = tokio::io::copy_bidirectional(&mut child, &mut up).await;
 }
 
-// ---------------------------------------------------------------------------
 // userns probe
-// ---------------------------------------------------------------------------
 
 use std::sync::OnceLock;
 
