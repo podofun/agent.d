@@ -120,7 +120,7 @@ fn install_default_store() -> std::result::Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn install_default_store() -> std::result::Result<(), String> {
-    use apple_native_keyring_store::Store;
+    use apple_native_keyring_store::keychain::Store;
     let store = Store::new().map_err(|e| e.to_string())?;
     keyring_core::set_default_store(store);
     Ok(())
