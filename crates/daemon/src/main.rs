@@ -12,7 +12,10 @@ use agentd_trace::JsonlSink;
 use agentd_types::Registry;
 use anyhow::{Result, anyhow, bail};
 use clap::Parser;
+use std::io::IsTerminal;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
 
 mod config;
@@ -28,16 +31,20 @@ fn main() -> Result<()> {
 
 #[tokio::main]
 async fn run() -> Result<()> {
+    let started = Instant::now();
     let cfg = Config::resolve(Cli::parse())?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(&cfg.log_level))
+        .compact()
+        .with_target(false)
+        .without_time()
         .init();
     if cfg.yolo {
         tracing::warn!(
             "runtime.yolo is reserved and currently ignored; the permission engine remains enforced"
         );
     }
-    tracing::info!(?cfg, "starting agentd");
+    tracing::debug!(?cfg, "starting agentd");
 
     let keyring = Arc::new(KeyringStore::default_service());
     let mut providers = ProviderRegistry::new();
@@ -96,7 +103,7 @@ async fn run() -> Result<()> {
         );
     }
     host.load_file(&cfg.init_file)?;
-    tracing::info!(
+    tracing::debug!(
         init = %cfg.init_file.display(),
         actions = host.list().len(),
         runners = host.runners().len(),
@@ -110,15 +117,15 @@ async fn run() -> Result<()> {
     let services = host.services();
 
     let trace = JsonlSink::open(&cfg.trace_file).await?;
-    tracing::info!(trace = %trace.path().display(), "trace open");
+    tracing::debug!(trace = %trace.path().display(), "trace open");
 
     let mut grants_file = load_grants_file(&cfg.grants_file).map_err(|e| anyhow!(e))?;
     // Desugar every trusted package into the per-tool/runner/service grant rows
     // the engine enforces. Untouched engine, default-deny preserved.
     let loaded_packages = host.loaded_packages();
     agentd_packages::expand_grants(&loaded_packages, &mut grants_file);
-    tracing::info!(packages = loaded_packages.len(), "package grants expanded");
-    tracing::info!(
+    tracing::debug!(packages = loaded_packages.len(), "package grants expanded");
+    tracing::debug!(
         grants = %cfg.grants_file.display(),
         tools = grants_file.tool.len(),
         runners = grants_file.runner.len(),
@@ -170,7 +177,7 @@ async fn run() -> Result<()> {
     // supervised by the executor's service registry. Handles dropped here =
     // tasks keep running until daemon exit.
     let handles = executor.start_services();
-    tracing::info!(spawned = handles.len(), "services started");
+    tracing::debug!(spawned = handles.len(), "services started");
 
     let auth_token = resolve_ws_token(&cfg)?;
     let admin_token = resolve_admin_token(&cfg)?;
@@ -182,9 +189,74 @@ async fn run() -> Result<()> {
     };
 
     let listener = tokio::net::TcpListener::bind(&cfg.addr).await?;
-    tracing::info!(addr = %cfg.addr, "listening");
+    let local_addr = listener.local_addr()?;
+    let startup = StartupSummary {
+        bind_addr: local_addr,
+        init_file: &cfg.init_file,
+        actions: host.list().len(),
+        runners: host.runners().len(),
+        services: host.services().len(),
+        skills: host.skills().len(),
+        elapsed: started.elapsed(),
+        color: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+    };
+    println!("{}", startup.render());
+    tracing::debug!(addr = %local_addr, "listening");
     serve(listener, router(state)).await?;
     Ok(())
+}
+
+struct StartupSummary<'a> {
+    bind_addr: SocketAddr,
+    init_file: &'a std::path::Path,
+    actions: usize,
+    runners: usize,
+    services: usize,
+    skills: usize,
+    elapsed: Duration,
+    color: bool,
+}
+
+impl StartupSummary<'_> {
+    fn render(&self) -> String {
+        let brand = if self.color {
+            "\x1b[1;35mAGENTD\x1b[0m"
+        } else {
+            "AGENTD"
+        };
+        let accent = if self.color { "\x1b[36m" } else { "" };
+        let reset = if self.color { "\x1b[0m" } else { "" };
+        let base = url_host(self.bind_addr);
+        let port = self.bind_addr.port();
+
+        format!(
+            "\n  {brand} v{}  ready in {} ms\n\n  Local:   {accent}http://{base}:{port}/{reset}\n  WS:      {accent}ws://{base}:{port}/ws{reset}\n  Control: {accent}ws://{base}:{port}/control{reset}\n  Loaded:  {}, {}, {}, {}\n  Init:    {}\n  Logs:    warnings/errors (AGENTD_LOG=debug for detail)\n",
+            env!("CARGO_PKG_VERSION"),
+            self.elapsed.as_millis(),
+            count_label(self.actions, "action"),
+            count_label(self.runners, "runner"),
+            count_label(self.services, "service"),
+            count_label(self.skills, "skill"),
+            self.init_file.display(),
+        )
+    }
+}
+
+fn url_host(addr: SocketAddr) -> String {
+    match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => "localhost".to_string(),
+        IpAddr::V6(ip) if ip.is_unspecified() => "localhost".to_string(),
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    }
+}
+
+fn count_label(count: usize, singular: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {singular}s")
+    }
 }
 
 /// Decide the effective `/ws` bearer token. `--no-auth` → `None`. Otherwise use
@@ -209,7 +281,7 @@ fn resolve_ws_token(cfg: &Config) -> Result<Option<String>> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
-    tracing::info!(token_file = %path.display(), "minted /ws auth token");
+    tracing::debug!(token_file = %path.display(), "minted /ws auth token");
     Ok(Some(token))
 }
 
@@ -235,7 +307,7 @@ fn resolve_admin_token(cfg: &Config) -> Result<Option<String>> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
-    tracing::info!(admin_token_file = %path.display(), "minted /control admin token");
+    tracing::debug!(admin_token_file = %path.display(), "minted /control admin token");
     Ok(Some(token))
 }
 
@@ -249,4 +321,51 @@ fn gen_token() -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::time::Duration;
+
+    #[test]
+    fn startup_summary_is_compact_and_actionable() {
+        let rendered = StartupSummary {
+            bind_addr: "127.0.0.1:7777".parse().unwrap(),
+            init_file: Path::new("/tmp/init.lua"),
+            actions: 2,
+            runners: 1,
+            services: 0,
+            skills: 3,
+            elapsed: Duration::from_millis(159),
+            color: false,
+        }
+        .render();
+
+        assert!(rendered.contains("AGENTD v"));
+        assert!(rendered.contains("ready in 159 ms"));
+        assert!(rendered.contains("Local:   http://127.0.0.1:7777/"));
+        assert!(rendered.contains("WS:      ws://127.0.0.1:7777/ws"));
+        assert!(rendered.contains("Loaded:  2 actions, 1 runner, 0 services, 3 skills"));
+        assert!(rendered.contains("Logs:    warnings/errors"));
+        assert_eq!(rendered.lines().count(), 9);
+    }
+
+    #[test]
+    fn startup_summary_uses_localhost_for_unspecified_binds() {
+        let rendered = StartupSummary {
+            bind_addr: "0.0.0.0:7777".parse().unwrap(),
+            init_file: Path::new("/tmp/init.lua"),
+            actions: 0,
+            runners: 0,
+            services: 0,
+            skills: 0,
+            elapsed: Duration::from_millis(1),
+            color: false,
+        }
+        .render();
+
+        assert!(rendered.contains("http://localhost:7777/"));
+    }
 }
