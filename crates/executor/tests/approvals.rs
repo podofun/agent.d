@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use agentd_executor::Executor;
 use agentd_permissions::{
-    Caller, Engine, Grants, GrantsFile, grants::ToolGrants, model::PermissionSet,
+    Caller, Engine, Grants, GrantsFile,
+    grants::{InterfaceGrants, RunnerGrants, ToolGrants},
+    model::PermissionSet,
 };
 use agentd_trace::{TraceEvent, TraceSink};
 use agentd_types::{
@@ -88,6 +90,10 @@ fn engine_with_tool_grant(perms: &[&str]) -> Engine {
     Engine::new(Grants::from_file(file))
 }
 
+fn engine_from_file(file: GrantsFile) -> Engine {
+    Engine::new(Grants::from_file(file))
+}
+
 fn base_executor(requires: &[&str], confirm: bool, engine: Engine) -> Executor {
     let reg = Arc::new(FakeRegistry {
         action_requires: requires.iter().map(|s| s.to_string()).collect(),
@@ -141,10 +147,15 @@ async fn deny_verdict_rejects() {
         .unwrap_err()
         .0;
     assert!(matches!(err, RegistryError::Denied { .. }), "got {err:?}");
+    let msg = err.to_string();
+    assert!(msg.contains("action `tool.act`"), "got {msg}");
+    assert!(msg.contains("tool `tool`"), "got {msg}");
+    assert!(msg.contains("[tool.tool]"), "got {msg}");
+    assert!(msg.contains("granted = [\"cap:foo\"]"), "got {msg}");
 }
 
 #[tokio::test]
-async fn no_broker_rejects_as_today() {
+async fn no_broker_rejects_with_diagnostic() {
     let exec = base_executor(&["cap:foo"], false, engine_with_tool_grant(&[]));
     let err = exec
         .run(Caller::interface("http"), act())
@@ -152,6 +163,90 @@ async fn no_broker_rejects_as_today() {
         .unwrap_err()
         .0;
     assert!(matches!(err, RegistryError::Denied { .. }), "got {err:?}");
+    let msg = err.to_string();
+    assert!(msg.contains("action `tool.act`"), "got {msg}");
+    assert!(msg.contains("caller: interface `http`"), "got {msg}");
+    assert!(msg.contains("fix: add to grants.toml"), "got {msg}");
+}
+
+#[tokio::test]
+async fn runner_denial_names_runner_and_fix() {
+    let mut file = GrantsFile::default();
+    file.tool.insert(
+        "tool".into(),
+        ToolGrants {
+            granted: PermissionSet::from_iter(["cap:foo"]),
+        },
+    );
+    file.runner
+        .insert("reviewer".into(), RunnerGrants::default());
+    let exec = base_executor(&["cap:foo"], false, engine_from_file(file));
+
+    let err = exec
+        .run(Caller::default().with_runner("reviewer"), act())
+        .await
+        .unwrap_err()
+        .0;
+    let msg = err.to_string();
+    assert!(msg.contains("runner `reviewer`"), "got {msg}");
+    assert!(msg.contains("[runner.reviewer]"), "got {msg}");
+    assert!(
+        msg.contains("allowed_actions = [\"tool.act\"]"),
+        "got {msg}"
+    );
+}
+
+#[tokio::test]
+async fn interface_denial_names_interface_and_fix() {
+    let mut file = GrantsFile::default();
+    file.tool.insert(
+        "tool".into(),
+        ToolGrants {
+            granted: PermissionSet::from_iter(["cap:foo"]),
+        },
+    );
+    let mut iface = InterfaceGrants::default();
+    iface.allowed_actions.insert("other.act".into());
+    file.interface.insert("telegram".into(), iface);
+    let exec = base_executor(&["cap:foo"], false, engine_from_file(file));
+
+    let err = exec
+        .run(Caller::interface("telegram"), act())
+        .await
+        .unwrap_err()
+        .0;
+    let msg = err.to_string();
+    assert!(msg.contains("interface `telegram`"), "got {msg}");
+    assert!(msg.contains("[interface.telegram]"), "got {msg}");
+    assert!(
+        msg.contains("allowed_actions = [\"tool.act\"]"),
+        "got {msg}"
+    );
+}
+
+#[tokio::test]
+async fn service_denial_names_service_and_fix() {
+    let mut file = GrantsFile::default();
+    file.tool.insert(
+        "tool".into(),
+        ToolGrants {
+            granted: PermissionSet::from_iter(["cap:foo"]),
+        },
+    );
+    let exec = base_executor(&["cap:foo"], false, engine_from_file(file));
+
+    let err = exec
+        .run(Caller::service("discord"), act())
+        .await
+        .unwrap_err()
+        .0;
+    let msg = err.to_string();
+    assert!(msg.contains("service `discord`"), "got {msg}");
+    assert!(msg.contains("[service.discord]"), "got {msg}");
+    assert!(
+        msg.contains("allowed_actions = [\"tool.act\"]"),
+        "got {msg}"
+    );
 }
 
 #[tokio::test]
