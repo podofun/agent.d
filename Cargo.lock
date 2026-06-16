@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-ai"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "agentd-codex",
  "agentd-http",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-api"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "agentd-ai",
  "agentd-approvals",
@@ -69,7 +69,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-approvals"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "agentd-types",
  "async-trait",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-cli"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "agentd-packages",
  "anyhow",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-codex"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "async-trait",
  "serde",
@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-executor"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "agentd-ai",
  "agentd-mcp",
@@ -132,7 +132,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-fs"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "serde",
  "tempfile",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-http"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "http-body-util",
  "hyper",
@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-mcp"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "agentd-ai",
  "agentd-permissions",
@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-memory"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "redb",
  "tempfile",
@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-packages"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "agentd-permissions",
  "serde",
@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-permissions"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "serde",
  "serde_json",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-runners"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "agentd-ai",
  "agentd-skills",
@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-scripting"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "agentd-ai",
  "agentd-fs",
@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-secrets"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "apple-native-keyring-store",
  "keyring-core",
@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-services"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "serde",
  "thiserror",
@@ -274,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-shell"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "agentd-permissions",
  "anyhow",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-skills"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "serde",
  "tempfile",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-trace"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "agentd-types",
  "anyhow",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-types"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "agentd-permissions",
  "async-trait",
@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-ws"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "futures-util",
  "serde",
@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "daemon"
-version = "0.2.0"
+version = "0.3.0-alpha"
 dependencies = [
  "agentd-ai",
  "agentd-api",
