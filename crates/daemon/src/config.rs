@@ -163,7 +163,7 @@ impl Config {
             .log
             .or(daemon.log_level)
             .or_else(|| std::env::var("RUST_LOG").ok())
-            .unwrap_or_else(|| "info".to_string());
+            .unwrap_or_else(|| "warn".to_string());
 
         let init_file = cli
             .init
@@ -381,6 +381,7 @@ mod tests {
         };
         let resolved = Config::resolve(cli).unwrap();
         assert_eq!(resolved.addr, "127.0.0.1:7777");
+        assert_eq!(resolved.log_level, "warn");
         assert_eq!(resolved.max_turns, 16);
         assert!(!resolved.yolo);
     }
