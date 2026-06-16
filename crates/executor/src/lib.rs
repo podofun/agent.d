@@ -23,7 +23,8 @@ use std::time::Instant;
 
 use agentd_ai::ProviderRegistry;
 use agentd_permissions::{
-    ActionMeta as PermActionMeta, Caller, Decision, Engine, PermissionSet, ToolMeta as PermToolMeta,
+    ActionMeta as PermActionMeta, Caller, Decision, Engine, PermissionSet,
+    ToolMeta as PermToolMeta, engine::DenyLayer,
 };
 use agentd_runners::{RunnerError, RunnerOutcome, RunnerRegistry};
 use agentd_services::{ServiceRegistry, ServiceState};
@@ -69,17 +70,23 @@ impl Dispatcher for Executor {
             requires: required,
             confirm: false,
         };
-        match self
+        let decision = self
             .engine
             .load()
-            .check(&caller, Some(&tool_meta), &action_meta)
-        {
+            .check(&caller, Some(&tool_meta), &action_meta);
+        match decision {
             Decision::Allow => agentd_types::GrantDecision::Allow,
-            Decision::Deny { layer, reason } => {
-                agentd_types::GrantDecision::Deny(format!("{layer:?}: {reason}"))
-            }
-            Decision::NeedsConfirmation { reason } => {
-                agentd_types::GrantDecision::Deny(format!("needs confirmation: {reason}"))
+            Decision::Deny { .. } | Decision::NeedsConfirmation { .. } => {
+                agentd_types::GrantDecision::Deny(
+                    decision_to_error(
+                        decision,
+                        &action_meta,
+                        Some(tool),
+                        &caller,
+                        &self.engine.load(),
+                    )
+                    .to_string(),
+                )
             }
         }
     }
@@ -93,17 +100,209 @@ enum Escalation {
     Reject(RegistryError),
 }
 
-/// Reconstruct the original `RegistryError` a non-escalated decision would have
-/// produced, for when the approver answers `Deny`.
-fn decision_to_error(decision: Decision) -> RegistryError {
+/// Reconstruct the `RegistryError` a non-escalated decision produces, with
+/// enough component context for users to fix grants.toml without guessing.
+fn decision_to_error(
+    decision: Decision,
+    action_meta: &PermActionMeta,
+    tool_name: Option<&str>,
+    caller: &Caller,
+    engine: &Engine,
+) -> RegistryError {
     match decision {
-        Decision::NeedsConfirmation { reason } => RegistryError::NeedsConfirmation(reason),
+        Decision::NeedsConfirmation { reason } => RegistryError::NeedsConfirmation(format!(
+            "action `{}` requires confirmation\nreason: {reason}\ncaller: {}\nfix: run `agentctl grants listen` and approve the request, or add `{}` to `[policy].auto_confirm` in grants.toml",
+            action_meta.name,
+            caller_summary(caller),
+            action_meta.name
+        )),
         Decision::Deny { layer, reason } => RegistryError::Denied {
-            layer: format!("{layer:?}"),
-            reason,
+            layer: deny_layer_label(layer).to_string(),
+            reason: denial_reason(layer, reason, action_meta, tool_name, caller, engine),
         },
         Decision::Allow => RegistryError::Invocation("unexpected Allow".into()),
     }
+}
+
+fn denial_reason(
+    layer: DenyLayer,
+    raw_reason: String,
+    action_meta: &PermActionMeta,
+    tool_name: Option<&str>,
+    caller: &Caller,
+    engine: &Engine,
+) -> String {
+    let action = action_meta.name.as_str();
+    let caller_text = caller_summary(caller);
+    match layer {
+        DenyLayer::Tool => {
+            let tool = tool_name
+                .or(action_meta.tool.as_deref())
+                .unwrap_or("<unknown>");
+            let missing = missing_tool_permissions(engine, tool_name, action_meta);
+            let missing_text = if missing.is_empty() {
+                "the action requirements".to_string()
+            } else {
+                backtick_list(&missing)
+            };
+            let fix = if missing.is_empty() {
+                format!(
+                    "add the required permissions to `{}` in grants.toml",
+                    toml_table("tool", tool)
+                )
+            } else {
+                format!(
+                    "add to grants.toml:\n{}\ngranted = [{}]",
+                    toml_table("tool", tool),
+                    toml_array(&missing)
+                )
+            };
+            format!(
+                "action `{action}` requires {missing_text}, but tool `{tool}` is not granted it\nmissing: {missing_text}\ncaller: {caller_text}\nfix: {fix}"
+            )
+        }
+        DenyLayer::Runner => {
+            let runner = caller_runner_name(caller);
+            let fix = runner
+                .as_deref()
+                .map(|runner| {
+                    format!(
+                        "add to grants.toml:\n{}\nallowed_actions = [{}]",
+                        toml_table("runner", runner),
+                        toml_array(&[action.to_string()])
+                    )
+                })
+                .unwrap_or_else(|| raw_reason.clone());
+            format!(
+                "action `{action}` is not allowed for runner `{}`\ncaller: {caller_text}\nfix: {fix}",
+                runner.unwrap_or_else(|| "<unknown>".to_string())
+            )
+        }
+        DenyLayer::Interface => {
+            let iface = caller
+                .interface
+                .as_ref()
+                .map(|id| id.as_str().to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            format!(
+                "action `{action}` is not allowed for interface `{iface}`\ncaller: {caller_text}\nfix: add to grants.toml:\n{}\nallowed_actions = [{}]",
+                toml_table("interface", &iface),
+                toml_array(&[action.to_string()])
+            )
+        }
+        DenyLayer::Service => {
+            let service = caller
+                .service
+                .as_ref()
+                .map(|id| id.as_str().to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            format!(
+                "action `{action}` is not allowed for service `{service}`\ncaller: {caller_text}\nfix: add to grants.toml:\n{}\nallowed_actions = [{}]",
+                toml_table("service", &service),
+                toml_array(&[action.to_string()])
+            )
+        }
+        DenyLayer::Policy => {
+            let fix = if raw_reason.contains("permission `") {
+                "remove the denied permission from `[policy].deny_permissions` in grants.toml"
+            } else {
+                "remove the action from `[policy].deny_actions` in grants.toml"
+            };
+            format!(
+                "action `{action}` is blocked by policy\nreason: {raw_reason}\ncaller: {caller_text}\nfix: {fix}"
+            )
+        }
+    }
+}
+
+fn missing_tool_permissions(
+    engine: &Engine,
+    tool_name: Option<&str>,
+    action_meta: &PermActionMeta,
+) -> Vec<String> {
+    let tool_name = tool_name.or(action_meta.tool.as_deref());
+    let granted = tool_name
+        .and_then(|t| engine.grants().tool(t).map(|g| g.granted.clone()))
+        .unwrap_or_else(PermissionSet::empty);
+    action_meta
+        .requires
+        .iter()
+        .filter(|p| !granted.contains(p))
+        .map(|p| p.as_str().to_string())
+        .collect()
+}
+
+fn caller_runner_name(caller: &Caller) -> Option<String> {
+    caller.runner.as_ref().map(|id| id.as_str().to_string())
+}
+
+fn deny_layer_label(layer: DenyLayer) -> &'static str {
+    match layer {
+        DenyLayer::Policy => "policy",
+        DenyLayer::Tool => "tool",
+        DenyLayer::Runner => "runner",
+        DenyLayer::Interface => "interface",
+        DenyLayer::Service => "service",
+    }
+}
+
+fn caller_summary(caller: &Caller) -> String {
+    let mut parts = Vec::new();
+    if let Some(v) = &caller.runner {
+        parts.push(format!("runner `{}`", v.as_str()));
+    }
+    if let Some(v) = &caller.interface {
+        parts.push(format!("interface `{}`", v.as_str()));
+    }
+    if let Some(v) = &caller.service {
+        parts.push(format!("service `{}`", v.as_str()));
+    }
+    if let Some(v) = &caller.session {
+        parts.push(format!("session `{}`", v.as_str()));
+    }
+    if let Some(v) = &caller.user {
+        parts.push(format!("user `{}`", v.as_str()));
+    }
+    if parts.is_empty() {
+        "direct call".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn backtick_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|s| format!("`{s}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn toml_table(section: &str, name: &str) -> String {
+    format!("[{section}.{}]", toml_key(name))
+}
+
+fn toml_key(name: &str) -> String {
+    if name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        name.to_string()
+    } else {
+        toml_string(name)
+    }
+}
+
+fn toml_array(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|s| toml_string(s))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn toml_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// Coerce a toml_edit item into a string array in place.
@@ -292,17 +491,15 @@ impl Executor {
                 }
             } else {
                 // Not escalatable (policy / runner / interface / service) or no
-                // broker wired: reject exactly as before.
-                let err = match decision {
-                    Decision::NeedsConfirmation { reason } => {
-                        RegistryError::NeedsConfirmation(reason)
-                    }
-                    Decision::Deny { layer, reason } => RegistryError::Denied {
-                        layer: format!("{layer:?}"),
-                        reason,
-                    },
-                    Decision::Allow => unreachable!("Allow handled above"),
-                };
+                // broker wired: reject with a diagnostic that names the
+                // denied component and the grants.toml fix.
+                let err = decision_to_error(
+                    decision,
+                    &action_meta,
+                    tool_name.as_deref(),
+                    &caller,
+                    &self.engine.load(),
+                );
                 let dur = started.elapsed().as_millis();
                 self.trace
                     .record(
@@ -445,7 +642,13 @@ impl Executor {
             .await;
 
         match verdict {
-            agentd_types::Verdict::Deny => Escalation::Reject(decision_to_error(decision)),
+            agentd_types::Verdict::Deny => Escalation::Reject(decision_to_error(
+                decision,
+                action_meta,
+                tool_name,
+                caller,
+                &self.engine.load(),
+            )),
             agentd_types::Verdict::AllowOnce => Escalation::Proceed {
                 extra: PermissionSet::from_iter(missing),
             },

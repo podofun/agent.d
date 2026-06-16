@@ -118,6 +118,12 @@ async fn shell_exec_denied_without_grant() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("shell.exec"), "got: {msg}");
+    assert!(msg.contains("call chain `s.echo`"), "got: {msg}");
+    assert!(msg.contains("[tool.s]"), "got: {msg}");
+    assert!(
+        msg.contains("granted = [\"shell.exec:echo\"]"),
+        "got: {msg}"
+    );
 }
 
 #[tokio::test]

@@ -59,6 +59,8 @@ pub(crate) struct ActiveContext {
     pub(crate) caller: agentd_permissions::Caller,
     pub(crate) effective_grants: PermissionSet,
     pub(crate) call_chain: Vec<String>,
+    pub(crate) grant_kind: Option<String>,
+    pub(crate) grant_name: Option<String>,
 }
 
 /// Where `import("name")` resolves installed packages. Set by the daemon.
@@ -1544,9 +1546,17 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
         active.effective_grants.contains(&bare_perm) || active.effective_grants.contains(&bin_perm)
     };
     if !allowed {
-        return Err(mlua::Error::external(format!(
-            "denied at context: missing `shell.exec` or `shell.exec:{}`",
-            req.bin
+        let active = lua
+            .app_data_ref::<ActiveContext>()
+            .ok_or_else(|| mlua::Error::external("active context missing"))?;
+        let scoped = format!("shell.exec:{}", req.bin);
+        return Err(mlua::Error::external(inline_denial(
+            &active,
+            &format!(
+                "Lua tried to run binary `{}` but is missing `{}` (or broader `shell.exec`)",
+                req.bin, scoped
+            ),
+            &[scoped],
         )));
     }
 
@@ -2627,9 +2637,13 @@ fn tools_resolve_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Function> 
         for req in &action_meta.requires {
             let p = Permission::new(req);
             if !active.effective_grants.contains(&p) {
-                return Err(mlua::Error::external(format!(
-                    "context.tools.call(`{name}`) denied: missing `{}`",
-                    p.as_str()
+                return Err(mlua::Error::external(inline_denial(
+                    &active,
+                    &format!(
+                        "Lua tried to call action `{name}` but that action requires `{}`",
+                        p.as_str()
+                    ),
+                    &[p.as_str().to_string()],
                 )));
             }
         }
@@ -2722,11 +2736,95 @@ fn check_permission_inline(lua: &Lua, req: &Permission) -> mlua::Result<()> {
     if active.effective_grants.contains(req) {
         Ok(())
     } else {
-        Err(mlua::Error::external(format!(
-            "denied at context: missing `{}`",
-            req.as_str()
+        Err(mlua::Error::external(inline_denial(
+            &active,
+            &format!("Lua tried to use host permission `{}`", req.as_str()),
+            &[req.as_str().to_string()],
         )))
     }
+}
+
+fn inline_denial(active: &ActiveContext, what: &str, missing: &[String]) -> String {
+    let location = if active.call_chain.is_empty() {
+        "unknown Lua execution".to_string()
+    } else {
+        format!("call chain `{}`", active.call_chain.join(" -> "))
+    };
+    let caller = lua_caller_summary(&active.caller);
+    let missing_text = missing
+        .iter()
+        .map(|s| format!("`{s}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "permission denied in {location}\nwhat: {what}\nmissing: {missing_text}\ncaller: {caller}\nfix: {}",
+        inline_fix(active, missing)
+    )
+}
+
+fn inline_fix(active: &ActiveContext, missing: &[String]) -> String {
+    match (active.grant_kind.as_deref(), active.grant_name.as_deref()) {
+        (Some(kind @ ("tool" | "service")), Some(name)) => format!(
+            "add to grants.toml:\n{}\ngranted = [{}]",
+            toml_table(kind, name),
+            toml_array(missing)
+        ),
+        _ => format!(
+            "add the missing grant to the tool or service that owns this execution: [{}]",
+            toml_array(missing)
+        ),
+    }
+}
+
+fn lua_caller_summary(caller: &agentd_permissions::Caller) -> String {
+    let mut parts = Vec::new();
+    if let Some(v) = &caller.runner {
+        parts.push(format!("runner `{}`", v.as_str()));
+    }
+    if let Some(v) = &caller.interface {
+        parts.push(format!("interface `{}`", v.as_str()));
+    }
+    if let Some(v) = &caller.service {
+        parts.push(format!("service `{}`", v.as_str()));
+    }
+    if let Some(v) = &caller.session {
+        parts.push(format!("session `{}`", v.as_str()));
+    }
+    if let Some(v) = &caller.user {
+        parts.push(format!("user `{}`", v.as_str()));
+    }
+    if parts.is_empty() {
+        "direct call".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn toml_table(section: &str, name: &str) -> String {
+    format!("[{section}.{}]", toml_key(name))
+}
+
+fn toml_key(name: &str) -> String {
+    if name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        name.to_string()
+    } else {
+        toml_string(name)
+    }
+}
+
+fn toml_array(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|s| toml_string(s))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn toml_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 // ---------- Registry impl ----------
@@ -2776,33 +2874,38 @@ impl Registry for LuaHost {
         // Phase 1: create coroutine for the handler. ActiveContext is now
         // bound per-resume by the scheduler (not here) so concurrent calls
         // / services don't stomp each other's grants.
-        let ctx_for_drive = ActiveContext {
-            caller: ctx.caller.clone(),
-            effective_grants,
-            call_chain,
-        };
         let setup = {
             let lua = lua.clone();
             let catalog = catalog.clone();
             let action = action.clone();
-            tokio::task::spawn_blocking(move || -> Result<mlua::Thread, RegistryError> {
-                let lua_g = lua.lock().unwrap();
-                let cat = catalog.read().unwrap();
-                let key = cat
-                    .actions
-                    .get(&action)
-                    .ok_or_else(|| RegistryError::NotFound(action.clone()))?;
-                let func: Function = lua_g
-                    .registry_value(key)
-                    .map_err(|e| RegistryError::Invocation(e.to_string()))?;
-                let thread = ctx_thread(&lua_g, func, true)
-                    .map_err(|e| RegistryError::Invocation(e.to_string()))?;
-                Ok(thread)
-            })
+            tokio::task::spawn_blocking(
+                move || -> Result<(mlua::Thread, Option<String>), RegistryError> {
+                    let lua_g = lua.lock().unwrap();
+                    let cat = catalog.read().unwrap();
+                    let key = cat
+                        .actions
+                        .get(&action)
+                        .ok_or_else(|| RegistryError::NotFound(action.clone()))?;
+                    let grant_name = cat.action_meta.get(&action).and_then(|m| m.tool.clone());
+                    let func: Function = lua_g
+                        .registry_value(key)
+                        .map_err(|e| RegistryError::Invocation(e.to_string()))?;
+                    let thread = ctx_thread(&lua_g, func, true)
+                        .map_err(|e| RegistryError::Invocation(e.to_string()))?;
+                    Ok((thread, grant_name))
+                },
+            )
             .await
             .map_err(|e| RegistryError::Invocation(format!("join: {e}")))?
         };
-        let thread = setup?;
+        let (thread, grant_name) = setup?;
+        let ctx_for_drive = ActiveContext {
+            caller: ctx.caller.clone(),
+            effective_grants,
+            call_chain,
+            grant_kind: grant_name.as_ref().map(|_| "tool".to_string()),
+            grant_name,
+        };
 
         // Phase 2: drive. Scheduler swaps ActiveContext into app-data on
         // each resume and restores default on the way out.
@@ -2828,6 +2931,8 @@ impl Registry for LuaHost {
             caller: ctx.caller.clone(),
             effective_grants: ctx.effective_grants.clone(),
             call_chain: ctx.call_chain.clone(),
+            grant_kind: Some("service".to_string()),
+            grant_name: Some(svc_name.clone()),
         };
 
         let thread = {
