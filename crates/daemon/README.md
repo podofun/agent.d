@@ -8,6 +8,7 @@ beyond config.
 - Evaluates `init.lua` as the sole entry point (`runtime.init` / `--init` / `AGENTD_INIT`).
 - Defaults: secrets = `KeyringStore`, memory = `RedbStore`, providers = `{ anthropic: ClaudeApiProvider, anthropic-cli: ClaudeCliProvider }`.
 - Mints + `0600`-writes the public + admin tokens if unset; runs package grant desugaring before loading `grants.toml`.
+- Console logging defaults to warnings/errors plus one compact startup banner. Use `AGENTD_LOG=debug` for startup detail.
 
 ```bash
 cargo run -p daemon -- --init ./examples/init.lua
