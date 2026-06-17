@@ -8,6 +8,7 @@ name = "agentctl"
 path = "src/main.rs"
 
 [dependencies]
+agentd-luals.workspace = true
 agentd-packages.workspace = true
 anyhow.workspace = true
 clap.workspace = true

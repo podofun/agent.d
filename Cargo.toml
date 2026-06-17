@@ -22,6 +22,7 @@ members = [
     "crates/scripting",
     "crates/executor",
     "crates/api",
+    "crates/luals",
     "crates/daemon",
 ]
 
@@ -41,6 +42,7 @@ agentd-approvals   = { path = "crates/approvals" }
 agentd-executor    = { path = "crates/executor" }
 agentd-fs          = { path = "crates/fs" }
 agentd-http        = { path = "crates/http" }
+agentd-luals       = { path = "crates/luals" }
 agentd-mcp         = { path = "crates/mcp" }
 agentd-memory      = { path = "crates/memory" }
 agentd-packages    = { path = "crates/packages" }

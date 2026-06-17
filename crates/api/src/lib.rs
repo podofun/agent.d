@@ -32,9 +32,6 @@
 //! interfaces (Telegram, Discord, …) can carry their own identity space.
 //! Lua handlers read it back via `ctx.caller`.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use agentd_executor::Executor;
 use agentd_permissions::Caller;
 use agentd_runners::{RunnerError, compose};
@@ -51,10 +48,16 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub executor: Arc<Executor>,
+    /// Hot-swappable executor. `daemon --watch` rebuilds the Lua runtime and
+    /// `store()`s a fresh executor here; in-flight requests keep the `Arc` they
+    /// `load()`ed and drain on the old runtime. Without `--watch` the pointer
+    /// never changes.
+    pub executor: Arc<arc_swap::ArcSwap<Executor>>,
     /// Bearer token required on the public `/ws` handshake. `None` disables auth
     /// (the daemon's `--no-auth`); `/health` is always open for liveness probes.
     pub auth_token: Option<Arc<String>>,
@@ -291,9 +294,12 @@ fn ws_caller(conn_session: &str, session: Option<String>, user: Option<String>) 
 
 async fn dispatch(state: AppState, req: WsRequest, conn_session: &str) -> WsResponse {
     let id = req.id;
+    // Pin the current runtime for this request. A concurrent hot-reload swap
+    // only affects requests dispatched after it; this one finishes on `executor`.
+    let executor = state.executor.load();
     match req.method.as_str() {
         "health" => ok(id, json!("ok")),
-        "tools.list" => ok(id, json!(state.executor.registry().list())),
+        "tools.list" => ok(id, json!(executor.registry().list())),
 
         "actions.call" => match serde_json::from_value::<CallParams>(req.params) {
             Ok(p) => {
@@ -302,7 +308,7 @@ async fn dispatch(state: AppState, req: WsRequest, conn_session: &str) -> WsResp
                     args: p.args.unwrap_or(Value::Null),
                 };
                 let caller = ws_caller(conn_session, p.session, p.user);
-                match state.executor.run(caller, call).await {
+                match executor.run(caller, call).await {
                     Ok((res, dur)) => ok(id, json!({ "result": res.value, "duration_ms": dur })),
                     Err((e, dur)) => action_error(id, e, dur),
                 }
@@ -313,8 +319,7 @@ async fn dispatch(state: AppState, req: WsRequest, conn_session: &str) -> WsResp
         "runners.list" => ok(
             id,
             json!(
-                state
-                    .executor
+                executor
                     .runners()
                     .list()
                     .into_iter()
@@ -329,10 +334,10 @@ async fn dispatch(state: AppState, req: WsRequest, conn_session: &str) -> WsResp
         ),
         "runners.inspect" => match serde_json::from_value::<NameParam>(req.params) {
             Ok(p) => {
-                let Some(def) = state.executor.runners().get(&p.name) else {
+                let Some(def) = executor.runners().get(&p.name) else {
                     return err(id, "not_found", format!("runner `{}` not found", p.name));
                 };
-                match compose(&def, state.executor.skills()) {
+                match compose(&def, executor.skills()) {
                     Ok(c) => ok_ser(id, &c),
                     Err(e) => err(id, "compose_failed", e.to_string()),
                 }
@@ -342,7 +347,7 @@ async fn dispatch(state: AppState, req: WsRequest, conn_session: &str) -> WsResp
         "runners.run" => match serde_json::from_value::<RunParams>(req.params) {
             Ok(p) => {
                 let caller = ws_caller(conn_session, p.session, p.user).with_runner(p.name.clone());
-                match state.executor.run_runner(caller, &p.name, p.prompt).await {
+                match executor.run_runner(caller, &p.name, p.prompt).await {
                     Ok(out) => ok_ser(id, &out),
                     Err(e) => runner_error(id, e),
                 }
@@ -353,8 +358,7 @@ async fn dispatch(state: AppState, req: WsRequest, conn_session: &str) -> WsResp
         "skills.list" => ok(
             id,
             json!(
-                state
-                    .executor
+                executor
                     .skills()
                     .list()
                     .into_iter()
@@ -367,14 +371,14 @@ async fn dispatch(state: AppState, req: WsRequest, conn_session: &str) -> WsResp
             ),
         ),
         "skills.inspect" => match serde_json::from_value::<NameParam>(req.params) {
-            Ok(p) => match state.executor.skills().get(&p.name) {
+            Ok(p) => match executor.skills().get(&p.name) {
                 Some(def) => ok_ser(id, &def),
                 None => err(id, "not_found", format!("skill `{}` not found", p.name)),
             },
             Err(e) => bad_params(id, e),
         },
 
-        "services.list" => ok_ser(id, &state.executor.services().statuses()),
+        "services.list" => ok_ser(id, &executor.services().statuses()),
 
         other => err(id, "unknown_method", format!("unknown method `{other}`")),
     }

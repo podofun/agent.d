@@ -96,6 +96,14 @@ impl SkillRegistry {
         g.keys().cloned().collect()
     }
 
+    /// Source file path of every skill loaded from disk (inline skills have
+    /// none). The daemon's `--watch` loop folds these into its watch set so
+    /// editing a skill `.md` triggers a hot reload.
+    pub fn sources(&self) -> Vec<PathBuf> {
+        let g = self.inner.read().unwrap();
+        g.values().filter_map(|d| d.source.clone()).collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.inner.read().unwrap().is_empty()
     }
