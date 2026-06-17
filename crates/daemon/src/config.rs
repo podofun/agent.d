@@ -52,6 +52,11 @@ pub struct Cli {
     /// verdict before failing closed. Overrides `daemon.approval_timeout_ms`.
     #[arg(long, env = "AGENTD_APPROVAL_TIMEOUT_MS")]
     pub approval_timeout_ms: Option<u64>,
+
+    /// Dev hot reload: watch init.lua plus the files it imports, loaded skill
+    /// sources, and grants.toml, and rebuild the runtime in place on change.
+    #[arg(long, env = "AGENTD_WATCH")]
+    pub watch: bool,
 }
 
 /// Raw `config.toml` shape. All fields optional; missing == fall through
@@ -93,6 +98,8 @@ pub struct RawRuntime {
     pub max_turns: Option<u32>,
     #[serde(default)]
     pub yolo: Option<bool>,
+    #[serde(default)]
+    pub watch: Option<bool>,
 }
 
 /// Final, fully-resolved daemon config.
@@ -119,6 +126,8 @@ pub struct Config {
     /// no effect today. Future implementation will bypass the 5-layer
     /// permission engine.
     pub yolo: bool,
+    /// Dev hot reload: watch the used file set and rebuild the runtime in place.
+    pub watch: bool,
 }
 
 impl Config {
@@ -176,6 +185,8 @@ impl Config {
 
         let max_turns = runtime.max_turns.unwrap_or(16);
         let yolo = runtime.yolo.unwrap_or(false);
+        // `--watch` (flag/env) wins; otherwise fall back to config.toml.
+        let watch = cli.watch || runtime.watch.unwrap_or(false);
 
         // `--no-auth` (flag/env) wins; otherwise fall back to config.toml.
         let no_auth = cli.no_auth || daemon.no_auth.unwrap_or(false);
@@ -203,6 +214,7 @@ impl Config {
             auth_token,
             admin_token,
             approval_timeout_ms,
+            watch,
         })
     }
 }

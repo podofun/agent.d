@@ -367,6 +367,36 @@ impl LuaHost {
         lua.set_app_data(RunnerDispatcherHolder(Some(dispatcher)));
     }
 
+    /// Snapshot of every file the runtime has loaded: init.lua plus every
+    /// `import("rel/path.lua")` target, keyed by canonicalized absolute path.
+    /// The daemon's `--watch` loop derives its watch set from this.
+    pub fn imported_paths(&self) -> Vec<PathBuf> {
+        let lua = self.lua.lock().unwrap();
+        match lua.app_data_ref::<ImportCache>() {
+            Some(cache) => cache.0.read().unwrap().iter().cloned().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Break the host -> executor reference cycle so the old runtime can drop on
+    /// hot reload. `set_runner_dispatcher` parks an `Arc<Executor>` in the Lua
+    /// app-data; the executor holds `Arc<dyn Registry>` back to this host.
+    /// Clearing the dispatcher releases the host's strong ref to the executor.
+    pub fn clear_runner_dispatcher(&self) {
+        let lua = self.lua.lock().unwrap();
+        lua.set_app_data(RunnerDispatcherHolder(None));
+    }
+
+    /// Stop the background coroutine driver started by
+    /// [`LuaHost::start_async_runtime`]. The driver task holds an
+    /// `Arc<Mutex<Lua>>` and its mpsc sender lives in the Lua app-data, so the
+    /// channel never closes on its own. Dropping the sender closes the receiver,
+    /// the driver loop exits, and the old Lua VM can drop on hot reload.
+    pub fn shutdown_async_runtime(&self) {
+        let lua = self.lua.lock().unwrap();
+        lua.remove_app_data::<scheduler::AsyncTaskSpawner>();
+    }
+
     pub fn load_dir(&self, dir: &Path) -> Result<usize> {
         if !dir.exists() {
             tracing::warn!(path = %dir.display(), "tools dir missing");
@@ -2962,6 +2992,56 @@ impl Registry for LuaHost {
         outcome
             .map(|_| ())
             .map_err(|e| RegistryError::Invocation(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod host_lifecycle_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    struct NoopDispatcher;
+
+    #[async_trait::async_trait]
+    impl agentd_types::RunnerDispatcher for NoopDispatcher {
+        async fn run_runner_json(
+            &self,
+            _caller: agentd_permissions::Caller,
+            _name: &str,
+            _opts: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(serde_json::Value::Null)
+        }
+    }
+
+    #[test]
+    fn imported_paths_includes_init_and_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let dep = dir.path().join("dep.lua");
+        std::fs::write(&dep, "return 1\n").unwrap();
+        let init = dir.path().join("init.lua");
+        std::fs::write(&init, "import(\"dep.lua\")\n").unwrap();
+
+        let host = LuaHost::new().unwrap();
+        host.set_root(dir.path());
+        host.load_file(&init).unwrap();
+
+        let paths = host.imported_paths();
+        let canon = |p: &std::path::Path| p.canonicalize().unwrap();
+        assert!(paths.contains(&canon(&init)), "init.lua tracked: {paths:?}");
+        assert!(paths.contains(&canon(&dep)), "dep.lua tracked: {paths:?}");
+    }
+
+    #[test]
+    fn clear_runner_dispatcher_breaks_host_executor_cycle() {
+        let host = LuaHost::new().unwrap();
+        let dispatcher: Arc<dyn agentd_types::RunnerDispatcher> = Arc::new(NoopDispatcher);
+        host.set_runner_dispatcher(dispatcher.clone());
+        // The host now holds a strong ref parked in Lua app-data.
+        assert_eq!(Arc::strong_count(&dispatcher), 2);
+        host.clear_runner_dispatcher();
+        // Clearing it releases the host's strong ref — only our local remains.
+        assert_eq!(Arc::strong_count(&dispatcher), 1);
     }
 }
 
