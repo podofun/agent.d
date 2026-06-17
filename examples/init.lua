@@ -2,8 +2,8 @@
 -- else is pulled in via `import(...)` or the explicit skill loaders. The
 -- layout under the root is up to you — this could just as well be one file.
 
--- `import` is a bare global (not a method on `agentd`); it resolves paths
--- relative to this file and refuses absolute paths and `..` traversal.
+-- `import` resolves paths relative to this file and refuses absolute paths
+-- and `..` traversal.
 import("tools/git.lua")
 
 -- Markdown skills: walk a directory, or load one file at a time.

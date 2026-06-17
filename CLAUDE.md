@@ -140,6 +140,7 @@ Important daemon flags and environment variables:
 | `--no-auth` | `AGENTD_NO_AUTH` | Disable authentication for development. |
 | `--admin-token` | `AGENTD_ADMIN_TOKEN` | Bearer token for `/control`. |
 | `--approval-timeout-ms` | `AGENTD_APPROVAL_TIMEOUT_MS` | Interactive approval timeout. |
+| `--watch` | `AGENTD_WATCH` | Dev hot reload of the used file set. |
 
 Runtime defaults:
 
@@ -1042,12 +1043,71 @@ agentctl packages ls
 agentctl packages install <git-url> --ref <tag>
 agentctl packages update <name>
 agentctl packages remove <name>
+agentctl types [dir]
 ```
 
 Package commands are local filesystem and git operations. They do not call the
 daemon WebSocket API.
 
 `agentctl health` uses HTTP `/health`. Other daemon operations use WebSocket.
+
+`agentctl types [dir]` generates lua-language-server type stubs for a project
+(see Dev Hot Reload And Type Generation). `dir` defaults to the current
+directory. It reads the live catalog over the existing `tools.list`,
+`runners.list`, and `skills.list` methods.
+
+## Dev Hot Reload And Type Generation
+
+These are opt-in development conveniences. Neither changes production behavior
+when unused.
+
+### Hot reload (`daemon --watch`)
+
+`daemon --watch` (or `AGENTD_WATCH=1`, or `runtime.watch = true`) watches the
+files the runtime actually loaded — `init.lua`, every `import()`ed Lua file,
+loaded skill `.md` sources, and `grants.toml` — and rebuilds the runtime in
+place on change. The rebuild is a true hot reload: a fresh `LuaHost` and
+`Executor` replace the old ones behind an `ArcSwap` in the API state, so live
+WebSocket connections survive. Calls already in flight finish on the old
+runtime, which is then torn down.
+
+The watch set is the *used* set, re-derived after every reload, so adding an
+`import(...)` to a watched file pulls the new file under watch automatically. A
+reload that fails to evaluate (bad Lua, bad grants) is logged and the previous
+runtime keeps serving.
+
+Leak-free teardown depends on breaking the host's two internal reference cycles
+on reload (`LuaHost::clear_runner_dispatcher` and
+`LuaHost::shutdown_async_runtime`) plus aborting the old service tasks. The
+watch loop lives in `crates/daemon/src/watch.rs`; the rebuild in
+`crates/daemon/src/runtime.rs`.
+
+### Type generation (`agentctl types` and `--watch`)
+
+`agentctl types [dir]` writes lua-language-server stubs into `dir/.luals/`:
+
+- `.luals/agentd.lua` — static stub for the fixed `agentd.*` / `ctx.*` / helper
+  API, embedded in `agentd-luals` (`crates/luals/assets/agentd.lua.stub`).
+- `.luals/project.lua` — generated `---@alias` unions of *this* project's
+  registered action / runner / skill names (`agentd.ActionName`,
+  `agentd.RunnerName`, `agentd.SkillName`), plus the `import` function with one
+  `---@overload` per project module that exports a type. Action arguments stay
+  untyped — Lua actions take free-form tables with no schema.
+
+`import("path/to/mod.lua")` is typed per-path: the generator scans the project
+for `*.lua` modules that end in `return <ident>` where `<ident>` is declared
+with a `---@class <Name>`, and emits `---@overload fun(path: "<rel>"): <Name>`
+so `local m = import("path/to/mod.lua")` resolves to that class. Modules that
+return nothing (side-effecting tool registration) stay `any`. (LuaLS's own
+`require` resolver can't be reused here — it treats `.` as a path separator, so
+agentd's `.lua`-suffixed paths don't resolve through it.)
+- `.luarc.json` — merged (never clobbered) to point the language server at
+  `.luals/`.
+
+`daemon --watch` regenerates `.luals/project.lua` on every reload so completions
+track the live name set during development. The same writer
+(`agentd_luals::write_project`) is used by both the daemon (from its live
+registries) and the CLI (from the `*.list` WebSocket methods).
 
 ## Development Commands
 
@@ -1108,7 +1168,9 @@ When changing security-sensitive behavior, add tests for allowed, denied, and
 escalatable cases.
 
 When changing Lua-facing behavior, update the Lua reference in this file and add
-tests in `agentd-scripting` or the crate that owns the Rust behavior.
+tests in `agentd-scripting` or the crate that owns the Rust behavior. When the
+change touches the `agentd.*` or `ctx.*` surface, also update the static
+language-server stub in `crates/luals/assets/agentd.lua.stub`.
 
 When changing WebSocket behavior, update the method list or envelope
 description in this file and test the API crate or CLI path.

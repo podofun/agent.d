@@ -77,6 +77,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PkgCmd,
     },
+    /// Generate lua-language-server type stubs into a project's `.luals/`.
+    Types {
+        /// Project directory (the folder holding `init.lua`). Defaults to the
+        /// current directory.
+        dir: Option<std::path::PathBuf>,
+    },
     /// Tail the JSONL trace file.
     Trace {
         #[arg(long)]
@@ -242,6 +248,7 @@ async fn main() -> Result<()> {
             GrantsCmd::Listen => cmd_grants_listen(&cli.url, cli.timeout).await,
         },
         Cmd::Packages { cmd } => run_packages(cmd),
+        Cmd::Types { dir } => cmd_types(&cli.url, cli.timeout, dir).await,
         Cmd::Trace {
             file,
             follow,
@@ -519,6 +526,56 @@ async fn ws_call(base: &str, timeout: u64, method: &str, params: Value) -> Resul
         }
     }
     Err(anyhow!("ws closed before response"))
+}
+
+/// Generate `.luals/` type stubs for a project. Fetches this project's live
+/// action / runner / skill names from the daemon (the same `*.list` methods the
+/// rest of the CLI uses) and writes the static + generated stubs plus a merged
+/// `.luarc.json`.
+async fn cmd_types(base: &str, timeout: u64, dir: Option<std::path::PathBuf>) -> Result<()> {
+    let actions = list_names(base, timeout, "tools.list").await?;
+    let runners = list_names(base, timeout, "runners.list").await?;
+    let skills = list_names(base, timeout, "skills.list").await?;
+
+    let dir = match dir {
+        Some(d) => d,
+        None => std::env::current_dir().context("resolve current dir")?,
+    };
+    agentd_luals::write_project(&dir, &actions, &runners, &skills)?;
+    println!(
+        "wrote {}/.luals/ (agentd.lua, project.lua) and merged .luarc.json",
+        dir.display()
+    );
+    println!(
+        "  {} actions, {} runners, {} skills",
+        actions.len(),
+        runners.len(),
+        skills.len()
+    );
+    Ok(())
+}
+
+/// Read a `*.list` response into a `Vec<String>` of names. `tools.list` returns
+/// bare strings; `runners.list` / `skills.list` return objects with a `name`.
+async fn list_names(base: &str, timeout: u64, method: &str) -> Result<Vec<String>> {
+    let resp = ws_call(base, timeout, method, Value::Null).await?;
+    if !resp.ok {
+        let code = resp.code.as_deref().unwrap_or("error");
+        let msg = resp.error.as_deref().unwrap_or("(no message)");
+        return Err(anyhow!("[{code}] {msg}"));
+    }
+    let arr = match resp.result {
+        Some(Value::Array(a)) => a,
+        _ => return Ok(Vec::new()),
+    };
+    Ok(arr
+        .into_iter()
+        .filter_map(|v| match v {
+            Value::String(s) => Some(s),
+            Value::Object(map) => map.get("name").and_then(|n| n.as_str()).map(String::from),
+            _ => None,
+        })
+        .collect())
 }
 
 fn print_result(resp: &WsResponse, compact: bool) -> Result<()> {
