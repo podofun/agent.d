@@ -3,14 +3,11 @@ use agentd_ai::{
     OpenAiApiProvider, ProviderRegistry,
 };
 use agentd_api::{AppState, router, serve};
-use agentd_executor::{Executor, ExecutorHandle};
 use agentd_memory::RedbStore;
-use agentd_permissions::{Engine, Grants, load_grants_file};
-use agentd_scripting::LuaHost;
 use agentd_secrets::KeyringStore;
 use agentd_trace::JsonlSink;
 use agentd_types::Registry;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use std::io::IsTerminal;
 use std::net::{IpAddr, SocketAddr};
@@ -19,7 +16,10 @@ use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
 
 mod config;
+mod runtime;
+mod watch;
 use config::{Cli, Config};
+use runtime::{Shared, build_runtime};
 
 fn main() -> Result<()> {
     // If this process was re-exec'd as the in-netns network supervisor, run it
@@ -63,21 +63,12 @@ async fn run() -> Result<()> {
     providers.set_default("anthropic");
     let providers = Arc::new(providers);
 
-    let host = Arc::new(LuaHost::new()?);
-    // `agentd.import("foo.lua")` resolves relative to init.lua's parent.
-    if let Some(root) = cfg.init_file.parent() {
-        host.set_root(root);
-    }
     // `agentd.import("name")` (bare) resolves installed packages here.
     let packages_root = dirs::data_dir()
         .map(|d| d.join("agentd").join("packages"))
         .ok_or_else(|| anyhow!("no XDG data dir for packages"))?;
-    host.set_packages_root(&packages_root);
-    // Boot the background coroutine driver before init.lua so any `async(fn)`
-    // call from init / tools / services has a runtime to spawn onto.
-    host.start_async_runtime(tokio::runtime::Handle::current());
-    host.set_secrets(keyring.clone());
-    // Durable `ctx.memory` store — one redb file under the XDG data dir.
+    // Durable `ctx.memory` store — one redb file under the XDG data dir, shared
+    // across hot reloads so memory survives.
     let memory_path = dirs::data_dir()
         .map(|d| d.join("agentd").join("memory.redb"))
         .ok_or_else(|| anyhow!("no XDG data dir for memory"))?;
@@ -86,120 +77,79 @@ async fn run() -> Result<()> {
     }
     let memory = RedbStore::open(&memory_path)
         .map_err(|e| anyhow!("open memory db {}: {e}", memory_path.display()))?;
-    host.set_memory(Arc::new(memory));
-    for name in providers.names() {
-        if let Some(p) = providers.get(&name) {
-            host.set_ai_provider(name, p);
-        }
-    }
-    if let Some(d) = providers.default_name() {
-        host.set_default_ai_provider(d);
-    }
-
-    if !cfg.init_file.exists() {
-        bail!(
-            "no init.lua at {}. Point --init / runtime.init at your entry file.",
-            cfg.init_file.display()
-        );
-    }
-    host.load_file(&cfg.init_file)?;
-    tracing::debug!(
-        init = %cfg.init_file.display(),
-        actions = host.list().len(),
-        runners = host.runners().len(),
-        services = host.services().len(),
-        skills = host.skills().len(),
-        "init.lua evaluated"
-    );
-
-    let skills = host.skills();
-    let runners = host.runners();
-    let services = host.services();
 
     let trace = JsonlSink::open(&cfg.trace_file).await?;
     tracing::debug!(trace = %trace.path().display(), "trace open");
 
-    let mut grants_file = load_grants_file(&cfg.grants_file).map_err(|e| anyhow!(e))?;
-    // Desugar every trusted package into the per-tool/runner/service grant rows
-    // the engine enforces. Untouched engine, default-deny preserved.
-    let loaded_packages = host.loaded_packages();
-    agentd_packages::expand_grants(&loaded_packages, &mut grants_file);
-    tracing::debug!(packages = loaded_packages.len(), "package grants expanded");
-    tracing::debug!(
-        grants = %cfg.grants_file.display(),
-        tools = grants_file.tool.len(),
-        runners = grants_file.runner.len(),
-        services = grants_file.service.len(),
-        interfaces = grants_file.interface.len(),
-        "grants loaded"
-    );
-    let engine = Arc::new(Engine::new(Grants::from_file(grants_file)));
-
-    let registry: Arc<dyn Registry> = host.clone();
-    let mut executor = Executor::new(
-        registry,
-        Arc::new(trace),
-        engine,
-        runners,
-        services,
-        skills,
-        providers,
-    );
-    executor.set_max_runner_turns(cfg.max_turns);
-
-    // Interactive approval: escalate Tool-missing / confirm denials to a
-    // connected operator on the control plane. The reload closure reproduces
-    // the daemon's grants-build pipeline so an "allow forever" verdict
-    // re-applies package desugaring on hot-reload.
+    // Interactive approval broker, shared across reloads so a connected operator
+    // stays subscribed through a hot reload.
     let broker = Arc::new(agentd_approvals::Broker::new(
         std::time::Duration::from_millis(cfg.approval_timeout_ms),
     ));
-    {
-        let reload_host = host.clone();
-        let reload_path = cfg.grants_file.clone();
-        let reload = Arc::new(move || -> std::result::Result<Engine, String> {
-            let mut gf = load_grants_file(&reload_path).map_err(|e| e.to_string())?;
-            let pkgs = reload_host.loaded_packages();
-            agentd_packages::expand_grants(&pkgs, &mut gf);
-            Ok(Engine::new(Grants::from_file(gf)))
-        });
-        executor.set_broker(broker.clone());
-        executor.set_grants_path(cfg.grants_file.clone());
-        executor.set_reload_grants(reload);
-    }
 
-    let executor = Arc::new(executor);
-    // Now that the executor exists, wire it back into Lua so
-    // `agentd.runners.run(name, opts)` works from any script.
-    host.set_runner_dispatcher(ExecutorHandle::new(executor.clone()));
-
-    // Spawn services as background tasks. Each runs in its own Tokio task,
-    // supervised by the executor's service registry. Handles dropped here =
-    // tasks keep running until daemon exit.
-    let handles = executor.start_services();
-    tracing::debug!(spawned = handles.len(), "services started");
-
-    let auth_token = resolve_ws_token(&cfg)?;
-    let admin_token = resolve_admin_token(&cfg)?;
-    let state = AppState {
-        executor: executor.clone(),
-        auth_token: auth_token.map(Arc::new),
-        admin_token: admin_token.map(Arc::new),
-        broker,
+    // Dependencies that must outlive any single runtime build.
+    let shared = Shared {
+        providers,
+        keyring,
+        memory: Arc::new(memory),
+        trace: Arc::new(trace),
+        broker: broker.clone(),
+        async_handle: tokio::runtime::Handle::current(),
+        packages_root,
     };
+
+    let built = build_runtime(&cfg, &shared)?;
+    tracing::debug!(
+        init = %cfg.init_file.display(),
+        actions = built.host.list().len(),
+        runners = built.host.runners().len(),
+        services = built.host.services().len(),
+        skills = built.host.skills().len(),
+        services_spawned = built.service_handles.len(),
+        "init.lua evaluated"
+    );
+
+    // Hot-swappable executor: the watch loop `store()`s a fresh one on reload.
+    let executor = Arc::new(arc_swap::ArcSwap::from(built.executor.clone()));
+
+    // Counts for the startup banner, captured before `built` is moved into the
+    // watcher below.
+    let (n_actions, n_runners, n_services, n_skills) = (
+        built.host.list().len(),
+        built.host.runners().len(),
+        built.host.services().len(),
+        built.host.skills().len(),
+    );
 
     let listener = tokio::net::TcpListener::bind(&cfg.addr).await?;
     let local_addr = listener.local_addr()?;
     let startup = StartupSummary {
         bind_addr: local_addr,
         init_file: &cfg.init_file,
-        actions: host.list().len(),
-        runners: host.runners().len(),
-        services: host.services().len(),
-        skills: host.skills().len(),
+        actions: n_actions,
+        runners: n_runners,
+        services: n_services,
+        skills: n_skills,
         elapsed: started.elapsed(),
         color: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
     };
+
+    // Start the dev hot-reload watcher (or let `built` keep its services running
+    // detached). The watcher takes ownership of `built` and `shared` so it can
+    // rebuild and tear down old runtimes on file changes.
+    if cfg.watch {
+        watch::spawn(cfg.clone(), shared, executor.clone(), built);
+    }
+
+    let auth_token = resolve_ws_token(&cfg)?;
+    let admin_token = resolve_admin_token(&cfg)?;
+    let state = AppState {
+        executor,
+        auth_token: auth_token.map(Arc::new),
+        admin_token: admin_token.map(Arc::new),
+        broker,
+    };
+
     println!("{}", startup.render());
     tracing::debug!(addr = %local_addr, "listening");
     serve(listener, router(state)).await?;

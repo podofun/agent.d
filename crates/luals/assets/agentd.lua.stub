@@ -1,0 +1,319 @@
+---@meta
+-- Static type stubs for the fixed agentd Lua API (`agentd.*`, `ctx.*`, and the
+-- helper globals). Hand-maintained source; copied verbatim into a project's
+-- `.luals/agentd.lua` by `agentctl types` and `daemon --watch`. The companion
+-- `project.lua` supplies this project's own `agentd.ActionName`,
+-- `agentd.RunnerName`, and `agentd.SkillName` names.
+
+-- Registration: agentd.*
+
+---@class agentd.ActionSpec
+---@field name string                      Fully-qualified `tool.action` name.
+---@field handler fun(args: table, ctx: Ctx): any
+---@field requires? string[]               Permission slugs the action needs.
+---@field confirm? boolean                 Require interactive approval per call.
+---@field tool? string                     Owning tool; inferred from `name` if omitted.
+
+---@class agentd.ToolSpec
+---@field name string
+---@field requires? string[]
+
+---@class agentd.RunnerSpec
+---@field name string
+---@field model string                     `<provider>/<model_id>`.
+---@field system? string
+---@field skills? string[]
+---@field actions? agentd.ActionName[]
+
+---@class agentd.SkillSpec
+---@field name string
+---@field description? string
+---@field system string
+---@field actions? agentd.ActionName[]
+
+---@class agentd.ServiceOpts
+---@field restart? "always"|"on_failure"
+---@field backoff_ms? integer
+---@field backoff_max_ms? integer
+
+---@class agentd.Skills
+---@field load fun(path: string): string   Load one Markdown skill file; returns the skill name.
+---@field dir fun(path: string): integer   Load every `*.md` under a directory; returns the count.
+---@field list fun(): string[]
+
+---@class agentd.Lib
+---@field skills agentd.Skills
+agentd = {}
+
+---Register an action (table form), or the short `(name, handler)` form.
+---@overload fun(name: string, handler: fun(args: table, ctx: Ctx): any)
+---@param spec agentd.ActionSpec
+function agentd.action(spec) end
+
+---@param spec agentd.ToolSpec
+function agentd.tool(spec) end
+
+---@param spec agentd.RunnerSpec
+function agentd.runner(spec) end
+
+---@param spec agentd.SkillSpec
+function agentd.skill(spec) end
+
+---Register a long-running service. `(name, fn)` or `(name, opts, fn)`.
+---@overload fun(name: string, body: fun(ctx: Ctx))
+---@param name string
+---@param opts agentd.ServiceOpts
+---@param body fun(ctx: Ctx)
+function agentd.service(name, opts, body) end
+
+-- Globals
+
+-- `import` is defined in the generated `project.lua` so its per-file
+-- `---@overload` mappings (path string -> module type) live next to this
+-- project's actual module list.
+
+---@param ms integer
+function sleep(ms) end
+
+---Spawn a coroutine; await its result with `await`. The body may return a
+---value (retrieved via `await`) or nothing.
+---@generic T
+---@param fn fun(): T?
+---@return userdata handle
+function async(fn) end
+
+---@generic T
+---@param handle userdata
+---@return T
+function await(handle) end
+
+---Run functions concurrently; returns results in input order.
+---@param fns (fun(): any)[]
+---@param opts? { limit?: integer, settled?: boolean }
+---@return any[]
+function parallel(fns, opts) end
+
+---@generic T, R
+---@param items T[]
+---@param fn fun(item: T, index: integer): R
+---@param opts? { limit?: integer, settled?: boolean }
+---@return R[]
+function parallel_map(items, fn, opts) end
+
+---@class agentd.Channel
+---@field send fun(self: agentd.Channel, msg: any)
+---@field recv fun(self: agentd.Channel): any
+---@field try_recv fun(self: agentd.Channel): any|nil
+---@field close fun(self: agentd.Channel)
+---@field is_closed fun(self: agentd.Channel): boolean
+---@field name string|nil
+
+---Anonymous channel, or a named process-wide channel.
+---@param name? string
+---@return agentd.Channel
+function channel(name) end
+
+---@class agentd.Timer
+---@field stop fun(self: agentd.Timer)
+
+---@class agentd.TimerLib
+---@field after fun(ms: integer, fn: fun()): agentd.Timer
+---@field every fun(ms: integer, fn: fun()): agentd.Timer
+timer = {}
+
+---@class agentd.Json
+---@field encode fun(value: any): string
+---@field decode fun(text: string, opts?: { nulls?: "sentinel"|"nil" }): any
+---@field null userdata
+---@field is_null fun(value: any): boolean
+json = {}
+
+-- string helpers (added to the stock string library)
+
+---@return string
+function string.trim(s) end
+---@return string
+function string.ltrim(s) end
+---@return string
+function string.rtrim(s) end
+---@return boolean
+function string.startswith(s, prefix) end
+---@return boolean
+function string.endswith(s, suffix) end
+---@return boolean
+function string.contains(s, needle) end
+---Split on a plain separator, or on whitespace when omitted.
+---@param s string
+---@param sep? string
+---@return string[]
+function string.split(s, sep) end
+
+-- Invocation context: ctx
+
+---@class Ctx.Log
+---@field trace fun(msg: string)
+---@field debug fun(msg: string)
+---@field info fun(msg: string)
+---@field warn fun(msg: string)
+---@field error fun(msg: string)
+
+---@class Ctx.ShellResult
+---@field stdout string
+---@field stderr string
+---@field exit_code integer
+
+---@class Ctx.ShellOpts
+---@field bin string
+---@field args? string[]
+---@field cwd? string
+---@field stdin? string
+---@field separate_stderr? boolean
+
+---@class Ctx.Fs
+---@field read fun(path: string): string
+---@field write fun(path: string, content: string)
+---@field append fun(path: string, content: string)
+---@field exists fun(path: string): boolean
+---@field stat fun(path: string): table
+---@field list_dir fun(path: string): table[]
+---@field remove fun(path: string)
+
+---@class Ctx.HttpResponse
+---@field status integer
+---@field headers table<string, string>
+---@field body string
+---@field json fun(self: Ctx.HttpResponse): any
+
+---@class Ctx.HttpOpts
+---@field headers? table<string, string>
+---@field timeout_ms? integer
+---@field json? any
+
+---@class Ctx.HttpClient
+---@field get fun(self: Ctx.HttpClient, path: string, opts?: Ctx.HttpOpts): Ctx.HttpResponse
+---@field post fun(self: Ctx.HttpClient, path: string, body?: any, opts?: Ctx.HttpOpts): Ctx.HttpResponse
+---@field request fun(self: Ctx.HttpClient, req: table): Ctx.HttpResponse
+
+---@class Ctx.Http
+---@field get fun(url: string, opts?: Ctx.HttpOpts): Ctx.HttpResponse
+---@field post fun(url: string, body?: any, opts?: Ctx.HttpOpts): Ctx.HttpResponse
+---@field request fun(req: { method: string, url: string, headers?: table, json?: any, body?: string, timeout_ms?: integer }): Ctx.HttpResponse
+---@field client fun(cfg: { base_url?: string, headers?: table, timeout_ms?: integer }): Ctx.HttpClient
+
+---@class Ctx.WsFrame
+---@field kind "text"|"binary"
+---@field text? string
+
+---@class Ctx.WsConn
+---@field send fun(self: Ctx.WsConn, msg: string)
+---@field send_binary fun(self: Ctx.WsConn, bytes: string)
+---@field recv fun(self: Ctx.WsConn, timeout_ms?: integer): Ctx.WsFrame|nil
+---@field recv_text fun(self: Ctx.WsConn, timeout_ms?: integer): string|nil
+---@field each fun(self: Ctx.WsConn, fn: fun(frame: Ctx.WsFrame))
+---@field close fun(self: Ctx.WsConn)
+---@field is_closed fun(self: Ctx.WsConn): boolean
+---@field url fun(self: Ctx.WsConn): string
+
+---@class Ctx.Ws
+---@field connect fun(url: string, opts?: { heartbeat_ms?: integer, heartbeat?: string }): Ctx.WsConn
+
+---@class Ctx.Secret
+---@field get fun(key: string): string|nil
+---@field set fun(key: string, value: string)
+---@field delete fun(key: string)
+---@field exists fun(key: string): boolean
+---@field list fun(): string[]
+
+---@class Ctx.MemoryHandle
+---@field get fun(self: Ctx.MemoryHandle, key: string, default?: any): any
+---@field set fun(self: Ctx.MemoryHandle, key: string, value: any)
+---@field exists fun(self: Ctx.MemoryHandle, key: string): boolean
+---@field keys fun(self: Ctx.MemoryHandle): string[]
+---@field delete fun(self: Ctx.MemoryHandle, key: string)
+---@field clear fun(self: Ctx.MemoryHandle)
+
+---@class Ctx.Memory
+---@field create fun(namespace: string): Ctx.MemoryHandle
+
+---@class Ctx.State
+---@field get fun(key: string, default?: any): any
+---@field set fun(key: string, value: any)
+---@field delete fun(key: string)
+---@field keys fun(): string[]
+---@field clear fun()
+
+---@class Ctx.Caller
+---@field interface string|nil
+---@field runner string|nil
+---@field service string|nil
+---@field session string|nil
+---@field user string|nil
+---@field execution string|nil
+
+---@class Ctx.Ai
+---@field ask fun(prompt: string, opts?: { provider?: string, model?: string, max_tokens?: integer, system?: string }): string
+---@field complete fun(opts: { model?: string, system?: string, prompt: string, max_tokens?: integer, messages?: table[] }): table
+---@field providers fun(): string[]
+
+---@class Ctx.RunResult
+---@field text string
+---@field provider string
+---@field model string
+---@field stop_reason string|nil
+
+---@class Ctx.RunOpts
+---@field prompt? string
+---@field system? string
+---@field model? string
+---@field messages? { role: string, content: string }[]
+---@field history? { role: string, content: string }[]
+
+---@class Ctx.StructuredOpts
+---@field prompt string
+---@field system? string
+---@field model? string
+---@field retries? integer
+---@field validate? fun(value: any): boolean, string?
+
+---@class Ctx
+---@field log Ctx.Log
+---@field fs Ctx.Fs
+---@field http Ctx.Http
+---@field ws Ctx.Ws
+---@field secret Ctx.Secret
+---@field memory Ctx.Memory
+---@field state Ctx.State
+---@field caller Ctx.Caller
+---@field ai Ctx.Ai
+local Ctx = {}
+
+---Run a child process (argv-only). Short form or structured `Ctx.ShellOpts`.
+---@overload fun(opts: Ctx.ShellOpts): Ctx.ShellResult
+---@param bin string
+---@param args? string[]
+---@param opts? { cwd?: string, stdin?: string, separate_stderr?: boolean }
+---@return Ctx.ShellResult
+function Ctx.shell(bin, args, opts) end
+
+---Registered action catalog (names).
+---@return string[]
+function Ctx.tools() end
+
+---Invoke another action. Inner requirements are checked; `confirm` actions are rejected.
+---@param name agentd.ActionName
+---@param args? table
+---@return any
+function Ctx.call(name, args) end
+
+---Run a runner. String prompt or structured options.
+---@overload fun(name: agentd.RunnerName, prompt: string): Ctx.RunResult
+---@param name agentd.RunnerName
+---@param opts Ctx.RunOpts
+---@return Ctx.RunResult
+function Ctx.run(name, opts) end
+
+---Run a runner and decode/validate a JSON object from its reply.
+---@param name agentd.RunnerName
+---@param opts Ctx.StructuredOpts
+---@return table decoded, Ctx.RunResult response
+function Ctx.structured(name, opts) end

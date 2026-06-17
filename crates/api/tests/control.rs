@@ -50,7 +50,7 @@ async fn boot() -> Booted {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let state = AppState {
-        executor,
+        executor: Arc::new(arc_swap::ArcSwap::from(executor)),
         auth_token: Some(Arc::new("public-tok".into())),
         admin_token: Some(Arc::new("admin-tok".into())),
         broker: broker.clone(),
