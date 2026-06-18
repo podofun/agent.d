@@ -1,0 +1,16 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "bun install --frozen-lockfile",
+  "buildCommand": "bun run docs:build",
+  "outputDirectory": ".vitepress/dist",
+  "rewrites": [
+    {
+      "source": "/agentd/:path*",
+      "destination": "/:path*"
+    },
+    {
+      "source": "/agentd",
+      "destination": "/"
+    }
+  ]
+}
