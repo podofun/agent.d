@@ -3,14 +3,11 @@
   "installCommand": "bun install --frozen-lockfile",
   "buildCommand": "bun run docs:build",
   "outputDirectory": ".vitepress/dist",
-  "rewrites": [
+  "redirects": [
     {
-      "source": "/agentd/:path*",
-      "destination": "/:path*"
-    },
-    {
-      "source": "/agentd",
-      "destination": "/"
+      "source": "/",
+      "destination": "/agentd/",
+      "permanent": false
     }
   ]
 }
