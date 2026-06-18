@@ -8,7 +8,12 @@ import { withBase } from 'vitepress'
     <div class="agent-home__inner">
       <div class="agent-home__copy">
         <p class="agent-home__eyebrow">podofun / agent.d</p>
-        <h1>Local agents.<br />Explicit access.</h1>
+        <div class="agent-home__headline">
+          <div class="agent-home__mark agent-home__mark--inline" aria-hidden="true">
+            <img :src="withBase('/agentd_logo.png')" alt="" />
+          </div>
+          <h1>Local agents.<br />Explicit access.</h1>
+        </div>
         <p class="agent-home__lead">
           A Lua-scriptable runtime for tools, runners, services, memory, and permissions in one daemon.
         </p>
@@ -18,7 +23,7 @@ import { withBase } from 'vitepress'
         </div>
       </div>
 
-      <div class="agent-home__mark" aria-label="agent.d logo">
+      <div class="agent-home__mark agent-home__mark--hero" aria-label="agent.d logo">
         <img :src="withBase('/agentd_logo.png')" alt="agent.d" />
       </div>
     </div>
