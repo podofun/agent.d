@@ -2,6 +2,7 @@ import { defineConfig } from 'vitepress'
 
 export default defineConfig({
   base: '/agentd/',
+  outDir: '.vitepress/dist/agentd',
   srcDir: 'docs',
   srcExclude: [
     'api-examples.md',
