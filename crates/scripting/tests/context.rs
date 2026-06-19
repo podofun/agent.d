@@ -126,6 +126,9 @@ async fn shell_exec_denied_without_grant() {
     );
 }
 
+// Unix-only: spawns `/bin/echo`. Windows execution through ctx.shell +
+// sandbox is covered by crates/shell/tests/sandbox_windows.rs.
+#[cfg(unix)]
 #[tokio::test]
 async fn shell_exec_allowed_with_grant() {
     let dir = write_tools(&[(
@@ -157,6 +160,9 @@ async fn shell_exec_allowed_with_grant() {
     assert_eq!(code, 0);
 }
 
+// Unix-only: spawns `/bin/echo`. The scoped-grant DENY path
+// (shell_exec_scoped_denies_other_bin) runs on every platform.
+#[cfg(unix)]
 #[tokio::test]
 async fn shell_exec_scoped_allows_matching_bin() {
     // A scoped `shell.exec:<bin>` grant authorizes exactly that binary.
@@ -294,6 +300,9 @@ async fn tools_call_denied_when_inner_requires_unmet() {
     assert!(err.to_string().contains("shell.exec"), "got: {err}");
 }
 
+// Unix-only: the inner action spawns `/bin/echo`. The nested-grant DENY path
+// (tools_call_denied_when_inner_requires_unmet) runs on every platform.
+#[cfg(unix)]
 #[tokio::test]
 async fn tools_call_allowed_when_grants_cover_inner() {
     let dir = write_tools(&[(
@@ -366,6 +375,11 @@ async fn tools_call_blocks_confirm_actions() {
 
 /// End-to-end: the OS sandbox confines a ctx.shell child to its fs.write grant.
 /// Skipped when the kernel has no enforcing Landlock backend.
+///
+/// Unix-only: drives `/bin/sh`. The Windows equivalent (write inside/outside an
+/// fs.write grant under the restricted-token sandbox) lives in
+/// crates/shell/tests/sandbox_windows.rs.
+#[cfg(unix)]
 #[tokio::test]
 async fn shell_child_confined_to_fs_write_grant() {
     if !agentd_shell::sandbox::is_supported() {

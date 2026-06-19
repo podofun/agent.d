@@ -24,6 +24,13 @@ fn ctx(grants: &[&str]) -> CallContext {
     }
 }
 
+/// Escape a host path for embedding inside a Lua string literal. On Windows the
+/// backslashes would otherwise be read as Lua escape sequences (`\U`, `\h`, ...)
+/// and fail to parse. No-op on POSIX paths.
+fn lua_lit(p: impl AsRef<str>) -> String {
+    p.as_ref().replace('\\', "\\\\")
+}
+
 // ---------- fs ----------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -31,7 +38,7 @@ async fn fs_read_denied_without_grant() {
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("hello.txt");
     std::fs::write(&target, "hi").unwrap();
-    let target_str = target.to_string_lossy().into_owned();
+    let target_str = lua_lit(target.to_string_lossy());
 
     let dir = write_tools(&[(
         "t.lua",
@@ -66,7 +73,7 @@ async fn fs_read_allowed_with_scoped_grant() {
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("hello.txt");
     std::fs::write(&target, "hello world").unwrap();
-    let target_str = target.to_string_lossy().into_owned();
+    let target_str = lua_lit(target.to_string_lossy());
     let glob = format!("fs.read:{}/**", tmp.path().display());
 
     let dir = write_tools(&[(
@@ -102,7 +109,7 @@ async fn fs_read_allowed_with_scoped_grant() {
 async fn fs_write_and_read_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("out.txt");
-    let target_str = target.to_string_lossy().into_owned();
+    let target_str = lua_lit(target.to_string_lossy());
     let read_glob = format!("fs.read:{}/**", tmp.path().display());
     let write_glob = format!("fs.write:{}/**", tmp.path().display());
 
@@ -141,7 +148,7 @@ async fn fs_write_and_read_roundtrip() {
 async fn fs_write_denied_when_only_read_granted() {
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("out.txt");
-    let target_str = target.to_string_lossy().into_owned();
+    let target_str = lua_lit(target.to_string_lossy());
     let read_glob = format!("fs.read:{}/**", tmp.path().display());
 
     let dir = write_tools(&[(
@@ -178,7 +185,7 @@ async fn fs_list_dir_returns_entries() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("a.txt"), b"").unwrap();
     std::fs::write(tmp.path().join("b.txt"), b"").unwrap();
-    let dir_str = tmp.path().to_string_lossy().into_owned();
+    let dir_str = lua_lit(tmp.path().to_string_lossy());
     let glob = format!("fs.read:{}/**", tmp.path().display());
 
     let dir = write_tools(&[(
@@ -357,6 +364,10 @@ async fn http_wildcard_grant_covers_any_host() {
 // deriving the permission slug — otherwise the slug describes the alias, not
 // the file actually touched.
 
+// Unix-only: creating a symlink on Windows needs elevation / Developer Mode,
+// which would make this flaky in CI. The `..`-traversal guard below covers the
+// other escape on every platform.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn fs_read_symlink_escape_denied() {
     let granted = tempfile::tempdir().unwrap();
@@ -366,7 +377,7 @@ async fn fs_read_symlink_escape_denied() {
     // A symlink inside the granted dir pointing at the out-of-scope secret.
     let link = granted.path().join("link.txt");
     std::os::unix::fs::symlink(&secret, &link).unwrap();
-    let link_str = link.to_string_lossy().into_owned();
+    let link_str = lua_lit(link.to_string_lossy());
     let glob = format!("fs.read:{}/**", granted.path().display());
 
     let dir = write_tools(&[(
@@ -406,7 +417,7 @@ async fn fs_read_parent_traversal_denied() {
     std::fs::write(&secret, "S").unwrap();
     // Grant only the sub dir; climb out of it with `..`.
     let glob = format!("fs.read:{}/**", sub.display());
-    let escape = format!("{}/../secret.txt", sub.display());
+    let escape = lua_lit(format!("{}/../secret.txt", sub.display()));
 
     let dir = write_tools(&[(
         "t.lua",

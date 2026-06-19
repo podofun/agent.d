@@ -1522,6 +1522,15 @@ fn log_at(level: tracing::Level, msg: &str) {
 
 // ---------- ctx.shell ----------
 
+/// Whether an `fs.*` specifier names an absolute path the sandbox can confine.
+/// Accepts POSIX-absolute (`/...`) and, on Windows, drive/UNC paths
+/// (`C:\...`, `\\server\share`). Relative specifiers are skipped — the sandbox
+/// confines by absolute subtree. `/...` is kept on every platform so existing
+/// POSIX-style grants and tests are unaffected.
+fn is_confinable_path(s: &str) -> bool {
+    s.starts_with('/') || std::path::Path::new(s).is_absolute()
+}
+
 /// Translate an execution's effective grants into a child-process sandbox
 /// policy. `fs.read`/`fs.write` slugs become readable/writable subtrees (globs
 /// collapsed to the concrete ancestor dir), any `net:` grant flips coarse
@@ -1537,14 +1546,14 @@ pub(crate) fn build_sandbox_policy(grants: &PermissionSet) -> SandboxPolicy {
         match domain {
             "fs.write" => {
                 if let Some(s) = spec
-                    && s.starts_with('/')
+                    && is_confinable_path(s)
                 {
                     policy.write_paths.push(concrete_ancestor(s));
                 }
             }
             "fs.read" => {
                 if let Some(s) = spec
-                    && s.starts_with('/')
+                    && is_confinable_path(s)
                 {
                     policy.read_paths.push(concrete_ancestor(s));
                 }
@@ -1719,6 +1728,24 @@ fn abs_path(path: String) -> std::path::PathBuf {
     }
 }
 
+/// Strip the Windows extended-length verbatim prefix (`\\?\`, `\\?\UNC\`) that
+/// `canonicalize` prepends, so the permission slug derived from the result is an
+/// ordinary `C:\...` path that matches grants authored in that form. No-op on
+/// non-Windows and on paths without the prefix.
+fn strip_verbatim(p: std::path::PathBuf) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(rest.to_string());
+        }
+    }
+    p
+}
+
 /// Resolve a user-supplied path to the absolute, symlink-free path used BOTH
 /// for the `fs.*` permission slug and the I/O that follows. Resolving before
 /// the slug is derived is what stops a `..` segment or a symlink from pointing
@@ -1727,14 +1754,14 @@ fn abs_path(path: String) -> std::path::PathBuf {
 fn resolve_path(path: String) -> std::path::PathBuf {
     let p = abs_path(path);
     if let Ok(canon) = p.canonicalize() {
-        return canon;
+        return strip_verbatim(canon);
     }
     // Target may not exist yet (writing a new file): canonicalize the parent
     // chain so symlinks / `..` there still collapse, then re-attach the leaf.
     if let (Some(parent), Some(name)) = (p.parent(), p.file_name())
         && let Ok(canon_parent) = parent.canonicalize()
     {
-        return canon_parent.join(name);
+        return strip_verbatim(canon_parent).join(name);
     }
     // Nothing on disk to resolve against — strip `.`/`..` lexically so a
     // traversal can't survive into the slug even on a fully novel path.
@@ -3091,5 +3118,27 @@ mod sandbox_policy_tests {
         assert!(p.write_paths.is_empty());
         assert!(!p.allow_net);
         assert!(!p.unrestricted);
+    }
+
+    // On Windows, fs grants are formed as `fs.write:{path.display()}`, i.e.
+    // drive-letter paths with backslashes (`C:\...`) — never a leading `/`. They
+    // must still map to write/read subtrees.
+    #[cfg(windows)]
+    #[test]
+    fn maps_windows_absolute_grants() {
+        let mut grants = PermissionSet::empty();
+        grants.insert(Permission::new(r"fs.write:C:\Users\test\out\**"));
+        grants.insert(Permission::new("fs.read:C:/Users/test/data/*"));
+        let p = build_sandbox_policy(&grants);
+        assert!(
+            p.write_paths.contains(&PathBuf::from(r"C:\Users\test\out")),
+            "windows fs.write grant dropped: {:?}",
+            p.write_paths
+        );
+        assert!(
+            p.read_paths.contains(&PathBuf::from("C:/Users/test/data")),
+            "windows fs.read grant dropped: {:?}",
+            p.read_paths
+        );
     }
 }
