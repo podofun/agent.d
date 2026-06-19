@@ -55,9 +55,10 @@ mod imp {
     };
     use windows::Win32::Security::{
         ACL, AllocateAndInitializeSid, CreateRestrictedToken, DACL_SECURITY_INFORMATION,
-        DISABLE_MAX_PRIVILEGE, FreeSid, LUA_TOKEN, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
-        SECURITY_NT_AUTHORITY, SID_AND_ATTRIBUTES, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-        TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY, WRITE_RESTRICTED,
+        DISABLE_MAX_PRIVILEGE, FreeSid, GetTokenInformation, LUA_TOKEN, PSECURITY_DESCRIPTOR, PSID,
+        SECURITY_ATTRIBUTES, SECURITY_NT_AUTHORITY, SID_AND_ATTRIBUTES,
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_GROUPS,
+        TOKEN_QUERY, TokenGroups, WRITE_RESTRICTED,
     };
     use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
     use windows::Win32::System::Pipes::CreatePipe;
@@ -95,7 +96,7 @@ mod imp {
         write: HANDLE,
     }
 
-    fn make_pipe(inherit_read: bool) -> Result<Pipe, ShellError> {
+    fn make_pipe(child_inherits_read: bool) -> Result<Pipe, ShellError> {
         let mut sa = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             bInheritHandle: true.into(),
@@ -107,7 +108,7 @@ mod imp {
             CreatePipe(&mut read, &mut write, Some(&sa), 0).map_err(sb)?;
             // Only the end the child inherits stays inheritable; the parent end
             // must NOT be inherited (it would leak into the child).
-            let parent_end = if inherit_read { write } else { read };
+            let parent_end = if child_inherits_read { write } else { read };
             SetHandleInformation(parent_end, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)).map_err(sb)?;
         }
         let _ = &mut sa;
@@ -193,9 +194,24 @@ mod imp {
         }
     }
 
-    /// Build a write-restricted token whose only restricting SID is `sandbox_sid`,
-    /// so (because of `WRITE_RESTRICTED`) writes succeed only where that SID has
-    /// an ACE — i.e. the stamped grant paths. Reads/exec are unaffected.
+    /// Build a write-restricted token confining filesystem writes to the stamped
+    /// grant paths while still letting a normal binary start.
+    ///
+    /// Under `WRITE_RESTRICTED`, a write is allowed only where one of the token's
+    /// restricting SIDs is granted; reads and execution ignore them. The set is:
+    ///
+    /// - `sandbox_sid` — stamped only on the granted write paths, so those are the
+    ///   only filesystem locations the child can write.
+    /// - RESTRICTED code SID `S-1-5-12` and the session **logon SID** — the kernel
+    ///   objects a process touches at startup (the `BaseNamedObjects` directory,
+    ///   section objects, the window station / desktop) are ACE'd for these.
+    /// - **Everyone** `S-1-1-0` — some of those startup objects grant only
+    ///   Everyone; without it DLL-heavy binaries (python, curl, the CLR) die at
+    ///   init with `STATUS_DLL_INIT_FAILED` / access-denied before `main`.
+    ///
+    /// None of RESTRICTED / logon / Everyone normally carries a *write* ACE on
+    /// user data (a temp dir under the profile grants the user SID, not Everyone),
+    /// so they do not widen the filesystem write surface beyond the stamped paths.
     fn restricted_token(sandbox_sid: PSID) -> Result<HANDLE, ShellError> {
         unsafe {
             let mut base = HANDLE::default();
@@ -206,22 +222,93 @@ mod imp {
             )
             .map_err(sb)?;
 
-            let restrict = [SID_AND_ATTRIBUTES {
-                Sid: sandbox_sid,
-                Attributes: 0,
-            }];
+            let auth = SECURITY_NT_AUTHORITY;
+            // RESTRICTED code SID S-1-5-12 (SECURITY_RESTRICTED_CODE_RID).
+            let mut restricted_code_sid = PSID::default();
+            AllocateAndInitializeSid(&auth, 1, 12, 0, 0, 0, 0, 0, 0, 0, &mut restricted_code_sid)
+                .map_err(sb)?;
+            // Everyone S-1-1-0 (SECURITY_WORLD_SID_AUTHORITY).
+            let world = windows::Win32::Security::SECURITY_WORLD_SID_AUTHORITY;
+            let mut everyone_sid = PSID::default();
+            AllocateAndInitializeSid(&world, 1, 0, 0, 0, 0, 0, 0, 0, 0, &mut everyone_sid)
+                .map_err(sb)?;
+
+            // The session logon SID, kept alive in `groups_buf` while in use.
+            let groups_buf = token_groups(base);
+            let logon_sid = groups_buf.as_ref().and_then(|b| logon_sid_in(b));
+
+            let mut restrict = vec![
+                SID_AND_ATTRIBUTES {
+                    Sid: sandbox_sid,
+                    Attributes: 0,
+                },
+                SID_AND_ATTRIBUTES {
+                    Sid: restricted_code_sid,
+                    Attributes: 0,
+                },
+                SID_AND_ATTRIBUTES {
+                    Sid: everyone_sid,
+                    Attributes: 0,
+                },
+            ];
+            if let Some(sid) = logon_sid {
+                restrict.push(SID_AND_ATTRIBUTES {
+                    Sid: sid,
+                    Attributes: 0,
+                });
+            }
+
             let mut restricted = HANDLE::default();
-            CreateRestrictedToken(
+            let res = CreateRestrictedToken(
                 base,
                 DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED,
                 None,
                 None,
                 Some(&restrict),
                 &mut restricted,
-            )
-            .map_err(sb)?;
+            );
             let _ = CloseHandle(base);
+            FreeSid(restricted_code_sid);
+            FreeSid(everyone_sid);
+            res.map_err(sb)?;
             Ok(restricted)
+        }
+    }
+
+    /// Read the `TokenGroups` info of `token` into an owned buffer (the SIDs it
+    /// references point into this buffer, so it must outlive their use).
+    fn token_groups(token: HANDLE) -> Option<Vec<u8>> {
+        unsafe {
+            let mut len = 0u32;
+            // First call sizes the buffer; it "fails" with ERROR_INSUFFICIENT_BUFFER.
+            let _ = GetTokenInformation(token, TokenGroups, None, 0, &mut len);
+            if len == 0 {
+                return None;
+            }
+            let mut buf = vec![0u8; len as usize];
+            GetTokenInformation(
+                token,
+                TokenGroups,
+                Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+                len,
+                &mut len,
+            )
+            .ok()?;
+            Some(buf)
+        }
+    }
+
+    /// Find the logon SID (group flagged `SE_GROUP_LOGON_ID`) in a `TokenGroups`
+    /// buffer from [`token_groups`]. The returned PSID borrows that buffer.
+    fn logon_sid_in(buf: &[u8]) -> Option<PSID> {
+        const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
+        unsafe {
+            let groups = &*(buf.as_ptr() as *const TOKEN_GROUPS);
+            let arr =
+                std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize);
+            arr.iter()
+                .find(|g| g.Attributes & SE_GROUP_LOGON_ID == SE_GROUP_LOGON_ID)
+                .map(|g| g.Sid)
         }
     }
 
@@ -255,9 +342,14 @@ mod imp {
         let token = restricted_token(sandbox_sid)?;
 
         // stdio pipes.
-        let out = make_pipe(true)?; // child writes `write`, parent reads `read`
-        let err = make_pipe(true)?;
-        let inp = make_pipe(false)?; // child reads `read`, parent writes `write`
+        // `make_pipe(child_inherits_read)`: keep the child's end inheritable, drop
+        // the parent's. stdout/stderr: the child inherits the WRITE end (false).
+        // stdin: the child inherits the READ end (true). Getting this wrong hands
+        // the child invalid std handles — no output, and CRTs that validate their
+        // std handles at startup die with STATUS_DLL_INIT_FAILED before `main`.
+        let out = make_pipe(false)?; // child writes `write`, parent reads `read`
+        let err = make_pipe(false)?;
+        let inp = make_pipe(true)?; // child reads `read`, parent writes `write`
 
         // Command line.
         let mut cmdline = String::new();
