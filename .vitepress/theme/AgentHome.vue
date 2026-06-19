@@ -18,13 +18,20 @@ import { withBase } from 'vitepress'
           A Lua-scriptable runtime for tools, runners, services, memory, and permissions in one daemon.
         </p>
         <div class="agent-home__actions">
-          <a class="agent-home__button agent-home__button--primary" href="https://github.com/podofun/agent.d">View on GitHub</a>
-          <a class="agent-home__button agent-home__button--secondary" href="https://github.com/podofun">podofun org</a>
+          <a class="agent-home__button agent-home__button--primary" :href="withBase('/v0/guide/quick-start')">Get started</a>
+          <a class="agent-home__button agent-home__button--secondary" :href="withBase('/v0/guide/what-is-agentd')">Read the guide</a>
         </div>
       </div>
 
-      <div class="agent-home__mark agent-home__mark--hero" aria-label="agent.d logo">
-        <img :src="withBase('/agentd_logo.png')" alt="agent.d" />
+      <div class="agent-home__demo" role="img" aria-label="Terminal: agentctl call git.status checks the shell.exec:git grant and returns a clean status.">
+        <pre class="agent-home__demo-body" aria-hidden="true"><code><span class="c-pr">$</span> <span class="type">agentctl call <span class="c-fn">git.status</span></span>
+<span class="out"><span class="c-mut"># checking grants.toml</span>
+<span class="c-ok">✓</span> <span class="c-perm">shell.exec:git</span> <span class="c-mut">granted</span>
+<span class="c-key">result</span> {
+  <span class="c-key">status</span>: <span class="c-str">"clean"</span>,
+  <span class="c-key">exit_code</span>: <span class="c-num">0</span>
+}
+<span class="c-pr">$</span> <span class="agent-home__caret"></span></span></code></pre>
       </div>
     </div>
 
@@ -36,8 +43,8 @@ import { withBase } from 'vitepress'
       </article>
       <article>
         <p>Access</p>
-        <h2>Default-deny grants</h2>
-        <span>Shell, filesystem, network, secrets, memory, and model calls stay behind explicit permissions.</span>
+        <h2>Explicit grants</h2>
+        <span>Shell, filesystem, network, secrets, memory, and model calls stay behind permissions you grant.</span>
       </article>
       <article>
         <p>Control</p>

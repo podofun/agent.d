@@ -98,16 +98,15 @@
   --agent-shadow: rgba(0, 0, 0, 0.34);
 }
 
-.VPContent.has-sidebar {
-  padding-left: 0;
-}
-
-.VPContent {
+/* Full-bleed landing ONLY. The home sets `layout: page` + `pageClass:
+   agent-home-page`; VitePress puts that class on the root .Layout, so these
+   overrides never touch the doc/reference pages (which keep their default
+   spacing under the fixed nav). */
+.agent-home-page .VPContent {
   padding-top: 0;
 }
 
-.VPContent .VPDoc,
-.VPContent .VPPage {
+.agent-home-page .VPContent .VPPage {
   padding: 0;
 }
 
@@ -305,6 +304,107 @@
   line-height: 1.6;
 }
 
+/* Bigger, better-balanced nav logo. */
+.VPNavBarTitle .logo {
+  height: 30px;
+  width: 30px;
+  margin-right: 2px;
+}
+
+/* Hero terminal demo — replaces the static logo image. Frameless window:
+   the command types out, then the output slams in. On-brand for a CLI daemon. */
+.agent-home__demo {
+  position: relative;
+  z-index: 1;
+  justify-self: end;
+  width: min(100%, 520px);
+  overflow: hidden;
+  border: 1px solid var(--agent-border);
+  border-radius: 12px;
+  background: var(--agent-surface-strong);
+  box-shadow: 0 34px 90px var(--agent-shadow);
+  font-family: var(--vp-font-family-mono, ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace);
+}
+
+.agent-home__demo-body {
+  margin: 0;
+  padding: 26px 26px 28px;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.5;
+  color: var(--agent-text-soft);
+  white-space: pre;
+  overflow-x: auto;
+  tab-size: 2;
+}
+
+.agent-home__demo-body code {
+  font-family: inherit;
+}
+
+.agent-home__demo .c-pr   { color: var(--agent-accent); }
+.agent-home__demo .c-fn   { color: var(--agent-text); }
+.agent-home__demo .c-ok   { color: var(--agent-accent); }
+.agent-home__demo .c-perm { color: var(--agent-warm); }
+.agent-home__demo .c-key  { color: var(--agent-text); }
+.agent-home__demo .c-str  { color: var(--agent-accent); }
+.agent-home__demo .c-num  { color: var(--agent-warm); }
+.agent-home__demo .c-mut  { color: var(--agent-text-muted); font-style: italic; }
+
+/* The command types out, character by character. */
+.agent-home__demo .type {
+  display: inline-block;
+  width: 0;
+  overflow: hidden;
+  white-space: pre;
+  vertical-align: bottom;
+  animation: agent-type 1.15s steps(24, end) 0.4s forwards;
+}
+
+@keyframes agent-type {
+  to { width: 24ch; }
+}
+
+/* The result is slammed in as one block once typing finishes (no per-line typing). */
+.agent-home__demo .out {
+  opacity: 0;
+  animation: agent-slam 0.01s linear 1.7s forwards;
+}
+
+@keyframes agent-slam {
+  to { opacity: 1; }
+}
+
+.agent-home__caret {
+  display: inline-block;
+  width: 9px;
+  height: 1.05em;
+  vertical-align: text-bottom;
+  background: var(--agent-accent);
+  opacity: 0;
+  animation: agent-caret 1.05s steps(1) 1.9s infinite;
+}
+
+@keyframes agent-caret {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-home__demo .type {
+    width: 24ch;
+    animation: none;
+  }
+  .agent-home__demo .out {
+    opacity: 1;
+    animation: none;
+  }
+  .agent-home__caret {
+    opacity: 1;
+    animation: none;
+  }
+}
+
 @media (max-width: 900px) {
   :root {
     --agent-title-size: 48px;
@@ -333,6 +433,10 @@
   }
 
   .agent-home__mark.agent-home__mark--hero {
+    display: none;
+  }
+
+  .agent-home__demo {
     display: none;
   }
 
