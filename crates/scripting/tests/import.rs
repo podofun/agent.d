@@ -77,9 +77,12 @@ fn import_rejects_absolute_paths() {
     host.set_root(tmp.path());
     let err = host.load_file(&tmp.path().join("init.lua")).unwrap_err();
     let msg = format!("{err:#}");
+    // `/etc/passwd` is rejected as absolute on POSIX; on Windows it lacks a drive
+    // so it trips the leading-root/prefix guard instead. Either way it must not
+    // resolve to an out-of-root path.
     assert!(
-        msg.contains("absolute"),
-        "expected absolute rejection: {msg}"
+        msg.contains("absolute") || msg.contains("root") || msg.contains("prefix"),
+        "expected absolute/root rejection: {msg}"
     );
 }
 
