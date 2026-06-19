@@ -3,6 +3,8 @@
   "installCommand": "bun install --frozen-lockfile",
   "buildCommand": "bun run docs:build",
   "outputDirectory": ".vitepress/dist",
+  "cleanUrls": true,
+  "trailingSlash": false,
   "redirects": [
     {
       "source": "/",
