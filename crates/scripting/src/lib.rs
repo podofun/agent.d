@@ -1728,6 +1728,24 @@ fn abs_path(path: String) -> std::path::PathBuf {
     }
 }
 
+/// Strip the Windows extended-length verbatim prefix (`\\?\`, `\\?\UNC\`) that
+/// `canonicalize` prepends, so the permission slug derived from the result is an
+/// ordinary `C:\...` path that matches grants authored in that form. No-op on
+/// non-Windows and on paths without the prefix.
+fn strip_verbatim(p: std::path::PathBuf) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(rest.to_string());
+        }
+    }
+    p
+}
+
 /// Resolve a user-supplied path to the absolute, symlink-free path used BOTH
 /// for the `fs.*` permission slug and the I/O that follows. Resolving before
 /// the slug is derived is what stops a `..` segment or a symlink from pointing
@@ -1736,14 +1754,14 @@ fn abs_path(path: String) -> std::path::PathBuf {
 fn resolve_path(path: String) -> std::path::PathBuf {
     let p = abs_path(path);
     if let Ok(canon) = p.canonicalize() {
-        return canon;
+        return strip_verbatim(canon);
     }
     // Target may not exist yet (writing a new file): canonicalize the parent
     // chain so symlinks / `..` there still collapse, then re-attach the leaf.
     if let (Some(parent), Some(name)) = (p.parent(), p.file_name())
         && let Ok(canon_parent) = parent.canonicalize()
     {
-        return canon_parent.join(name);
+        return strip_verbatim(canon_parent).join(name);
     }
     // Nothing on disk to resolve against — strip `.`/`..` lexically so a
     // traversal can't survive into the slug even on a fully novel path.

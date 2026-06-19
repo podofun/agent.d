@@ -47,6 +47,13 @@ fn match_spec(holder: &str, required: &str) -> bool {
     if holder == required {
         return true;
     }
+    // Path specifiers may arrive with either separator (a Windows grant writes
+    // `C:\dir\**`, while a resolved slug uses native backslashes). Treat `\` and
+    // `/` as equivalent so the `/`-based glob logic below matches either form.
+    // No-op for specifiers without backslashes (hosts, bare binaries, ...).
+    if holder.contains('\\') || required.contains('\\') {
+        return match_spec(&holder.replace('\\', "/"), &required.replace('\\', "/"));
+    }
     if let Some(prefix) = holder.strip_suffix("/**") {
         return required == prefix || required.starts_with(&format!("{prefix}/"));
     }
@@ -266,6 +273,30 @@ mod tests {
     #[test]
     fn permission_domain_mismatch_never_covers() {
         assert!(!Permission::new("calendar.read").covers(&Permission::new("net:googleapis.com")));
+    }
+
+    #[test]
+    fn permission_windows_paths_match_either_separator() {
+        // A Windows grant uses backslashes; a resolved fs slug does too. The
+        // `/`-based glob logic must still cover them, and `\`/`/` are equivalent.
+        assert!(
+            Permission::new(r"fs.read:C:\Users\me\**")
+                .covers(&Permission::new(r"fs.read:C:\Users\me\proj\a.txt"))
+        );
+        assert!(
+            Permission::new(r"fs.write:C:\data\*")
+                .covers(&Permission::new(r"fs.write:C:\data\out.txt"))
+        );
+        // Mixed separators (grant authored with `/`, slug with `\`).
+        assert!(
+            Permission::new("fs.read:C:/Users/me/**")
+                .covers(&Permission::new(r"fs.read:C:\Users\me\a.txt"))
+        );
+        // Confinement still holds: a sibling dir is not covered.
+        assert!(
+            !Permission::new(r"fs.read:C:\Users\me\**")
+                .covers(&Permission::new(r"fs.read:C:\Users\other\a.txt"))
+        );
     }
 
     #[test]
