@@ -68,23 +68,27 @@ impl std::error::Error for SandboxError {}
 
 /// Collapse a permission specifier to its deepest concrete ancestor directory.
 /// Kernel sandboxes confine by subtree, not glob; a specifier with `*`/`**` is
-/// reduced to the path prefix before the first glob segment.
+/// reduced to the path prefix before the first glob segment. Accepts both `/`
+/// and `\` separators so Windows drive paths (`C:\dir\**`) collapse correctly.
 pub fn concrete_ancestor(spec: &str) -> PathBuf {
-    let mut out = PathBuf::new();
-    for seg in spec.split('/') {
-        if seg.contains('*') {
-            break;
+    let Some(glob) = spec.find('*') else {
+        // No glob: the whole specifier is already a concrete path.
+        return PathBuf::from(spec);
+    };
+    // Drop the partial segment the glob sits in: back up to its separator.
+    let head = &spec[..glob];
+    let trimmed = match head.rfind(['/', '\\']) {
+        Some(i) => &head[..i],
+        None => "",
+    };
+    if trimmed.is_empty() {
+        // Preserve the POSIX root for specifiers like `/**`.
+        if spec.starts_with('/') {
+            return PathBuf::from("/");
         }
-        if seg.is_empty() {
-            // leading empty segment => absolute root
-            if out.as_os_str().is_empty() {
-                out.push("/");
-            }
-            continue;
-        }
-        out.push(seg);
+        return PathBuf::new();
     }
-    out
+    PathBuf::from(trimmed)
 }
 
 #[cfg(test)]
@@ -110,6 +114,24 @@ mod tests {
     fn concrete_ancestor_ignores_relative() {
         // Non-absolute specifiers are skipped by callers; helper returns as-is.
         assert_eq!(concrete_ancestor("relative/*"), PathBuf::from("relative"));
+    }
+
+    #[test]
+    fn concrete_ancestor_handles_windows_separators() {
+        // Windows grants arrive with backslashes and a drive letter.
+        assert_eq!(
+            concrete_ancestor(r"C:\Users\test\out\**"),
+            PathBuf::from(r"C:\Users\test\out")
+        );
+        assert_eq!(
+            concrete_ancestor(r"C:\Users\test\file.txt"),
+            PathBuf::from(r"C:\Users\test\file.txt")
+        );
+        // Mixed separators (display path + appended `/**`).
+        assert_eq!(
+            concrete_ancestor(r"C:\Users\test/*"),
+            PathBuf::from(r"C:\Users\test")
+        );
     }
 
     #[test]
