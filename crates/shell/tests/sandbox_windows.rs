@@ -215,7 +215,8 @@ async fn net_host_allowlist_is_enforced() {
     let dir = tempfile::tempdir().unwrap();
     let curl_args = |url: &str| {
         vec![
-            "-s".into(),
+            "-sS".into(),
+            "-v".into(),
             "-m".into(),
             "15".into(),
             "-o".into(),
@@ -234,8 +235,8 @@ async fn net_host_allowlist_is_enforced() {
     .unwrap();
     assert_eq!(
         allowed.exit_code, 0,
-        "allowlisted host must be reachable; stderr: {}",
-        allowed.stderr
+        "allowlisted host must be reachable; exit={} stderr:\n{}",
+        allowed.exit_code, allowed.stderr
     );
 
     // Non-allowlisted host blocked by the proxy.
