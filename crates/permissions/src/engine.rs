@@ -76,15 +76,17 @@ impl Engine {
         // never self-granting. If the user hasn't approved the tool in the
         // grants file, the tool has no permissions. Default-deny.
         if !action.requires.is_empty() {
-            let tool_meta = tool;
-            let pkg_granted = match tool_meta {
-                Some(t) => self
-                    .grants
-                    .tool(&t.name)
-                    .map(|g| g.granted.clone())
-                    .unwrap_or_else(crate::model::PermissionSet::empty),
-                None => crate::model::PermissionSet::empty(),
-            };
+            // Grants are keyed by tool NAME, not by a registered tool object.
+            // Prefer the registered `ToolMeta` name, but fall back to the action's
+            // own declared tool (its `tool.action` namespace) so an action with no
+            // explicit `agentd.tool{...}` is still grantable via `[tool.<ns>]`. The
+            // executor's denial reporter and "allow forever" persistence both key
+            // off `action.tool`; binding here the same way keeps all three in sync
+            // and avoids the `<unknown>` / ungrantable-action footgun.
+            let tool_name = tool.map(|t| t.name.as_str()).or(action.tool.as_deref());
+            let pkg_granted = tool_name
+                .and_then(|n| self.grants.tool(n).map(|g| g.granted.clone()))
+                .unwrap_or_else(crate::model::PermissionSet::empty);
             if !pkg_granted.covers_all(&action.requires) {
                 let missing: Vec<String> = action
                     .requires
@@ -92,7 +94,7 @@ impl Engine {
                     .filter(|r| !pkg_granted.contains(r))
                     .map(|p| p.as_str().to_string())
                     .collect();
-                let tool_name = tool_meta.map(|t| t.name.as_str()).unwrap_or("<unknown>");
+                let tool_name = tool_name.unwrap_or("<unknown>");
                 return Decision::Deny {
                     layer: DenyLayer::Tool,
                     reason: format!(
@@ -262,6 +264,43 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn grants_bind_by_action_tool_name_without_registered_tool_meta() {
+        // An action declares `tool: Some("google_calendar")` via its namespace
+        // but no `agentd.tool{...}` was registered, so the dispatcher passes
+        // `tool = None`. The `[tool.google_calendar]` grant must still apply —
+        // otherwise the action is permanently ungrantable and errors print
+        // `<unknown>` instead of the real tool name.
+        let mut file = GrantsFile::default();
+        file.tool.insert(
+            "google_calendar".into(),
+            ToolGrants {
+                granted: PermissionSet::from_iter(["calendar.read"]),
+            },
+        );
+        let engine = engine_with(file);
+        let decision = engine.check(&Caller::default(), None, &read_action());
+        assert_eq!(decision, Decision::Allow);
+    }
+
+    #[test]
+    fn deny_names_the_tool_namespace_when_no_tool_meta() {
+        // Without a registered ToolMeta the denial must still name the tool
+        // (from the action namespace), never `<unknown>`.
+        let engine = engine_with(GrantsFile::default());
+        let decision = engine.check(&Caller::default(), None, &read_action());
+        match decision {
+            Decision::Deny { layer, reason } => {
+                assert_eq!(layer, DenyLayer::Tool);
+                assert!(
+                    reason.contains("google_calendar") && !reason.contains("<unknown>"),
+                    "reason should name the tool namespace, got: {reason}"
+                );
+            }
+            other => panic!("expected Tool deny, got {other:?}"),
+        }
     }
 
     #[test]
