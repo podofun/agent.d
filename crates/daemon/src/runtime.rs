@@ -14,7 +14,7 @@ use std::sync::Arc;
 use agentd_ai::ProviderRegistry;
 use agentd_executor::{Executor, ExecutorHandle};
 use agentd_memory::RedbStore;
-use agentd_permissions::{Engine, Grants, load_grants_file};
+use agentd_permissions::{Engine, Grants, GrantsFile, load_grants_file};
 use agentd_scripting::LuaHost;
 use agentd_secrets::KeyringStore;
 use agentd_trace::JsonlSink;
@@ -85,6 +85,7 @@ pub fn build_runtime(cfg: &Config, shared: &Shared) -> Result<BuiltRuntime> {
     let mut grants_file = load_grants_file(&cfg.grants_file).map_err(|e| anyhow!(e))?;
     let loaded_packages = host.loaded_packages();
     agentd_packages::expand_grants(&loaded_packages, &mut grants_file);
+    warn_orphan_tool_grants(host.as_ref(), &grants_file);
     let engine = Arc::new(Engine::new(Grants::from_file(grants_file)));
 
     let registry: Arc<dyn Registry> = host.clone();
@@ -128,6 +129,21 @@ pub fn build_runtime(cfg: &Config, shared: &Shared) -> Result<BuiltRuntime> {
         service_handles,
         used_paths,
     })
+}
+
+/// Warn for every `[tool.<name>]` in grants.toml that has no matching tool
+/// registered in Lua. Such a grant silently grants nothing — the engine binds
+/// grants to the tool that owns the action (by name), so a typo or a name that
+/// doesn't match any `agentd.tool{...}` is a common, hard-to-debug footgun.
+fn warn_orphan_tool_grants(reg: &dyn Registry, grants: &GrantsFile) {
+    for name in grants.tool.keys() {
+        if reg.tool_info(name).is_none() {
+            tracing::warn!(
+                tool = %name,
+                "grants.toml declares `[tool.{name}]` but no tool named `{name}` is registered in Lua; this grant has no effect"
+            );
+        }
+    }
 }
 
 /// The file set a runtime loaded: init + `import()`ed Lua, skill sources, grants.
