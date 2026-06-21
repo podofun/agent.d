@@ -186,3 +186,96 @@ async fn net_denied_blocks_outbound() {
         res.stderr
     );
 }
+
+/// `..` cannot climb out of the granted write subtree.
+#[tokio::test]
+async fn write_via_parent_traversal_is_denied() {
+    assert!(is_supported(), "windows sandbox must be supported");
+
+    let granted = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("pwned.txt");
+    // {granted}\..\{outside_name}\pwned.txt resolves to a sibling not granted.
+    let escape = format!(
+        "{}\\..\\{}\\pwned.txt",
+        granted.path().display(),
+        outside.path().file_name().unwrap().to_string_lossy()
+    );
+    let res = exec(req(
+        powershell(),
+        vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            format!("Set-Content -LiteralPath '{escape}' -Value 'x' -NoNewline"),
+        ],
+        policy(granted.path()),
+    ))
+    .await
+    .unwrap();
+    assert_ne!(res.exit_code, 0, "traversal write must fail");
+    assert!(!target.exists(), "file outside grant must not exist");
+}
+
+/// A file outside every grant is unreadable by the AppContainer.
+#[tokio::test]
+async fn read_outside_grant_is_denied() {
+    assert!(is_supported(), "windows sandbox must be supported");
+
+    let granted = tempfile::tempdir().unwrap();
+    let secret_dir = tempfile::tempdir().unwrap();
+    let secret = secret_dir.path().join("secret.txt");
+    std::fs::write(&secret, "TOPSECRET").unwrap();
+    let res = exec(req(
+        powershell(),
+        vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            format!("Get-Content -LiteralPath '{}'", secret.display()),
+        ],
+        policy(granted.path()),
+    ))
+    .await
+    .unwrap();
+    assert!(
+        !res.stdout.contains("TOPSECRET"),
+        "secret leaked: {:?}",
+        res.stdout
+    );
+    assert_ne!(res.exit_code, 0, "read outside grant must fail");
+}
+
+/// A grandchild (the child spawns another process) stays confined: the
+/// AppContainer token is inherited across process creation.
+#[tokio::test]
+async fn grandchild_inherits_filesystem_confinement() {
+    assert!(is_supported(), "windows sandbox must be supported");
+
+    let granted = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("pwned.txt");
+    // Outer PowerShell spawns an inner PowerShell that attempts the escape.
+    let inner = format!(
+        "Set-Content -LiteralPath '{}' -Value 'x' -NoNewline",
+        target.display()
+    );
+    let res = exec(req(
+        powershell(),
+        vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            format!(
+                "& '{}' -NoProfile -NonInteractive -Command \"{}\"",
+                powershell(),
+                inner
+            ),
+        ],
+        policy(granted.path()),
+    ))
+    .await
+    .unwrap();
+    assert!(!target.exists(), "grandchild escaped fs confinement");
+    let _ = res;
+}
