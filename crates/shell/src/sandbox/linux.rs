@@ -92,5 +92,12 @@ pub fn apply(policy: &SandboxPolicy) -> Result<(), SandboxError> {
     if status.ruleset == RulesetStatus::NotEnforced {
         return Err(SandboxError::Unsupported);
     }
+
+    // Landlock's network access only covers TCP. When network is denied, add a
+    // seccomp filter that blocks creating IP sockets entirely, closing the
+    // UDP/raw egress that Landlock alone leaves open.
+    if !policy.allow_net {
+        super::seccomp_linux::deny_ip_sockets()?;
+    }
     Ok(())
 }
