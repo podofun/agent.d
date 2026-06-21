@@ -151,24 +151,42 @@ mod imp {
         Ok(Pipe { read, write })
     }
 
-    /// Ensure the AppContainer profile exists and return its package SID. The
-    /// profile is created on first use; subsequent calls hit `ALREADY_EXISTS`
-    /// and fall back to deriving the SID from the (stable) name.
-    fn appcontainer_sid() -> Result<PSID, ShellError> {
-        let name = to_wide(PROFILE_NAME);
-        let display = to_wide("agent.d shell sandbox");
-        let desc = to_wide("agent.d confined shell execution");
-        unsafe {
-            match CreateAppContainerProfile(
-                PCWSTR(name.as_ptr()),
-                PCWSTR(display.as_ptr()),
-                PCWSTR(desc.as_ptr()),
-                None,
-            ) {
-                Ok(sid) => Ok(sid),
-                Err(_) => DeriveAppContainerSidFromAppContainerName(PCWSTR(name.as_ptr()))
-                    .map_err(|e| sb(format!("derive AppContainer SID: {e}"))),
+    /// Ensure the AppContainer profile exists, exactly once per process. Calling
+    /// `CreateAppContainerProfile` concurrently for the same name races: a loser
+    /// can observe the profile as not-yet-registered, and a subsequent
+    /// `DeriveAppContainerSidFromAppContainerName` then fails with FILE_NOT_FOUND.
+    /// Serialize creation here so every caller derives a SID from a profile that
+    /// is already committed.
+    fn ensure_profile() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let name = to_wide(PROFILE_NAME);
+            let display = to_wide("agent.d shell sandbox");
+            let desc = to_wide("agent.d confined shell execution");
+            // Ignore the result: success and ALREADY_EXISTS are both fine, and a
+            // transient failure is surfaced later by the Derive call.
+            unsafe {
+                if let Ok(sid) = CreateAppContainerProfile(
+                    PCWSTR(name.as_ptr()),
+                    PCWSTR(display.as_ptr()),
+                    PCWSTR(desc.as_ptr()),
+                    None,
+                ) {
+                    FreeSid(sid);
+                }
             }
+        });
+    }
+
+    /// Return the AppContainer package SID, ensuring the profile exists first.
+    /// The SID is derived from the stable profile name (deterministic) and must
+    /// be released with `FreeSid`.
+    fn appcontainer_sid() -> Result<PSID, ShellError> {
+        ensure_profile();
+        let name = to_wide(PROFILE_NAME);
+        unsafe {
+            DeriveAppContainerSidFromAppContainerName(PCWSTR(name.as_ptr()))
+                .map_err(|e| sb(format!("derive AppContainer SID: {e}")))
         }
     }
 
