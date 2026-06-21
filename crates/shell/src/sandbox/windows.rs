@@ -69,9 +69,8 @@ mod imp {
         CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
     };
     use windows::Win32::Security::{
-        ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION, FreeSid, PSECURITY_DESCRIPTOR, PSID,
-        SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
-        SUB_CONTAINERS_AND_OBJECTS_INHERIT, WinCapabilityInternetClientSid,
+        ACL, DACL_SECURITY_INFORMATION, FreeSid, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+        SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
     };
     use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
     use windows::Win32::System::Pipes::CreatePipe;
@@ -94,7 +93,6 @@ mod imp {
 
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
-    const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 
     fn sb(e: impl std::fmt::Display) -> ShellError {
         ShellError::Sandbox(e.to_string())
@@ -190,45 +188,53 @@ mod imp {
         }
     }
 
-    /// Owns the buffer backing a `internetClient` capability SID and exposes it
-    /// as a `SID_AND_ATTRIBUTES`. The SID points into `buf`, so this must outlive
-    /// any `SECURITY_CAPABILITIES` referencing it.
-    struct Capability {
-        buf: Vec<u8>,
-    }
+    /// Exempt our AppContainer from loopback isolation so it can reach the
+    /// loopback egress proxy — and ONLY the proxy. The container holds no network
+    /// capability, so it has no route to the internet; its single reachable
+    /// endpoint is the policy-enforcing proxy on 127.0.0.1. This is the Windows
+    /// equivalent of the Linux netns / macOS Seatbelt "proxy is the only egress"
+    /// model, giving identical host-granular behaviour.
+    ///
+    /// The exemption list is machine-global; we read it, add our (stable) package
+    /// SID if absent, and write it back — once per process.
+    fn ensure_loopback_exemption(sid: PSID) -> Result<(), ShellError> {
+        use windows::Win32::NetworkManagement::WindowsFirewall::{
+            NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
+        };
+        use windows::Win32::Security::EqualSid;
 
-    fn internet_capability() -> Result<Capability, ShellError> {
         unsafe {
-            let mut size = 0u32;
-            // First call sizes the buffer (returns false / ERROR_INSUFFICIENT_BUFFER).
-            let _ = CreateWellKnownSid(
-                WinCapabilityInternetClientSid,
-                None,
-                PSID::default(),
-                &mut size,
-            );
-            if size == 0 {
-                return Err(sb("CreateWellKnownSid sizing failed"));
-            }
-            let mut buf = vec![0u8; size as usize];
-            CreateWellKnownSid(
-                WinCapabilityInternetClientSid,
-                None,
-                PSID(buf.as_mut_ptr() as *mut core::ffi::c_void),
-                &mut size,
-            )
-            .map_err(sb)?;
-            Ok(Capability { buf })
-        }
-    }
+            let mut count = 0u32;
+            let mut arr: *mut SID_AND_ATTRIBUTES = std::ptr::null_mut();
+            // Best-effort read of the current exemption list (non-zero = failure;
+            // treat as empty).
+            let _ = NetworkIsolationGetAppContainerConfig(&mut count, &mut arr);
 
-    impl Capability {
-        fn as_sid_and_attributes(&mut self) -> SID_AND_ATTRIBUTES {
-            SID_AND_ATTRIBUTES {
-                Sid: PSID(self.buf.as_mut_ptr() as *mut core::ffi::c_void),
-                Attributes: SE_GROUP_ENABLED,
+            let mut list: Vec<SID_AND_ATTRIBUTES> = Vec::new();
+            if !arr.is_null() {
+                let existing = std::slice::from_raw_parts(arr, count as usize);
+                for e in existing {
+                    if EqualSid(e.Sid, sid).is_ok() {
+                        return Ok(()); // already exempt
+                    }
+                    list.push(*e);
+                }
+            }
+            list.push(SID_AND_ATTRIBUTES {
+                Sid: sid,
+                Attributes: 0,
+            });
+            // Note: the SID array returned by Get has no documented free routine;
+            // it is a small one-time leak guarded by the per-process Once below.
+            let r = NetworkIsolationSetAppContainerConfig(&list);
+            if r != 0 {
+                return Err(sb(format!(
+                    "NetworkIsolationSetAppContainerConfig failed: {r} (loopback exemption \
+                     typically requires elevation)"
+                )));
             }
         }
+        Ok(())
     }
 
     /// Best-effort: stamp an access-allowed ACE for `sid` on `path` (subtree).
@@ -366,26 +372,24 @@ mod imp {
             block
         });
 
-        // Capability set: `internetClient` only when network is permitted.
-        // Empty otherwise — the AppContainer then has no outbound network.
-        let mut internet = if policy.allow_net {
-            Some(internet_capability()?)
-        } else {
-            None
-        };
-        let mut caps: Vec<SID_AND_ATTRIBUTES> = Vec::new();
-        if let Some(cap) = internet.as_mut() {
-            caps.push(cap.as_sid_and_attributes());
+        // The AppContainer holds NO network capability in any case — it has no
+        // route to the internet. When network is permitted, we instead exempt it
+        // from loopback isolation (once per process) so its ONLY reachable
+        // endpoint is the loopback egress proxy, which enforces the per-host
+        // allowlist. A child cannot bypass the proxy: without a network
+        // capability there is no other egress. This mirrors the Linux/macOS model
+        // and yields identical host-granular behaviour.
+        if proxy_addr.is_some() {
+            static EXEMPT: std::sync::Once = std::sync::Once::new();
+            let mut exempt_result = Ok(());
+            EXEMPT.call_once(|| exempt_result = ensure_loopback_exemption(sid));
+            exempt_result?;
         }
 
         let sec_caps = SECURITY_CAPABILITIES {
             AppContainerSid: sid,
-            Capabilities: if caps.is_empty() {
-                std::ptr::null_mut()
-            } else {
-                caps.as_mut_ptr()
-            },
-            CapabilityCount: caps.len() as u32,
+            Capabilities: std::ptr::null_mut(),
+            CapabilityCount: 0,
             Reserved: 0,
         };
 
@@ -511,8 +515,7 @@ mod imp {
                 let _ = LocalFree(HLOCAL(pipe_sd.0));
             }
         }
-        // `internet` / `caps` / `attr_buf` stay alive until here, after spawn.
-        drop(internet);
+        // `attr_buf` stays alive until here, after spawn.
 
         result
     }

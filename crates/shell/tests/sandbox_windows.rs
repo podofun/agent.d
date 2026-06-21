@@ -9,6 +9,7 @@
 //! - writes land only inside the granted scratch dir, never outside;
 //! - with `allow_net = false` the child has no outbound network at all.
 
+use agentd_permissions::Permission;
 use agentd_shell::sandbox::is_supported;
 use agentd_shell::{ExecRequest, SandboxPolicy, exec};
 
@@ -20,6 +21,20 @@ fn policy(write: &std::path::Path) -> SandboxPolicy {
         write_paths: vec![write.to_path_buf()],
         allow_net: false,
         net_hosts: vec![],
+        unrestricted: false,
+    }
+}
+
+/// Policy that permits network to exactly the named hosts (host-granular).
+fn net_policy(write: &std::path::Path, hosts: &[&str]) -> SandboxPolicy {
+    SandboxPolicy {
+        read_paths: vec![],
+        write_paths: vec![write.to_path_buf()],
+        allow_net: true,
+        net_hosts: hosts
+            .iter()
+            .map(|h| Permission::new(format!("net:{h}")))
+            .collect(),
         unrestricted: false,
     }
 }
@@ -184,6 +199,56 @@ async fn net_denied_blocks_outbound() {
         res.exit_code, 0,
         "net-denied child reached the loopback responder — AppContainer net block missing; stderr: {}",
         res.stderr
+    );
+}
+
+/// Host-granular network: with only `example.com` permitted, a request to it
+/// succeeds (relayed by the policy-enforcing proxy) while a request to the
+/// non-allowlisted `google.com` is blocked. The AppContainer holds no network
+/// capability, so the proxy is its only egress — the denied case also proves the
+/// child cannot bypass the proxy to reach an arbitrary host. Behaviour matches
+/// Linux/macOS.
+#[tokio::test]
+async fn net_host_allowlist_is_enforced() {
+    assert!(is_supported(), "windows sandbox must be supported");
+
+    let dir = tempfile::tempdir().unwrap();
+    let curl_args = |url: &str| {
+        vec![
+            "-s".into(),
+            "-m".into(),
+            "15".into(),
+            "-o".into(),
+            "NUL".into(),
+            url.to_string(),
+        ]
+    };
+
+    // Allowed host reachable via the proxy.
+    let allowed = exec(req(
+        curl(),
+        curl_args("http://example.com/"),
+        net_policy(dir.path(), &["example.com"]),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        allowed.exit_code, 0,
+        "allowlisted host must be reachable; stderr: {}",
+        allowed.stderr
+    );
+
+    // Non-allowlisted host blocked by the proxy.
+    let denied = exec(req(
+        curl(),
+        curl_args("http://google.com/"),
+        net_policy(dir.path(), &["example.com"]),
+    ))
+    .await
+    .unwrap();
+    assert_ne!(
+        denied.exit_code, 0,
+        "non-allowlisted host must be blocked, but curl succeeded"
     );
 }
 
