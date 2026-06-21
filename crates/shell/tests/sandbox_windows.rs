@@ -213,14 +213,16 @@ async fn net_host_allowlist_is_enforced() {
     assert!(is_supported(), "windows sandbox must be supported");
 
     let dir = tempfile::tempdir().unwrap();
+    // Write the body into the granted write dir (NUL is unwritable under the
+    // AppContainer and would surface as a curl write error, not a net result).
+    let outfile = dir.path().join("body");
     let curl_args = |url: &str| {
         vec![
             "-sS".into(),
-            "-v".into(),
             "-m".into(),
             "15".into(),
             "-o".into(),
-            "NUL".into(),
+            outfile.to_string_lossy().into_owned(),
             url.to_string(),
         ]
     };
