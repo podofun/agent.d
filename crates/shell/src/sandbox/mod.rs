@@ -25,6 +25,9 @@ pub use backend::run_contained as windows_run_contained;
 #[cfg(target_os = "linux")]
 pub mod linux_net;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod seccomp_linux;
+
 /// If this process was re-exec'd as the in-netns network supervisor, run it and
 /// exit. The host binary (daemon) must call this first thing in `main`, before
 /// any threads/async runtime start. No-op when not in supervisor mode or off
