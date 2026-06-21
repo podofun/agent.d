@@ -136,41 +136,53 @@ async fn write_outside_grant_is_denied() {
     assert!(!target.exists(), "file outside grant must not be created");
 }
 
+/// Absolute path to the bundled `curl.exe` (System32). Present on Windows 10
+/// 1803+ and the CI runners. Used as a capability-free network probe — unlike
+/// `Test-NetConnection`, it needs no PowerShell module to load.
+fn curl() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    format!(r"{root}\System32\curl.exe")
+}
+
 /// Network confinement: with `allow_net = false` the child has no outbound
 /// connectivity. An AppContainer with no network capability is blocked from all
 /// outbound by the OS firewall — including loopback — so a connect to a
-/// parent-owned listener must fail. No admin / WFP required.
+/// parent-owned responder must fail. No admin / WFP required.
 #[tokio::test]
 async fn net_denied_blocks_outbound() {
     assert!(is_supported(), "windows sandbox must be supported");
 
-    // A bound listener: the TCP handshake would complete from the backlog if the
-    // connect were permitted, so a "blocked" result is unambiguous.
+    // A one-shot HTTP responder: if the child's connect were permitted, curl
+    // would reach it and exit 0. Under the net block the connect fails, so curl
+    // exits non-zero — an unambiguous "blocked".
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            use std::io::Write;
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+        }
+    });
 
     let dir = tempfile::tempdir().unwrap();
-    let script = format!(
-        "(Test-NetConnection -ComputerName 127.0.0.1 -Port {port} \
-         -InformationLevel Quiet -WarningAction SilentlyContinue)"
-    );
     let res = exec(req(
-        powershell(),
+        curl(),
         vec![
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-Command".into(),
-            script,
+            "-s".into(),
+            "-m".into(),
+            "5".into(),
+            "-o".into(),
+            "NUL".into(),
+            format!("http://127.0.0.1:{port}/"),
         ],
         policy(dir.path()), // allow_net = false
     ))
     .await
     .unwrap();
 
-    assert_eq!(res.exit_code, 0, "probe should run; stderr: {}", res.stderr);
-    assert!(
-        !res.stdout.contains("True"),
-        "net-denied child reached the loopback listener — AppContainer net block missing; stdout: {:?}",
-        res.stdout
+    assert_ne!(
+        res.exit_code, 0,
+        "net-denied child reached the loopback responder — AppContainer net block missing; stderr: {}",
+        res.stderr
     );
 }
