@@ -1,12 +1,15 @@
 #![cfg(target_os = "windows")]
-//! Real restricted-token enforcement tests for the Windows backend.
+//! Real AppContainer enforcement tests for the Windows backend.
 //!
-//! Regression coverage for DLL-init under the sandbox: a child launched with a
-//! write-restricted token must still be able to attach to the window station /
-//! desktop during `user32`/`gdi32` initialization. Without that, any non-trivial
-//! binary (python, powershell, ...) dies with `STATUS_DLL_INIT_FAILED`
-//! (`0xC0000142` => `-1073741502`) before `main` ever runs.
+//! Coverage:
+//! - a DLL-heavy binary (PowerShell) still initializes inside the AppContainer
+//!   (system DLLs grant `ALL_APPLICATION_PACKAGES`, and the stdio pipes are
+//!   ACL'd for the package so I/O works); `STATUS_DLL_INIT_FAILED`
+//!   (`0xC0000142` => `-1073741502`) before `main` would mean we broke startup;
+//! - writes land only inside the granted scratch dir, never outside;
+//! - with `allow_net = false` the child has no outbound network at all.
 
+use agentd_permissions::Permission;
 use agentd_shell::sandbox::is_supported;
 use agentd_shell::{ExecRequest, SandboxPolicy, exec};
 
@@ -18,6 +21,20 @@ fn policy(write: &std::path::Path) -> SandboxPolicy {
         write_paths: vec![write.to_path_buf()],
         allow_net: false,
         net_hosts: vec![],
+        unrestricted: false,
+    }
+}
+
+/// Policy that permits network to exactly the named hosts (host-granular).
+fn net_policy(write: &std::path::Path, hosts: &[&str]) -> SandboxPolicy {
+    SandboxPolicy {
+        read_paths: vec![],
+        write_paths: vec![write.to_path_buf()],
+        allow_net: true,
+        net_hosts: hosts
+            .iter()
+            .map(|h| Permission::new(format!("net:{h}")))
+            .collect(),
         unrestricted: false,
     }
 }
@@ -104,9 +121,8 @@ async fn write_inside_grant_succeeds() {
 }
 
 /// A write to a directory that was NOT granted must fail. Guards the
-/// confinement boundary: the RESTRICTED / logon / Everyone restricting SIDs
-/// added so binaries can start must not let the child write user files (a temp
-/// dir under the profile grants the user SID, not Everyone).
+/// confinement boundary: a lowbox child can only touch paths whose ACL grants
+/// the AppContainer package SID, which we stamp only on the granted scratch dir.
 #[tokio::test]
 async fn write_outside_grant_is_denied() {
     assert!(is_supported(), "windows sandbox must be supported");
@@ -133,4 +149,201 @@ async fn write_outside_grant_is_denied() {
 
     assert_ne!(res.exit_code, 0, "write outside grant must fail");
     assert!(!target.exists(), "file outside grant must not be created");
+}
+
+/// Absolute path to the bundled `curl.exe` (System32). Present on Windows 10
+/// 1803+ and the CI runners. Used as a capability-free network probe — unlike
+/// `Test-NetConnection`, it needs no PowerShell module to load.
+fn curl() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    format!(r"{root}\System32\curl.exe")
+}
+
+/// Network confinement: with `allow_net = false` the child has no outbound
+/// connectivity. An AppContainer with no network capability is blocked from all
+/// outbound by the OS firewall — including loopback — so a connect to a
+/// parent-owned responder must fail. No admin / WFP required.
+#[tokio::test]
+async fn net_denied_blocks_outbound() {
+    assert!(is_supported(), "windows sandbox must be supported");
+
+    // A one-shot HTTP responder: if the child's connect were permitted, curl
+    // would reach it and exit 0. Under the net block the connect fails, so curl
+    // exits non-zero — an unambiguous "blocked".
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            use std::io::Write;
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let res = exec(req(
+        curl(),
+        vec![
+            "-s".into(),
+            "-m".into(),
+            "5".into(),
+            "-o".into(),
+            "NUL".into(),
+            format!("http://127.0.0.1:{port}/"),
+        ],
+        policy(dir.path()), // allow_net = false
+    ))
+    .await
+    .unwrap();
+
+    assert_ne!(
+        res.exit_code, 0,
+        "net-denied child reached the loopback responder — AppContainer net block missing; stderr: {}",
+        res.stderr
+    );
+}
+
+/// Host-granular network: with only `example.com` permitted, a request to it
+/// succeeds (relayed by the policy-enforcing proxy) while a request to the
+/// non-allowlisted `google.com` is blocked. The AppContainer holds no network
+/// capability, so the proxy is its only egress — the denied case also proves the
+/// child cannot bypass the proxy to reach an arbitrary host. Behaviour matches
+/// Linux/macOS.
+#[tokio::test]
+async fn net_host_allowlist_is_enforced() {
+    assert!(is_supported(), "windows sandbox must be supported");
+
+    let dir = tempfile::tempdir().unwrap();
+    // Write the body into the granted write dir (NUL is unwritable under the
+    // AppContainer and would surface as a curl write error, not a net result).
+    let outfile = dir.path().join("body");
+    let curl_args = |url: &str| {
+        vec![
+            "-sS".into(),
+            "-m".into(),
+            "15".into(),
+            "-o".into(),
+            outfile.to_string_lossy().into_owned(),
+            url.to_string(),
+        ]
+    };
+
+    // Allowed host reachable via the proxy.
+    let allowed = exec(req(
+        curl(),
+        curl_args("http://example.com/"),
+        net_policy(dir.path(), &["example.com"]),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        allowed.exit_code, 0,
+        "allowlisted host must be reachable; exit={} stderr:\n{}",
+        allowed.exit_code, allowed.stderr
+    );
+
+    // Non-allowlisted host blocked by the proxy.
+    let denied = exec(req(
+        curl(),
+        curl_args("http://google.com/"),
+        net_policy(dir.path(), &["example.com"]),
+    ))
+    .await
+    .unwrap();
+    assert_ne!(
+        denied.exit_code, 0,
+        "non-allowlisted host must be blocked, but curl succeeded"
+    );
+}
+
+/// `..` cannot climb out of the granted write subtree.
+#[tokio::test]
+async fn write_via_parent_traversal_is_denied() {
+    assert!(is_supported(), "windows sandbox must be supported");
+
+    let granted = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("pwned.txt");
+    // {granted}\..\{outside_name}\pwned.txt resolves to a sibling not granted.
+    let escape = format!(
+        "{}\\..\\{}\\pwned.txt",
+        granted.path().display(),
+        outside.path().file_name().unwrap().to_string_lossy()
+    );
+    let res = exec(req(
+        powershell(),
+        vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            format!("Set-Content -LiteralPath '{escape}' -Value 'x' -NoNewline"),
+        ],
+        policy(granted.path()),
+    ))
+    .await
+    .unwrap();
+    assert_ne!(res.exit_code, 0, "traversal write must fail");
+    assert!(!target.exists(), "file outside grant must not exist");
+}
+
+/// A file outside every grant is unreadable by the AppContainer.
+#[tokio::test]
+async fn read_outside_grant_is_denied() {
+    assert!(is_supported(), "windows sandbox must be supported");
+
+    let granted = tempfile::tempdir().unwrap();
+    let secret_dir = tempfile::tempdir().unwrap();
+    let secret = secret_dir.path().join("secret.txt");
+    std::fs::write(&secret, "TOPSECRET").unwrap();
+    let res = exec(req(
+        powershell(),
+        vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            format!("Get-Content -LiteralPath '{}'", secret.display()),
+        ],
+        policy(granted.path()),
+    ))
+    .await
+    .unwrap();
+    assert!(
+        !res.stdout.contains("TOPSECRET"),
+        "secret leaked: {:?}",
+        res.stdout
+    );
+    assert_ne!(res.exit_code, 0, "read outside grant must fail");
+}
+
+/// A grandchild (the child spawns another process) stays confined: the
+/// AppContainer token is inherited across process creation.
+#[tokio::test]
+async fn grandchild_inherits_filesystem_confinement() {
+    assert!(is_supported(), "windows sandbox must be supported");
+
+    let granted = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("pwned.txt");
+    // Outer PowerShell spawns an inner PowerShell that attempts the escape.
+    let inner = format!(
+        "Set-Content -LiteralPath '{}' -Value 'x' -NoNewline",
+        target.display()
+    );
+    let res = exec(req(
+        powershell(),
+        vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            format!(
+                "& '{}' -NoProfile -NonInteractive -Command \"{}\"",
+                powershell(),
+                inner
+            ),
+        ],
+        policy(granted.path()),
+    ))
+    .await
+    .unwrap();
+    assert!(!target.exists(), "grandchild escaped fs confinement");
+    let _ = res;
 }
