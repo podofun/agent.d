@@ -1,11 +1,13 @@
 #![cfg(target_os = "windows")]
-//! Real restricted-token enforcement tests for the Windows backend.
+//! Real AppContainer enforcement tests for the Windows backend.
 //!
-//! Regression coverage for DLL-init under the sandbox: a child launched with a
-//! write-restricted token must still be able to attach to the window station /
-//! desktop during `user32`/`gdi32` initialization. Without that, any non-trivial
-//! binary (python, powershell, ...) dies with `STATUS_DLL_INIT_FAILED`
-//! (`0xC0000142` => `-1073741502`) before `main` ever runs.
+//! Coverage:
+//! - a DLL-heavy binary (PowerShell) still initializes inside the AppContainer
+//!   (system DLLs grant `ALL_APPLICATION_PACKAGES`, and the stdio pipes are
+//!   ACL'd for the package so I/O works); `STATUS_DLL_INIT_FAILED`
+//!   (`0xC0000142` => `-1073741502`) before `main` would mean we broke startup;
+//! - writes land only inside the granted scratch dir, never outside;
+//! - with `allow_net = false` the child has no outbound network at all.
 
 use agentd_shell::sandbox::is_supported;
 use agentd_shell::{ExecRequest, SandboxPolicy, exec};
@@ -104,9 +106,8 @@ async fn write_inside_grant_succeeds() {
 }
 
 /// A write to a directory that was NOT granted must fail. Guards the
-/// confinement boundary: the RESTRICTED / logon / Everyone restricting SIDs
-/// added so binaries can start must not let the child write user files (a temp
-/// dir under the profile grants the user SID, not Everyone).
+/// confinement boundary: a lowbox child can only touch paths whose ACL grants
+/// the AppContainer package SID, which we stamp only on the granted scratch dir.
 #[tokio::test]
 async fn write_outside_grant_is_denied() {
     assert!(is_supported(), "windows sandbox must be supported");
@@ -133,4 +134,43 @@ async fn write_outside_grant_is_denied() {
 
     assert_ne!(res.exit_code, 0, "write outside grant must fail");
     assert!(!target.exists(), "file outside grant must not be created");
+}
+
+/// Network confinement: with `allow_net = false` the child has no outbound
+/// connectivity. An AppContainer with no network capability is blocked from all
+/// outbound by the OS firewall — including loopback — so a connect to a
+/// parent-owned listener must fail. No admin / WFP required.
+#[tokio::test]
+async fn net_denied_blocks_outbound() {
+    assert!(is_supported(), "windows sandbox must be supported");
+
+    // A bound listener: the TCP handshake would complete from the backlog if the
+    // connect were permitted, so a "blocked" result is unambiguous.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let dir = tempfile::tempdir().unwrap();
+    let script = format!(
+        "(Test-NetConnection -ComputerName 127.0.0.1 -Port {port} \
+         -InformationLevel Quiet -WarningAction SilentlyContinue)"
+    );
+    let res = exec(req(
+        powershell(),
+        vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            script,
+        ],
+        policy(dir.path()), // allow_net = false
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(res.exit_code, 0, "probe should run; stderr: {}", res.stderr);
+    assert!(
+        !res.stdout.contains("True"),
+        "net-denied child reached the loopback listener — AppContainer net block missing; stdout: {:?}",
+        res.stdout
+    );
 }
