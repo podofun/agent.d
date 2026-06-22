@@ -52,6 +52,11 @@ pub async fn run_contained(
         .map_err(|e| crate::ShellError::Sandbox(format!("join: {e}")))?
 }
 
+/// One-time privileged sandbox setup; see [`imp::install`].
+pub fn install() -> Result<(), crate::ShellError> {
+    imp::install()
+}
+
 #[cfg(target_os = "windows")]
 mod imp {
     use std::os::windows::ffi::OsStrExt;
@@ -86,13 +91,17 @@ mod imp {
     use crate::policy::SandboxPolicy;
     use crate::{ExecRequest, ExecResult, ShellError};
 
-    /// Fixed AppContainer profile name. Reused across invocations (created once,
-    /// then derived); it carries no per-call state — confinement comes from the
-    /// empty/`internetClient` capability set and the per-call path ACEs.
-    const PROFILE_NAME: &str = "agentd.shell.sandbox";
+    /// Two AppContainer profiles. The loopback egress proxy is reachable only by
+    /// a package SID on the machine's loopback-exemption list, which is per-SID
+    /// and persistent — so `PROFILE_NET` is exempted (see `install`) and carries
+    /// `allow_net` children, while `PROFILE_CONFINED` is never exempted and
+    /// carries denied children, which therefore reach no loopback service at all.
+    const PROFILE_CONFINED: &str = "agentd.shell.confined";
+    const PROFILE_NET: &str = "agentd.shell.net";
 
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
+    const GENERIC_EXECUTE: u32 = 0x2000_0000;
 
     fn sb(e: impl std::fmt::Display) -> ShellError {
         ShellError::Sandbox(e.to_string())
@@ -149,55 +158,71 @@ mod imp {
         Ok(Pipe { read, write })
     }
 
-    /// Ensure the AppContainer profile exists, exactly once per process. Calling
-    /// `CreateAppContainerProfile` concurrently for the same name races: a loser
-    /// can observe the profile as not-yet-registered, and a subsequent
-    /// `DeriveAppContainerSidFromAppContainerName` then fails with FILE_NOT_FOUND.
-    /// Serialize creation here so every caller derives a SID from a profile that
-    /// is already committed.
-    fn ensure_profile() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            let name = to_wide(PROFILE_NAME);
-            let display = to_wide("agent.d shell sandbox");
-            let desc = to_wide("agent.d confined shell execution");
-            // Ignore the result: success and ALREADY_EXISTS are both fine, and a
-            // transient failure is surfaced later by the Derive call.
-            unsafe {
-                if let Ok(sid) = CreateAppContainerProfile(
-                    PCWSTR(name.as_ptr()),
-                    PCWSTR(display.as_ptr()),
-                    PCWSTR(desc.as_ptr()),
-                    None,
-                ) {
-                    FreeSid(sid);
-                }
+    /// Ensure the named AppContainer profile exists, serialized and deduped per
+    /// process. `CreateAppContainerProfile` raced concurrently for one name lets a
+    /// loser observe the profile as not-yet-registered, after which
+    /// `DeriveAppContainerSidFromAppContainerName` fails with FILE_NOT_FOUND.
+    /// Creating a profile needs NO elevation. Idempotent: ALREADY_EXISTS is fine.
+    fn ensure_profile(name: &str) {
+        use std::sync::Mutex;
+        static DONE: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+        let key: &'static str = if name == PROFILE_NET {
+            PROFILE_NET
+        } else {
+            PROFILE_CONFINED
+        };
+        let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+        if done.contains(&key) {
+            return;
+        }
+        let wname = to_wide(name);
+        let display = to_wide("agent.d shell sandbox");
+        let desc = to_wide("agent.d confined shell execution");
+        unsafe {
+            if let Ok(sid) = CreateAppContainerProfile(
+                PCWSTR(wname.as_ptr()),
+                PCWSTR(display.as_ptr()),
+                PCWSTR(desc.as_ptr()),
+                None,
+            ) {
+                FreeSid(sid);
             }
-        });
+        }
+        done.push(key);
     }
 
-    /// Return the AppContainer package SID, ensuring the profile exists first.
-    /// The SID is derived from the stable profile name (deterministic) and must
-    /// be released with `FreeSid`.
-    fn appcontainer_sid() -> Result<PSID, ShellError> {
-        ensure_profile();
-        let name = to_wide(PROFILE_NAME);
+    /// Return the AppContainer package SID for the confined (`net = false`) or
+    /// network (`net = true`) profile, ensuring that profile exists first. The
+    /// SID is deterministic from the profile name and must be released with
+    /// `FreeSid`.
+    fn appcontainer_sid(net: bool) -> Result<PSID, ShellError> {
+        let name = if net { PROFILE_NET } else { PROFILE_CONFINED };
+        ensure_profile(name);
+        let wname = to_wide(name);
         unsafe {
-            DeriveAppContainerSidFromAppContainerName(PCWSTR(name.as_ptr()))
+            DeriveAppContainerSidFromAppContainerName(PCWSTR(wname.as_ptr()))
                 .map_err(|e| sb(format!("derive AppContainer SID: {e}")))
         }
     }
 
-    /// Exempt our AppContainer from loopback isolation so it can reach the
-    /// loopback egress proxy — and ONLY the proxy. The container holds no network
-    /// capability, so it has no route to the internet; its single reachable
-    /// endpoint is the policy-enforcing proxy on 127.0.0.1. This is the Windows
-    /// equivalent of the Linux netns / macOS Seatbelt "proxy is the only egress"
-    /// model, giving identical host-granular behaviour.
-    ///
-    /// The exemption list is machine-global; we read it, add our (stable) package
-    /// SID if absent, and write it back — once per process.
-    fn ensure_loopback_exemption(sid: PSID) -> Result<(), ShellError> {
+    /// Whether `sid` is on the machine's loopback-exemption list. Read-only.
+    fn loopback_exemption_present(sid: PSID) -> bool {
+        use windows::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
+        use windows::Win32::Security::EqualSid;
+        unsafe {
+            let mut count = 0u32;
+            let mut arr: *mut SID_AND_ATTRIBUTES = std::ptr::null_mut();
+            if NetworkIsolationGetAppContainerConfig(&mut count, &mut arr) != 0 || arr.is_null() {
+                return false;
+            }
+            let existing = std::slice::from_raw_parts(arr, count as usize);
+            existing.iter().any(|e| EqualSid(e.Sid, sid).is_ok())
+        }
+    }
+
+    /// Add `sid` to the machine-global loopback-exemption list. Writing the list
+    /// requires Administrator. Idempotent.
+    fn add_loopback_exemption(sid: PSID) -> Result<(), ShellError> {
         use windows::Win32::NetworkManagement::WindowsFirewall::{
             NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
         };
@@ -206,8 +231,6 @@ mod imp {
         unsafe {
             let mut count = 0u32;
             let mut arr: *mut SID_AND_ATTRIBUTES = std::ptr::null_mut();
-            // Best-effort read of the current exemption list (non-zero = failure;
-            // treat as empty).
             let _ = NetworkIsolationGetAppContainerConfig(&mut count, &mut arr);
 
             let mut list: Vec<SID_AND_ATTRIBUTES> = Vec::new();
@@ -224,29 +247,35 @@ mod imp {
                 Sid: sid,
                 Attributes: 0,
             });
-            // Note: the SID array returned by Get has no documented free routine;
-            // it is a small one-time leak guarded by the per-process Once below.
             let r = NetworkIsolationSetAppContainerConfig(&list);
             if r != 0 {
                 return Err(sb(format!(
-                    "NetworkIsolationSetAppContainerConfig failed: {r} (loopback exemption \
-                     typically requires elevation)"
+                    "NetworkIsolationSetAppContainerConfig failed: {r} — the loopback \
+                     exemption requires Administrator; run the sandbox install elevated once"
                 )));
             }
         }
         Ok(())
     }
 
-    /// Best-effort: stamp an access-allowed ACE for `sid` on `path` (subtree).
-    /// `write` selects read+write vs read-only. A failure leaves the path
-    /// inaccessible to the AppContainer (safe / over-restrictive).
-    fn stamp_ace(path: &str, sid: PSID, write: bool) {
+    /// One-time, Administrator-only setup for network-enabled sandboxing. Creates
+    /// both AppContainer profiles and adds the loopback exemption that lets an
+    /// `allow_net` child reach the egress proxy. The exemption persists, so this
+    /// is run once (elevated) and the daemon then runs unelevated; a net child
+    /// requested before it runs fails closed with an install hint. Idempotent.
+    pub fn install() -> Result<(), ShellError> {
+        ensure_profile(PROFILE_CONFINED);
+        let net_sid = appcontainer_sid(true)?;
+        let res = add_loopback_exemption(net_sid);
+        unsafe { FreeSid(net_sid) };
+        res
+    }
+
+    /// Best-effort: stamp an access-allowed ACE granting `mask` to `sid` on
+    /// `path` (subtree, inheritable). A failure leaves the path inaccessible to
+    /// the AppContainer (safe / over-restrictive).
+    fn stamp_ace(path: &str, sid: PSID, mask: u32) {
         let wide = to_wide(path);
-        let mask = if write {
-            GENERIC_READ | GENERIC_WRITE
-        } else {
-            GENERIC_READ
-        };
         unsafe {
             let mut old_dacl: *mut ACL = std::ptr::null_mut();
             let mut psd = PSECURITY_DESCRIPTOR::default();
@@ -298,6 +327,89 @@ mod imp {
         }
     }
 
+    /// Resolve `bin` to the directory that holds it, so we can grant the
+    /// AppContainer read+execute there. Absolute paths are used directly;
+    /// otherwise `bin` (with and without a `.exe` suffix) is looked up on `PATH`,
+    /// matching how `CreateProcessW` resolves a bare name.
+    fn resolve_bin_dir(bin: &str) -> Option<std::path::PathBuf> {
+        let p = std::path::Path::new(bin);
+        let file = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::split_paths(&std::env::var_os("PATH")?).find_map(|d| {
+                [d.join(bin), d.join(format!("{bin}.exe"))]
+                    .into_iter()
+                    .find(|c| c.is_file())
+            })?
+        };
+        file.parent().map(|d| d.to_path_buf())
+    }
+
+    /// Whether `path`'s DACL already carries an allow-ACE for any SID in `sids`.
+    /// Used to skip the (inheritable, tree-propagating) binary-directory grant
+    /// when it is unnecessary: the directory already grants our process-stable
+    /// package SID (a prior invocation stamped it), or it grants
+    /// `ALL_APPLICATION_PACKAGES` — which every System32 directory does, so we
+    /// never try to re-ACL system locations we cannot (and must not) modify.
+    fn dacl_contains_any(path: &str, sids: &[PSID]) -> bool {
+        use windows::Win32::Security::{ACCESS_ALLOWED_ACE, ACE_HEADER, EqualSid, GetAce};
+        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+        let wide = to_wide(path);
+        unsafe {
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut psd = PSECURITY_DESCRIPTOR::default();
+            if GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut dacl),
+                None,
+                &mut psd,
+            )
+            .is_err()
+            {
+                return false;
+            }
+            let mut found = false;
+            if !dacl.is_null() {
+                'outer: for i in 0..(*dacl).AceCount {
+                    let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+                    if GetAce(dacl, i as u32, &mut ace).is_ok() && !ace.is_null() {
+                        let header = &*(ace as *const ACE_HEADER);
+                        if header.AceType == ACCESS_ALLOWED_ACE_TYPE {
+                            let aa = &*(ace as *const ACCESS_ALLOWED_ACE);
+                            let ace_sid =
+                                PSID(&aa.SidStart as *const u32 as *mut core::ffi::c_void);
+                            for want in sids {
+                                if EqualSid(ace_sid, *want).is_ok() {
+                                    found = true;
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !psd.0.is_null() {
+                let _ = LocalFree(HLOCAL(psd.0));
+            }
+            found
+        }
+    }
+
+    /// `ALL_APPLICATION_PACKAGES` SID (`S-1-15-2-1`). Freed with `LocalFree`.
+    fn all_app_packages_sid() -> Option<PSID> {
+        use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+        let s = to_wide("S-1-15-2-1");
+        let mut sid = PSID::default();
+        unsafe {
+            ConvertStringSidToSidW(PCWSTR(s.as_ptr()), &mut sid).ok()?;
+        }
+        Some(sid)
+    }
+
     fn drain(read: HANDLE) -> String {
         let mut out: Vec<u8> = Vec::new();
         let mut buf = [0u8; 4096];
@@ -317,18 +429,44 @@ mod imp {
         policy: &SandboxPolicy,
         proxy_addr: Option<std::net::SocketAddr>,
     ) -> Result<ExecResult, ShellError> {
-        let sid = appcontainer_sid()?;
+        // `proxy_addr` is Some iff the policy permits network. Network children
+        // run in the loopback-exempt profile; denied children in the confined one.
+        let net = proxy_addr.is_some();
+        let sid = appcontainer_sid(net)?;
 
         // Grant the AppContainer access to exactly the policy's paths. Without an
         // ACE for the package SID a lowbox child cannot touch user files at all.
         for p in &policy.write_paths {
             if let Some(s) = p.to_str() {
-                stamp_ace(s, sid, true);
+                stamp_ace(s, sid, GENERIC_READ | GENERIC_WRITE);
             }
         }
         for p in &policy.read_paths {
             if let Some(s) = p.to_str() {
-                stamp_ace(s, sid, false);
+                stamp_ace(s, sid, GENERIC_READ);
+            }
+        }
+
+        // Grant read+execute on the binary's own directory so a user-installed
+        // program and the DLLs next to it can be loaded. System binaries under
+        // System32 already grant ALL_APPLICATION_PACKAGES (which the lowbox token
+        // holds), so they start; a binary in a user directory (e.g. a packaged
+        // Python) does not, and its child-side DLL loads fail with
+        // STATUS_DLL_NOT_FOUND / DLL_INIT_FAILED. The grant is skipped when the
+        // package SID is already on the directory, so the inheritable propagation
+        // is paid once, not on every invocation.
+        let aap = all_app_packages_sid();
+        if let Some(bin_dir) = resolve_bin_dir(&req.bin)
+            && let Some(s) = bin_dir.to_str()
+        {
+            let known: Vec<PSID> = [Some(sid), aap].into_iter().flatten().collect();
+            if !dacl_contains_any(s, &known) {
+                stamp_ace(s, sid, GENERIC_READ | GENERIC_EXECUTE);
+            }
+        }
+        if let Some(p) = aap {
+            unsafe {
+                let _ = LocalFree(HLOCAL(p.0));
             }
         }
 
@@ -372,18 +510,14 @@ mod imp {
             block
         });
 
-        // The AppContainer holds NO network capability in any case — it has no
-        // route to the internet. When network is permitted, we instead exempt it
-        // from loopback isolation (once per process) so its ONLY reachable
-        // endpoint is the loopback egress proxy, which enforces the per-host
-        // allowlist. A child cannot bypass the proxy: without a network
-        // capability there is no other egress. This mirrors the Linux/macOS model
-        // and yields identical host-granular behaviour.
-        if proxy_addr.is_some() {
-            static EXEMPT: std::sync::Once = std::sync::Once::new();
-            let mut exempt_result = Ok(());
-            EXEMPT.call_once(|| exempt_result = ensure_loopback_exemption(sid));
-            exempt_result?;
+        // Fail closed (no admin) if a net child is requested before `install`.
+        if net && !loopback_exemption_present(sid) {
+            unsafe { FreeSid(sid) };
+            return Err(sb(
+                "network sandbox not installed: run `daemon --install-sandbox` once as \
+                 Administrator to grant the loopback exemption (the daemon itself stays \
+                 unelevated)",
+            ));
         }
 
         let sec_caps = SECURITY_CAPABILITIES {
