@@ -1,10 +1,11 @@
 use agentd_ai::{
     ClaudeApiProvider, ClaudeCliProvider, CodexAppServerProvider, CodexCliProvider,
-    OpenAiApiProvider, ProviderRegistry,
+    OpenAiApiProvider, Provider as AIProvider, ProviderRegistry,
 };
 use agentd_api::{AppState, router, serve};
 use agentd_memory::RedbStore;
 use agentd_secrets::KeyringStore;
+use agentd_shell::sandbox;
 use agentd_trace::JsonlSink;
 use agentd_types::Registry;
 use anyhow::{Result, anyhow};
@@ -25,14 +26,25 @@ fn main() -> Result<()> {
     // If this process was re-exec'd as the in-netns network supervisor, run it
     // and exit here — BEFORE any threads or the async runtime start (the
     // supervisor forks the sandboxed command and must be single-threaded).
-    agentd_shell::sandbox::run_netns_supervisor_if_requested();
-    run()
+    sandbox::run_netns_supervisor_if_requested();
+
+    let cli = Cli::parse();
+    // Privileged one-time setup runs synchronously and exits — no server, no
+    // async runtime. This is the only path expected to run elevated.
+    if cli.install_sandbox {
+        sandbox::install()?;
+        println!(
+            "Windows sandbox installed successfully! You can now run agentd as documented.\nhttps://docs.podo.fun/agentd/v0/guide/quick-start"
+        );
+        return Ok(());
+    }
+    run(cli)
 }
 
 #[tokio::main]
-async fn run() -> Result<()> {
+async fn run(cli: Cli) -> Result<()> {
     let started = Instant::now();
-    let cfg = Config::resolve(Cli::parse())?;
+    let cfg = Config::resolve(cli)?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(&cfg.log_level))
         .compact()
@@ -48,13 +60,11 @@ async fn run() -> Result<()> {
 
     let keyring = Arc::new(KeyringStore::default_service());
     let mut providers = ProviderRegistry::new();
-    let anthropic_api: Arc<dyn agentd_ai::Provider> =
-        Arc::new(ClaudeApiProvider::new(keyring.clone()));
-    let anthropic_cli: Arc<dyn agentd_ai::Provider> = Arc::new(ClaudeCliProvider::new());
-    let openai_api: Arc<dyn agentd_ai::Provider> =
-        Arc::new(OpenAiApiProvider::new(keyring.clone()));
-    let codex: Arc<dyn agentd_ai::Provider> = Arc::new(CodexAppServerProvider::new());
-    let openai_cli: Arc<dyn agentd_ai::Provider> = Arc::new(CodexCliProvider::new());
+    let anthropic_api: Arc<dyn AIProvider> = Arc::new(ClaudeApiProvider::new(keyring.clone()));
+    let anthropic_cli: Arc<dyn AIProvider> = Arc::new(ClaudeCliProvider::new());
+    let openai_api: Arc<dyn AIProvider> = Arc::new(OpenAiApiProvider::new(keyring.clone()));
+    let codex: Arc<dyn AIProvider> = Arc::new(CodexAppServerProvider::new());
+    let openai_cli: Arc<dyn AIProvider> = Arc::new(CodexCliProvider::new());
     providers.insert("anthropic", anthropic_api);
     providers.insert("anthropic-cli", anthropic_cli);
     providers.insert("openai", openai_api);

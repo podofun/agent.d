@@ -51,6 +51,19 @@ pub fn is_supported() -> bool {
     backend::is_supported()
 }
 
+/// Run the platform's one-time privileged network-sandbox setup; a no-op where
+/// none is needed. On Windows it requires Administrator (see `windows::install`).
+pub fn install() -> Result<(), SandboxError> {
+    #[cfg(target_os = "windows")]
+    {
+        backend::install().map_err(|e| SandboxError::Apply(e.to_string()))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(())
+    }
+}
+
 /// Whether host-granular network containment can be enforced here.
 pub fn net_supported() -> bool {
     backend::net_supported()

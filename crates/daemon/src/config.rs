@@ -57,6 +57,10 @@ pub struct Cli {
     /// sources, and grants.toml, and rebuild the runtime in place on change.
     #[arg(long, env = "AGENTD_WATCH")]
     pub watch: bool,
+
+    /// Run one-time network-sandbox setup (elevated on Windows), then exit.
+    #[arg(long)]
+    pub install_sandbox: bool,
 }
 
 /// Raw `config.toml` shape. All fields optional; missing == fall through

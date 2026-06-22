@@ -29,6 +29,7 @@ CLI flag  >  environment variable  >  config.toml  >  built-in default
 | `--no-auth` | `AGENTD_NO_AUTH` | `false` | Disable `/ws` and `/control` auth |
 | `--approval-timeout-ms <n>` | `AGENTD_APPROVAL_TIMEOUT_MS` | `120000` | Approval wait budget (ms) |
 | `--watch` | `AGENTD_WATCH` | `false` | Dev hot reload |
+| `--install-sandbox` | — | — | Windows only: one-time setup for sandboxed networking, then exit. See [Shell sandbox](/v0/security/sandbox#windows-one-time-network-setup) |
 
 ---
 
