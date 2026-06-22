@@ -46,6 +46,16 @@ Move-Item agentd\daemon.exe, agentd\agentctl.exe "$env:LOCALAPPDATA\Programs\age
 
 :::
 
+::: tip Windows: enable sandboxed networking
+If your agents run network-enabled shell tools, run this once in an elevated terminal so the sandbox can confine their network:
+
+```powershell
+daemon --install-sandbox
+```
+
+The daemon itself then runs without Administrator. See [Shell sandbox](/v0/security/sandbox#windows-one-time-network-setup) for details.
+:::
+
 Then jump to the [quick start](/v0/guide/quick-start).
 
 ## Build from source

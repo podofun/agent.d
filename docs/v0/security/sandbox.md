@@ -20,23 +20,36 @@ Because the runtime calls the binary directly (argv-only), there is **no shell**
 This protection applies only to the shell invocation itself. If you pass user input to a program that *itself* interprets it as a script (e.g. passing arbitrary strings to `bash -c`), injection is still possible. Validate inputs before passing them to such programs.
 :::
 
-## Network namespace sandbox (Linux)
+## Filesystem confinement
 
-On Linux, child processes spawned via `ctx.shell` are confined inside a network namespace sandbox. This prevents a child process from making arbitrary outbound network connections that would bypass the `net:*` permission checks applied at the Lua API layer.
+A child process spawned by `ctx.shell` can only write to the paths you grant with `fs.write`. A write anywhere else fails, even with `shell.exec` granted — so a tool cannot modify files outside what its grants allow. Enforced on Linux, macOS, and Windows.
 
-::: info
-Network namespace confinement is a Linux-specific feature. Do not rely on equivalent network isolation on other platforms.
-:::
+Keep grants narrow, and use the `cwd` option to scope where a tool's relative paths resolve.
+
+## Network confinement
+
+A child process can only reach hosts you allow with `net:` grants. With no `net:` grant it has no outbound network, and it cannot bypass the grants by connecting directly — the hosts allowed at the Lua API layer are the only ones a spawned binary can reach. Enforced on Linux, macOS, and Windows.
+
+### Windows: one-time network setup
+
+On Windows, sandboxed networking needs a one-time setup that requires Administrator. Run it once, in an elevated terminal:
+
+```powershell
+daemon --install-sandbox
+```
+
+It prints a confirmation and exits. The daemon itself then runs normally, without Administrator — you only do this once per machine.
+
+Until you run it, `ctx.shell` calls that need network fail closed with a message pointing you here. Calls that don't use the network are unaffected.
 
 ## Fail-closed
 
-The sandbox is designed to fail closed. If confinement cannot be established, the call fails rather than proceeding without isolation. This means a sandbox configuration or OS environment that does not support the required isolation will cause `ctx.shell` calls to error rather than silently running unconfined.
+The sandbox fails closed: if confinement cannot be established, the call errors rather than running unconfined.
 
 ## What the sandbox does not cover
 
-- **Filesystem access**: Child processes inherit the daemon's filesystem view. Use `fs.read` / `fs.write` grants and, where possible, narrow the `cwd` option to limit effective file access.
-- **CPU and memory**: There are no resource limits on child processes at this time.
-- **Specifier matching**: The `shell.exec:<bin>` specifier is matched against the first argument to `ctx.shell`. Use specific specifiers (`shell.exec:git`) rather than the bare `shell.exec` to limit which binaries can be invoked.
+- **CPU and memory**: there are no resource limits on child processes at this time.
+- **Specifier matching**: the `shell.exec:<bin>` specifier is matched against the first argument to `ctx.shell`. Prefer specific specifiers (`shell.exec:git`) over the bare `shell.exec` to limit which binaries can run.
 
 ## See also
 
