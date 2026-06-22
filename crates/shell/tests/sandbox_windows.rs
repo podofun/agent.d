@@ -15,6 +15,12 @@ use agentd_shell::{ExecRequest, SandboxPolicy, exec};
 
 const STATUS_DLL_INIT_FAILED: i32 = -1073741502; // 0xC0000142
 
+/// Serialize the sandbox tests. They all create AppContainers under one shared
+/// profile and mutate the machine-global loopback-exemption list, so running
+/// them in parallel races on that global state — and the concurrent per-test
+/// runtimes intermittently trip the tokio I/O driver on Windows. One at a time.
+static SANDBOX_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn policy(write: &std::path::Path) -> SandboxPolicy {
     SandboxPolicy {
         read_paths: vec![],
@@ -60,6 +66,7 @@ fn powershell() -> String {
 
 #[tokio::test]
 async fn dll_heavy_binary_initializes_under_sandbox() {
+    let _serial = SANDBOX_SERIAL.lock().await;
     assert!(is_supported(), "windows sandbox must be supported");
 
     let dir = tempfile::tempdir().unwrap();
@@ -95,6 +102,7 @@ async fn dll_heavy_binary_initializes_under_sandbox() {
 /// window-station fix must not loosen the write-restriction confinement.
 #[tokio::test]
 async fn write_inside_grant_succeeds() {
+    let _serial = SANDBOX_SERIAL.lock().await;
     assert!(is_supported(), "windows sandbox must be supported");
 
     let dir = tempfile::tempdir().unwrap();
@@ -125,6 +133,7 @@ async fn write_inside_grant_succeeds() {
 /// the AppContainer package SID, which we stamp only on the granted scratch dir.
 #[tokio::test]
 async fn write_outside_grant_is_denied() {
+    let _serial = SANDBOX_SERIAL.lock().await;
     assert!(is_supported(), "windows sandbox must be supported");
 
     let granted = tempfile::tempdir().unwrap(); // the only writable subtree
@@ -165,6 +174,7 @@ fn curl() -> String {
 /// parent-owned responder must fail. No admin / WFP required.
 #[tokio::test]
 async fn net_denied_blocks_outbound() {
+    let _serial = SANDBOX_SERIAL.lock().await;
     assert!(is_supported(), "windows sandbox must be supported");
 
     // A one-shot HTTP responder: if the child's connect were permitted, curl
@@ -210,6 +220,7 @@ async fn net_denied_blocks_outbound() {
 /// Linux/macOS.
 #[tokio::test]
 async fn net_host_allowlist_is_enforced() {
+    let _serial = SANDBOX_SERIAL.lock().await;
     assert!(is_supported(), "windows sandbox must be supported");
 
     let dir = tempfile::tempdir().unwrap();
@@ -258,6 +269,7 @@ async fn net_host_allowlist_is_enforced() {
 /// `..` cannot climb out of the granted write subtree.
 #[tokio::test]
 async fn write_via_parent_traversal_is_denied() {
+    let _serial = SANDBOX_SERIAL.lock().await;
     assert!(is_supported(), "windows sandbox must be supported");
 
     let granted = tempfile::tempdir().unwrap();
@@ -288,6 +300,7 @@ async fn write_via_parent_traversal_is_denied() {
 /// A file outside every grant is unreadable by the AppContainer.
 #[tokio::test]
 async fn read_outside_grant_is_denied() {
+    let _serial = SANDBOX_SERIAL.lock().await;
     assert!(is_supported(), "windows sandbox must be supported");
 
     let granted = tempfile::tempdir().unwrap();
@@ -318,6 +331,7 @@ async fn read_outside_grant_is_denied() {
 /// AppContainer token is inherited across process creation.
 #[tokio::test]
 async fn grandchild_inherits_filesystem_confinement() {
+    let _serial = SANDBOX_SERIAL.lock().await;
     assert!(is_supported(), "windows sandbox must be supported");
 
     let granted = tempfile::tempdir().unwrap();
