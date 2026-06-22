@@ -98,6 +98,53 @@ async fn dll_heavy_binary_initializes_under_sandbox() {
     );
 }
 
+/// Locate a user-installed `python.exe` on PATH (never under System32), to
+/// exercise the child-side DLL load path. `None` if Python is not installed.
+fn user_python() -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|d| {
+        // Skip the Windows Store reparse stub under WindowsApps.
+        if d.to_string_lossy().contains("WindowsApps") {
+            return None;
+        }
+        let c = d.join("python.exe");
+        c.is_file().then(|| c.to_string_lossy().into_owned())
+    })
+}
+
+/// A user-installed binary must load the DLLs sitting next to it inside the
+/// AppContainer. Its install directory does not grant `ALL_APPLICATION_PACKAGES`
+/// (unlike System32), so unless the package SID is granted read+execute there,
+/// the child dies at load with `STATUS_DLL_NOT_FOUND` / `STATUS_DLL_INIT_FAILED`
+/// before producing any output. Regression test for that grant.
+#[tokio::test]
+async fn user_installed_binary_loads_its_own_dlls() {
+    let _serial = SANDBOX_SERIAL.lock().await;
+    assert!(is_supported(), "windows sandbox must be supported");
+
+    let Some(py) = user_python() else {
+        eprintln!("no user-installed python on PATH; skipping");
+        return;
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let res = exec(req(py, vec!["--version".into()], policy(dir.path())))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        res.exit_code, 0,
+        "user-installed binary failed to load its co-located DLLs under the \
+         AppContainer (exit {:#x}); stderr: {}",
+        res.exit_code as u32, res.stderr
+    );
+    assert!(
+        res.stdout.to_lowercase().contains("python"),
+        "expected version output, got: {:?}",
+        res.stdout
+    );
+}
+
 /// A minimal write inside the granted scratch dir must still succeed: the
 /// window-station fix must not loosen the write-restriction confinement.
 #[tokio::test]
@@ -222,6 +269,12 @@ async fn net_denied_blocks_outbound() {
 async fn net_host_allowlist_is_enforced() {
     let _serial = SANDBOX_SERIAL.lock().await;
     assert!(is_supported(), "windows sandbox must be supported");
+
+    // Skip where the test process can't run the privileged install.
+    if agentd_shell::sandbox::install().is_err() {
+        eprintln!("network sandbox install needs elevation; skipping");
+        return;
+    }
 
     let dir = tempfile::tempdir().unwrap();
     // Write the body into the granted write dir (NUL is unwritable under the
