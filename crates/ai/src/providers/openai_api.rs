@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use agentd_http::{Request as HttpRequest, send as http_send};
+use agentd_net::http::{Request as HttpRequest, send as http_send};
 use agentd_secrets::SecretStore;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
