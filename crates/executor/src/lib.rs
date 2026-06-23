@@ -461,6 +461,17 @@ impl Executor {
             .and_then(|t| self.registry.tool_info(t))
             .map(|i| info_to_perm_tool(&i));
 
+        // Required permissions are the union of the action's own `requires`
+        // and its tool's declared `requires`. Fold the tool's into the action
+        // meta so the engine check, the escalation request, and grant
+        // persistence all operate on the same set.
+        let mut action_meta = action_meta;
+        if let Some(t) = &tool_meta {
+            for p in t.requires.iter() {
+                action_meta.requires.insert(p.clone());
+            }
+        }
+
         let decision = self
             .engine
             .load()

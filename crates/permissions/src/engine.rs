@@ -69,13 +69,24 @@ impl Engine {
             };
         }
 
-        // 2. Tool package covers action requirements.
+        // Required permissions are the UNION of the action's own `requires`
+        // and the declaring tool's `requires`. Declaring on the tool, the
+        // action, or both is equivalent — every permission in the union must
+        // be covered by the grants file.
+        let mut required = action.requires.clone();
+        if let Some(t) = tool {
+            for p in t.requires.iter() {
+                required.insert(p.clone());
+            }
+        }
+
+        // 2. Tool package covers required permissions.
         //
         // The ONLY source of "granted" is the grants file. A tool's own
         // manifest declares what it `requires` (what it asks for) — that is
         // never self-granting. If the user hasn't approved the tool in the
         // grants file, the tool has no permissions. Default-deny.
-        if !action.requires.is_empty() {
+        if !required.is_empty() {
             // Grants are keyed by tool NAME, not by a registered tool object.
             // Prefer the registered `ToolMeta` name, but fall back to the action's
             // own declared tool (its `tool.action` namespace) so an action with no
@@ -87,9 +98,8 @@ impl Engine {
             let pkg_granted = tool_name
                 .and_then(|n| self.grants.tool(n).map(|g| g.granted.clone()))
                 .unwrap_or_else(crate::model::PermissionSet::empty);
-            if !pkg_granted.covers_all(&action.requires) {
-                let missing: Vec<String> = action
-                    .requires
+            if !pkg_granted.covers_all(&required) {
+                let missing: Vec<String> = required
                     .iter()
                     .filter(|r| !pkg_granted.contains(r))
                     .map(|p| p.as_str().to_string())
@@ -165,7 +175,7 @@ impl Engine {
         // Interface gating is opt-in: if you want to gate Telegram, list it.
 
         // 5. Policy denial of any required permission.
-        for req in action.requires.iter() {
+        for req in required.iter() {
             if policy.denies_permission(req) {
                 return Decision::Deny {
                     layer: DenyLayer::Policy,
@@ -229,11 +239,12 @@ mod tests {
             confirm: true,
         }
     }
-    fn calendar_tool(_manifest_requires: &[&str]) -> ToolMeta {
-        // The values passed here are informational. The engine ignores them.
+    fn calendar_tool(manifest_requires: &[&str]) -> ToolMeta {
+        // `requires` here is unioned with the action's own `requires`; the
+        // engine treats them as required permissions, never as grants.
         ToolMeta {
             name: "google_calendar".into(),
-            requires: PermissionSet::from_iter(_manifest_requires.iter().copied()),
+            requires: PermissionSet::from_iter(manifest_requires.iter().copied()),
         }
     }
 
@@ -305,9 +316,9 @@ mod tests {
 
     #[test]
     fn tool_meta_granted_is_not_self_granting() {
-        // Even if ToolMeta carries permissions (e.g. inherited from a Lua
-        // manifest), the engine ignores them. Only the grants file confers
-        // grants. Default-deny is non-negotiable.
+        // ToolMeta permissions are required (unioned with the action), but
+        // never self-granting. Only the grants file confers grants.
+        // Default-deny is non-negotiable.
         let engine = engine_with(GrantsFile::default());
         let caller = Caller::default();
         let tool = calendar_tool(&["calendar.read"]);
@@ -518,6 +529,58 @@ mod tests {
         };
         let engine = engine_with(GrantsFile::default());
         let decision = engine.check(&Caller::default(), None, &action);
+        assert_eq!(decision, Decision::Allow);
+    }
+
+    fn noop_action_for(tool: &str) -> ActionMeta {
+        ActionMeta {
+            name: "google_calendar.noop".into(),
+            tool: Some(tool.into()),
+            requires: PermissionSet::empty(),
+            confirm: false,
+        }
+    }
+
+    #[test]
+    fn tool_requires_are_checked_when_action_declares_none() {
+        // `requires` on the tool must be enforced as a union with the action's
+        // own `requires`. An action that declares nothing still inherits its
+        // tool's declared permissions.
+        let engine = engine_with(GrantsFile::default());
+        let tool = calendar_tool(&["calendar.read"]);
+        let decision = engine.check(
+            &Caller::default(),
+            Some(&tool),
+            &noop_action_for("google_calendar"),
+        );
+        assert!(
+            matches!(
+                decision,
+                Decision::Deny {
+                    layer: DenyLayer::Tool,
+                    ..
+                }
+            ),
+            "tool.requires must gate even with empty action.requires, got: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn tool_requires_satisfied_by_grants_allows() {
+        let mut file = GrantsFile::default();
+        file.tool.insert(
+            "google_calendar".into(),
+            ToolGrants {
+                granted: PermissionSet::from_iter(["calendar.read"]),
+            },
+        );
+        let engine = engine_with(file);
+        let tool = calendar_tool(&["calendar.read"]);
+        let decision = engine.check(
+            &Caller::default(),
+            Some(&tool),
+            &noop_action_for("google_calendar"),
+        );
         assert_eq!(decision, Decision::Allow);
     }
 
