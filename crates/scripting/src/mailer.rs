@@ -95,7 +95,9 @@ fn mailer_send_internal(
         .unwrap_or_default();
     let from: Option<String> = mail_table.get("from")?;
     let reply_to: Option<String> = mail_table.get("reply_to")?;
-    let subject: String = mail_table.get("subject")?;
+    let subject: String = mail_table
+        .get::<Option<String>>("subject")?
+        .ok_or_else(|| mlua::Error::external("mailer:send: `subject` is required"))?;
     let text: Option<String> = mail_table.get("text")?;
     let html: Option<String> = mail_table.get("html")?;
 
