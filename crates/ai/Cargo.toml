@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 agentd-codex.workspace = true
-agentd-http.workspace = true
+agentd-net.workspace = true
 agentd-permissions.workspace = true
 agentd-secrets.workspace = true
 agentd-types.workspace = true
