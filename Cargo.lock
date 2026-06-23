@@ -24,8 +24,8 @@ name = "agentd-ai"
 version = "0.4.0-alpha"
 dependencies = [
  "agentd-codex",
- "agentd-http",
  "agentd-mcp",
+ "agentd-net",
  "agentd-permissions",
  "agentd-secrets",
  "agentd-types",
@@ -143,21 +143,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentd-http"
-version = "0.4.0-alpha"
-dependencies = [
- "http-body-util",
- "hyper",
- "hyper-util",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "url",
-]
-
-[[package]]
 name = "agentd-luals"
 version = "0.4.0-alpha"
 dependencies = [
@@ -194,6 +179,23 @@ dependencies = [
  "redb",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "agentd-net"
+version = "0.4.0-alpha"
+dependencies = [
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "url",
 ]
 
 [[package]]
@@ -236,8 +238,8 @@ version = "0.4.0-alpha"
 dependencies = [
  "agentd-ai",
  "agentd-fs",
- "agentd-http",
  "agentd-memory",
+ "agentd-net",
  "agentd-packages",
  "agentd-permissions",
  "agentd-runners",
@@ -246,7 +248,6 @@ dependencies = [
  "agentd-shell",
  "agentd-skills",
  "agentd-types",
- "agentd-ws",
  "anyhow",
  "async-trait",
  "futures-util",
@@ -334,18 +335,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
-]
-
-[[package]]
-name = "agentd-ws"
-version = "0.4.0-alpha"
-dependencies = [
- "futures-util",
- "serde",
- "thiserror",
- "tokio",
- "tokio-tungstenite",
- "url",
 ]
 
 [[package]]
