@@ -19,6 +19,7 @@ use async_trait::async_trait;
 
 struct FakeRegistry {
     action_requires: Vec<String>,
+    tool_requires: Vec<String>,
     confirm: bool,
 }
 
@@ -39,7 +40,7 @@ impl Registry for FakeRegistry {
     fn tool_info(&self, name: &str) -> Option<RegistryToolInfo> {
         (name == "tool").then(|| RegistryToolInfo {
             name: "tool".into(),
-            requires: Vec::new(),
+            requires: self.tool_requires.clone(),
         })
     }
     async fn call(
@@ -96,8 +97,18 @@ fn engine_from_file(file: GrantsFile) -> Engine {
 }
 
 fn base_executor(requires: &[&str], confirm: bool, engine: Engine) -> Executor {
+    executor_with(requires, &[], confirm, engine)
+}
+
+fn executor_with(
+    action_requires: &[&str],
+    tool_requires: &[&str],
+    confirm: bool,
+    engine: Engine,
+) -> Executor {
     let reg = Arc::new(FakeRegistry {
-        action_requires: requires.iter().map(|s| s.to_string()).collect(),
+        action_requires: action_requires.iter().map(|s| s.to_string()).collect(),
+        tool_requires: tool_requires.iter().map(|s| s.to_string()).collect(),
         confirm,
     });
     Executor::new(
@@ -128,6 +139,20 @@ async fn allow_once_missing_grant_proceeds_without_writing_grants() {
     assert!(res.is_ok(), "allow-once should proceed: {res:?}");
     let seen = broker.seen.lock().unwrap();
     assert_eq!(seen.as_ref().unwrap().missing, vec!["cap:foo".to_string()]);
+}
+
+#[tokio::test]
+async fn escalation_missing_includes_tool_declared_requires() {
+    // Action declares no `requires`; the tool declares `cap:tool`. The
+    // escalation request must surface the tool's permission so an
+    // allow-forever verdict persists the right grant.
+    let mut exec = executor_with(&[], &["cap:tool"], false, engine_with_tool_grant(&[]));
+    let broker = MockBroker::new(Verdict::AllowOnce);
+    exec.set_broker(broker.clone());
+    let res = exec.run(Caller::interface("http"), act()).await;
+    assert!(res.is_ok(), "allow-once should proceed: {res:?}");
+    let seen = broker.seen.lock().unwrap();
+    assert_eq!(seen.as_ref().unwrap().missing, vec!["cap:tool".to_string()]);
 }
 
 #[tokio::test]
