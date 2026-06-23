@@ -7,7 +7,7 @@ use serde::Deserialize;
 /// CLI args. clap reads `env = "..."` automatically, so env var fallback
 /// is folded into this struct before [`Config::resolve`] sees it.
 #[derive(Parser, Debug, Clone, Default)]
-#[command(name = "daemon", about = "agentd runtime")]
+#[command(name = "daemon", version, about = "agentd runtime")]
 pub struct Cli {
     /// Path to `config.toml`. Defaults to `$XDG_CONFIG_HOME/agentd/config.toml`.
     #[arg(long, env = "AGENTD_CONFIG")]
