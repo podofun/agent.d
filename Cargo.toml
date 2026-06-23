@@ -14,10 +14,9 @@ members = [
     "crates/skills",
     "crates/memory",
     "crates/fs",
-    "crates/http",
     "crates/codex",
     "crates/mcp",
-    "crates/ws",
+    "crates/net",
     "crates/cli",
     "crates/scripting",
     "crates/executor",
@@ -41,10 +40,10 @@ agentd-api         = { path = "crates/api" }
 agentd-approvals   = { path = "crates/approvals" }
 agentd-executor    = { path = "crates/executor" }
 agentd-fs          = { path = "crates/fs" }
-agentd-http        = { path = "crates/http" }
 agentd-luals       = { path = "crates/luals" }
 agentd-mcp         = { path = "crates/mcp" }
 agentd-memory      = { path = "crates/memory" }
+agentd-net         = { path = "crates/net" }
 agentd-packages    = { path = "crates/packages" }
 agentd-permissions = { path = "crates/permissions" }
 agentd-runners     = { path = "crates/runners" }
@@ -55,7 +54,6 @@ agentd-shell       = { path = "crates/shell" }
 agentd-skills      = { path = "crates/skills" }
 agentd-trace       = { path = "crates/trace" }
 agentd-types       = { path = "crates/types" }
-agentd-ws          = { path = "crates/ws" }
 agentd-cli         = { path = "crates/cli" }
 agentd-codex       = { path = "crates/codex" }
 daemon             = { path = "crates/daemon" }

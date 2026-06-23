@@ -21,11 +21,12 @@
 //! blocking the calling thread.
 
 use agentd_ai::{CompletionRequest, CompletionResponse, Provider};
-use agentd_http::{Request as HttpRequest, Response as HttpResponse, send as http_send};
+use agentd_net::http::{Request as HttpRequest, Response as HttpResponse, send as http_send};
+use agentd_net::mailer::{Mail, Mailer, SendOutcome};
+use agentd_net::ws::{Connection as WsConnection, Frame as WsFrame};
 use agentd_permissions::Caller;
 use agentd_shell::{ExecRequest, ExecResult, exec as shell_exec};
 use agentd_types::RunnerDispatcher;
-use agentd_ws::{Connection as WsConnection, Frame as WsFrame};
 use mlua::{Function, Lua, MultiValue, Table, Thread, ThreadStatus, Value};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -86,6 +87,10 @@ pub(crate) enum Op {
         caller: Caller,
         name: String,
         opts: serde_json::Value,
+    },
+    MailerSend {
+        mailer: Arc<Mailer>,
+        mail: Mail,
     },
 }
 
@@ -322,7 +327,16 @@ async fn perform(op: Op) -> Result<serde_json::Value, String> {
             name,
             opts,
         } => dispatcher.run_runner_json(caller, &name, opts).await,
+        Op::MailerSend { mailer, mail } => mailer
+            .send(mail)
+            .await
+            .map(send_outcome_to_json)
+            .map_err(|e| e.to_string()),
     }
+}
+
+fn send_outcome_to_json(o: SendOutcome) -> serde_json::Value {
+    serde_json::json!({ "ok": true, "message_id": o.message_id })
 }
 
 fn ws_frame_to_json(frame: WsFrame) -> serde_json::Value {

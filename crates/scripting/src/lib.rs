@@ -1,4 +1,5 @@
 mod channels;
+mod mailer;
 mod sandbox;
 mod scheduler;
 
@@ -8,8 +9,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use agentd_ai::{CompletionRequest, Message, Provider, Role};
 use agentd_fs as fs;
-use agentd_http::{Request as HttpRequest, host_of, send as http_send};
 use agentd_memory::MemoryStore;
+use agentd_net::http::{Request as HttpRequest, host_of, send as http_send};
+use agentd_net::ws::{Connection as WsConnection, Frame as WsFrame, host_of as ws_host_of};
 use agentd_permissions::{Permission, PermissionSet};
 use agentd_runners::{RunnerDef, RunnerRegistry};
 use agentd_secrets::SecretStore;
@@ -21,7 +23,6 @@ use agentd_types::{
     ActionCall, ActionResult, CallContext, Registry, RegistryActionInfo, RegistryError,
     RegistryToolInfo,
 };
-use agentd_ws::{Connection as WsConnection, Frame as WsFrame, host_of as ws_host_of};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use mlua::{Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Table, Value};
@@ -567,6 +568,7 @@ fn build_and_store_ctx(lua: &Lua) -> mlua::Result<()> {
     ctx.set("secret", build_secret_table(lua)?)?;
     ctx.set("ai", build_ai_table(lua)?)?;
     ctx.set("ws", build_ws_table(lua)?)?;
+    ctx.set("mailer", mailer::build_mailer_table(lua)?)?;
     ctx.set("state", build_state_table(lua)?)?;
     ctx.set("memory", build_memory_table(lua)?)?;
     ctx.set("caller", build_caller_table(lua)?)?;
@@ -1984,7 +1986,7 @@ fn resolve_path(path: String) -> std::path::PathBuf {
     out
 }
 
-fn block_on<F: std::future::Future<Output = T>, T>(fut: F) -> mlua::Result<T> {
+pub(crate) fn block_on<F: std::future::Future<Output = T>, T>(fut: F) -> mlua::Result<T> {
     tokio::runtime::Handle::try_current()
         .map_err(|e| mlua::Error::external(format!("no tokio runtime: {e}")))
         .map(|h| h.block_on(fut))
@@ -2992,7 +2994,7 @@ fn tools_list_binding(lua: &Lua, _args: MultiValue) -> mlua::Result<Table> {
 
 // ---------- Permission helper ----------
 
-fn check_permission_inline(lua: &Lua, req: &Permission) -> mlua::Result<()> {
+pub(crate) fn check_permission_inline(lua: &Lua, req: &Permission) -> mlua::Result<()> {
     let active = lua
         .app_data_ref::<ActiveContext>()
         .ok_or_else(|| mlua::Error::external("active context missing"))?;
