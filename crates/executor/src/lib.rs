@@ -959,16 +959,17 @@ impl Executor {
             out.push(agentd_ai::ToolDef {
                 name: info.name,
                 description,
-                // We don't yet collect per-action JSON schemas. The model
-                // sees a free-form `arguments` object — most LLMs handle
-                // this fine for our action shapes (small JSON objects).
-                input_schema: serde_json::json!({ "type": "object" }),
+                // Prefer the action's declared schema (compiled from its Lua
+                // `input` table) so the model sees exact field names, types,
+                // and required-ness. Actions without one fall back to a
+                // free-form unconstrained object.
+                input_schema: info
+                    .input_schema
+                    .unwrap_or_else(|| serde_json::json!({ "type": "object" })),
             });
         }
         out
     }
-
-    // ---------- services ----------
 
     /// Spawn one service as a Tokio task and return its `JoinHandle`. The
     /// task drives the Lua body to completion (or until daemon shutdown).
