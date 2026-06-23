@@ -179,27 +179,28 @@ impl Mailer {
         }
         builder = builder.subject(&mail.subject);
 
-        let body = self.assemble_body(&mail)?;
-
-        builder
-            .multipart(body)
-            .map_err(|e| MailerError::Build(e.to_string()))
+        match self.assemble_body(&mail)? {
+            Body::Single(part) => builder.singlepart(part),
+            Body::Multi(part) => builder.multipart(part),
+        }
+        .map_err(|e| MailerError::Build(e.to_string()))
     }
 
-    /// Assemble the MIME body. The chosen text/html body is always wrapped in a
-    /// `MultiPart` so the builder path is uniform; attachments add a
-    /// `multipart/mixed` outer layer.
-    fn assemble_body(&self, mail: &Mail) -> Result<MultiPart, MailerError> {
-        let inner: MultiPart = match (&mail.text, &mail.html) {
-            (Some(text), Some(html)) => MultiPart::alternative()
-                .singlepart(SinglePart::plain(text.clone()))
-                .singlepart(SinglePart::html(html.clone())),
-            (Some(text), None) => {
-                MultiPart::mixed().singlepart(SinglePart::plain(text.clone()))
-            }
-            (None, Some(html)) => {
-                MultiPart::mixed().singlepart(SinglePart::html(html.clone()))
-            }
+    /// Assemble the MIME body following RFC structure:
+    /// - exactly one of text/html, no attachments → a bare `SinglePart`
+    ///   (`text/plain` or `text/html`), NOT multipart;
+    /// - both text and html → `multipart/alternative`;
+    /// - any attachments → `multipart/mixed` wrapping the above.
+    fn assemble_body(&self, mail: &Mail) -> Result<Body, MailerError> {
+        // The content part: a single text/html part, or an alternative of both.
+        let inner: BodyInner = match (&mail.text, &mail.html) {
+            (Some(text), Some(html)) => BodyInner::Multi(
+                MultiPart::alternative()
+                    .singlepart(SinglePart::plain(text.clone()))
+                    .singlepart(SinglePart::html(html.clone())),
+            ),
+            (Some(text), None) => BodyInner::Single(SinglePart::plain(text.clone())),
+            (None, Some(html)) => BodyInner::Single(SinglePart::html(html.clone())),
             (None, None) => {
                 return Err(MailerError::Build(
                     "mail has neither text nor html body".into(),
@@ -208,10 +209,17 @@ impl Mailer {
         };
 
         if mail.attachments.is_empty() {
-            return Ok(inner);
+            return Ok(match inner {
+                BodyInner::Single(part) => Body::Single(part),
+                BodyInner::Multi(part) => Body::Multi(part),
+            });
         }
 
-        let mut mixed = MultiPart::mixed().multipart(inner);
+        // Attachments present → wrap the content in a multipart/mixed.
+        let mut mixed = match inner {
+            BodyInner::Single(part) => MultiPart::mixed().singlepart(part),
+            BodyInner::Multi(part) => MultiPart::mixed().multipart(part),
+        };
         for att in &mail.attachments {
             let ct = att
                 .content_type
@@ -221,8 +229,21 @@ impl Mailer {
                 LettreAttachment::new(att.filename.clone()).body(att.bytes.clone(), ct),
             );
         }
-        Ok(mixed)
+        Ok(Body::Multi(mixed))
     }
+}
+
+/// The fully assembled top-level body: either a single part (one text/html
+/// body, no attachments) or a multipart.
+enum Body {
+    Single(SinglePart),
+    Multi(MultiPart),
+}
+
+/// The content part before any attachment wrapping.
+enum BodyInner {
+    Single(SinglePart),
+    Multi(MultiPart),
 }
 
 #[cfg(test)]
@@ -385,6 +406,17 @@ mod tests {
         let cap = rx.await.unwrap();
         assert!(cap.data.contains("Subject: hi"), "data: {}", cap.data);
         assert!(cap.data.contains("body"), "data: {}", cap.data);
+        // Single text body, no attachments → bare text/plain, never multipart.
+        assert!(
+            cap.data.contains("Content-Type: text/plain"),
+            "data: {}",
+            cap.data
+        );
+        assert!(
+            !cap.data.contains("multipart"),
+            "single text body must not be multipart: {}",
+            cap.data
+        );
         assert!(
             cap.rcpts.iter().any(|r| r.contains("<x@y.z>")),
             "rcpts: {:?}",
@@ -406,8 +438,18 @@ mod tests {
         .await
         .unwrap();
         let cap = rx.await.unwrap();
-        assert!(cap.data.contains("text/html"), "data: {}", cap.data);
         assert!(cap.data.contains("<b>hi</b>"), "data: {}", cap.data);
+        // Single html body, no attachments → bare text/html, never multipart.
+        assert!(
+            cap.data.contains("Content-Type: text/html"),
+            "data: {}",
+            cap.data
+        );
+        assert!(
+            !cap.data.contains("multipart"),
+            "single html body must not be multipart: {}",
+            cap.data
+        );
     }
 
     #[tokio::test]
