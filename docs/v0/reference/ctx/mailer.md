@@ -66,16 +66,26 @@ Body shape follows from which fields are set: `text` only → `text/plain`; `htm
 
 ## Permission
 
+Grants are tool-scoped. A `mail` tool that sends through `smtp.example.com` and reads its credentials from the keyring needs:
+
 ```toml
-[action.send_report]
+[tool.mail]
 granted = ["net:smtp.example.com", "secret:smtp_user", "secret:smtp_pass"]
 ```
 
 ## Examples
 
+Actions are fully-qualified `tool.action` names declared against a tool. Both examples below belong to the `mail` tool granted above.
+
 ```lua
--- Send a simple notification from an action
-agentd.action("notify", function(args, ctx)
+-- tools/mail.lua
+agentd.tool({
+  name     = "mail",
+  requires = { "net:smtp.example.com", "secret:smtp_user", "secret:smtp_pass" },
+})
+
+-- Send a plain-text message
+agentd.action("mail.send", function(args, ctx)
   local mailer = ctx.mailer.create({
     host     = "smtp.example.com",
     user     = ctx.secret.get("smtp_user"),
@@ -96,24 +106,26 @@ end)
 
 ```lua
 -- HTML + plain-text alternative with an attachment
-local mailer = ctx.mailer.create({
-  host = "smtp.example.com",
-  user = ctx.secret.get("smtp_user"),
-  pass = ctx.secret.get("smtp_pass"),
-  from = "Reports <reports@example.com>",
-})
+agentd.action("mail.report", function(args, ctx)
+  local mailer = ctx.mailer.create({
+    host = "smtp.example.com",
+    user = ctx.secret.get("smtp_user"),
+    pass = ctx.secret.get("smtp_pass"),
+    from = "Reports <reports@example.com>",
+  })
 
-mailer:send({
-  to       = { "ops@example.com" },
-  cc       = { "lead@example.com" },
-  subject  = "Daily report",
-  text     = "See attached.",
-  html     = "<p>See <b>attached</b>.</p>",
-  reply_to = "support@example.com",
-  attachments = {
-    { filename = "report.pdf", content_type = "application/pdf", bytes = ctx.fs.read("/path/to/report.pdf") },
-  },
-})
+  return mailer:send({
+    to       = { "ops@example.com" },
+    cc       = { "lead@example.com" },
+    subject  = "Daily report",
+    text     = "See attached.",
+    html     = "<p>See <b>attached</b>.</p>",
+    reply_to = "support@example.com",
+    attachments = {
+      { filename = "report.pdf", content_type = "application/pdf", bytes = ctx.fs.read(args.report_path) },
+    },
+  }).message_id
+end)
 ```
 
 ::: tip Queueing and rate-limiting

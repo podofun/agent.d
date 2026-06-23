@@ -136,7 +136,8 @@ impl Mailer {
         })
     }
 
-    /// Config host, for deriving the `net:<host>` permission slug.
+    /// The SMTP host this mailer connects to. The scripting layer derives the
+    /// `net:<host>` permission slug from the same value before construction.
     pub fn host(&self) -> &str {
         &self.host
     }
