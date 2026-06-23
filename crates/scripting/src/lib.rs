@@ -32,6 +32,13 @@ struct ActionMeta {
     tool: Option<String>,
     requires: Vec<String>,
     confirm: bool,
+    /// Compiled JSON Schema for the action's args (`input` table), or `None`
+    /// if the action declared no schema. Surfaced to LLMs and validated
+    /// against incoming args before the handler runs.
+    input_schema: Option<serde_json::Value>,
+    /// Compiled JSON Schema for the handler's return value (`output` table).
+    /// Validated after the handler returns; kept registry-side only.
+    output_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -686,6 +693,17 @@ fn parse_register_table(t: Table) -> mlua::Result<(String, Function, ActionMeta)
     let confirm: bool = t.get::<Option<bool>>("confirm")?.unwrap_or(false);
     let tool: Option<String> = t.get::<Option<String>>("tool")?;
     let inferred_tool = tool.or_else(|| name.split_once('.').map(|(t, _)| t.to_string()));
+    // `strict` (default true) controls additionalProperties on the compiled
+    // input schema.
+    let strict = t.get::<Option<bool>>("strict")?.unwrap_or(true);
+    let input_schema = match t.get::<Option<Table>>("input")? {
+        Some(props) => Some(compile_object_schema(&props, strict)?),
+        None => None,
+    };
+    let output_schema = match t.get::<Option<Table>>("output")? {
+        Some(props) => Some(compile_object_schema(&props, false)?),
+        None => None,
+    };
     Ok((
         name,
         func,
@@ -693,6 +711,8 @@ fn parse_register_table(t: Table) -> mlua::Result<(String, Function, ActionMeta)
             tool: inferred_tool,
             requires,
             confirm,
+            input_schema,
+            output_schema,
         },
     ))
 }
@@ -1133,6 +1153,192 @@ fn resolve_import_path(lua: &Lua, rel: &str) -> mlua::Result<PathBuf> {
         }
     }
     Ok(root.join(p))
+}
+
+/// Compile an `{ field = { type=..., ... }, ... }` table into an object JSON
+/// Schema. `strict` adds `additionalProperties: false` (reject hallucinated
+/// keys), inherited by nested objects.
+fn compile_object_schema(props: &Table, strict: bool) -> mlua::Result<serde_json::Value> {
+    let mut properties = serde_json::Map::new();
+    let mut required: Vec<String> = Vec::new();
+    for pair in props.pairs::<String, Value>() {
+        let (key, spec_val) = pair?;
+        let spec = match spec_val {
+            Value::Table(t) => t,
+            other => {
+                return Err(mlua::Error::external(format!(
+                    "schema field `{key}` must be a table, got {}",
+                    other.type_name()
+                )));
+            }
+        };
+        let (schema, is_required) = compile_field(&key, &spec, strict)?;
+        if is_required {
+            required.push(key.clone());
+        }
+        properties.insert(key, schema);
+    }
+    // Deterministic order: Lua table iteration is unordered.
+    required.sort();
+    let mut m = serde_json::Map::new();
+    m.insert("type".into(), serde_json::Value::from("object"));
+    m.insert("properties".into(), serde_json::Value::Object(properties));
+    if !required.is_empty() {
+        m.insert("required".into(), serde_json::Value::from(required));
+    }
+    if strict {
+        m.insert(
+            "additionalProperties".into(),
+            serde_json::Value::Bool(false),
+        );
+    }
+    Ok(serde_json::Value::Object(m))
+}
+
+/// Compile one field spec. Returns the field's JSON Schema plus whether the
+/// author marked it `required` (hoisted by the caller into the object's
+/// `required` array).
+fn compile_field(key: &str, spec: &Table, strict: bool) -> mlua::Result<(serde_json::Value, bool)> {
+    let ty: String = spec.get::<Option<String>>("type")?.ok_or_else(|| {
+        mlua::Error::external(format!("schema field `{key}`: `type` is required"))
+    })?;
+    let required = spec.get::<Option<bool>>("required")?.unwrap_or(false);
+    let desc = spec.get::<Option<String>>("desc")?;
+
+    // Object with nested `props` delegates to the object compiler so nesting
+    // gets the same required-hoisting + additionalProperties treatment.
+    if ty == "object"
+        && let Some(nested) = spec.get::<Option<Table>>("props")?
+    {
+        let mut obj = compile_object_schema(&nested, strict)?;
+        if let (Some(d), Some(map)) = (desc, obj.as_object_mut()) {
+            map.insert("description".into(), serde_json::Value::from(d));
+        }
+        return Ok((obj, required));
+    }
+
+    let mut m = serde_json::Map::new();
+    m.insert("type".into(), serde_json::Value::from(ty.clone()));
+    if let Some(d) = desc {
+        m.insert("description".into(), serde_json::Value::from(d));
+    }
+    match ty.as_str() {
+        "string" => {
+            if let Some(n) = spec.get::<Option<i64>>("min_len")? {
+                m.insert("minLength".into(), serde_json::Value::from(n));
+            }
+        }
+        "array" => {
+            let items = match spec.get::<Value>("items")? {
+                Value::String(s) => {
+                    serde_json::json!({ "type": s.to_string_lossy() })
+                }
+                Value::Table(t) => compile_field(key, &t, strict)?.0,
+                Value::Nil => serde_json::json!({}),
+                other => {
+                    return Err(mlua::Error::external(format!(
+                        "schema field `{key}`: `items` must be a type string or table, got {}",
+                        other.type_name()
+                    )));
+                }
+            };
+            m.insert("items".into(), items);
+            if let Some(n) = spec.get::<Option<i64>>("max_items")? {
+                m.insert("maxItems".into(), serde_json::Value::from(n));
+            }
+        }
+        _ => {}
+    }
+    Ok((serde_json::Value::Object(m), required))
+}
+
+/// Validate `value` against a schema produced by [`compile_object_schema`].
+/// Returns `Err` with a human-readable, path-prefixed list of every violation.
+fn validate_json(value: &serde_json::Value, schema: &serde_json::Value) -> Result<(), String> {
+    let mut errs = Vec::new();
+    check_json(value, schema, "", &mut errs);
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join("; "))
+    }
+}
+
+fn check_json(
+    value: &serde_json::Value,
+    schema: &serde_json::Value,
+    path: &str,
+    errs: &mut Vec<String>,
+) {
+    let here = if path.is_empty() { "(root)" } else { path };
+    let ty = schema.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match ty {
+        "object" => {
+            let Some(obj) = value.as_object() else {
+                errs.push(format!("{here}: expected object"));
+                return;
+            };
+            let props = schema.get("properties").and_then(|p| p.as_object());
+            if let Some(req) = schema.get("required").and_then(|r| r.as_array()) {
+                for r in req {
+                    if let Some(k) = r.as_str()
+                        && !obj.contains_key(k)
+                    {
+                        errs.push(format!("{path}/{k}: required field missing"));
+                    }
+                }
+            }
+            let strict = schema
+                .get("additionalProperties")
+                .and_then(|a| a.as_bool())
+                .map(|b| !b)
+                .unwrap_or(false);
+            for (k, v) in obj {
+                match props.and_then(|p| p.get(k)) {
+                    Some(sub) => check_json(v, sub, &format!("{path}/{k}"), errs),
+                    None if strict => errs.push(format!("{path}/{k}: unexpected field")),
+                    None => {}
+                }
+            }
+        }
+        "array" => {
+            let Some(arr) = value.as_array() else {
+                errs.push(format!("{here}: expected array"));
+                return;
+            };
+            if let Some(max) = schema.get("maxItems").and_then(|m| m.as_u64())
+                && arr.len() as u64 > max
+            {
+                errs.push(format!("{here}: array exceeds maxItems {max}"));
+            }
+            if let Some(items) = schema.get("items") {
+                for (i, el) in arr.iter().enumerate() {
+                    check_json(el, items, &format!("{path}[{i}]"), errs);
+                }
+            }
+        }
+        "string" => {
+            let Some(s) = value.as_str() else {
+                errs.push(format!("{here}: expected string"));
+                return;
+            };
+            if let Some(min) = schema.get("minLength").and_then(|m| m.as_u64())
+                && (s.chars().count() as u64) < min
+            {
+                errs.push(format!("{here}: string shorter than minLength {min}"));
+            }
+        }
+        "integer" if !(value.is_i64() || value.is_u64()) => {
+            errs.push(format!("{here}: expected integer"));
+        }
+        "number" if !value.is_number() => {
+            errs.push(format!("{here}: expected number"));
+        }
+        "boolean" if !value.is_boolean() => {
+            errs.push(format!("{here}: expected boolean"));
+        }
+        _ => {}
+    }
 }
 
 fn read_string_array(t: &Table, key: &str) -> mlua::Result<Vec<String>> {
@@ -2906,6 +3112,7 @@ impl Registry for LuaHost {
             tool: meta.tool,
             requires: meta.requires,
             confirm: meta.confirm,
+            input_schema: meta.input_schema,
         })
     }
 
@@ -2927,6 +3134,24 @@ impl Registry for LuaHost {
         let ActionCall { action, args } = call;
         let effective_grants = ctx.effective_grants.clone();
         let call_chain = ctx.call_chain.clone();
+
+        // Snapshot the declared schemas (if any) so we can validate args before
+        // the handler runs and the return value after — without holding the
+        // catalog lock across the await.
+        let (input_schema, output_schema) = {
+            let cat = catalog.read().unwrap();
+            cat.action_meta
+                .get(&action)
+                .map(|m| (m.input_schema.clone(), m.output_schema.clone()))
+                .unwrap_or((None, None))
+        };
+        if let Some(schema) = &input_schema
+            && let Err(e) = validate_json(&args, schema)
+        {
+            return Err(RegistryError::Invocation(format!(
+                "{action}: input validation failed: {e}"
+            )));
+        }
 
         // Phase 1: create coroutine for the handler. ActiveContext is now
         // bound per-resume by the scheduler (not here) so concurrent calls
@@ -2968,9 +3193,15 @@ impl Registry for LuaHost {
         // each resume and restores default on the way out.
         let outcome = scheduler::drive(lua.clone(), thread, vec![args], ctx_for_drive).await;
 
-        outcome
-            .map(|value| ActionResult { value })
-            .map_err(|e| RegistryError::Invocation(e.to_string()))
+        let value = outcome.map_err(|e| RegistryError::Invocation(e.to_string()))?;
+        if let Some(schema) = &output_schema
+            && let Err(e) = validate_json(&value, schema)
+        {
+            return Err(RegistryError::Invocation(format!(
+                "{action}: output validation failed: {e}"
+            )));
+        }
+        Ok(ActionResult { value })
     }
 
     fn list_services(&self) -> Vec<String> {
@@ -3069,6 +3300,167 @@ mod host_lifecycle_tests {
         host.clear_runner_dispatcher();
         // Clearing it releases the host's strong ref — only our local remains.
         assert_eq!(Arc::strong_count(&dispatcher), 1);
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::{compile_object_schema, validate_json};
+    use mlua::Lua;
+    use serde_json::json;
+
+    fn compile(src: &str, strict: bool) -> serde_json::Value {
+        let lua = Lua::new();
+        let t: mlua::Table = lua.load(src).eval().unwrap();
+        compile_object_schema(&t, strict).unwrap()
+    }
+
+    #[test]
+    fn compiles_object_with_required_opt_in() {
+        let schema = compile(
+            r#"return { repo = { type="string", required=true }, body = { type="string" } }"#,
+            true,
+        );
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["repo"]["type"], "string");
+        assert_eq!(schema["properties"]["body"]["type"], "string");
+        assert_eq!(schema["required"], json!(["repo"]));
+        assert_eq!(schema["additionalProperties"], json!(false));
+    }
+
+    #[test]
+    fn renames_sugar_keys_and_strips_them() {
+        let schema = compile(
+            r#"return { title = { type="string", desc="t", min_len=1 } }"#,
+            true,
+        );
+        let f = &schema["properties"]["title"];
+        assert_eq!(f["description"], "t");
+        assert_eq!(f["minLength"], 1);
+        assert!(f.get("desc").is_none(), "sugar `desc` leaked: {f}");
+        assert!(f.get("min_len").is_none(), "sugar `min_len` leaked: {f}");
+        assert!(f.get("required").is_none(), "`required` leaked: {f}");
+    }
+
+    #[test]
+    fn array_items_string_shorthand() {
+        let schema = compile(
+            r#"return { labels = { type="array", items="string", max_items=10 } }"#,
+            true,
+        );
+        let f = &schema["properties"]["labels"];
+        assert_eq!(f["type"], "array");
+        assert_eq!(f["items"]["type"], "string");
+        assert_eq!(f["maxItems"], 10);
+    }
+
+    #[test]
+    fn nested_object_recurses() {
+        let schema = compile(
+            r#"return { author = { type="object", props = { id = { type="string", required=true } } } }"#,
+            true,
+        );
+        let a = &schema["properties"]["author"];
+        assert_eq!(a["type"], "object");
+        assert_eq!(a["properties"]["id"]["type"], "string");
+        assert_eq!(a["required"], json!(["id"]));
+        assert_eq!(a["additionalProperties"], json!(false));
+    }
+
+    #[test]
+    fn non_strict_omits_additional_properties() {
+        let schema = compile(r#"return { a = { type="string" } }"#, false);
+        assert!(schema.get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn empty_required_omitted() {
+        let schema = compile(r#"return { a = { type="string" } }"#, true);
+        assert!(schema.get("required").is_none());
+    }
+
+    #[test]
+    fn validate_accepts_valid() {
+        let schema = compile(
+            r#"return { repo = { type="string", required=true } }"#,
+            true,
+        );
+        assert!(validate_json(&json!({"repo":"x/y"}), &schema).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_missing_required() {
+        let schema = compile(
+            r#"return { repo = { type="string", required=true } }"#,
+            true,
+        );
+        let err = validate_json(&json!({}), &schema).unwrap_err();
+        assert!(err.contains("repo"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_wrong_type() {
+        let schema = compile(r#"return { n = { type="integer", required=true } }"#, true);
+        let err = validate_json(&json!({"n":"str"}), &schema).unwrap_err();
+        assert!(err.contains("n"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_integer_rejects_float() {
+        let schema = compile(r#"return { n = { type="integer", required=true } }"#, true);
+        assert!(validate_json(&json!({"n":3}), &schema).is_ok());
+        assert!(validate_json(&json!({"n":1.5}), &schema).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_key_when_strict() {
+        let schema = compile(r#"return { a = { type="string" } }"#, true);
+        let err = validate_json(&json!({"a":"x","b":1}), &schema).unwrap_err();
+        assert!(err.contains("b"), "{err}");
+    }
+
+    #[test]
+    fn validate_allows_unknown_key_when_not_strict() {
+        let schema = compile(r#"return { a = { type="string" } }"#, false);
+        assert!(validate_json(&json!({"a":"x","b":1}), &schema).is_ok());
+    }
+
+    #[test]
+    fn validate_enforces_min_length_and_max_items() {
+        let schema = compile(
+            r#"return { s = { type="string", min_len=2 }, arr = { type="array", items="string", max_items=1 } }"#,
+            true,
+        );
+        assert!(
+            validate_json(&json!({"s":"a"}), &schema)
+                .unwrap_err()
+                .contains("s")
+        );
+        assert!(
+            validate_json(&json!({"arr":["a","b"]}), &schema)
+                .unwrap_err()
+                .contains("arr")
+        );
+    }
+
+    #[test]
+    fn validate_recurses_into_nested_object() {
+        let schema = compile(
+            r#"return { author = { type="object", props = { id = { type="string", required=true } } } }"#,
+            true,
+        );
+        let err = validate_json(&json!({"author":{}}), &schema).unwrap_err();
+        assert!(err.contains("id"), "{err}");
+    }
+
+    #[test]
+    fn validate_recurses_into_array_items() {
+        let schema = compile(
+            r#"return { ids = { type="array", items="integer" } }"#,
+            true,
+        );
+        let err = validate_json(&json!({"ids":[1,"two"]}), &schema).unwrap_err();
+        assert!(err.contains("ids"), "{err}");
     }
 }
 

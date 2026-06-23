@@ -39,6 +39,7 @@ impl Registry for FakeNotes {
                 tool: Some("notes".into()),
                 requires: vec!["notes.read".into()],
                 confirm: false,
+                input_schema: None,
             })
         } else {
             None
