@@ -77,6 +77,12 @@ Like `ctx.run`, but instructs the runner to return a JSON object and decodes it.
 
 **Returns:** `(decoded: table, response: RunResult)` — two values.
 
+`ctx.structured` validates a runner's reply at the point you call it, using a
+`validate` function you write. To validate an **action's own** arguments and
+return value instead — declaratively, and so AI runners see the expected shape —
+describe them with `input`/`output` schemas; see
+[Describing arguments and results](/v0/writing/tools#describing-arguments-and-results).
+
 ## RunResult
 
 | Field | Type | Description |
@@ -137,5 +143,6 @@ end)
 
 - [Concepts: tools and actions](/v0/concepts/tools-and-actions)
 - [Concepts: runners](/v0/concepts/runners)
+- [Writing tools: describing arguments and results](/v0/writing/tools#describing-arguments-and-results)
 - [ctx.ai — inline model calls](/v0/reference/ctx/ai)
 - [Security: approvals](/v0/security/approvals)
