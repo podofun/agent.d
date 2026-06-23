@@ -1155,7 +1155,6 @@ fn resolve_import_path(lua: &Lua, rel: &str) -> mlua::Result<PathBuf> {
     Ok(root.join(p))
 }
 
-
 /// Compile an `{ field = { type=..., ... }, ... }` table into an object JSON
 /// Schema. `strict` adds `additionalProperties: false` (reject hallucinated
 /// keys), inherited by nested objects.
@@ -1188,7 +1187,10 @@ fn compile_object_schema(props: &Table, strict: bool) -> mlua::Result<serde_json
         m.insert("required".into(), serde_json::Value::from(required));
     }
     if strict {
-        m.insert("additionalProperties".into(), serde_json::Value::Bool(false));
+        m.insert(
+            "additionalProperties".into(),
+            serde_json::Value::Bool(false),
+        );
     }
     Ok(serde_json::Value::Object(m))
 }
@@ -1196,11 +1198,7 @@ fn compile_object_schema(props: &Table, strict: bool) -> mlua::Result<serde_json
 /// Compile one field spec. Returns the field's JSON Schema plus whether the
 /// author marked it `required` (hoisted by the caller into the object's
 /// `required` array).
-fn compile_field(
-    key: &str,
-    spec: &Table,
-    strict: bool,
-) -> mlua::Result<(serde_json::Value, bool)> {
+fn compile_field(key: &str, spec: &Table, strict: bool) -> mlua::Result<(serde_json::Value, bool)> {
     let ty: String = spec.get::<Option<String>>("type")?.ok_or_else(|| {
         mlua::Error::external(format!("schema field `{key}`: `type` is required"))
     })?;
@@ -1298,9 +1296,7 @@ fn check_json(
             for (k, v) in obj {
                 match props.and_then(|p| p.get(k)) {
                     Some(sub) => check_json(v, sub, &format!("{path}/{k}"), errs),
-                    None if strict => {
-                        errs.push(format!("{path}/{k}: unexpected field"))
-                    }
+                    None if strict => errs.push(format!("{path}/{k}: unexpected field")),
                     None => {}
                 }
             }
@@ -3385,13 +3381,19 @@ mod schema_tests {
 
     #[test]
     fn validate_accepts_valid() {
-        let schema = compile(r#"return { repo = { type="string", required=true } }"#, true);
+        let schema = compile(
+            r#"return { repo = { type="string", required=true } }"#,
+            true,
+        );
         assert!(validate_json(&json!({"repo":"x/y"}), &schema).is_ok());
     }
 
     #[test]
     fn validate_rejects_missing_required() {
-        let schema = compile(r#"return { repo = { type="string", required=true } }"#, true);
+        let schema = compile(
+            r#"return { repo = { type="string", required=true } }"#,
+            true,
+        );
         let err = validate_json(&json!({}), &schema).unwrap_err();
         assert!(err.contains("repo"), "{err}");
     }
@@ -3429,7 +3431,11 @@ mod schema_tests {
             r#"return { s = { type="string", min_len=2 }, arr = { type="array", items="string", max_items=1 } }"#,
             true,
         );
-        assert!(validate_json(&json!({"s":"a"}), &schema).unwrap_err().contains("s"));
+        assert!(
+            validate_json(&json!({"s":"a"}), &schema)
+                .unwrap_err()
+                .contains("s")
+        );
         assert!(
             validate_json(&json!({"arr":["a","b"]}), &schema)
                 .unwrap_err()

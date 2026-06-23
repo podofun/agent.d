@@ -148,7 +148,10 @@ async fn live_loop_fills_nested_input_schema() {
         resp.text
     );
     let c = &calls[0];
-    assert_eq!(c.action, "calendar.create_event", "[{label}] wrong tool: {c:?}");
+    assert_eq!(
+        c.action, "calendar.create_event",
+        "[{label}] wrong tool: {c:?}"
+    );
     let a = &c.args;
 
     // Top level.
@@ -174,10 +177,7 @@ async fn live_loop_fills_nested_input_schema() {
     let attendees = a.get("attendees").and_then(|v| v.as_array());
     assert!(
         attendees
-            .map(|arr| {
-                !arr.is_empty()
-                    && arr[0].get("name").and_then(|v| v.as_str()).is_some()
-            })
+            .map(|arr| { !arr.is_empty() && arr[0].get("name").and_then(|v| v.as_str()).is_some() })
             .unwrap_or(false),
         "[{label}] missing `attendees[].name`: {a}"
     );

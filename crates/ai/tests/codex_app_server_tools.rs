@@ -187,7 +187,11 @@ async fn live_loop_fills_declared_input_schema_fields() {
         resp.text
     );
     let args = &calls[0].args;
-    assert_eq!(calls[0].action, "discord.send", "unexpected tool: {:?}", calls[0]);
+    assert_eq!(
+        calls[0].action, "discord.send",
+        "unexpected tool: {:?}",
+        calls[0]
+    );
     assert!(
         args.get("channel_id").and_then(|v| v.as_str()).is_some(),
         "codex didn't fill schema field `channel_id`: {args}"

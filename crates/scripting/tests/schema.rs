@@ -127,8 +127,7 @@ async fn unknown_arg_rejected_under_strict_default() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn discord_example_loads_and_exposes_schemas() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/discord");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/discord");
     let host = host_with(&root);
     host.set_secrets(Arc::new(agentd_secrets::MemoryStore::default()));
     host.load_file(&root.join("init.lua")).unwrap();
@@ -139,7 +138,10 @@ async fn discord_example_loads_and_exposes_schemas() {
         .expect("discord.send input schema");
     assert_eq!(send["properties"]["channel_id"]["type"], "string");
     assert_eq!(send["properties"]["content"]["type"], "string");
-    assert_eq!(send["required"], serde_json::json!(["channel_id", "content"]));
+    assert_eq!(
+        send["required"],
+        serde_json::json!(["channel_id", "content"])
+    );
 
     let tok = host
         .action_info("discord.set_token")
@@ -164,5 +166,8 @@ async fn bad_return_value_rejected_by_output_schema() {
         )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("output validation failed"), "{err}");
+    assert!(
+        err.to_string().contains("output validation failed"),
+        "{err}"
+    );
 }
