@@ -17,5 +17,3 @@ url.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
-futures-util = { workspace = true, features = ["std", "sink"] }
-tokio = { workspace = true, features = ["net", "io-util", "sync", "macros", "rt-multi-thread", "time"] }
