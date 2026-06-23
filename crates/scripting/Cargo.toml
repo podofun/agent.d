@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 agentd-ai.workspace = true
 agentd-fs.workspace = true
-agentd-http.workspace = true
+agentd-net.workspace = true
 agentd-memory.workspace = true
 agentd-permissions.workspace = true
 agentd-packages.workspace = true
@@ -16,7 +16,6 @@ agentd-services.workspace = true
 agentd-shell.workspace = true
 agentd-skills.workspace = true
 agentd-types.workspace = true
-agentd-ws.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 mlua = { workspace = true, features = ["serialize"] }

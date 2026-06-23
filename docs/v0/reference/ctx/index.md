@@ -11,6 +11,7 @@
 | [`ctx.fs`](/v0/reference/ctx/fs) | Read, write, and inspect files | `fs.read:<path>` / `fs.write:<path>` |
 | [`ctx.http`](/v0/reference/ctx/http) | HTTP requests and persistent clients | `net:<host>` |
 | [`ctx.ws`](/v0/reference/ctx/websocket) | WebSocket connections | `net:<host>` |
+| [`ctx.mailer`](/v0/reference/ctx/mailer) | Send email over SMTP | `net:<host>` |
 | [`ctx.secret`](/v0/reference/ctx/secrets) | OS keyring get/set/delete | `secret:<key>` |
 | [`ctx.memory`](/v0/reference/ctx/memory) | Durable namespaced key/value (redb) | `memory.read:<ns>` / `memory.write:<ns>` |
 | [`ctx.state`](/v0/reference/ctx/memory) | Ephemeral in-process key/value | none |
