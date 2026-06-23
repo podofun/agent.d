@@ -3,4 +3,5 @@
 //! gates each on `net:<host>`.
 
 pub mod http;
+pub mod mailer;
 pub mod ws;
