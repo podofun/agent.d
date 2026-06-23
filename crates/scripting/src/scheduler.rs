@@ -22,11 +22,11 @@
 
 use agentd_ai::{CompletionRequest, CompletionResponse, Provider};
 use agentd_net::http::{Request as HttpRequest, Response as HttpResponse, send as http_send};
+use agentd_net::mailer::{Mail, Mailer, SendOutcome};
+use agentd_net::ws::{Connection as WsConnection, Frame as WsFrame};
 use agentd_permissions::Caller;
 use agentd_shell::{ExecRequest, ExecResult, exec as shell_exec};
 use agentd_types::RunnerDispatcher;
-use agentd_net::ws::{Connection as WsConnection, Frame as WsFrame};
-use agentd_net::mailer::{Mail, Mailer, SendOutcome};
 use mlua::{Function, Lua, MultiValue, Table, Thread, ThreadStatus, Value};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;

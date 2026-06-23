@@ -23,10 +23,7 @@ impl mlua::UserData for MailerHandle {}
 
 /// `mailer.create(opts)` C internal: parse config, gate on `net:<host>`, and
 /// connect. Returns the raw userdata; the Lua ctor wraps it in a table handle.
-fn mailer_create_internal(
-    lua: &mlua::Lua,
-    opts: mlua::Table,
-) -> mlua::Result<mlua::AnyUserData> {
+fn mailer_create_internal(lua: &mlua::Lua, opts: mlua::Table) -> mlua::Result<mlua::AnyUserData> {
     let host: String = opts.get("host")?;
     if host.is_empty() {
         return Err(mlua::Error::external("mailer.create: `host` is required"));
@@ -88,8 +85,12 @@ fn mailer_send_internal(
 ) -> mlua::Result<mlua::Value> {
     let mailer = ud.borrow::<MailerHandle>()?.mailer.clone();
 
-    let to: Vec<String> = mail_table.get::<Option<Vec<String>>>("to")?.unwrap_or_default();
-    let cc: Vec<String> = mail_table.get::<Option<Vec<String>>>("cc")?.unwrap_or_default();
+    let to: Vec<String> = mail_table
+        .get::<Option<Vec<String>>>("to")?
+        .unwrap_or_default();
+    let cc: Vec<String> = mail_table
+        .get::<Option<Vec<String>>>("cc")?
+        .unwrap_or_default();
     let bcc: Vec<String> = mail_table
         .get::<Option<Vec<String>>>("bcc")?
         .unwrap_or_default();

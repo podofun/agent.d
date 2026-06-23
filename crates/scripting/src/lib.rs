@@ -9,8 +9,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use agentd_ai::{CompletionRequest, Message, Provider, Role};
 use agentd_fs as fs;
-use agentd_net::http::{Request as HttpRequest, host_of, send as http_send};
 use agentd_memory::MemoryStore;
+use agentd_net::http::{Request as HttpRequest, host_of, send as http_send};
+use agentd_net::ws::{Connection as WsConnection, Frame as WsFrame, host_of as ws_host_of};
 use agentd_permissions::{Permission, PermissionSet};
 use agentd_runners::{RunnerDef, RunnerRegistry};
 use agentd_secrets::SecretStore;
@@ -22,7 +23,6 @@ use agentd_types::{
     ActionCall, ActionResult, CallContext, Registry, RegistryActionInfo, RegistryError,
     RegistryToolInfo,
 };
-use agentd_net::ws::{Connection as WsConnection, Frame as WsFrame, host_of as ws_host_of};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use mlua::{Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Table, Value};

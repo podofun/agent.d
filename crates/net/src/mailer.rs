@@ -7,10 +7,10 @@
 use std::time::Duration;
 
 use lettre::message::header::ContentType;
-use lettre::message::{Attachment as LettreAttachment, Mailbox, MultiPart, SinglePart};
 use lettre::message::header::MessageId as MessageIdHeader;
-use lettre::transport::smtp::authentication::Credentials;
+use lettre::message::{Attachment as LettreAttachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::AsyncSmtpTransport;
+use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncTransport, Message, Tokio1Executor};
 use thiserror::Error;
 
@@ -270,10 +270,7 @@ mod tests {
     /// Result of a single mock SMTP session: either captured data, or a flag
     /// that the session was rejected at RCPT.
     /// `reject_rcpt` makes the server answer `550` to every RCPT TO.
-    async fn serve_session(
-        stream: tokio::net::TcpStream,
-        reject_rcpt: bool,
-    ) -> Captured {
+    async fn serve_session(stream: tokio::net::TcpStream, reject_rcpt: bool) -> Captured {
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
         let mut captured = Captured::default();
@@ -299,10 +296,7 @@ mod tests {
                 let addr = line.trim().to_string();
                 captured.rcpts.push(addr);
                 if reject_rcpt {
-                    write_half
-                        .write_all(b"550 No such user\r\n")
-                        .await
-                        .unwrap();
+                    write_half.write_all(b"550 No such user\r\n").await.unwrap();
                 } else {
                     write_half.write_all(b"250 OK\r\n").await.unwrap();
                 }
