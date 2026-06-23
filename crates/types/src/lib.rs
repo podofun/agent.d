@@ -39,6 +39,8 @@ pub struct RegistryActionInfo {
     pub requires: Vec<String>,
     #[serde(default)]
     pub confirm: bool,
+    #[serde(default)]
+    pub input_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

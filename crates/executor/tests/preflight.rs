@@ -33,6 +33,7 @@ impl Registry for FakeRegistry {
             tool: Some("tool".into()),
             requires: self.action_requires.clone(),
             confirm: self.confirm,
+            input_schema: None,
         })
     }
     fn tool_info(&self, name: &str) -> Option<RegistryToolInfo> {

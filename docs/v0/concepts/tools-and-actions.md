@@ -47,6 +47,14 @@ end)
 | `requires` | no | Permission slugs the handler needs (e.g. `"shell.exec:git"`). |
 | `confirm` | no | When `true`, each call requires interactive operator approval unless `auto_confirm` covers it. |
 | `tool` | no | Owning tool name; inferred from the `name` prefix when omitted. |
+| `input` | no | Ergonomic schema for the action's args. Surfaced to LLM runners as the tool's `input_schema` and validated before the handler runs. |
+| `output` | no | Schema for the return value, validated after the handler runs (registry-side only). |
+| `strict` | no | Default `true`; adds `additionalProperties: false` to the compiled `input` so the model can't invent keys. |
+
+When an action declares `input`, the model fills the exact declared fields
+(instead of a free-form object) and bad args are rejected before the handler
+executes. See [Writing tools → input/output schemas](/v0/writing/tools) for the
+DSL, sugar, and current limitations.
 
 ## The `ctx` handle
 

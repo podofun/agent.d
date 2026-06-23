@@ -63,6 +63,144 @@ function(args, ctx) -> JSON-serializable table | nil
 Return value must be a JSON-serializable Lua table (or `nil`). Returning a
 non-serializable value (e.g. a function or userdata) is a runtime error.
 
+## Describing arguments and results
+
+By default a handler receives whatever arguments the caller sends, and it is up
+to the handler to check them. You can instead describe the shape of an action's
+arguments with an `input` table, and the shape of its result with an `output`
+table. Both are optional.
+
+```lua
+agentd.action({
+  name     = "github.create_issue",
+  requires = { "net:api.github.com", "secret:GITHUB_TOKEN" },
+
+  input = {
+    repo      = { type = "string", desc = "owner/name", required = true },
+    title     = { type = "string", min_len = 1, required = true },
+    body      = { type = "string" },
+    labels    = { type = "array", items = "string" },
+    assignees = { type = "array", items = "string", max_items = 10 },
+  },
+
+  output = {
+    number = { type = "integer" },
+    url    = { type = "string" },
+  },
+
+  handler = function(args, ctx)
+    -- args.repo and args.title are guaranteed to be present and of the right
+    -- type here, so no defensive checks are needed.
+    ...
+  end,
+})
+```
+
+Describing the arguments has two benefits:
+
+- **Models call the action correctly.** When an AI runner is given the action
+  as a tool, it sees the argument shape and fills in the right field names and
+  types. Without an `input` table it only knows that the action takes "some
+  object", and has to guess.
+- **Bad calls are rejected early.** Arguments are checked against `input`
+  before the handler runs, and the return value is checked against `output`
+  after. If a check fails, the call returns a validation error that points at
+  the offending field (for example, `/assignees: array exceeds maxItems 10`)
+  and the handler never runs on bad input.
+
+### Writing a schema
+
+Each entry in an `input` (or `output`) table is one field. The key is the field
+name; the value describes it:
+
+```lua
+input = {
+  repo  = { type = "string", required = true },
+  body  = { type = "string" },
+}
+```
+
+Every field needs a `type`. The supported types and their options are:
+
+| `type` | Options | Notes |
+|---|---|---|
+| `"string"` | `min_len` | Minimum length. |
+| `"integer"` | — | Whole numbers only. |
+| `"number"` | — | Any number. |
+| `"boolean"` | — | |
+| `"array"` | `items`, `max_items` | `items` is the element type. |
+| `"object"` | `props` | `props` is a nested table of fields. |
+
+Every field also accepts:
+
+- `desc` — a human-readable description (shown to the model).
+- `required` — whether the field must be present. **Fields are optional by
+  default**; set `required = true` to require one.
+
+Arrays describe their elements with `items`. Use a type name as shorthand, or a
+full field spec:
+
+```lua
+labels = { type = "array", items = "string" },
+scores = { type = "array", items = { type = "number" }, max_items = 5 },
+```
+
+Objects nest with `props`, which follows the same rules all the way down:
+
+```lua
+input = {
+  author = {
+    type = "object",
+    required = true,
+    props = {
+      name  = { type = "string", required = true },
+      email = { type = "string" },
+    },
+  },
+}
+```
+
+By default, an object rejects any field you did not describe — so if a model
+invents an extra argument, the call fails instead of silently passing it
+through. To allow extra fields, set `strict = false` on the action:
+
+```lua
+agentd.action({
+  name   = "notes.save",
+  strict = false,   -- accept arguments beyond those described in `input`
+  input  = { text = { type = "string", required = true } },
+  handler = function(args, ctx) ... end,
+})
+```
+
+Schemas can only be declared in the table form of `agentd.action`. The
+two-argument short form (`agentd.action(name, handler)`) takes no schema.
+
+### Current limitations
+
+Schema support covers the common cases; some JSON Schema features are not
+available yet. If you need one of these, validate it inside the handler for now:
+
+- **Types** are limited to `string`, `integer`, `number`, `boolean`, `array`,
+  and `object`. There is no enum, no nullable type, and no "one of several
+  types".
+- **Strings** support `min_len` only — no maximum length, regular-expression
+  pattern, or format such as email or date-time.
+- **Numbers** have no minimum, maximum, or step constraint.
+- **Arrays** support `items` and `max_items` only — no minimum count and no
+  per-position element types.
+- **Objects** can either reject unknown fields (`strict = true`, the default)
+  or allow them (`strict = false`); there is no per-field control.
+- **Defaults and shared/reusable schemas** are not supported — each schema is
+  written inline on its action.
+- **The `output` schema is not shown to models.** It is only used to validate
+  the handler's return value.
+- **Validation errors are plain messages**, not a structured per-field result.
+  They name the offending path but are intended for humans and logs.
+
+You always write the Lua table shown above; raw JSON Schema cannot be supplied
+directly.
+
 ## Permission slugs in `requires`
 
 List every permission slug the handler will use at runtime. The runtime
