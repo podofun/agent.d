@@ -19,6 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 #[derive(Parser, Debug)]
 #[command(
     name = "agentctl",
+    version,
     about = "Console client for agentd. Speaks WebSocket to the daemon."
 )]
 struct Cli {
