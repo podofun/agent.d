@@ -18,6 +18,7 @@ members = [
     "crates/codex",
     "crates/mcp",
     "crates/ws",
+    "crates/net",
     "crates/cli",
     "crates/scripting",
     "crates/executor",
@@ -45,6 +46,7 @@ agentd-http        = { path = "crates/http" }
 agentd-luals       = { path = "crates/luals" }
 agentd-mcp         = { path = "crates/mcp" }
 agentd-memory      = { path = "crates/memory" }
+agentd-net         = { path = "crates/net" }
 agentd-packages    = { path = "crates/packages" }
 agentd-permissions = { path = "crates/permissions" }
 agentd-runners     = { path = "crates/runners" }
