@@ -173,6 +173,83 @@ async fn live_loop_calls_tool_via_mcp() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn live_loop_fills_declared_input_schema_fields() {
+    // A declared `input` schema must reach the model as the tool's
+    // input_schema and shape the call — the model fills the schema's
+    // named, required fields rather than guessing.
+    if !gated() {
+        eprintln!("skip: set AGENTD_TEST_CLAUDE=1");
+        return;
+    }
+
+    let log = CallLog::new(serde_json::json!({ "status": 200 }));
+    let dispatcher = log.clone().into_dispatcher();
+    let tools = vec![ToolDef {
+        name: "discord.send".into(),
+        description: Some("Send a message to a Discord channel.".into()),
+        // Mirrors compile_object_schema(discord.send.input, strict=true).
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "channel_id": { "type": "string", "description": "Discord channel snowflake" },
+                "content": { "type": "string", "minLength": 1, "description": "Message body (<=2000 chars)" },
+            },
+            "required": ["channel_id", "content"],
+            "additionalProperties": false,
+        }),
+    }];
+    let loopback = bind_loopback(
+        dispatcher,
+        Caller::default(),
+        tools.clone(),
+        agentd_mcp::gen_token(),
+    )
+    .await
+    .expect("bind loopback");
+
+    let p = ClaudeCliProvider::new();
+    let req = CompletionRequest {
+        system: Some(
+            "You send Discord messages. When asked, call the `discord.send` \
+             tool exactly once with the channel id and message text. Do not \
+             ask clarifying questions."
+                .into(),
+        ),
+        messages: vec![Message::user(
+            "Send the message 'Hello from agentd' to Discord channel 123456789012345678.",
+        )],
+        prompt: None,
+        model: Some("claude-haiku-4-5-20251001".into()),
+        max_tokens: Some(512),
+        tools,
+        mcp_endpoint: Some(McpEndpoint::Http {
+            url: loopback.url.clone(),
+            token: loopback.token.clone(),
+        }),
+        ..CompletionRequest::default()
+    };
+
+    let resp = p.complete(req).await.expect("live claude call w/ MCP");
+    let calls = log.calls();
+    assert!(
+        !calls.is_empty(),
+        "expected claude to invoke discord.send, got 0 calls\nresponse was: {}",
+        resp.text
+    );
+    let args = &calls[0].args;
+    assert_eq!(calls[0].action, "discord.send");
+    assert!(
+        args.get("channel_id").and_then(|v| v.as_str()).is_some(),
+        "model didn't fill schema field `channel_id`: {args}"
+    );
+    assert!(
+        args.get("content").and_then(|v| v.as_str()).is_some(),
+        "model didn't fill schema field `content`: {args}"
+    );
+    drop(loopback);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn live_loop_handles_denied_tool() {
     if !gated() {
         eprintln!("skip: set AGENTD_TEST_CLAUDE=1");

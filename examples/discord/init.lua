@@ -24,8 +24,14 @@ d.tool({
 d.action({
 	name = "discord.set_token",
 	requires = { "secret:discord_token" },
+	input = {
+		token = { type = "string", min_len = 1, required = true, desc = "Discord bot token" },
+	},
+	output = {
+		ok = { type = "boolean" },
+	},
 	handler = function(args, ctx)
-		assert(type(args.token) == "string" and args.token ~= "", "token is required")
+		-- the token is pre-validated by the input schema
 		ctx.secret.set("discord_token", args.token)
 		return { ok = true }
 	end,
@@ -45,6 +51,16 @@ end
 d.action({
 	name = "discord.send",
 	requires = { "net:discord.com" },
+	input = {
+		channel_id = { type = "string", required = true, desc = "Discord channel snowflake" },
+		content = { type = "string", min_len = 1, required = true, desc = "Message body (<=2000 chars)" },
+	},
+	output = {
+		status = { type = "integer", desc = "HTTP status from the Discord REST API" },
+	},
+	-- The runner sees this schema as the tool's input_schema, so it fills
+	-- channel_id + content with the right names; bad calls are rejected
+	-- before this function is called
 	handler = function(args, ctx)
 		local res = rest_client(ctx):post(
 			"/channels/" .. args.channel_id .. "/messages",

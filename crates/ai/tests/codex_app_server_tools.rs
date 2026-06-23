@@ -129,3 +129,72 @@ async fn live_loop_calls_dynamic_tool_via_mcp() {
     );
     drop(loopback);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_loop_fills_declared_input_schema_fields() {
+    if !gated() {
+        eprintln!("skip: set AGENTD_TEST_CODEX=1");
+        return;
+    }
+
+    let log = CallLog::new(serde_json::json!({ "status": 200 }));
+    let dispatcher = log.clone().into_dispatcher();
+    let tools = vec![ToolDef {
+        name: "discord.send".into(),
+        description: Some("Send a message to a Discord channel.".into()),
+        // Mirrors compile_object_schema(discord.send.input, strict=true).
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "channel_id": { "type": "string", "description": "Discord channel snowflake" },
+                "content": { "type": "string", "minLength": 1, "description": "Message body (<=2000 chars)" },
+            },
+            "required": ["channel_id", "content"],
+            "additionalProperties": false,
+        }),
+    }];
+    let p = CodexAppServerProvider::new();
+    let token = p.preferred_mcp_token().expect("codex provides a token");
+    let loopback = bind_loopback(dispatcher, Caller::default(), tools.clone(), token)
+        .await
+        .expect("bind loopback");
+
+    let req = CompletionRequest {
+        system: Some(
+            "You send Discord messages. When asked, call the `discord.send` \
+             MCP tool (server `agentd`) exactly once with the channel id and \
+             message text. Do not ask clarifying questions."
+                .into(),
+        ),
+        messages: vec![Message::user(
+            "Send the message 'Hello from agentd' to Discord channel 123456789012345678.",
+        )],
+        model: Some("gpt-5.5".into()),
+        max_tokens: Some(512),
+        tools,
+        mcp_endpoint: Some(McpEndpoint::Http {
+            url: loopback.url.clone(),
+            token: loopback.token.clone(),
+        }),
+        ..CompletionRequest::default()
+    };
+
+    let resp = p.complete(req).await.expect("live codex call w/ MCP");
+    let calls = log.calls();
+    assert!(
+        !calls.is_empty(),
+        "expected codex to invoke discord.send, got 0 calls\nresponse was: {}",
+        resp.text
+    );
+    let args = &calls[0].args;
+    assert_eq!(calls[0].action, "discord.send", "unexpected tool: {:?}", calls[0]);
+    assert!(
+        args.get("channel_id").and_then(|v| v.as_str()).is_some(),
+        "codex didn't fill schema field `channel_id`: {args}"
+    );
+    assert!(
+        args.get("content").and_then(|v| v.as_str()).is_some(),
+        "codex didn't fill schema field `content`: {args}"
+    );
+    drop(loopback);
+}
