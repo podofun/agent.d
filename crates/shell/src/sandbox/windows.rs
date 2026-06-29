@@ -1,20 +1,20 @@
-//! Windows sandbox backend: **AppContainer** filesystem + network confinement.
+//! Windows sandbox backend: **AppContainer** filesystem confinement + **WFP**
+//! host/IP-granular network.
 //!
 //! The child is launched into an AppContainer (a low-privilege "lowbox" token)
 //! via `CreateProcessW` + a `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`
-//! attribute. Two properties fall out of the AppContainer model, neither of
-//! which requires administrator rights (unlike the old WFP approach):
+//! attribute:
 //!
-//! - **Network**: an AppContainer has NO outbound network unless it holds a
-//!   network capability. We grant `internetClient` only when the policy permits
-//!   network; with `allow_net = false` the capability set is empty and the OS
-//!   firewall blocks all outbound by construction. This is how Chromium / Codex
-//!   sandbox network without elevation.
 //! - **Filesystem**: a lowbox token can only touch objects whose ACL grants the
 //!   AppContainer's package SID (or `ALL_APPLICATION_PACKAGES`). System binaries
 //!   and their DLLs already grant `ALL_APPLICATION_PACKAGES`, so programs start;
 //!   user data does not, so the child is confined. We stamp the package SID onto
 //!   exactly the granted read/write paths.
+//! - **Network**: with `allow_net = false` the child holds no network capability
+//!   and the OS blocks all outbound by construction. When network is permitted we
+//!   grant the `internetClient` capability so the child can attempt DNS/TCP, and
+//!   a WFP filter set scoped to its package SID enforces the host/IP allowlist
+//!   (see [`super::windows_wfp`]).
 
 use crate::policy::{SandboxError, SandboxPolicy};
 
@@ -37,17 +37,17 @@ pub fn apply(_policy: &SandboxPolicy) -> Result<(), SandboxError> {
     ))
 }
 
-/// Run `req` inside an AppContainer. `proxy_addr` is the egress proxy loopback
-/// address used for host-granular filtering when network is permitted; it is
-/// `None` when the policy denies network.
+/// Run `req` inside an AppContainer. When the policy permits network, a WFP
+/// filter set scoped to the child's AppContainer package SID enforces the
+/// host/IP allowlist (transparent, driver-free); otherwise the child gets no
+/// network capability at all.
 pub async fn run_contained(
     req: &crate::ExecRequest,
     policy: &SandboxPolicy,
-    proxy_addr: Option<std::net::SocketAddr>,
 ) -> Result<crate::ExecResult, crate::ShellError> {
     let req = req.clone();
     let policy = policy.clone();
-    tokio::task::spawn_blocking(move || imp::run_blocking(&req, &policy, proxy_addr))
+    tokio::task::spawn_blocking(move || imp::run_blocking(&req, &policy))
         .await
         .map_err(|e| crate::ShellError::Sandbox(format!("join: {e}")))?
 }
@@ -66,10 +66,15 @@ mod imp {
         SetHandleInformation,
     };
     use windows::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
-        GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE, SDDL_REVISION_1, SE_FILE_OBJECT,
-        SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE,
+        SDDL_REVISION_1, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID,
+        TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
     };
+    use windows::Win32::Security::GetLengthSid;
+
+    use crate::netfilter::NetFilter;
+    use crate::sandbox::windows_wfp::{WfpFilter, WfpHandle};
     use windows::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
     };
@@ -205,70 +210,18 @@ mod imp {
         }
     }
 
-    /// Whether `sid` is on the machine's loopback-exemption list. Read-only.
-    fn loopback_exemption_present(sid: PSID) -> bool {
-        use windows::Win32::NetworkManagement::WindowsFirewall::NetworkIsolationGetAppContainerConfig;
-        use windows::Win32::Security::EqualSid;
-        unsafe {
-            let mut count = 0u32;
-            let mut arr: *mut SID_AND_ATTRIBUTES = std::ptr::null_mut();
-            if NetworkIsolationGetAppContainerConfig(&mut count, &mut arr) != 0 || arr.is_null() {
-                return false;
-            }
-            let existing = std::slice::from_raw_parts(arr, count as usize);
-            existing.iter().any(|e| EqualSid(e.Sid, sid).is_ok())
-        }
-    }
-
-    /// Add `sid` to the machine-global loopback-exemption list. Writing the list
-    /// requires Administrator. Idempotent.
-    fn add_loopback_exemption(sid: PSID) -> Result<(), ShellError> {
-        use windows::Win32::NetworkManagement::WindowsFirewall::{
-            NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
-        };
-        use windows::Win32::Security::EqualSid;
-
-        unsafe {
-            let mut count = 0u32;
-            let mut arr: *mut SID_AND_ATTRIBUTES = std::ptr::null_mut();
-            let _ = NetworkIsolationGetAppContainerConfig(&mut count, &mut arr);
-
-            let mut list: Vec<SID_AND_ATTRIBUTES> = Vec::new();
-            if !arr.is_null() {
-                let existing = std::slice::from_raw_parts(arr, count as usize);
-                for e in existing {
-                    if EqualSid(e.Sid, sid).is_ok() {
-                        return Ok(()); // already exempt
-                    }
-                    list.push(*e);
-                }
-            }
-            list.push(SID_AND_ATTRIBUTES {
-                Sid: sid,
-                Attributes: 0,
-            });
-            let r = NetworkIsolationSetAppContainerConfig(&list);
-            if r != 0 {
-                return Err(sb(format!(
-                    "NetworkIsolationSetAppContainerConfig failed: {r} — the loopback \
-                     exemption requires Administrator; run the sandbox install elevated once"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// One-time, Administrator-only setup for network-enabled sandboxing. Creates
-    /// both AppContainer profiles and adds the loopback exemption that lets an
-    /// `allow_net` child reach the egress proxy. The exemption persists, so this
-    /// is run once (elevated) and the daemon then runs unelevated; a net child
-    /// requested before it runs fails closed with an install hint. Idempotent.
+    /// One-time setup: ensure the AppContainer profiles exist (no elevation
+    /// needed to create them).
+    ///
+    /// NOTE: network enforcement uses WFP filters added at runtime
+    /// ([`super::windows_wfp`]). Adding WFP filters requires the daemon to hold
+    /// WFP access — typically Administrator, or an admin-granted WFP access ACL
+    /// on the daemon's identity. The exact requirement must be verified on the
+    /// target machine; a net child whose `provision` fails surfaces the WFP error.
     pub fn install() -> Result<(), ShellError> {
         ensure_profile(PROFILE_CONFINED);
-        let net_sid = appcontainer_sid(true)?;
-        let res = add_loopback_exemption(net_sid);
-        unsafe { FreeSid(net_sid) };
-        res
+        ensure_profile(PROFILE_NET);
+        Ok(())
     }
 
     /// Best-effort: stamp an access-allowed ACE granting `mask` to `sid` on
@@ -424,14 +377,65 @@ mod imp {
         String::from_utf8_lossy(&out).into_owned()
     }
 
+    /// Build the `internetClient` capability (S-1-15-3-1) so the AppContainer
+    /// child can attempt outbound network; WFP then restricts it to allowed IPs.
+    /// The returned SID must be freed (LocalFree) after the spawn.
+    fn internet_client_capability() -> (Vec<SID_AND_ATTRIBUTES>, PSID) {
+        let s = to_wide("S-1-15-3-1");
+        let mut psid = PSID::default();
+        unsafe {
+            let _ = ConvertStringSidToSidW(PCWSTR(s.as_ptr()), &mut psid);
+        }
+        let caps = vec![SID_AND_ATTRIBUTES {
+            Sid: psid,
+            Attributes: 0x0000_0004, // SE_GROUP_ENABLED
+        }];
+        (caps, psid)
+    }
+
+    /// Copy a SID's raw bytes (for the WFP package-id condition).
+    fn sid_to_bytes(sid: PSID) -> Vec<u8> {
+        unsafe {
+            let len = GetLengthSid(sid) as usize;
+            std::slice::from_raw_parts(sid.0 as *const u8, len).to_vec()
+        }
+    }
+
+    /// Provision the WFP filter set for a network child: default-deny scoped to
+    /// the package SID, permit literal-IP grants, pre-resolved host grants, and
+    /// DNS servers. The filter + handle are held for the child's lifetime.
+    fn provision_wfp(
+        sid: PSID,
+        policy: &SandboxPolicy,
+    ) -> Result<(WfpFilter, WfpHandle), ShellError> {
+        use crate::dns_pin::{Resolve, SystemResolver, split_grants};
+        let (host_grants, mut ips) = split_grants(&policy.net_hosts);
+        let resolver = SystemResolver;
+        for g in &host_grants {
+            if let ("net", Some(name)) = g.parts()
+                && !name.contains('*')
+                && let Ok(addrs) = resolver.resolve(name)
+            {
+                // Only concrete names pre-resolve; wildcards are skipped (no L7).
+                ips.extend(addrs);
+            }
+        }
+        ips.extend(crate::sandbox::windows_wfp::system_dns_servers());
+        let filter = WfpFilter::new(sid_to_bytes(sid));
+        let handle = filter
+            .provision(&ips)
+            .map_err(|e| sb(format!("WFP provision: {e}")))?;
+        Ok((filter, handle))
+    }
+
     pub fn run_blocking(
         req: &ExecRequest,
         policy: &SandboxPolicy,
-        proxy_addr: Option<std::net::SocketAddr>,
     ) -> Result<ExecResult, ShellError> {
-        // `proxy_addr` is Some iff the policy permits network. Network children
-        // run in the loopback-exempt profile; denied children in the confined one.
-        let net = proxy_addr.is_some();
+        // Network children get the `internetClient` capability + a WFP filter set
+        // scoped to their package SID (host/IP allowlist). Denied children get no
+        // capability and no WFP, so the OS blocks all outbound by construction.
+        let net = policy.allow_net;
         let sid = appcontainer_sid(net)?;
 
         // Grant the AppContainer access to exactly the policy's paths. Without an
@@ -470,6 +474,14 @@ mod imp {
             }
         }
 
+        // Network child: provision the WFP allowlist scoped to this package SID
+        // (held for the child's lifetime, torn down at the end).
+        let mut wfp = if net {
+            Some(provision_wfp(sid, policy)?)
+        } else {
+            None
+        };
+
         // stdio pipes. stdout/stderr: child inherits the WRITE end (false).
         // stdin: child inherits the READ end (true). The shared SD grants the
         // AppContainer access to the inherited ends.
@@ -491,39 +503,25 @@ mod imp {
         }
         let mut cmdline_w = to_wide(&cmdline);
 
-        // Proxy env block (UTF-16, double-NUL terminated) when a proxy is active.
-        let env_block: Option<Vec<u16>> = proxy_addr.map(|addr| {
-            let proxy = format!("http://127.0.0.1:{}", addr.port());
-            let mut vars: Vec<(String, String)> = std::env::vars().collect();
-            for k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"] {
-                vars.retain(|(name, _)| !name.eq_ignore_ascii_case(k));
-            }
-            for k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
-                vars.push((k.to_string(), proxy.clone()));
-            }
-            vars.push(("NO_PROXY".into(), "localhost,127.0.0.1,::1".into()));
-            let mut block = Vec::new();
-            for (k, v) in vars {
-                block.extend(to_wide(&format!("{k}={v}")));
-            }
-            block.push(0);
-            block
-        });
+        // No proxy env: enforcement is the WFP allowlist + AppContainer.
+        let env_block: Option<Vec<u16>> = None;
 
-        // Fail closed (no admin) if a net child is requested before `install`.
-        if net && !loopback_exemption_present(sid) {
-            unsafe { FreeSid(sid) };
-            return Err(sb(
-                "network sandbox not installed: run `daemon --install-sandbox` once as \
-                 Administrator to grant the loopback exemption (the daemon itself stays \
-                 unelevated)",
-            ));
-        }
-
+        // A network child gets the `internetClient` capability so the OS lets it
+        // attempt DNS/TCP; WFP then restricts it to allowed IPs. `caps` and
+        // `ic_sid` must outlive `CreateProcessW`.
+        let (caps, ic_sid) = if net {
+            internet_client_capability()
+        } else {
+            (Vec::new(), PSID::default())
+        };
         let sec_caps = SECURITY_CAPABILITIES {
             AppContainerSid: sid,
-            Capabilities: std::ptr::null_mut(),
-            CapabilityCount: 0,
+            Capabilities: if caps.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                caps.as_ptr() as *mut SID_AND_ATTRIBUTES
+            },
+            CapabilityCount: caps.len() as u32,
             Reserved: 0,
         };
 
@@ -638,18 +636,24 @@ mod imp {
             })
         })();
 
-        // Teardown.
+        // Teardown. Close the WFP dynamic session (removes all our filters).
+        if let Some((filter, handle)) = wfp.take() {
+            filter.teardown(handle);
+        }
         unsafe {
             DeleteProcThreadAttributeList(attr_list);
             let _ = CloseHandle(out.read);
             let _ = CloseHandle(err.read);
             let _ = CloseHandle(inp.write);
             FreeSid(sid);
+            if !ic_sid.0.is_null() {
+                let _ = LocalFree(HLOCAL(ic_sid.0));
+            }
             if !pipe_sd.0.is_null() {
                 let _ = LocalFree(HLOCAL(pipe_sd.0));
             }
         }
-        // `attr_buf` stays alive until here, after spawn.
+        // `attr_buf` / `caps` stay alive until here, after spawn.
 
         result
     }

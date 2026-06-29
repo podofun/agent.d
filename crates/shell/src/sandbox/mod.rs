@@ -17,13 +17,22 @@ mod backend;
 mod backend;
 
 #[cfg(target_os = "macos")]
-pub use backend::wrap_argv;
+pub use backend::{run_contained as macos_run_contained, wrap_argv};
+
+#[cfg(target_os = "macos")]
+pub mod macos_pf;
 
 #[cfg(target_os = "windows")]
 pub use backend::run_contained as windows_run_contained;
 
+#[cfg(target_os = "windows")]
+pub mod windows_wfp;
+
 #[cfg(target_os = "linux")]
 pub mod linux_net;
+
+#[cfg(target_os = "linux")]
+pub mod linux_transparent;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod seccomp_linux;
@@ -34,7 +43,7 @@ pub(crate) mod seccomp_linux;
 /// Linux.
 pub fn run_netns_supervisor_if_requested() {
     #[cfg(target_os = "linux")]
-    linux_net::run_supervisor_if_requested();
+    linux_transparent::run_supervisor_if_requested();
 }
 
 /// Apply the policy to the CURRENT process/thread (call site is the forked

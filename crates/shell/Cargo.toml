@@ -16,6 +16,9 @@ landlock = "0.4.5"
 nix = { version = "0.29", features = ["sched", "socket", "user", "process", "fs", "mount", "net"] }
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",

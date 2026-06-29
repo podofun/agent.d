@@ -1,0 +1,271 @@
+//! Windows transparent network backend: WFP ALE filters scoped to the child's
+//! AppContainer package SID (driver-free, the same mechanism Windows Firewall
+//! and simplewall use).
+//!
+//! Model (Architecture, Windows variant):
+//! - The child runs in an AppContainer **with** the `internetClient` capability
+//!   (so the OS lets it attempt DNS/TCP), but a WFP filter set scoped to its
+//!   package SID **default-denies** all outbound and permits only specific
+//!   remote IPs.
+//! - DNS-pin is daemon-side **pre-resolution**: we resolve the policy's
+//!   `net:<host>` grants up front, permit the resulting IPs (+ literal `net:<ip>`
+//!   grants + the configured DNS servers), and refresh on a timer. There is no
+//!   transparent redirect (that needs a callout driver), so this is IP-level
+//!   only, with a documented multi-IP/TTL staleness window.
+//! - Filters live in a WFP **dynamic session**: they are auto-removed when the
+//!   engine handle closes (process exit / teardown), so nothing leaks.
+
+#![cfg(target_os = "windows")]
+
+use std::net::{IpAddr, Ipv4Addr};
+
+use windows::Win32::Foundation::ERROR_SUCCESS;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
+    FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_ACTION_TYPE, FWP_BYTE_ARRAY16, FWP_BYTE_ARRAY16_TYPE,
+    FWP_BYTE_BLOB, FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_SID,
+    FWP_UINT32, FWP_VALUE0, FWP_VALUE0_0, FWPM_CONDITION_ALE_PACKAGE_ID,
+    FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_FILTER_CONDITION0, FWPM_FILTER0,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_SESSION_FLAG_DYNAMIC,
+    FWPM_SESSION0, FWPM_SUBLAYER0, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0,
+    FwpmSubLayerAdd0,
+};
+use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
+use windows::core::GUID;
+
+use crate::netfilter::{FilterError, FilterHandle, NetFilter, Supports};
+
+/// Owns the WFP engine handle for one identity; closed at teardown.
+pub struct EngineHandle(pub windows::Win32::Foundation::HANDLE);
+
+/// A live WFP engine session owning the filter set for one sandboxed identity.
+pub struct WfpHandle {
+    engine: EngineHandle,
+    sublayer: GUID,
+}
+
+impl FilterHandle for WfpHandle {}
+
+// SAFETY: the engine handle is a kernel handle usable across threads; we only
+// touch it under the host's single owning task.
+unsafe impl Send for WfpHandle {}
+unsafe impl Sync for WfpHandle {}
+
+/// WFP-backed filter. `package_sid` scopes every filter to the child's
+/// AppContainer so only that process tree is constrained.
+pub struct WfpFilter {
+    /// The child's AppContainer package SID, as a raw SID byte blob.
+    package_sid: Vec<u8>,
+}
+
+impl WfpFilter {
+    pub fn new(package_sid: Vec<u8>) -> Self {
+        WfpFilter { package_sid }
+    }
+}
+
+fn wfp_err(code: u32, what: &str) -> FilterError {
+    FilterError::Apply(format!("{what}: WFP error {code:#x}"))
+}
+
+/// The package-SID match condition. `blob` must outlive the filter-add call.
+/// The value encoding for `ALE_PACKAGE_ID` is `FWP_SID` + a byte blob.
+fn pkg_condition(blob: &FWP_BYTE_BLOB) -> FWPM_FILTER_CONDITION0 {
+    let mut c = FWPM_FILTER_CONDITION0::default();
+    c.fieldKey = FWPM_CONDITION_ALE_PACKAGE_ID;
+    c.matchType = FWP_MATCH_EQUAL;
+    c.conditionValue = FWP_CONDITION_VALUE0 {
+        r#type: FWP_SID,
+        Anonymous: FWP_CONDITION_VALUE0_0 {
+            byteBlob: blob as *const _ as *mut FWP_BYTE_BLOB,
+        },
+    };
+    c
+}
+
+impl NetFilter for WfpFilter {
+    type Handle = WfpHandle;
+
+    fn supports(&self) -> Supports {
+        // WFP ALE filters cover both families.
+        Supports {
+            ipv4: true,
+            ipv6: true,
+        }
+    }
+
+    fn provision(&self, literal_ips: &[IpAddr]) -> Result<WfpHandle, FilterError> {
+        // Open a dynamic engine session (filters auto-removed on close).
+        let mut session = FWPM_SESSION0::default();
+        session.flags = FWPM_SESSION_FLAG_DYNAMIC;
+        let mut engine = windows::Win32::Foundation::HANDLE::default();
+        let rc = unsafe {
+            FwpmEngineOpen0(
+                None,
+                RPC_C_AUTHN_WINNT,
+                None,
+                Some(&session),
+                &mut engine as *mut _ as *mut _,
+            )
+        };
+        if rc != ERROR_SUCCESS.0 {
+            return Err(wfp_err(rc, "FwpmEngineOpen0"));
+        }
+        let engine = EngineHandle(engine);
+
+        // A private sublayer to hold our filters.
+        let sublayer = GUID::new().map_err(|e| FilterError::Apply(e.to_string()))?;
+        let mut sl = FWPM_SUBLAYER0::default();
+        sl.subLayerKey = sublayer;
+        let name: Vec<u16> = "agentd.sbx\0".encode_utf16().collect();
+        sl.displayData.name = windows::core::PWSTR(name.as_ptr() as *mut u16);
+        let rc = unsafe { FwpmSubLayerAdd0(engine.0, &sl, None) };
+        if rc != ERROR_SUCCESS.0 {
+            return Err(wfp_err(rc, "FwpmSubLayerAdd0"));
+        }
+
+        let h = WfpHandle { engine, sublayer };
+
+        // Default-deny: block all outbound for this package SID (low weight).
+        self.add_block_all(&h)?;
+        // Seed literal-IP grants.
+        for ip in literal_ips {
+            self.add_permit_ip(&h, *ip)?;
+        }
+        Ok(h)
+    }
+
+    fn commit_allow(
+        &self,
+        handle: &WfpHandle,
+        ips: &[IpAddr],
+        _ttl: std::time::Duration,
+    ) -> Result<(), FilterError> {
+        for ip in ips {
+            self.add_permit_ip(handle, *ip)?;
+        }
+        Ok(())
+    }
+
+    fn revoke(&self, _handle: &WfpHandle, _ips: &[IpAddr]) -> Result<(), FilterError> {
+        // Per-IP revoke would require tracking filter ids; the dynamic session is
+        // torn down wholesale at teardown, which is sufficient for the
+        // pre-resolve model (the set is rebuilt per exec). No-op.
+        Ok(())
+    }
+
+    fn teardown(&self, handle: WfpHandle) {
+        // Closing the dynamic engine session removes every filter we added.
+        unsafe {
+            let _ = FwpmEngineClose0(handle.engine.0);
+        }
+    }
+}
+
+impl WfpFilter {
+    fn pkg_blob(&self) -> FWP_BYTE_BLOB {
+        FWP_BYTE_BLOB {
+            size: self.package_sid.len() as u32,
+            // Points into `self.package_sid` (owned by self, stable for the
+            // lifetime of every filter call).
+            data: self.package_sid.as_ptr() as *mut u8,
+        }
+    }
+
+    fn add_block_all(&self, h: &WfpHandle) -> Result<(), FilterError> {
+        // `blob` must outlive the FwpmFilterAdd0 calls below — keep it here.
+        let blob = self.pkg_blob();
+        let pkg = pkg_condition(&blob);
+        for layer in [
+            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        ] {
+            self.add_filter(h, layer, FWP_ACTION_BLOCK, 0, &[pkg])?;
+        }
+        Ok(())
+    }
+
+    fn add_permit_ip(&self, h: &WfpHandle, ip: IpAddr) -> Result<(), FilterError> {
+        // `blob` (and `arr` for v6) must outlive the FwpmFilterAdd0 call.
+        let blob = self.pkg_blob();
+        let pkg = pkg_condition(&blob);
+        let mut addr = FWPM_FILTER_CONDITION0::default();
+        addr.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+        addr.matchType = FWP_MATCH_EQUAL;
+        match ip {
+            IpAddr::V4(v4) => {
+                addr.conditionValue = FWP_CONDITION_VALUE0 {
+                    r#type: FWP_UINT32,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        uint32: u32::from(v4),
+                    },
+                };
+                self.add_filter(
+                    h,
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+                    FWP_ACTION_PERMIT,
+                    10,
+                    &[pkg, addr],
+                )?;
+            }
+            IpAddr::V6(v6) => {
+                let arr = FWP_BYTE_ARRAY16 {
+                    byteArray16: v6.octets(),
+                };
+                addr.conditionValue = FWP_CONDITION_VALUE0 {
+                    r#type: FWP_BYTE_ARRAY16_TYPE,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        byteArray16: &arr as *const _ as *mut FWP_BYTE_ARRAY16,
+                    },
+                };
+                self.add_filter(
+                    h,
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+                    FWP_ACTION_PERMIT,
+                    10,
+                    &[pkg, addr],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn add_filter(
+        &self,
+        h: &WfpHandle,
+        layer: GUID,
+        action: FWP_ACTION_TYPE,
+        weight: u8,
+        conditions: &[FWPM_FILTER_CONDITION0],
+    ) -> Result<(), FilterError> {
+        let mut filter = FWPM_FILTER0::default();
+        filter.layerKey = layer;
+        filter.subLayerKey = h.sublayer;
+        filter.action.r#type = action;
+        filter.weight = FWP_VALUE0 {
+            r#type: FWP_UINT32,
+            Anonymous: FWP_VALUE0_0 {
+                uint32: weight as u32,
+            },
+        };
+        filter.numFilterConditions = conditions.len() as u32;
+        filter.filterCondition = conditions.as_ptr() as *mut FWPM_FILTER_CONDITION0;
+        let mut id = 0u64;
+        let rc = unsafe { FwpmFilterAdd0(h.engine.0, &filter, None, Some(&mut id)) };
+        if rc != ERROR_SUCCESS.0 {
+            return Err(wfp_err(rc, "FwpmFilterAdd0"));
+        }
+        Ok(())
+    }
+}
+
+/// DNS servers the child is allowed to reach (so name resolution works),
+/// seeded into the permit set. This returns a conservative default set (the
+/// loopback stub + common public resolvers); reading the active interface's
+/// configured resolvers is a planned improvement.
+pub fn system_dns_servers() -> Vec<IpAddr> {
+    vec![
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+    ]
+}
