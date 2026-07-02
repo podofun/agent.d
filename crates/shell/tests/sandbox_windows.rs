@@ -260,19 +260,18 @@ async fn net_denied_blocks_outbound() {
 }
 
 /// Host-granular network: with only `example.com` permitted, a request to it
-/// succeeds (relayed by the policy-enforcing proxy) while a request to the
-/// non-allowlisted `google.com` is blocked. The AppContainer holds no network
-/// capability, so the proxy is its only egress — the denied case also proves the
-/// child cannot bypass the proxy to reach an arbitrary host. Behaviour matches
-/// Linux/macOS.
+/// succeeds while a request to the non-allowlisted `google.com` is blocked. The
+/// child's outbound is default-denied by WFP and permitted only to the resolved
+/// IPs of allowed hosts, so the denied case proves it cannot reach an arbitrary
+/// host. Behaviour matches Linux/macOS.
 #[tokio::test]
 async fn net_host_allowlist_is_enforced() {
     let _serial = SANDBOX_SERIAL.lock().await;
     assert!(is_supported(), "windows sandbox must be supported");
 
-    // Skip where the test process can't run the privileged install.
-    if agentd_shell::sandbox::install().is_err() {
-        eprintln!("network sandbox install needs elevation; skipping");
+    // Requires the broker service (installed via `daemon --install-sandbox`).
+    if !agentd_shell::netbroker::available() {
+        eprintln!("network broker not installed; skipping");
         return;
     }
 
@@ -316,6 +315,76 @@ async fn net_host_allowlist_is_enforced() {
     assert_ne!(
         denied.exit_code, 0,
         "non-allowlisted host must be blocked, but curl succeeded"
+    );
+}
+
+/// Raw SMTP (not HTTP) through the sandbox: with `smtp.gmail.com` granted, a
+/// Python `socket` connect to port 587 reaches the server and reads its `220`
+/// banner; with only an unrelated host granted, the same connect is blocked.
+/// Proves the WFP model is all-protocol — not limited to an HTTP proxy — and
+/// still host-granular. Reachability only; sends no mail and needs no creds.
+#[tokio::test]
+async fn python_smtp_allow_and_deny() {
+    let _serial = SANDBOX_SERIAL.lock().await;
+    assert!(is_supported(), "windows sandbox must be supported");
+
+    if !agentd_shell::netbroker::available() {
+        eprintln!("network broker not installed; skipping");
+        return;
+    }
+    let Some(py) = user_python() else {
+        eprintln!("no user-installed python on PATH; skipping");
+        return;
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let script = "import socket, sys\n\
+try:\n\
+\x20   s = socket.create_connection((\"smtp.gmail.com\", 587), timeout=15)\n\
+\x20   banner = s.recv(64); s.close()\n\
+\x20   print(\"SMTP_OK\" if banner[:3] == b\"220\" else \"SMTP_BAD\")\n\
+except Exception as e:\n\
+\x20   print(\"SMTP_FAIL\", e); sys.exit(1)\n";
+    let script_path = dir.path().join("probe.py");
+    std::fs::write(&script_path, script).unwrap();
+    let script_arg = script_path.to_string_lossy().into_owned();
+
+    // Allowed: smtp.gmail.com is granted → connect + banner succeed.
+    let allow = exec(req(
+        py.clone(),
+        vec![script_arg.clone()],
+        net_policy(dir.path(), &["smtp.gmail.com"]),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        allow.exit_code, 0,
+        "granted SMTP host must be reachable; stdout={:?} stderr={}",
+        allow.stdout, allow.stderr
+    );
+    assert!(
+        allow.stdout.contains("SMTP_OK"),
+        "expected SMTP banner; got {:?}",
+        allow.stdout
+    );
+
+    // Denied: only an unrelated host granted → SMTP connect blocked by WFP.
+    let deny = exec(req(
+        py,
+        vec![script_arg],
+        net_policy(dir.path(), &["example.com"]),
+    ))
+    .await
+    .unwrap();
+    assert_ne!(
+        deny.exit_code, 0,
+        "non-granted SMTP host must be blocked; stdout={:?}",
+        deny.stdout
+    );
+    assert!(
+        !deny.stdout.contains("SMTP_OK"),
+        "reached SMTP without a grant: {:?}",
+        deny.stdout
     );
 }
 

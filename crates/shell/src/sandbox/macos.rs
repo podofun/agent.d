@@ -1,5 +1,11 @@
 //! macOS Seatbelt backend. Enforced by wrapping argv in `sandbox-exec`, not by
 //! self-restriction, so `apply` returns an error and `exec` calls `wrap_argv`.
+//!
+//! The no-network path is pure Seatbelt (`deny default`, no network-outbound
+//! allow). Host-granular network is enforced by the transparent pf-broker path
+//! (see [`super::macos_transparent`]): the child runs under a Seatbelt profile
+//! that *allows* outbound ([`sbpl_net_for_broker`]) while `pf` — scoped to the
+//! broker-leased uid — redirects its traffic to the daemon's policy relay.
 
 use crate::policy::{READ_BASELINE, SandboxError, SandboxPolicy, WRITE_SCRATCH};
 
@@ -7,9 +13,9 @@ pub fn is_supported() -> bool {
     std::path::Path::new("/usr/bin/sandbox-exec").exists()
 }
 
-/// Net containment uses the same Seatbelt wrapper, so support tracks `is_supported`.
+/// Host-granular net requires the pf broker to be reachable; support tracks it.
 pub fn net_supported() -> bool {
-    is_supported()
+    is_supported() && super::macos_transparent::broker_available()
 }
 
 /// Unused on macOS (wrapper model); kept for the dispatch signature parity.
@@ -19,47 +25,92 @@ pub fn apply(_policy: &SandboxPolicy) -> Result<(), SandboxError> {
     ))
 }
 
-/// Generate SBPL and return the rewritten (bin, args) running under
-/// `sandbox-exec`. Caller (exec on macOS) substitutes these for the original.
-///
-/// `proxy_addr` is the egress proxy's loopback address when host-granular net is
-/// active: the child is then allowed to reach ONLY that exact loopback port, so
-/// its only network path is the policy-enforcing proxy. When `None` and
-/// `allow_net` is false, all network is denied.
-pub fn wrap_argv(
-    policy: &SandboxPolicy,
-    proxy_addr: Option<std::net::SocketAddr>,
-    bin: &str,
-    args: &[String],
-) -> (String, Vec<String>) {
-    let mut sbpl = String::from("(version 1)\n(deny default)\n(allow process-exec process-fork)\n");
+/// macOS-only read baseline on top of [`READ_BASELINE`]: dyld needs to stat
+/// `/` itself (literal, not subpath — grants nothing below it) and read the
+/// shared cache + system frameworks, or every child dies with SIGABRT before
+/// `main`. Verified minimal on macOS 26: without the `/` literal, even
+/// `/bin/echo` aborts.
+const MACOS_READ_EXTRA: &[&str] = &[
+    "/System",
+    "/private/var/db",
+    "/private/var/select", // `/bin/sh` reads its implementation through here
+    "/dev/urandom",
+    "/dev/random",
+    "/dev/zero",
+];
 
+/// Seatbelt matches on RESOLVED paths, but grants often come in via symlinks
+/// (`/var` -> `/private/var`, `/tmp` -> `/private/tmp` — every macOS tempdir).
+/// Emit BOTH forms: the canonical one is what the kernel checks; the original
+/// keeps the rule readable and covers non-resolving lookups.
+fn path_forms(p: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = p.to_str().map(str::to_owned).into_iter().collect();
+    if let Ok(c) = std::fs::canonicalize(p)
+        && let Some(c) = c.to_str()
+        && !out.iter().any(|o| o == c)
+    {
+        out.push(c.to_owned());
+    }
+    out
+}
+
+/// Shared SBPL prelude: default-deny + fs confinement from the policy. Network
+/// rules are appended by the caller (none for the deny path).
+///
+/// `file-read-metadata` is allowed globally: stat/readlink only (no contents),
+/// and required for symlink traversal (`/var`, `/tmp`) and the child's getcwd.
+fn sbpl_fs(policy: &SandboxPolicy) -> String {
+    let mut sbpl = String::from(
+        "(version 1)\n(deny default)\n(allow process-exec* process-fork)\n(allow sysctl-read)\n\
+         (allow file-read-metadata)\n(allow file-read* (literal \"/\"))\n",
+    );
     for r in READ_BASELINE
         .iter()
-        .copied()
-        .chain(policy.read_paths.iter().filter_map(|p| p.to_str()))
+        .chain(MACOS_READ_EXTRA.iter())
+        .map(|s| s.to_string())
+        .chain(policy.read_paths.iter().flat_map(|p| path_forms(p)))
     {
         sbpl.push_str(&format!("(allow file-read* (subpath \"{r}\"))\n"));
     }
     for w in policy
         .write_paths
         .iter()
-        .filter_map(|p| p.to_str())
-        .chain(WRITE_SCRATCH.iter().copied())
+        .flat_map(|p| path_forms(p))
+        .chain(WRITE_SCRATCH.iter().map(|s| s.to_string()))
     {
         sbpl.push_str(&format!("(allow file-write* (subpath \"{w}\"))\n"));
     }
-    // Network is default-denied. When the egress proxy is active, allow only the
-    // exact proxy loopback port — not `localhost` broadly — so no other local
-    // listener becomes a lateral path.
-    if let Some(addr) = proxy_addr {
-        sbpl.push_str(&format!(
-            "(allow network-outbound (remote ip \"localhost:{}\"))\n",
-            addr.port()
-        ));
-    }
+    sbpl
+}
 
+/// Generate SBPL and return the rewritten (bin, args) running under
+/// `sandbox-exec`. Caller (exec on macOS) substitutes these for the original.
+///
+/// Network is fully denied: this path is only taken when the policy permits no
+/// network (host-granular network has no transparent macOS backend yet, so
+/// `allow_net` execs fail closed before reaching here).
+pub fn wrap_argv(policy: &SandboxPolicy, bin: &str, args: &[String]) -> (String, Vec<String>) {
+    // Network is default-denied (deny default + no network-outbound allow).
+    let sbpl = sbpl_fs(policy);
     let mut new_args = vec!["-p".to_string(), sbpl, "--".to_string(), bin.to_string()];
     new_args.extend(args.iter().cloned());
     ("/usr/bin/sandbox-exec".to_string(), new_args)
+}
+
+/// SBPL for a broker-spawned net child: confine the filesystem but ALLOW
+/// outbound network — `pf` (scoped to the child's dedicated uid) enforces the
+/// host/IP allowlist, and the daemon's relay does the per-connection admit
+/// decision. Built here, sent to the broker over the wire.
+///
+/// `mach-lookup` is allowed so the child resolves names normally via
+/// mDNSResponder. macOS name resolution does NOT traverse a per-uid UDP/53 path
+/// we could redirect (verified: denying mDNSResponder does not make
+/// `getaddrinfo` fall back to catchable direct DNS), so — unlike Linux — the
+/// daemon never sees the query name. Concrete `net:<host>` grants are honored
+/// by the relay's reactive resolution (resolve the grant, admit the matching
+/// IP); see `macos_transparent::admit_dst`.
+pub fn sbpl_net_for_broker(policy: &SandboxPolicy) -> String {
+    let mut sbpl = sbpl_fs(policy);
+    sbpl.push_str("(allow network-outbound)\n(allow network-bind)\n(allow mach-lookup)\n(allow system-socket)\n");
+    sbpl
 }

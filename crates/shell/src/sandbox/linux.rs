@@ -1,4 +1,5 @@
-//! Landlock backend. Phase 1: filesystem confinement + coarse network on/off.
+//! Landlock backend: filesystem confinement (network is enforced separately via
+//! the netns supervisor + nftables, see `linux_transparent`/`netfilter`).
 //!
 //! `apply` builds the ruleset and calls `restrict_self` on the CALLING thread,
 //! so it must run from the forked child (via `pre_exec`) — never the daemon.

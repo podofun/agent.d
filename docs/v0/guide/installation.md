@@ -17,8 +17,10 @@ Pick the archive for your platform:
 | macOS (Apple Silicon) | `agentd-aarch64-macos.tar.gz` |
 | Windows (x86-64) | `agentd-x86_64-windows.zip` |
 
-Each archive contains both binaries (`daemon` and `agentctl`, with `.exe`
-extensions on Windows) plus the README and license. A `SHA256SUMS.txt` is
+Each archive contains the `daemon` and `agentctl` binaries (with `.exe`
+extensions on Windows) plus the README and license. The Windows archive also
+includes `agentd-netbroker.exe`, a helper the daemon launches for sandboxed
+networking — keep it in the same folder as `daemon.exe`. A `SHA256SUMS.txt` is
 published alongside the archives so you can verify your download.
 
 ::: code-group
@@ -38,9 +40,9 @@ install -m 0755 daemon agentctl ~/.local/bin/
 # Extract the archive
 Expand-Archive agentd-x86_64-windows.zip -DestinationPath agentd
 
-# Move the binaries somewhere on your PATH, e.g.
+# Move the binaries somewhere on your PATH, e.g. (keep all three together)
 New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\Programs\agentd" | Out-Null
-Move-Item agentd\daemon.exe, agentd\agentctl.exe "$env:LOCALAPPDATA\Programs\agentd"
+Move-Item agentd\daemon.exe, agentd\agentctl.exe, agentd\agentd-netbroker.exe "$env:LOCALAPPDATA\Programs\agentd"
 # Then add that folder to your PATH (System settings → Environment Variables)
 ```
 
