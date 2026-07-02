@@ -4,10 +4,11 @@
   "buildCommand": "bun run docs:build",
   "outputDirectory": ".vitepress/dist",
   "cleanUrls": true,
+  "trailingSlash": false,
   "redirects": [
     {
       "source": "/",
-      "destination": "/agentd/",
+      "destination": "/agentd",
       "permanent": false
     }
   ]
