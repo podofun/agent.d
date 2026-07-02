@@ -11,6 +11,7 @@ members = [
     "crates/packages",
     "crates/services",
     "crates/shell",
+    "crates/netbroker",
     "crates/skills",
     "crates/memory",
     "crates/fs",

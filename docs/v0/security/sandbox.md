@@ -30,17 +30,32 @@ Keep grants narrow, and use the `cwd` option to scope where a tool's relative pa
 
 A child process can only reach hosts you allow with `net:` grants. With no `net:` grant it has no outbound network, and it cannot bypass the grants by connecting directly — the hosts allowed at the Lua API layer are the only ones a spawned binary can reach. Enforced on Linux, macOS, and Windows.
 
-### Windows: one-time network setup
+The grant syntax is identical everywhere: `net:1.2.3.4` (literal IP), `net:api.example.com` (host), `net:api.example.*` (suffix wildcard). You write the same `grants.toml` on every platform.
 
-On Windows, sandboxed networking needs a one-time setup that requires Administrator. Run it once, in an elevated terminal:
+### One-time network setup (macOS and Windows)
+
+The daemon **never runs elevated**. Sandboxed networking needs a small one-time setup that does — run it once per machine, then the daemon runs unprivileged from then on.
+
+**macOS:**
+
+```bash
+sudo agentd --install-sandbox    # sudo agentd --uninstall-sandbox to reverse
+```
+
+**Windows** (elevated terminal):
 
 ```powershell
 daemon --install-sandbox
 ```
 
-It prints a confirmation and exits. The daemon itself then runs normally, without Administrator — you only do this once per machine.
+Each prints a confirmation and exits. Until you run it, `ctx.shell` calls that need network fail closed with a message pointing here; calls that don't use the network are unaffected. **Linux needs no setup.**
 
-Until you run it, `ctx.shell` calls that need network fail closed with a message pointing you here. Calls that don't use the network are unaffected.
+### Platform notes
+
+On every platform a binary can reach exactly the hosts and IPs your `net:` grants cover — literal IPs, host names, and suffix wildcards — and nothing else, over both IPv4 and IPv6. Two behaviors differ slightly today:
+
+- **macOS wildcards** rely on the destination having correct reverse DNS, which is true for most services. If a wildcard-granted host isn't reachable, grant it by its concrete name or IP instead.
+- **Windows** does not yet honor wildcard host grants — a connection to a wildcard-granted host fails closed. Grant those hosts by concrete name or IP on Windows for now.
 
 ## Fail-closed
 

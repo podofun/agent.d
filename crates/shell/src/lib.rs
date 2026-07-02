@@ -12,8 +12,13 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+pub mod dns_pin;
+pub mod dns_wire;
+pub mod gateway;
+#[cfg(target_os = "windows")]
+pub mod netbroker;
+pub mod netfilter;
 pub mod policy;
-pub mod proxy;
 pub mod sandbox;
 pub use policy::{SandboxError, SandboxPolicy};
 
@@ -79,60 +84,63 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
         return Err(ShellError::SandboxUnavailable);
     }
 
-    // Host-granular network (Linux): when the policy permits network, the child
-    // is confined inside a netns whose only route out is the egress proxy. This
-    // path owns the whole spawn and returns. Fail closed if unavailable.
-    #[cfg(target_os = "linux")]
+    // Host-granular network is enforced ONLY by the Linux transparent backend
+    // (netns + nft redirect + DNS-pin, protocol-agnostic, no proxy env). When a
+    // policy permits network:
+    //   - Linux: run the child in the transparent netns; this owns the whole
+    //     spawn and returns.
+    //   - other OSes: no transparent backend yet -> fail closed (never spawn with
+    //     unconfined network).
     if let Some(policy) = req.sandbox.clone()
         && !policy.unrestricted
         && policy.allow_net
     {
-        if !sandbox::net_supported() {
-            return Err(ShellError::SandboxUnavailable);
+        #[cfg(target_os = "linux")]
+        {
+            if !sandbox::net_supported() {
+                return Err(ShellError::SandboxUnavailable);
+            }
+            let (host_grants, literal_ips) = dns_pin::split_grants(&policy.net_hosts);
+            return sandbox::linux_transparent::run_contained(
+                &req,
+                &policy,
+                host_grants,
+                literal_ips,
+            )
+            .await;
         }
-        let proxy = proxy::Proxy::start(policy.net_hosts.clone())
-            .await
-            .map_err(|e| ShellError::Sandbox(e.to_string()))?;
-        return sandbox::linux_net::run_contained(&req, &policy, &proxy).await;
+        // Windows enforces host-granular net via WFP filters scoped to the
+        // child's AppContainer package SID (handled inside run_contained).
+        #[cfg(target_os = "windows")]
+        return sandbox::windows_run_contained(&req, &policy).await;
+        // macOS enforces via the transparent pf-broker path: same DNS-pin +
+        // PermitSet core as Linux, capture via pf redirect to a daemon relay.
+        #[cfg(target_os = "macos")]
+        {
+            if !sandbox::net_supported() {
+                return Err(ShellError::SandboxUnavailable);
+            }
+            let (host_grants, literal_ips) = dns_pin::split_grants(&policy.net_hosts);
+            return sandbox::macos_run_contained(&req, &policy, host_grants, literal_ips).await;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        return Err(ShellError::SandboxUnavailable);
     }
 
-    // Host-granular network (non-Linux): start the egress proxy and keep it alive
-    // for the child's lifetime; the per-OS profile (macOS Seatbelt below) locks
-    // the child to the proxy's loopback port. Fail closed if unavailable.
-    #[cfg(not(target_os = "linux"))]
-    let mut _net_proxy: Option<proxy::Proxy> = None;
-    #[cfg(not(target_os = "linux"))]
-    let mut proxy_addr: Option<std::net::SocketAddr> = None;
-    #[cfg(not(target_os = "linux"))]
-    if let Some(policy) = req.sandbox.clone()
-        && !policy.unrestricted
-        && policy.allow_net
-    {
-        if !sandbox::net_supported() {
-            return Err(ShellError::SandboxUnavailable);
-        }
-        let proxy = proxy::Proxy::start(policy.net_hosts.clone())
-            .await
-            .map_err(|e| ShellError::Sandbox(e.to_string()))?;
-        proxy_addr = Some(proxy.addr());
-        _net_proxy = Some(proxy);
-    }
-
-    // Windows applies confinement at spawn (restricted token + WFP), not via
-    // pre_exec, so it owns the whole spawn and returns. The proxy (if any) stays
-    // alive in `_net_proxy` for the child's lifetime.
+    // No network (or unrestricted): apply the filesystem sandbox. The OS profile
+    // denies network by construction (Landlock/Seatbelt/AppContainer), so no
+    // egress path exists.
     #[cfg(target_os = "windows")]
     if let Some(policy) = req.sandbox.clone()
         && !policy.unrestricted
     {
-        return sandbox::windows_run_contained(&req, &policy, proxy_addr).await;
+        return sandbox::windows_run_contained(&req, &policy).await;
     }
 
-    // macOS enforces via an argv wrapper (sandbox-exec), chosen before spawn. The
-    // proxy address (if any) locks the child's network to the proxy port only.
+    // macOS enforces via an argv wrapper (sandbox-exec), chosen before spawn.
     #[cfg(target_os = "macos")]
     let (bin, args): (String, Vec<String>) = match &req.sandbox {
-        Some(p) if !p.unrestricted => sandbox::wrap_argv(p, proxy_addr, &req.bin, &req.args),
+        Some(p) if !p.unrestricted => sandbox::wrap_argv(p, &req.bin, &req.args),
         _ => (req.bin.clone(), req.args.clone()),
     };
     #[cfg(not(target_os = "macos"))]
@@ -140,23 +148,6 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
 
     let mut cmd = Command::new(&bin);
     cmd.args(&args);
-
-    // Point the child at the egress proxy (cooperative path; enforcement is the
-    // OS profile that confines the child to the proxy port).
-    #[cfg(not(target_os = "linux"))]
-    if let Some(addr) = proxy_addr {
-        let p = format!("http://127.0.0.1:{}", addr.port());
-        for k in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "ALL_PROXY",
-        ] {
-            cmd.env(k, &p);
-        }
-        cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
-    }
 
     if let Some(cwd) = &req.cwd {
         cmd.current_dir(cwd);
