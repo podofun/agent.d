@@ -238,6 +238,11 @@ impl WfpFilter {
         conditions: &[FWPM_FILTER_CONDITION0],
     ) -> Result<(), FilterError> {
         let mut filter = FWPM_FILTER0::default();
+        // WFP requires every filter to carry a display name; a null name fails
+        // `FwpmFilterAdd0` with FWP_E_NULL_DISPLAY_NAME (0x80320023). `name` must
+        // outlive the add call below.
+        let mut name: Vec<u16> = "agentd.sbx.filter\0".encode_utf16().collect();
+        filter.displayData.name = windows::core::PWSTR(name.as_mut_ptr());
         filter.layerKey = layer;
         filter.subLayerKey = h.sublayer;
         filter.action.r#type = action;
