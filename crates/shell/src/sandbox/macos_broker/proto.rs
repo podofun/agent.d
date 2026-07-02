@@ -113,7 +113,6 @@ pub fn write_msg<W: Write, M: Serialize>(w: &mut W, msg: &M) -> Result<(), WireE
 pub fn read_msg<R: BufRead, M: for<'de> Deserialize<'de>>(r: &mut R) -> Result<M, WireError> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
-    use std::io::Read;
     loop {
         match r.read(&mut byte)? {
             0 => {

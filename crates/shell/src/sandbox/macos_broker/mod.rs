@@ -5,7 +5,10 @@
 //! The wire protocol lives in [`proto`] and is unit-tested on every unix OS;
 //! the connected client and `broker_available()` are macOS-only.
 
+pub mod config;
+pub mod pool;
 pub mod proto;
+pub mod server;
 
 /// Filesystem path of the broker's unix socket (created root-owned by the
 /// launchd daemon; connect access is what `getpeereid` guards).
