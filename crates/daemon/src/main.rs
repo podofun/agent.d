@@ -49,13 +49,12 @@ fn main() -> Result<()> {
                     broker.display()
                 ));
             }
-            match elevate::run_elevated(&broker, "--install")? {
-                true => println!(
-                    "Network sandbox installed. The daemon runs without Administrator."
-                ),
-                false => {
-                    return Err(anyhow!("Administrator approval was declined; nothing was changed."));
-                }
+            if elevate::run_elevated(&broker, "--install")? {
+                println!("Network sandbox installed. The daemon runs without Administrator.");
+            } else {
+                return Err(anyhow!(
+                    "Administrator approval was declined; nothing was changed."
+                ));
             }
         }
         #[cfg(not(target_os = "windows"))]

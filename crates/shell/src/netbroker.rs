@@ -9,8 +9,6 @@
 //! (child exit, or daemon crash) the broker tears the child's filters down. No
 //! explicit teardown message, so a dead daemon never leaks filters.
 
-#![cfg(target_os = "windows")]
-
 use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
@@ -163,8 +161,9 @@ pub fn provision(sid: Vec<u8>, ips: Vec<IpAddr>) -> Result<Provision, ShellError
     let pipe = connect()?;
     let req = serde_json::to_vec(&Request::Provision { sid, ips }).map_err(sb)?;
     write_frame(pipe, &req).map_err(|e| sb(format!("broker write: {e}")))?;
-    let resp: Response = serde_json::from_slice(&read_frame(pipe).map_err(|e| sb(format!("broker read: {e}")))?)
-        .map_err(sb)?;
+    let resp: Response =
+        serde_json::from_slice(&read_frame(pipe).map_err(|e| sb(format!("broker read: {e}")))?)
+            .map_err(sb)?;
     match resp {
         Response::Ok => Ok(Provision { pipe }),
         Response::Err(e) => {

@@ -5,8 +5,6 @@
 //! standard UAC consent dialog; the elevated broker registers itself as the
 //! SYSTEM service and the daemon (still Medium integrity) reports the result.
 
-#![cfg(target_os = "windows")]
-
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
