@@ -61,11 +61,34 @@ pub fn build_anchor_rules(uid: u32, tcp_port: u16, dns_port: u16) -> String {
     )
 }
 
-/// Top-level hooks the installer adds once to the main ruleset so per-uid
-/// anchors under `agentd/` are evaluated.
-pub const MAIN_HOOKS: &str = "rdr-anchor \"agentd/*\"\nanchor \"agentd/*\"\n";
+/// Complete main pf ruleset the installer loads ONCE: preserves the stock
+/// `com.apple/*` anchors AND adds the `agentd/*` hooks so per-uid sub-anchors
+/// are evaluated. Section order is mandatory (scrub → nat → rdr → dummynet →
+/// filter); a partial `pfctl -f` reload silently drops whichever sections it
+/// omits (verified the hard way — Task 3 spike). rdr hook precedes the filter
+/// hook because translation runs first.
+pub const MAIN_CONF: &str = "\
+scrub-anchor \"com.apple/*\"\n\
+nat-anchor \"com.apple/*\"\n\
+rdr-anchor \"com.apple/*\"\n\
+rdr-anchor \"agentd/*\"\n\
+dummynet-anchor \"com.apple/*\"\n\
+anchor \"com.apple/*\"\n\
+anchor \"agentd/*\"\n\
+load anchor \"com.apple\" from \"/etc/pf.anchors/com.apple\"\n";
 
-// ---- DIOCNATLOOK ABI (xnu bsd/net/pfvar.h) ----
+/// sysctls the installer must set (and persist) for `route-to (lo0 ...)` to
+/// actually reroute the child's packets onto loopback. Without IP forwarding,
+/// pf accepts the rule but the packet is dropped instead of looped — the child
+/// then reaches the network unfiltered on the deny path / not at all on allow.
+/// VERIFIED in Task 3: forwarding=0 → no interception; forwarding=1 → works.
+pub const REQUIRED_SYSCTLS: &[(&str, &str)] = &[
+    ("net.inet.ip.forwarding", "1"),
+    ("net.inet6.ip6.forwarding", "1"),
+];
+
+// The DIOCNATLOOK ioctl ABI, mirrored from xnu's bsd/net/pfvar.h so the broker
+// can recover a redirected connection's original destination.
 
 /// `struct pf_addr`: 16-byte address union, network byte order; v4 occupies
 /// the first 4 bytes.
@@ -188,6 +211,28 @@ mod tests {
     fn natlook_struct_is_84_bytes_and_ioctl_matches() {
         assert_eq!(std::mem::size_of::<PfiocNatlook>(), 84);
         assert_eq!(DIOCNATLOOK, 0xC054_4417);
+    }
+
+    #[test]
+    fn main_conf_preserves_apple_and_adds_agentd_in_order() {
+        let c = MAIN_CONF;
+        assert!(c.contains("rdr-anchor \"com.apple/*\""), "keep apple rdr");
+        assert!(c.contains("anchor \"com.apple/*\""), "keep apple filter");
+        assert!(c.contains("rdr-anchor \"agentd/*\""));
+        assert!(c.contains("anchor \"agentd/*\""));
+        // rdr hook before filter hook (translation evaluates first).
+        assert!(
+            c.find("rdr-anchor \"agentd/*\"").unwrap() < c.find("\nanchor \"agentd/*\"").unwrap()
+        );
+        // nat section before rdr section before filter section.
+        assert!(c.find("nat-anchor").unwrap() < c.find("rdr-anchor").unwrap());
+        assert!(c.find("rdr-anchor").unwrap() < c.find("\nanchor \"com.apple").unwrap());
+    }
+
+    #[test]
+    fn forwarding_sysctls_required() {
+        assert!(REQUIRED_SYSCTLS.iter().any(|(k, _)| *k == "net.inet.ip.forwarding"));
+        assert!(REQUIRED_SYSCTLS.iter().all(|(_, v)| *v == "1"));
     }
 
     #[test]
