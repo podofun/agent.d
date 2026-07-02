@@ -115,6 +115,18 @@ fn bind_dual_udp() -> std::io::Result<std::net::UdpSocket> {
     Ok(sock.into())
 }
 
+/// Serializes macOS net execs. pf translation (`rdr`) rules cannot match by
+/// user, so two sessions' redirect rules both match a child's packet and pf
+/// takes the first — one uid's traffic could reach the other's relay (wrong
+/// permit set). Holding this for a session's lifetime guarantees only one set
+/// of `agentd/*` rdr rules is ever active, so each child reaches exactly its
+/// own relay. This bounds macOS to one sandboxed-network command at a time; the
+/// access decision is unaffected (it is a throughput limit, not a policy one).
+fn net_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Run `req` under the transparent pf-broker sandbox. Same signature as the
 /// Linux backend so `lib.rs` dispatch is symmetric.
 pub async fn run_contained(
@@ -123,6 +135,7 @@ pub async fn run_contained(
     host_grants: Vec<Permission>,
     literal_ips: Vec<IpAddr>,
 ) -> Result<ExecResult, ShellError> {
+    let _serialize = net_lock().lock().await;
     let broker = Arc::new(Broker::connect()?);
 
     // Relay + DNS listeners (std sockets; converted to tokio below).

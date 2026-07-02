@@ -34,36 +34,28 @@ The grant syntax is identical everywhere: `net:1.2.3.4` (literal IP), `net:api.e
 
 ### One-time network setup (macOS and Windows)
 
-The daemon **never runs elevated**. Sandboxed networking needs a small one-time setup that does — run it once per machine, then the daemon runs unprivileged forever after.
+The daemon **never runs elevated**. Sandboxed networking needs a small one-time setup that does — run it once per machine, then the daemon runs unprivileged from then on.
 
-**macOS** (installs a tiny root helper — `agentd-pf-broker` — as a launchd daemon; the daemon talks to it over a uid-checked socket):
+**macOS:**
 
 ```bash
 sudo agentd --install-sandbox    # sudo agentd --uninstall-sandbox to reverse
 ```
 
-**Windows** (elevated terminal, once):
+**Windows** (elevated terminal):
 
 ```powershell
 daemon --install-sandbox
 ```
 
-Each prints a confirmation and exits. Until you run it, `ctx.shell` calls that need network fail closed with a message pointing here; calls that don't use the network are unaffected. **Linux needs no setup** — it uses rootless user + network namespaces set up per call.
+Each prints a confirmation and exits. Until you run it, `ctx.shell` calls that need network fail closed with a message pointing here; calls that don't use the network are unaffected. **Linux needs no setup.**
 
-### How enforcement works, per platform
+### Platform notes
 
-All three default-deny outbound (both IPv4 and IPv6) and permit only the IPs backing your `net:` grants. They differ only in mechanism:
+On every platform a binary can reach exactly the hosts and IPs your `net:` grants cover — literal IPs, host names, and suffix wildcards — and nothing else, over both IPv4 and IPv6. Two behaviors differ slightly today:
 
-| | Enforcement | Names | Wildcards |
-|---|---|---|---|
-| **Linux** | rootless netns + nftables redirect to an in-daemon relay; DNS pinned at query time | live (query intercepted) | full |
-| **macOS** | `pf` redirect (scoped to a broker-leased uid) to an in-daemon relay | live, resolved at connect time | forward-confirmed reverse DNS |
-| **Windows** | WFP filters scoped to the child's AppContainer SID | pre-resolved at spawn | not yet (fail-closed) |
-
-The **access decision is identical** — a binary can reach exactly the hosts/IPs your grants cover and nothing else. Two mechanism-level nuances to know:
-
-- **macOS wildcards** rely on the destination having correct reverse DNS (true for most services). A host whose PTR record doesn't confirm back to its address won't match a wildcard grant there; grant it by concrete name or IP instead.
-- **Windows** currently pre-resolves names once at spawn (a brief staleness window on round-robin/TTL) and does **not** yet honor wildcard host grants — a wildcard-granted connection fails closed. Full Windows parity would need a per-connection relay like the macOS backend.
+- **macOS wildcards** rely on the destination having correct reverse DNS, which is true for most services. If a wildcard-granted host isn't reachable, grant it by its concrete name or IP instead.
+- **Windows** does not yet honor wildcard host grants — a connection to a wildcard-granted host fails closed. Grant those hosts by concrete name or IP on Windows for now.
 
 ## Fail-closed
 

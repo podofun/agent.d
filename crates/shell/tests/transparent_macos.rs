@@ -1,22 +1,20 @@
 #![cfg(target_os = "macos")]
 //! End-to-end transparent pf-broker backend (macOS): an unmodified binary doing
 //! raw TCP is reachable iff the destination IP is granted, DNS resolves only
-//! allowed names, and — the parity feature the old IP-preresolve path lacked —
-//! wildcard `net:` grants resolve live through the DNS pin.
+//! allowed names, and wildcard `net:` grants are honored.
 //!
-//! Opt-in (`AGENTD_TEST_NET_MACOS=1`) AND requires the broker to be installed
-//! and running (`sudo agentd --install-sandbox`), so a plain `cargo test` on a
-//! dev machine skips cleanly.
+//! These run automatically on macOS whenever the broker is installed and
+//! running (`sudo agentd --install-sandbox`); on a machine without it they skip
+//! cleanly rather than fail, so a plain `cargo test` is always green.
 
 use agentd_permissions::Permission;
 use agentd_shell::{ExecRequest, SandboxPolicy};
 
 fn e2e_enabled() -> bool {
-    std::env::var("AGENTD_TEST_NET_MACOS").as_deref() == Ok("1")
-        && agentd_shell::sandbox::net_supported()
+    agentd_shell::sandbox::net_supported()
 }
 
-const SKIP: &str = "skip: set AGENTD_TEST_NET_MACOS=1 and install the broker (sudo agentd --install-sandbox)";
+const SKIP: &str = "skip: pf broker not installed (run: sudo agentd --install-sandbox)";
 
 fn policy(net_hosts: Vec<&str>) -> SandboxPolicy {
     SandboxPolicy {
