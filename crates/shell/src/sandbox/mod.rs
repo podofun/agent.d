@@ -1,5 +1,6 @@
-//! Native-OS sandbox backend dispatch. Phase 1: filesystem confinement +
-//! coarse network on/off. Applied in the forked child (Linux) or via wrapper.
+//! Native-OS sandbox backend dispatch: filesystem confinement + host/IP-granular
+//! network. Enforcement is per-backend — a re-exec'd netns supervisor (Linux),
+//! an argv wrapper + pf (macOS), and a custom AppContainer + WFP spawn (Windows).
 
 use crate::policy::{SandboxError, SandboxPolicy};
 

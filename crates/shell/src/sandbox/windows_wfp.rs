@@ -22,12 +22,11 @@ use std::net::{IpAddr, Ipv4Addr};
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_ACTION_TYPE, FWP_BYTE_ARRAY16, FWP_BYTE_ARRAY16_TYPE,
-    FWP_BYTE_BLOB, FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_SID,
-    FWP_UINT32, FWP_VALUE0, FWP_VALUE0_0, FWPM_CONDITION_ALE_PACKAGE_ID,
-    FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_FILTER_CONDITION0, FWPM_FILTER0,
-    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_SESSION_FLAG_DYNAMIC,
-    FWPM_SESSION0, FWPM_SUBLAYER0, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0,
-    FwpmSubLayerAdd0,
+    FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_SID, FWP_UINT8, FWP_UINT32,
+    FWP_VALUE0, FWP_VALUE0_0, FWPM_CONDITION_ALE_PACKAGE_ID, FWPM_CONDITION_IP_REMOTE_ADDRESS,
+    FWPM_FILTER_CONDITION0, FWPM_FILTER0, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SESSION0, FWPM_SUBLAYER0,
+    FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmSubLayerAdd0,
 };
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 use windows::core::GUID;
@@ -67,16 +66,18 @@ fn wfp_err(code: u32, what: &str) -> FilterError {
     FilterError::Apply(format!("{what}: WFP error {code:#x}"))
 }
 
-/// The package-SID match condition. `blob` must outlive the filter-add call.
-/// The value encoding for `ALE_PACKAGE_ID` is `FWP_SID` + a byte blob.
-fn pkg_condition(blob: &FWP_BYTE_BLOB) -> FWPM_FILTER_CONDITION0 {
+/// The package-SID match condition. `sid_bytes` (the raw SID) must outlive the
+/// filter-add call. For an `FWP_SID`-typed value WFP reads the `sid` union
+/// member — a pointer to a real `SID` — not a byte blob; passing a blob there
+/// makes WFP parse it as a SID and fail with ERROR_INVALID_SID (0x539).
+fn pkg_condition(sid_bytes: &[u8]) -> FWPM_FILTER_CONDITION0 {
     let mut c = FWPM_FILTER_CONDITION0::default();
     c.fieldKey = FWPM_CONDITION_ALE_PACKAGE_ID;
     c.matchType = FWP_MATCH_EQUAL;
     c.conditionValue = FWP_CONDITION_VALUE0 {
         r#type: FWP_SID,
         Anonymous: FWP_CONDITION_VALUE0_0 {
-            byteBlob: blob as *const _ as *mut FWP_BYTE_BLOB,
+            sid: sid_bytes.as_ptr() as *mut windows::Win32::Security::SID,
         },
     };
     c
@@ -162,19 +163,10 @@ impl NetFilter for WfpFilter {
 }
 
 impl WfpFilter {
-    fn pkg_blob(&self) -> FWP_BYTE_BLOB {
-        FWP_BYTE_BLOB {
-            size: self.package_sid.len() as u32,
-            // Points into `self.package_sid` (owned by self, stable for the
-            // lifetime of every filter call).
-            data: self.package_sid.as_ptr() as *mut u8,
-        }
-    }
-
     fn add_block_all(&self, h: &WfpHandle) -> Result<(), FilterError> {
-        // `blob` must outlive the FwpmFilterAdd0 calls below — keep it here.
-        let blob = self.pkg_blob();
-        let pkg = pkg_condition(&blob);
+        // `self.package_sid` (owned by self, stable) backs the SID pointer for
+        // the FwpmFilterAdd0 calls below.
+        let pkg = pkg_condition(&self.package_sid);
         for layer in [
             FWPM_LAYER_ALE_AUTH_CONNECT_V4,
             FWPM_LAYER_ALE_AUTH_CONNECT_V6,
@@ -185,9 +177,8 @@ impl WfpFilter {
     }
 
     fn add_permit_ip(&self, h: &WfpHandle, ip: IpAddr) -> Result<(), FilterError> {
-        // `blob` (and `arr` for v6) must outlive the FwpmFilterAdd0 call.
-        let blob = self.pkg_blob();
-        let pkg = pkg_condition(&blob);
+        // `self.package_sid` (and `arr` for v6) must outlive the FwpmFilterAdd0 call.
+        let pkg = pkg_condition(&self.package_sid);
         let mut addr = FWPM_FILTER_CONDITION0::default();
         addr.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
         addr.matchType = FWP_MATCH_EQUAL;
@@ -238,14 +229,19 @@ impl WfpFilter {
         conditions: &[FWPM_FILTER_CONDITION0],
     ) -> Result<(), FilterError> {
         let mut filter = FWPM_FILTER0::default();
+        // WFP requires every filter to carry a display name; a null name fails
+        // `FwpmFilterAdd0` with FWP_E_NULL_DISPLAY_NAME (0x80320023). `name` must
+        // outlive the add call below.
+        let mut name: Vec<u16> = "agentd.sbx.filter\0".encode_utf16().collect();
+        filter.displayData.name = windows::core::PWSTR(name.as_mut_ptr());
         filter.layerKey = layer;
         filter.subLayerKey = h.sublayer;
         filter.action.r#type = action;
+        // Weight must be FWP_UINT8 (a 0..=15 priority index) or FWP_UINT64;
+        // FWP_UINT32 is rejected with FWP_E_INVALID_WEIGHT (0x80320025).
         filter.weight = FWP_VALUE0 {
-            r#type: FWP_UINT32,
-            Anonymous: FWP_VALUE0_0 {
-                uint32: weight as u32,
-            },
+            r#type: FWP_UINT8,
+            Anonymous: FWP_VALUE0_0 { uint8: weight },
         };
         filter.numFilterConditions = conditions.len() as u32;
         filter.filterCondition = conditions.as_ptr() as *mut FWPM_FILTER_CONDITION0;
@@ -259,13 +255,96 @@ impl WfpFilter {
 }
 
 /// DNS servers the child is allowed to reach (so name resolution works),
-/// seeded into the permit set. This returns a conservative default set (the
-/// loopback stub + common public resolvers); reading the active interface's
-/// configured resolvers is a planned improvement.
+/// seeded into the permit set. The child does its own `getaddrinfo`, which goes
+/// to the machine's *configured* resolvers — so we must permit exactly those, or
+/// the query is blocked (WFP denies it) and every name fails to resolve.
+///
+/// We enumerate the live adapters' resolvers via `GetAdaptersAddresses` and add
+/// the loopback stub (the Windows DNS Client service often answers there). The
+/// common public resolvers are appended only as a last resort, when enumeration
+/// returned nothing usable.
 pub fn system_dns_servers() -> Vec<IpAddr> {
-    vec![
-        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-    ]
+    let mut out = configured_dns_servers();
+    // The DNS Client service / stub resolver commonly answers on loopback.
+    out.push(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+    // Fallback only if the machine reported no real (non-loopback) resolvers.
+    if out.iter().all(|ip| ip.is_loopback()) {
+        out.push(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        out.push(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Enumerate the DNS resolvers configured on every adapter via
+/// `GetAdaptersAddresses`. Empty vec on any failure (the caller adds fallbacks).
+/// This is what makes resolution actually work inside the AppContainer on a
+/// normal network, where the resolver is the router/ISP, not a hardcoded IP.
+fn configured_dns_servers() -> Vec<IpAddr> {
+    use std::net::Ipv6Addr;
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_FRIENDLY_NAME, GAA_FLAG_SKIP_MULTICAST,
+        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
+    };
+
+    const ERROR_BUFFER_OVERFLOW: u32 = 111;
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_FRIENDLY_NAME;
+
+    // Size the buffer, then fetch (retry while the required size keeps growing).
+    let mut size: u32 = 16 * 1024;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut rc = ERROR_BUFFER_OVERFLOW;
+    for _ in 0..3 {
+        buf.resize(size as usize, 0);
+        rc = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC.0 as u32,
+                flags,
+                None,
+                Some(buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH),
+                &mut size,
+            )
+        };
+        if rc != ERROR_BUFFER_OVERFLOW {
+            break;
+        }
+    }
+    if rc != 0 {
+        return Vec::new();
+    }
+
+    let mut ips = Vec::new();
+    unsafe {
+        let mut adapter = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+        while !adapter.is_null() {
+            let mut dns = (*adapter).FirstDnsServerAddress;
+            while !dns.is_null() {
+                let sa = (*dns).Address;
+                if !sa.lpSockaddr.is_null() {
+                    let family = (*sa.lpSockaddr).sa_family;
+                    if family == AF_INET {
+                        let v4 = &*(sa.lpSockaddr as *const SOCKADDR_IN);
+                        let octets = v4.sin_addr.S_un.S_addr.to_ne_bytes();
+                        ips.push(IpAddr::V4(Ipv4Addr::from(octets)));
+                    } else if family == AF_INET6 {
+                        let v6 = &*(sa.lpSockaddr as *const SOCKADDR_IN6);
+                        let a = Ipv6Addr::from(v6.sin6_addr.u.Byte);
+                        // Skip link-local (fe80::/10) resolvers: not usable as a
+                        // bare permit target without a scope id.
+                        if (a.segments()[0] & 0xffc0) != 0xfe80 {
+                            ips.push(IpAddr::V6(a));
+                        }
+                    }
+                }
+                dns = (*dns).Next;
+            }
+            adapter = (*adapter).Next;
+        }
+    }
+    ips.retain(|ip| !ip.is_unspecified());
+    ips
 }

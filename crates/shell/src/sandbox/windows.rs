@@ -73,8 +73,6 @@ mod imp {
     };
     use windows::Win32::Security::GetLengthSid;
 
-    use crate::netfilter::NetFilter;
-    use crate::sandbox::windows_wfp::{WfpFilter, WfpHandle};
     use windows::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
     };
@@ -401,13 +399,15 @@ mod imp {
         }
     }
 
-    /// Provision the WFP filter set for a network child: default-deny scoped to
-    /// the package SID, permit literal-IP grants, pre-resolved host grants, and
-    /// DNS servers. The filter + handle are held for the child's lifetime.
-    fn provision_wfp(
+    /// Resolve the policy's net grants to an IP allowlist (host grants resolved
+    /// here, non-privileged, + literal-IP grants + the machine's DNS servers) and
+    /// ask the elevated broker to install the matching WFP filter set for `sid`.
+    /// The returned guard holds the broker connection open, keeping the filters
+    /// live for the child's lifetime; dropping it tears them down.
+    fn provision_net(
         sid: PSID,
         policy: &SandboxPolicy,
-    ) -> Result<(WfpFilter, WfpHandle), ShellError> {
+    ) -> Result<crate::netbroker::Provision, ShellError> {
         use crate::dns_pin::{Resolve, SystemResolver, split_grants};
         let (host_grants, mut ips) = split_grants(&policy.net_hosts);
         let resolver = SystemResolver;
@@ -421,11 +421,7 @@ mod imp {
             }
         }
         ips.extend(crate::sandbox::windows_wfp::system_dns_servers());
-        let filter = WfpFilter::new(sid_to_bytes(sid));
-        let handle = filter
-            .provision(&ips)
-            .map_err(|e| sb(format!("WFP provision: {e}")))?;
-        Ok((filter, handle))
+        crate::netbroker::provision(sid_to_bytes(sid), ips)
     }
 
     pub fn run_blocking(
@@ -474,10 +470,18 @@ mod imp {
             }
         }
 
-        // Network child: provision the WFP allowlist scoped to this package SID
-        // (held for the child's lifetime, torn down at the end).
-        let mut wfp = if net {
-            Some(provision_wfp(sid, policy)?)
+        // Network child: ask the broker to provision the WFP allowlist scoped to
+        // this package SID. The guard is held for the child's lifetime; dropping
+        // it (function exit) closes the broker connection, tearing filters down.
+        // Fail closed with guidance if the broker isn't installed.
+        let _net_guard = if net {
+            if !crate::netbroker::available() {
+                unsafe { FreeSid(sid) };
+                return Err(sb(
+                    "network sandbox not installed: run `daemon --install-sandbox`",
+                ));
+            }
+            Some(provision_net(sid, policy)?)
         } else {
             None
         };
@@ -636,10 +640,9 @@ mod imp {
             })
         })();
 
-        // Teardown. Close the WFP dynamic session (removes all our filters).
-        if let Some((filter, handle)) = wfp.take() {
-            filter.teardown(handle);
-        }
+        // Teardown. Dropping `_net_guard` closes the broker connection, which
+        // makes the broker remove this child's WFP filters.
+        drop(_net_guard);
         unsafe {
             DeleteProcThreadAttributeList(attr_list);
             let _ = CloseHandle(out.read);

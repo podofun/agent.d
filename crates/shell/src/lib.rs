@@ -15,6 +15,8 @@ use tokio::process::Command;
 pub mod dns_pin;
 pub mod dns_wire;
 pub mod gateway;
+#[cfg(target_os = "windows")]
+pub mod netbroker;
 pub mod netfilter;
 pub mod policy;
 pub mod sandbox;
