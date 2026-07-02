@@ -126,10 +126,9 @@ mod imp {
     }
 
     fn uninstall() -> anyhow::Result<()> {
-        let manager =
-            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-        let service = manager
-            .open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::DELETE)?;
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let service =
+            manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::DELETE)?;
         let _ = service.stop();
         service.delete()?;
         println!("agent.d network broker removed.");
