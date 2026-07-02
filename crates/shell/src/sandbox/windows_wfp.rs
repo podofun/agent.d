@@ -23,7 +23,7 @@ use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_ACTION_TYPE, FWP_BYTE_ARRAY16, FWP_BYTE_ARRAY16_TYPE,
     FWP_BYTE_BLOB, FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_SID,
-    FWP_UINT32, FWP_VALUE0, FWP_VALUE0_0, FWPM_CONDITION_ALE_PACKAGE_ID,
+    FWP_UINT8, FWP_UINT32, FWP_VALUE0, FWP_VALUE0_0, FWPM_CONDITION_ALE_PACKAGE_ID,
     FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_FILTER_CONDITION0, FWPM_FILTER0,
     FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_SESSION_FLAG_DYNAMIC,
     FWPM_SESSION0, FWPM_SUBLAYER0, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0,
@@ -246,11 +246,11 @@ impl WfpFilter {
         filter.layerKey = layer;
         filter.subLayerKey = h.sublayer;
         filter.action.r#type = action;
+        // Weight must be FWP_UINT8 (a 0..=15 priority index) or FWP_UINT64;
+        // FWP_UINT32 is rejected with FWP_E_INVALID_WEIGHT (0x80320025).
         filter.weight = FWP_VALUE0 {
-            r#type: FWP_UINT32,
-            Anonymous: FWP_VALUE0_0 {
-                uint32: weight as u32,
-            },
+            r#type: FWP_UINT8,
+            Anonymous: FWP_VALUE0_0 { uint8: weight },
         };
         filter.numFilterConditions = conditions.len() as u32;
         filter.filterCondition = conditions.as_ptr() as *mut FWPM_FILTER_CONDITION0;
