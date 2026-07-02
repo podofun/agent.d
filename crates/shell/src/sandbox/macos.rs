@@ -24,6 +24,64 @@ pub fn apply(_policy: &SandboxPolicy) -> Result<(), SandboxError> {
     ))
 }
 
+/// macOS-only read baseline on top of [`READ_BASELINE`]: dyld needs to stat
+/// `/` itself (literal, not subpath — grants nothing below it) and read the
+/// shared cache + system frameworks, or every child dies with SIGABRT before
+/// `main`. Verified minimal on macOS 26: without the `/` literal, even
+/// `/bin/echo` aborts.
+const MACOS_READ_EXTRA: &[&str] = &[
+    "/System",
+    "/private/var/db",
+    "/private/var/select", // `/bin/sh` reads its implementation through here
+    "/dev/urandom",
+    "/dev/random",
+    "/dev/zero",
+];
+
+/// Seatbelt matches on RESOLVED paths, but grants often come in via symlinks
+/// (`/var` -> `/private/var`, `/tmp` -> `/private/tmp` — every macOS tempdir).
+/// Emit BOTH forms: the canonical one is what the kernel checks; the original
+/// keeps the rule readable and covers non-resolving lookups.
+fn path_forms(p: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = p.to_str().map(str::to_owned).into_iter().collect();
+    if let Ok(c) = std::fs::canonicalize(p)
+        && let Some(c) = c.to_str()
+        && !out.iter().any(|o| o == c)
+    {
+        out.push(c.to_owned());
+    }
+    out
+}
+
+/// Shared SBPL prelude: default-deny + fs confinement from the policy. Network
+/// rules are appended by the caller (none for the deny path).
+///
+/// `file-read-metadata` is allowed globally: stat/readlink only (no contents),
+/// and required for symlink traversal (`/var`, `/tmp`) and the child's getcwd.
+fn sbpl_fs(policy: &SandboxPolicy) -> String {
+    let mut sbpl = String::from(
+        "(version 1)\n(deny default)\n(allow process-exec* process-fork)\n(allow sysctl-read)\n\
+         (allow file-read-metadata)\n(allow file-read* (literal \"/\"))\n",
+    );
+    for r in READ_BASELINE
+        .iter()
+        .chain(MACOS_READ_EXTRA.iter())
+        .map(|s| s.to_string())
+        .chain(policy.read_paths.iter().flat_map(|p| path_forms(p)))
+    {
+        sbpl.push_str(&format!("(allow file-read* (subpath \"{r}\"))\n"));
+    }
+    for w in policy
+        .write_paths
+        .iter()
+        .flat_map(|p| path_forms(p))
+        .chain(WRITE_SCRATCH.iter().map(|s| s.to_string()))
+    {
+        sbpl.push_str(&format!("(allow file-write* (subpath \"{w}\"))\n"));
+    }
+    sbpl
+}
+
 /// Generate SBPL and return the rewritten (bin, args) running under
 /// `sandbox-exec`. Caller (exec on macOS) substitutes these for the original.
 ///
@@ -31,25 +89,8 @@ pub fn apply(_policy: &SandboxPolicy) -> Result<(), SandboxError> {
 /// network (host-granular network has no transparent macOS backend yet, so
 /// `allow_net` execs fail closed before reaching here).
 pub fn wrap_argv(policy: &SandboxPolicy, bin: &str, args: &[String]) -> (String, Vec<String>) {
-    let mut sbpl = String::from("(version 1)\n(deny default)\n(allow process-exec process-fork)\n");
-
-    for r in READ_BASELINE
-        .iter()
-        .copied()
-        .chain(policy.read_paths.iter().filter_map(|p| p.to_str()))
-    {
-        sbpl.push_str(&format!("(allow file-read* (subpath \"{r}\"))\n"));
-    }
-    for w in policy
-        .write_paths
-        .iter()
-        .filter_map(|p| p.to_str())
-        .chain(WRITE_SCRATCH.iter().copied())
-    {
-        sbpl.push_str(&format!("(allow file-write* (subpath \"{w}\"))\n"));
-    }
     // Network is default-denied (deny default + no network-outbound allow).
-
+    let sbpl = sbpl_fs(policy);
     let mut new_args = vec!["-p".to_string(), sbpl, "--".to_string(), bin.to_string()];
     new_args.extend(args.iter().cloned());
     ("/usr/bin/sandbox-exec".to_string(), new_args)
@@ -75,23 +116,9 @@ fn sandbox_uid() -> Result<u32, ShellError> {
 /// SBPL that confines the filesystem but ALLOWS outbound network — `pf` enforces
 /// the host/IP allowlist for net children.
 fn sbpl_net_allowed(policy: &SandboxPolicy) -> String {
-    let mut sbpl = String::from("(version 1)\n(deny default)\n(allow process-exec process-fork)\n");
-    for r in READ_BASELINE
-        .iter()
-        .copied()
-        .chain(policy.read_paths.iter().filter_map(|p| p.to_str()))
-    {
-        sbpl.push_str(&format!("(allow file-read* (subpath \"{r}\"))\n"));
-    }
-    for w in policy
-        .write_paths
-        .iter()
-        .filter_map(|p| p.to_str())
-        .chain(WRITE_SCRATCH.iter().copied())
-    {
-        sbpl.push_str(&format!("(allow file-write* (subpath \"{w}\"))\n"));
-    }
-    sbpl.push_str("(allow network-outbound)\n(allow network-bind)\n");
+    let mut sbpl = sbpl_fs(policy);
+    // mach-lookup: DNS on macOS goes through mDNSResponder's mach service.
+    sbpl.push_str("(allow network-outbound)\n(allow network-bind)\n(allow mach-lookup)\n(allow system-socket)\n");
     sbpl
 }
 
