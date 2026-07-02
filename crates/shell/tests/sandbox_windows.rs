@@ -260,19 +260,18 @@ async fn net_denied_blocks_outbound() {
 }
 
 /// Host-granular network: with only `example.com` permitted, a request to it
-/// succeeds (relayed by the policy-enforcing proxy) while a request to the
-/// non-allowlisted `google.com` is blocked. The AppContainer holds no network
-/// capability, so the proxy is its only egress — the denied case also proves the
-/// child cannot bypass the proxy to reach an arbitrary host. Behaviour matches
-/// Linux/macOS.
+/// succeeds while a request to the non-allowlisted `google.com` is blocked. The
+/// child's outbound is default-denied by WFP and permitted only to the resolved
+/// IPs of allowed hosts, so the denied case proves it cannot reach an arbitrary
+/// host. Behaviour matches Linux/macOS.
 #[tokio::test]
 async fn net_host_allowlist_is_enforced() {
     let _serial = SANDBOX_SERIAL.lock().await;
     assert!(is_supported(), "windows sandbox must be supported");
 
-    // Skip where the test process can't run the privileged install.
-    if agentd_shell::sandbox::install().is_err() {
-        eprintln!("network sandbox install needs elevation; skipping");
+    // Requires the broker service (installed via `daemon --install-sandbox`).
+    if !agentd_shell::netbroker::available() {
+        eprintln!("network broker not installed; skipping");
         return;
     }
 
