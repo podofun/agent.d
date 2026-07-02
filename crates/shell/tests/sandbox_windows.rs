@@ -112,6 +112,38 @@ fn user_python() -> Option<String> {
     })
 }
 
+/// A bare executable name that is on `PATH` but NOT under System32 must resolve
+/// and run through the sandbox: the child's AppContainer cannot search `PATH`
+/// itself (its lowbox token cannot stat those directories), so the daemon must
+/// resolve the name to an absolute path before spawning. Regression test for
+/// "executable not found" on a name that is plainly on `PATH`.
+#[tokio::test]
+async fn bare_name_on_path_resolves() {
+    let _serial = SANDBOX_SERIAL.lock().await;
+    assert!(is_supported(), "windows sandbox must be supported");
+    if user_python().is_none() {
+        eprintln!("skip: no user python.exe on PATH");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    // Bare name, NOT an absolute path.
+    let res = exec(req(
+        "python.exe".into(),
+        vec!["-c".into(), "print('alive')".into()],
+        policy(dir.path()),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(res.exit_code, 0, "bare name failed to resolve; stderr: {}", res.stderr);
+    assert!(
+        res.stdout.contains("alive"),
+        "expected child stdout, got: {:?}",
+        res.stdout
+    );
+}
+
 /// A user-installed binary must load the DLLs sitting next to it inside the
 /// AppContainer. Its install directory does not grant `ALL_APPLICATION_PACKAGES`
 /// (unlike System32), so unless the package SID is granted read+execute there,
