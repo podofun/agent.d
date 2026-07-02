@@ -58,7 +58,12 @@ fn main() -> Result<()> {
             }
         }
         #[cfg(not(target_os = "windows"))]
-        println!("Sandbox setup complete.");
+        println!("Sandbox setup complete. The daemon runs unprivileged from here on.");
+        return Ok(());
+    }
+    if cli.uninstall_sandbox {
+        sandbox::uninstall().map_err(|e| anyhow!("sandbox teardown failed: {e}"))?;
+        println!("Sandbox setup removed.");
         return Ok(());
     }
     run(cli)

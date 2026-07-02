@@ -71,17 +71,39 @@ pub fn is_supported() -> bool {
 }
 
 /// Run the platform's one-time privileged network-sandbox setup; a no-op where
-/// none is needed. On Windows it requires Administrator (see `windows::install`).
+/// none is needed. Windows requires Administrator; macOS requires root (sudo)
+/// and installs the pf broker + sandbox users (see `macos_install`). Linux
+/// needs nothing — rootless netns is set up per-exec.
 pub fn install() -> Result<(), SandboxError> {
     #[cfg(target_os = "windows")]
     {
         backend::install().map_err(|e| SandboxError::Apply(e.to_string()))
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_install::install()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         Ok(())
     }
 }
+
+/// Reverse [`install`]. Only macOS/Windows have state to remove; Linux is a
+/// no-op.
+pub fn uninstall() -> Result<(), SandboxError> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_install::uninstall()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub mod macos_install;
 
 /// Whether host-granular network containment can be enforced here.
 pub fn net_supported() -> bool {

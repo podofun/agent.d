@@ -22,6 +22,12 @@ pub trait Backend {
     fn spawn(&mut self, user: &SandboxUser, bin: &str, args: &[String], cwd: Option<&str>, sbpl: &str, want_stdin: bool) -> Result<i32, String>;
     /// DIOCNATLOOK: original destination of a redirected connection.
     fn natlook(&self, proto: Proto, src: SocketAddr, dst: SocketAddr) -> Result<SocketAddr, String>;
+    /// Stdio fds produced by the most recent `spawn`, to hand to the daemon
+    /// out-of-band AFTER its reply is written (so the reply line and the
+    /// SCM_RIGHTS dummy byte don't interleave). Default: none.
+    fn take_stdio_fds(&mut self) -> Vec<i32> {
+        Vec::new()
+    }
     /// Block until the spawned child exits; return its code. Called at most
     /// once, after which teardown's `kill_child` is a no-op.
     fn wait_child(&mut self, pid: i32) -> i32;
@@ -116,6 +122,11 @@ impl<'u, B: Backend> Session<'u, B> {
         dst: SocketAddr,
     ) -> Result<SocketAddr, SessionError> {
         self.backend.natlook(proto, src, dst).map_err(backend_err)
+    }
+
+    /// Stdio fds to pass to the daemon after the `Spawned` reply is written.
+    pub fn take_stdio_fds(&mut self) -> Vec<i32> {
+        self.backend.take_stdio_fds()
     }
 
     /// Wait for the child, returning its exit code. Clears the tracked pid so

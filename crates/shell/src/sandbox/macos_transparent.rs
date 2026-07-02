@@ -25,7 +25,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agentd_permissions::Permission;
 
@@ -101,6 +101,8 @@ fn bind_dual_tcp() -> std::io::Result<std::net::TcpListener> {
     sock.set_reuse_address(true)?;
     sock.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)).into())?;
     sock.listen(128)?;
+    // tokio refuses to register a blocking fd; make it non-blocking up front.
+    sock.set_nonblocking(true)?;
     Ok(sock.into())
 }
 
@@ -109,6 +111,7 @@ fn bind_dual_udp() -> std::io::Result<std::net::UdpSocket> {
     let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_only_v6(false)?;
     sock.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)).into())?;
+    sock.set_nonblocking(true)?;
     Ok(sock.into())
 }
 
@@ -202,16 +205,23 @@ pub async fn run_contained(
     // TCP relay task.
     let relay_set = set.clone();
     let relay_broker = broker.clone();
+    let relay_grants = host_grants.clone();
     let tcp = tokio::net::TcpListener::from_std(tcp).map_err(io_sb)?;
-    let relay_task = tokio::spawn(async move { relay_loop(tcp, relay_broker, relay_set).await });
+    let relay_task =
+        tokio::spawn(async move { relay_loop(tcp, relay_broker, relay_set, relay_grants).await });
 
     // Feed stdin (if any), drain stdout/stderr to completion (EOF = child done).
     if let (Some(input), Some(fd)) = (&req.stdin, stdin_wr) {
+        // SAFETY: `fd` is the write end of the child's stdin, received from the
+        // broker via SCM_RIGHTS and owned by us. Adopting it into a File gives
+        // RAII close (drop shuts the child's stdin, signalling EOF). No safe
+        // constructor exists for an fd handed over out-of-band.
         let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
         use std::io::Write;
         let _ = f.write_all(input.as_bytes());
-        // drop closes the child's stdin.
     } else if let Some(fd) = stdin_wr {
+        // SAFETY: close(2) on the stdin fd we own but won't write to; closing
+        // signals immediate EOF to the child. Raw fd (no owning wrapper) → libc.
         unsafe { libc::close(fd) };
     }
     let out_task = tokio::task::spawn_blocking(move || read_fd_to_end(stdout_rd));
@@ -251,7 +261,22 @@ fn io_sb(e: std::io::Error) -> ShellError {
     ShellError::Sandbox(e.to_string())
 }
 
+/// Collapse an IPv4-mapped IPv6 socket address (`::ffff:a.b.c.d`) to real v4,
+/// so pf natlook and upstream connect use the family pf actually tracked.
+fn demap(a: SocketAddr) -> SocketAddr {
+    match a {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
+            None => a,
+        },
+        v4 => v4,
+    }
+}
+
 fn read_fd_to_end(fd: RawFd) -> Vec<u8> {
+    // SAFETY: `fd` is a stdout/stderr read end received from the broker via
+    // SCM_RIGHTS and owned here; adopting it into a File gives buffered reads
+    // and RAII close. No safe constructor exists for an out-of-band fd.
     let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
     let mut v = Vec::new();
     let _ = f.read_to_end(&mut v);
@@ -282,6 +307,8 @@ fn recv_fds(stream: &UnixStream, n: usize) -> std::io::Result<Vec<RawFd>> {
     }
     if fds.len() != n {
         for fd in &fds {
+            // SAFETY: close(2) on fds we just received and own; on the
+            // wrong-count error path we drop them all to avoid leaking.
             unsafe { libc::close(*fd) };
         }
         return Err(std::io::Error::other(format!(
@@ -292,9 +319,56 @@ fn recv_fds(stream: &UnixStream, n: usize) -> std::io::Result<Vec<RawFd>> {
     Ok(fds)
 }
 
+/// Whether a connection to `ip` is permitted. First checks the pinned set
+/// (literal grants + IPs pinned by our intercepted DNS). On a miss, resolves
+/// the concrete allowed host grants LIVE and admits+pins `ip` if it backs one
+/// of them.
+///
+/// This reactive path is what makes name grants work on macOS: unlike Linux —
+/// where the child's `getaddrinfo` hits our DNS server directly — macOS routes
+/// resolution through the shared mDNSResponder, out of our per-uid pf redirect,
+/// so we never see the query. Resolving the grant ourselves at connect time
+/// gives the same host-granular, live decision. (Wildcard grants can't be
+/// enumerated this way — they still rely on intercepting a direct DNS query.)
+async fn admit_dst(ip: IpAddr, set: &SharedSet, host_grants: &[Permission]) -> bool {
+    if admit(ip, set) {
+        return true;
+    }
+    let grants: Vec<Permission> = host_grants.to_vec();
+    let matched = tokio::task::spawn_blocking(move || {
+        use crate::dns_pin::{Resolve, SystemResolver};
+        let resolver = SystemResolver;
+        for g in &grants {
+            if let ("net", Some(name)) = g.parts() {
+                // Wildcards can't be enumerated to a set of names; skip here.
+                if name.contains('*') {
+                    continue;
+                }
+                if let Ok(ips) = resolver.resolve(name)
+                    && ips.contains(&ip)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    if matched {
+        set.lock().unwrap().allow_resolved(ip, PIN_TTL, Instant::now());
+    }
+    matched
+}
+
 /// Accept intercepted connections; natlook each via the broker, admit iff the
 /// permitted set allows the original destination, then splice.
-async fn relay_loop(listener: tokio::net::TcpListener, broker: Arc<Broker>, set: SharedSet) {
+async fn relay_loop(
+    listener: tokio::net::TcpListener,
+    broker: Arc<Broker>,
+    set: SharedSet,
+    host_grants: Vec<Permission>,
+) {
     loop {
         let (inbound, peer) = match listener.accept().await {
             Ok(x) => x,
@@ -306,12 +380,18 @@ async fn relay_loop(listener: tokio::net::TcpListener, broker: Arc<Broker>, set:
         };
         let broker = broker.clone();
         let set = set.clone();
+        // A dual-stack listener reports v4 connections as IPv4-mapped v6
+        // (`::ffff:a.b.c.d`). pf's state for those is a real AF_INET entry, so
+        // demap before natlook or DIOCNATLOOK queries the wrong family and misses.
+        let peer = demap(peer);
+        let local = demap(local);
+        let grants = host_grants.clone();
         tokio::spawn(async move {
             let orig = match natlook(&broker, peer, local).await {
                 Some(d) => d,
                 None => return, // no original dst → drop
             };
-            if !admit(orig.ip(), &set) {
+            if !admit_dst(orig.ip(), &set, &grants).await {
                 return; // not granted → drop (fail closed)
             }
             let mut inbound = inbound;

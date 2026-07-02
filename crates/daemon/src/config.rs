@@ -58,9 +58,13 @@ pub struct Cli {
     #[arg(long, env = "AGENTD_WATCH")]
     pub watch: bool,
 
-    /// Run one-time network-sandbox setup (elevated on Windows), then exit.
+    /// Run one-time network-sandbox setup (elevated on Windows/macOS), then exit.
     #[arg(long)]
     pub install_sandbox: bool,
+
+    /// Reverse `--install-sandbox` (macOS/Windows), then exit.
+    #[arg(long)]
+    pub uninstall_sandbox: bool,
 }
 
 /// Raw `config.toml` shape. All fields optional; missing == fall through

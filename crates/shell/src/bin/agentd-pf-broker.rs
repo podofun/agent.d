@@ -21,7 +21,7 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use std::io::{BufReader, Read, Write};
+    use std::io::{BufReader, Write};
     use std::net::SocketAddr;
     use std::os::fd::{AsRawFd, RawFd};
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -58,11 +58,24 @@ mod macos {
         }
         let listener = UnixListener::bind(SOCKET_PATH)
             .unwrap_or_else(|e| fatal(&format!("bind {SOCKET_PATH}: {e}")));
-        // Socket is root-owned; 0600 so only root (and our peer check) matters.
+        // Restrict the socket to the daemon uid at the filesystem layer (0600 +
+        // chown), so only that uid can even connect; getpeereid then re-checks
+        // per connection. Defense in depth, not either/or.
         let _ = std::fs::set_permissions(
             SOCKET_PATH,
             std::os::unix::fs::PermissionsExt::from_mode(0o600),
         );
+        // SAFETY: FFI to chown(2) with a static NUL-terminated path literal and
+        // plain integer ids. No Rust std wrapper sets owner uid/gid on a path
+        // (std::fs only exposes permission bits), so libc is the only option; a
+        // failure is non-fatal (perms already restrict to 0600).
+        unsafe {
+            libc::chown(
+                b"/var/run/agentd/broker.sock\0".as_ptr() as *const _,
+                cfg.daemon_uid,
+                0,
+            );
+        }
 
         for conn in listener.incoming() {
             let Ok(stream) = conn else { continue };
@@ -117,8 +130,24 @@ mod macos {
                 Err(_) => break, // disconnect / EOF → drop tears down
             };
             let resp = dispatch(&mut session, &user, req);
+            let was_spawn = matches!(resp, Resp::Spawned { .. });
             if write_msg(&mut writer, &resp).is_err() {
                 break;
+            }
+            // Pass the child's stdio fds AFTER the reply, so the reply line and
+            // the SCM_RIGHTS dummy byte never interleave on the wire.
+            if was_spawn {
+                let fds = session.take_stdio_fds();
+                if !fds.is_empty() {
+                    let _ = send_fds(raw, &fds);
+                    for fd in fds {
+                        // SAFETY: close(2) on the broker's own ends of the child
+                        // stdio pipes, now dup'd into the daemon via SCM_RIGHTS.
+                        // These raw fds are owned here (not wrapped in an OwnedFd)
+                        // so a manual close is the only way to release them.
+                        unsafe { libc::close(fd) };
+                    }
+                }
             }
         }
         // session drop → teardown; lease drop → uid returned
@@ -170,13 +199,12 @@ mod macos {
     /// The real root-side backend. Holds the connection fd so `spawn` can pass
     /// the child's stdio back to the daemon via `SCM_RIGHTS`.
     struct MacBackend {
-        conn_fd: RawFd,
-        child_stdio_sent: bool,
+        pending_fds: Vec<RawFd>,
     }
 
     impl MacBackend {
-        fn new(conn_fd: RawFd) -> Self {
-            MacBackend { conn_fd, child_stdio_sent: false }
+        fn new(_conn_fd: RawFd) -> Self {
+            MacBackend { pending_fds: Vec::new() }
         }
     }
 
@@ -198,14 +226,14 @@ mod macos {
 
         fn spawn(&mut self, user: &SandboxUser, bin: &str, args: &[String], cwd: Option<&str>, sbpl: &str, want_stdin: bool) -> Result<i32, String> {
             let (pid, fds) = spawn_as_uid(user.uid, bin, args, cwd, sbpl, want_stdin)?;
-            // Pass [stdin_wr?, stdout_rd, stderr_rd] to the daemon out-of-band.
-            send_fds(self.conn_fd, &fds)?;
-            for fd in fds {
-                // The daemon now owns dup'd copies; close ours.
-                unsafe { libc::close(fd) };
-            }
-            self.child_stdio_sent = true;
+            // Stash the daemon-facing stdio ends; the caller sends them via
+            // SCM_RIGHTS only AFTER the Spawned reply line is on the wire.
+            self.pending_fds = fds;
             Ok(pid)
+        }
+
+        fn take_stdio_fds(&mut self) -> Vec<RawFd> {
+            std::mem::take(&mut self.pending_fds)
         }
 
         fn natlook(&self, proto: Proto, src: SocketAddr, dst: SocketAddr) -> Result<SocketAddr, String> {
@@ -217,6 +245,9 @@ mod macos {
 
         fn wait_child(&mut self, pid: i32) -> i32 {
             let mut status = 0;
+            // SAFETY: waitpid(2) on a pid this broker forked; `status` is a valid
+            // local out-param. std has no child-reaping API for a bare pid we
+            // fork()'d ourselves (Command owns its own Child), so libc is required.
             unsafe { libc::waitpid(pid, &mut status, 0) };
             if libc::WIFEXITED(status) {
                 libc::WEXITSTATUS(status)
@@ -228,8 +259,9 @@ mod macos {
         }
 
         fn kill_child(&mut self, pid: i32) {
+            // SAFETY: kill(2)+waitpid(2) on a pid this broker forked. Signalling
+            // and reaping a raw pid has no safe std equivalent (no Child handle).
             unsafe { libc::kill(pid, libc::SIGKILL) };
-            // Reap to avoid a zombie.
             let mut status = 0;
             unsafe { libc::waitpid(pid, &mut status, 0) };
         }
@@ -308,6 +340,9 @@ mod macos {
         // pipes: (read, write)
         let mk = || -> Result<(RawFd, RawFd), String> {
             let mut fds = [0i32; 2];
+            // SAFETY: pipe(2) writes two fds into a valid 2-element array. We
+            // need the raw fds (not std's OwnedFd) because they must survive
+            // fork() and be dup2'd in the async-signal-safe child region below.
             if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
                 return Err(std::io::Error::last_os_error().to_string());
             }
@@ -333,12 +368,21 @@ mod macos {
         argv.push(std::ptr::null());
         let cwd_c = cwd.map(|c| CString::new(c).unwrap());
 
-        // SAFETY: fork; child region is async-signal-safe (raw syscalls only).
+        // SAFETY: fork(2) has no safe wrapper. This process is a plain
+        // single-threaded connection handler at this point, so the child may run
+        // the async-signal-safe region below before execve. Returns the child
+        // pid in the parent, 0 in the child.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err("fork failed".into());
         }
         if pid == 0 {
+            // SAFETY: async-signal-safe-only region in the forked child. Every
+            // call here (dup2/open/close/chdir/setgid/setgroups/setuid/execv/
+            // _exit) is on the POSIX async-signal-safe list and operates on fds
+            // and CStrings that outlive this block; no allocation, no locks. A
+            // safe wrapper (e.g. Command) is forbidden here because it may
+            // allocate/lock between fork and exec.
             unsafe {
                 libc::dup2(out_w, 1);
                 libc::dup2(err_w, 2);
@@ -371,6 +415,8 @@ mod macos {
             }
         }
         // Parent: close the child ends, keep the daemon-facing ends.
+        // SAFETY: close(2) on the parent's copies of the child-side pipe fds,
+        // owned here as raw ints; the daemon-facing ends stay open in `fds`.
         unsafe {
             libc::close(out_w);
             libc::close(err_w);
@@ -393,6 +439,10 @@ mod macos {
         // One dummy byte so the receiver's recvmsg returns >0 with the cmsg.
         let iov = [std::io::IoSlice::new(b"F")];
         let cmsg = [ControlMessage::ScmRights(fds)];
+        // SAFETY: borrow_raw over the connection fd, which the caller owns and
+        // keeps open for the whole session; the BorrowedFd does not outlive this
+        // call. nix's sendmsg needs a borrowed fd and there is no owned handle to
+        // hand it without taking ownership of the live connection socket.
         let borrowed = unsafe { BorrowedFd::borrow_raw(conn_fd) };
         sendmsg::<()>(borrowed.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
             .map_err(|e| format!("sendmsg fds: {e}"))?;
@@ -400,12 +450,20 @@ mod macos {
     }
 
     fn natlook_ioctl(src: SocketAddr, dst: SocketAddr) -> Result<SocketAddr, String> {
+        // SAFETY: open(2) on a static NUL-terminated path; returns a raw fd or
+        // <0. There is no std API for /dev/pf, and the ioctl below needs the raw
+        // fd anyway. Closed unconditionally before returning.
         let fd = unsafe { libc::open(b"/dev/pf\0".as_ptr() as *const _, libc::O_RDWR) };
         if fd < 0 {
             return Err(format!("open /dev/pf: {}", std::io::Error::last_os_error()));
         }
         let mut nl = PfiocNatlook::for_tcp(src, dst);
+        // SAFETY: DIOCNATLOOK ioctl on /dev/pf. `nl` is a #[repr(C)] struct whose
+        // layout mirrors xnu's pfioc_natlook (size asserted in macos_pf_rules
+        // tests) and outlives the call; the ioctl request code is derived from
+        // that same struct's size. ioctl has no safe wrapper.
         let rc = unsafe { libc::ioctl(fd, DIOCNATLOOK as libc::c_ulong, &mut nl) };
+        // SAFETY: close(2) on the fd we just opened and still own.
         unsafe { libc::close(fd) };
         if rc != 0 {
             return Err(format!("DIOCNATLOOK: {}", std::io::Error::last_os_error()));
@@ -416,6 +474,9 @@ mod macos {
     fn peer_uid(stream: &UnixStream) -> Option<u32> {
         let mut uid: libc::uid_t = 0;
         let mut gid: libc::gid_t = 0;
+        // SAFETY: getpeereid(2) on the connected socket's fd (borrowed for the
+        // call via as_raw_fd), writing two valid local out-params. std exposes
+        // no peer-credential API on UnixStream, so libc is required.
         let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
         (rc == 0).then_some(uid)
     }
@@ -423,12 +484,5 @@ mod macos {
     fn fatal(msg: &str) -> ! {
         eprintln!("agentd-pf-broker: {msg}");
         std::process::exit(1);
-    }
-
-    // Silence unused warnings for the dummy-byte reader path.
-    #[allow(dead_code)]
-    fn _touch(mut r: impl Read) {
-        let mut b = [0u8; 1];
-        let _ = r.read(&mut b);
     }
 }
