@@ -102,9 +102,16 @@ pub fn wrap_argv(policy: &SandboxPolicy, bin: &str, args: &[String]) -> (String,
 /// outbound network — `pf` (scoped to the child's dedicated uid) enforces the
 /// host/IP allowlist, and the daemon's relay does the per-connection admit
 /// decision. Built here, sent to the broker over the wire.
+///
+/// `mach-lookup` is allowed so the child resolves names normally via
+/// mDNSResponder. macOS name resolution does NOT traverse a per-uid UDP/53 path
+/// we could redirect (verified: denying mDNSResponder does not make
+/// `getaddrinfo` fall back to catchable direct DNS), so — unlike Linux — the
+/// daemon never sees the query name. Concrete `net:<host>` grants are honored
+/// by the relay's reactive resolution (resolve the grant, admit the matching
+/// IP); see `macos_transparent::admit_dst`.
 pub fn sbpl_net_for_broker(policy: &SandboxPolicy) -> String {
     let mut sbpl = sbpl_fs(policy);
-    // mach-lookup: DNS on macOS goes through mDNSResponder's mach service.
     sbpl.push_str("(allow network-outbound)\n(allow network-bind)\n(allow mach-lookup)\n(allow system-socket)\n");
     sbpl
 }

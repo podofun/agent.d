@@ -335,30 +335,116 @@ async fn admit_dst(ip: IpAddr, set: &SharedSet, host_grants: &[Permission]) -> b
         return true;
     }
     let grants: Vec<Permission> = host_grants.to_vec();
-    let matched = tokio::task::spawn_blocking(move || {
-        use crate::dns_pin::{Resolve, SystemResolver};
-        let resolver = SystemResolver;
-        for g in &grants {
-            if let ("net", Some(name)) = g.parts() {
-                // Wildcards can't be enumerated to a set of names; skip here.
-                if name.contains('*') {
-                    continue;
-                }
-                if let Ok(ips) = resolver.resolve(name)
-                    && ips.contains(&ip)
-                {
-                    return true;
-                }
-            }
-        }
-        false
-    })
-    .await
-    .unwrap_or(false);
+    let matched = tokio::task::spawn_blocking(move || resolve_admit(ip, &grants))
+        .await
+        .unwrap_or(false);
     if matched {
         set.lock().unwrap().allow_resolved(ip, PIN_TTL, Instant::now());
     }
     matched
+}
+
+/// Blocking admit decision for an unpinned IP, run off the async executor.
+///
+/// - Concrete `net:<host>` grant: resolve it and admit if `ip` is one of its
+///   addresses (exact, live — same decision Linux makes at DNS-pin time).
+/// - Wildcard `net:<prefix>*` grant: reverse-resolve `ip` to its name(s) and,
+///   for any name the wildcard covers, forward-confirm that the name still
+///   resolves back to `ip` before admitting. This covers hosts with correct
+///   reverse DNS (the common case); hosts without matching PTR records are the
+///   one place macOS is less capable than Linux's direct DNS interception.
+fn resolve_admit(ip: IpAddr, host_grants: &[Permission]) -> bool {
+    use crate::dns_pin::{Resolve, SystemResolver, name_allowed};
+    let resolver = SystemResolver;
+    let mut has_wildcard = false;
+    for g in host_grants {
+        if let ("net", Some(name)) = g.parts() {
+            if name.contains('*') {
+                has_wildcard = true;
+                continue;
+            }
+            if let Ok(ips) = resolver.resolve(name)
+                && ips.contains(&ip)
+            {
+                return true;
+            }
+        }
+    }
+    if has_wildcard {
+        for name in reverse_lookup(ip) {
+            // Forward-confirm: the reverse name must be covered by a grant AND
+            // resolve back to this IP, so a forged PTR cannot widen access.
+            if name_allowed(host_grants, &name)
+                && resolver.resolve(&name).map(|ips| ips.contains(&ip)).unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Reverse-resolve `ip` to hostname(s) via `getnameinfo`. Empty on failure.
+fn reverse_lookup(ip: IpAddr) -> Vec<String> {
+    use std::ffi::CStr;
+    let mut host = [0 as libc::c_char; libc::NI_MAXHOST as usize];
+    let (sa, len): (libc::sockaddr_storage, libc::socklen_t) = match ip {
+        IpAddr::V4(v4) => {
+            let mut s: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            s.sin_family = libc::AF_INET as libc::sa_family_t;
+            s.sin_addr.s_addr = u32::from_ne_bytes(v4.octets());
+            // SAFETY: transmuting a fully-initialized sockaddr_in into the
+            // storage union; sockaddr_storage is larger and this is the standard
+            // libc idiom (no safe wrapper for getnameinfo input).
+            let mut st: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &s as *const _ as *const u8,
+                    &mut st as *mut _ as *mut u8,
+                    std::mem::size_of::<libc::sockaddr_in>(),
+                )
+            };
+            (st, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
+        }
+        IpAddr::V6(v6) => {
+            let mut s: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            s.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            s.sin6_addr.s6_addr = v6.octets();
+            let mut st: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &s as *const _ as *const u8,
+                    &mut st as *mut _ as *mut u8,
+                    std::mem::size_of::<libc::sockaddr_in6>(),
+                )
+            };
+            (st, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+        }
+    };
+    // SAFETY: getnameinfo reads `len` bytes of the sockaddr we just initialized
+    // and writes a NUL-terminated name into `host` (NI_MAXHOST bytes). All
+    // pointers/lengths are valid for the call; there is no safe std wrapper for
+    // reverse DNS.
+    let rc = unsafe {
+        libc::getnameinfo(
+            &sa as *const _ as *const libc::sockaddr,
+            len,
+            host.as_mut_ptr(),
+            host.len() as libc::socklen_t,
+            std::ptr::null_mut(),
+            0,
+            libc::NI_NAMEREQD,
+        )
+    };
+    if rc != 0 {
+        return Vec::new();
+    }
+    // SAFETY: on success getnameinfo NUL-terminated `host`.
+    let name = unsafe { CStr::from_ptr(host.as_ptr()) }
+        .to_string_lossy()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if name.is_empty() { Vec::new() } else { vec![name] }
 }
 
 /// Accept intercepted connections; natlook each via the broker, admit iff the

@@ -124,3 +124,30 @@ async fn name_grant_reaches_host_and_exchanges_data() {
         "name-granted host must resolve + exchange data (Linux parity): {res:?}"
     );
 }
+
+/// Wildcard parity: a suffix-wildcard grant (`net:one.one.one.*`) — impossible
+/// on the old IP-preresolve path — now works because the child's DNS goes
+/// direct (mDNSResponder denied) and hits our interception, which matches the
+/// live query name against the wildcard and pins the answer before replying.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wildcard_grant_resolves_like_linux() {
+    if !e2e_enabled() {
+        eprintln!("{SKIP}");
+        return;
+    }
+    let script = "exec 3<>/dev/tcp/one.one.one.one/80 && printf 'GET / HTTP/1.0\\r\\nHost: one.one.one.one\\r\\n\\r\\n' >&3 && head -c4 <&3";
+    let mut req = ExecRequest {
+        bin: "/bin/bash".into(),
+        args: vec!["-c".into(), script.into()],
+        cwd: None,
+        stdin: None,
+        separate_stderr: true,
+        sandbox: None,
+    };
+    req.sandbox = Some(policy(vec!["net:one.one.one.*"]));
+    let res = agentd_shell::exec(req).await.expect("exec");
+    assert!(
+        res.stdout.starts_with("HTTP"),
+        "wildcard-granted name must resolve + exchange data (Linux parity): {res:?}"
+    );
+}
