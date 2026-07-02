@@ -6,7 +6,7 @@
 //! Compiled on all unix targets so the codec is unit-tested everywhere; only
 //! the broker binary and the pf plumbing are macOS-gated.
 
-use std::io::{BufRead, Write};
+use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +46,10 @@ pub enum Req {
     /// `DIOCNATLOOK`: original destination of a redirected TCP connection, as
     /// seen by the relay (`src` = child's ephemeral endpoint, `dst` = relay).
     Natlook { proto: Proto, src: String, dst: String },
+    /// Block until the spawned child exits; reply is `Exit`. Sent by the daemon
+    /// after the child's stdout/stderr reach EOF. Keeps the stream strictly
+    /// request/response (no async events racing concurrent natlooks).
+    Wait,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,7 +67,7 @@ pub enum Resp {
     Leased { uid: u32, user: String },
     Spawned { pid: i32 },
     NatlookResult { orig: String },
-    /// Child reaped; sent asynchronously on the same stream.
+    /// Reply to `Wait`: the reaped child's exit code.
     Exit { code: i32 },
     Err { kind: ErrKind, msg: String },
 }
@@ -108,9 +112,11 @@ pub fn write_msg<W: Write, M: Serialize>(w: &mut W, msg: &M) -> Result<(), WireE
     Ok(())
 }
 
-/// Read one message. Enforces [`MAX_LINE`] BEFORE parsing so a hostile peer
-/// cannot balloon memory with an unterminated line.
-pub fn read_msg<R: BufRead, M: for<'de> Deserialize<'de>>(r: &mut R) -> Result<M, WireError> {
+/// Read one message. Reads a byte at a time (so it never consumes past the
+/// newline — critical on the daemon side, where an `SCM_RIGHTS` fd message
+/// follows a `Spawned` reply and must be `recvmsg`'d separately). Enforces
+/// [`MAX_LINE`] BEFORE parsing so a hostile peer cannot balloon memory.
+pub fn read_msg<R: Read, M: for<'de> Deserialize<'de>>(r: &mut R) -> Result<M, WireError> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
@@ -172,6 +178,7 @@ mod tests {
             src: "127.0.0.1:50123".into(),
             dst: "127.0.0.1:4321".into(),
         });
+        roundtrip(Req::Wait);
     }
 
     #[test]

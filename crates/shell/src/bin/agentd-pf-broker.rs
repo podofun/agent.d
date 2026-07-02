@@ -160,6 +160,10 @@ mod macos {
                     Err(e) => Resp::Err { kind: e.kind, msg: e.msg },
                 }
             }
+            Req::Wait => match session.wait() {
+                Ok(code) => Resp::Exit { code },
+                Err(e) => Resp::Err { kind: e.kind, msg: e.msg },
+            },
         }
     }
 
@@ -209,6 +213,18 @@ mod macos {
                 return Err("only tcp natlook supported".into());
             }
             natlook_ioctl(src, dst)
+        }
+
+        fn wait_child(&mut self, pid: i32) -> i32 {
+            let mut status = 0;
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else if libc::WIFSIGNALED(status) {
+                128 + libc::WTERMSIG(status)
+            } else {
+                -1
+            }
         }
 
         fn kill_child(&mut self, pid: i32) {

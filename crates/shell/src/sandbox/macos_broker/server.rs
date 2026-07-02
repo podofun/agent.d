@@ -22,6 +22,9 @@ pub trait Backend {
     fn spawn(&mut self, user: &SandboxUser, bin: &str, args: &[String], cwd: Option<&str>, sbpl: &str, want_stdin: bool) -> Result<i32, String>;
     /// DIOCNATLOOK: original destination of a redirected connection.
     fn natlook(&self, proto: Proto, src: SocketAddr, dst: SocketAddr) -> Result<SocketAddr, String>;
+    /// Block until the spawned child exits; return its code. Called at most
+    /// once, after which teardown's `kill_child` is a no-op.
+    fn wait_child(&mut self, pid: i32) -> i32;
     /// Kill the spawned child if still alive.
     fn kill_child(&mut self, pid: i32);
     /// Flush the pf anchor for this uid.
@@ -115,6 +118,18 @@ impl<'u, B: Backend> Session<'u, B> {
         self.backend.natlook(proto, src, dst).map_err(backend_err)
     }
 
+    /// Wait for the child, returning its exit code. Clears the tracked pid so
+    /// teardown does not also try to kill it.
+    pub fn wait(&mut self) -> Result<i32, SessionError> {
+        match self.progress.child_pid.take() {
+            Some(pid) => Ok(self.backend.wait_child(pid)),
+            None => Err(SessionError {
+                kind: ErrKind::Proto,
+                msg: "wait before spawn".into(),
+            }),
+        }
+    }
+
     /// Undo every effect in reverse order: kill child → flush anchor → remove
     /// ACLs. Idempotent; the uid lease is released by the caller dropping the
     /// `Lease` after this returns.
@@ -185,6 +200,10 @@ mod tests {
         fn natlook(&self, _p: Proto, _s: SocketAddr, _d: SocketAddr) -> Result<SocketAddr, String> {
             Ok("1.1.1.1:443".parse().unwrap())
         }
+        fn wait_child(&mut self, pid: i32) -> i32 {
+            self.push(&format!("wait {pid}"));
+            0
+        }
         fn kill_child(&mut self, pid: i32) {
             self.push(&format!("kill {pid}"));
         }
@@ -254,6 +273,22 @@ mod tests {
             vec!["provision 1 2", "acl r=0 w=0", "flush_anchor", "remove_acls"],
             "no kill (spawn failed) but anchor+acls undone"
         );
+    }
+
+    #[test]
+    fn wait_clears_pid_so_teardown_does_not_kill() {
+        let (be, log) = MockBackend::new();
+        let u = user();
+        {
+            let mut s = Session::new(be, &u);
+            s.provision(1, 2).unwrap();
+            s.spawn("/x", &[], None, "", false).unwrap();
+            assert_eq!(s.wait().unwrap(), 0);
+        }
+        let ev = log.borrow();
+        assert!(ev.events.contains(&"wait 4242".to_string()));
+        assert!(!ev.events.iter().any(|e| e.starts_with("kill")), "no kill after wait");
+        assert!(ev.events.contains(&"flush_anchor".to_string()));
     }
 
     #[test]

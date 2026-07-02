@@ -1,0 +1,361 @@
+//! macOS transparent host/IP-granular network backend — the daemon (client)
+//! half. Semantically identical to the Linux netns backend: the SAME
+//! [`crate::gateway`] DNS-pin + [`PermitSet`] core decides which IPs the child
+//! may reach; only the capture mechanism differs.
+//!
+//! Flow:
+//! 1. Connect the root `agentd-pf-broker`, lease a sandbox uid.
+//! 2. Bind a dual-stack TCP relay + UDP DNS server on loopback; tell the broker
+//!    to `provision` a pf anchor redirecting the leased uid's traffic to those
+//!    ports (`route-to lo0` + `rdr`), and to stamp per-uid fs ACLs.
+//! 3. Ask the broker to `spawn` the child as that uid under a Seatbelt profile
+//!    that allows outbound; receive the child's stdio fds over `SCM_RIGHTS`.
+//! 4. Relay: for each intercepted connection, ask the broker for the original
+//!    destination (`DIOCNATLOOK`), admit iff the shared [`PermitSet`] allows it,
+//!    then splice to the real dst. DNS: resolve allowed names, commit their IPs
+//!    to the set BEFORE answering — the exact ordering Linux uses.
+//!
+//! Enforcement never runs in the daemon with elevated privilege: every root
+//! operation is a narrow broker verb.
+
+#![cfg(target_os = "macos")]
+
+use std::io::Read;
+use std::net::{IpAddr, SocketAddr};
+use std::os::fd::{FromRawFd, RawFd};
+use std::os::unix::net::UnixStream;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use agentd_permissions::Permission;
+
+use super::macos_broker::proto::{ErrKind, Proto, Req, Resp, read_msg, write_msg};
+use super::macos_broker::SOCKET_PATH;
+use crate::gateway::{SharedSet, admit, handle_dns};
+use crate::netfilter::{PermitSet, SetConfig};
+use crate::{ExecRequest, ExecResult, SandboxPolicy, ShellError};
+
+const PIN_TTL: Duration = Duration::from_secs(120);
+
+/// Whether the broker socket is present and answers `Ping`. Used by
+/// `net_supported()` to fail closed when the broker isn't installed/running.
+pub fn broker_available() -> bool {
+    let Ok(mut s) = UnixStream::connect(SOCKET_PATH) else {
+        return false;
+    };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    if write_msg(&mut s, &Req::Ping).is_err() {
+        return false;
+    }
+    matches!(read_msg::<_, Resp>(&mut s), Ok(Resp::Ok))
+}
+
+/// Serialized broker connection: setup verbs run once, then `natlook`/`wait`
+/// are request/response under the mutex (concurrent relay connections natlook
+/// through the same channel).
+struct Broker {
+    stream: Mutex<UnixStream>,
+}
+
+impl Broker {
+    fn connect() -> Result<Self, ShellError> {
+        let stream = UnixStream::connect(SOCKET_PATH)
+            .map_err(|e| ShellError::Sandbox(format!("broker connect: {e}")))?;
+        Ok(Broker {
+            stream: Mutex::new(stream),
+        })
+    }
+
+    fn call(&self, req: &Req) -> Result<Resp, ShellError> {
+        let mut s = self.stream.lock().unwrap();
+        write_msg(&mut *s, req).map_err(|e| ShellError::Sandbox(format!("broker send: {e}")))?;
+        read_msg::<_, Resp>(&mut *s).map_err(|e| ShellError::Sandbox(format!("broker recv: {e}")))
+    }
+
+    fn expect_ok(&self, req: &Req) -> Result<(), ShellError> {
+        match self.call(req)? {
+            Resp::Ok => Ok(()),
+            Resp::Err { kind, msg } => Err(broker_error(kind, msg)),
+            other => Err(ShellError::Sandbox(format!("unexpected broker reply: {other:?}"))),
+        }
+    }
+}
+
+fn broker_error(kind: ErrKind, msg: String) -> ShellError {
+    match kind {
+        ErrKind::PoolExhausted => {
+            ShellError::Sandbox("all sandbox slots in use; retry shortly".into())
+        }
+        _ => ShellError::Sandbox(format!("broker: {msg}")),
+    }
+}
+
+/// Bind a dual-stack loopback listener (v4 + v6 on one port) so the pf `rdr`
+/// rules — which target `127.0.0.1:port` for v4 and `[::1]:port` for v6 — both
+/// land here. Without dual-stack, a granted v6 host would fail on macOS while
+/// working on Linux: a hidden platform difference.
+fn bind_dual_tcp() -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    sock.set_only_v6(false)?;
+    sock.set_reuse_address(true)?;
+    sock.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)).into())?;
+    sock.listen(128)?;
+    Ok(sock.into())
+}
+
+fn bind_dual_udp() -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_only_v6(false)?;
+    sock.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)).into())?;
+    Ok(sock.into())
+}
+
+/// Run `req` under the transparent pf-broker sandbox. Same signature as the
+/// Linux backend so `lib.rs` dispatch is symmetric.
+pub async fn run_contained(
+    req: &ExecRequest,
+    policy: &SandboxPolicy,
+    host_grants: Vec<Permission>,
+    literal_ips: Vec<IpAddr>,
+) -> Result<ExecResult, ShellError> {
+    let broker = Arc::new(Broker::connect()?);
+
+    // Relay + DNS listeners (std sockets; converted to tokio below).
+    let tcp = bind_dual_tcp().map_err(|e| ShellError::Sandbox(format!("relay bind: {e}")))?;
+    let udp = bind_dual_udp().map_err(|e| ShellError::Sandbox(format!("dns bind: {e}")))?;
+    let tcp_port = tcp.local_addr().map_err(io_sb)?.port();
+    let dns_port = udp.local_addr().map_err(io_sb)?.port();
+
+    // Lease → provision anchor → stamp ACLs.
+    match broker.call(&Req::Lease { v: 1 })? {
+        Resp::Leased { .. } => {}
+        Resp::Err { kind, msg } => return Err(broker_error(kind, msg)),
+        other => return Err(ShellError::Sandbox(format!("lease reply: {other:?}"))),
+    }
+    broker.expect_ok(&Req::Provision { tcp_port, dns_port })?;
+    let read: Vec<String> = policy
+        .read_paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let write: Vec<String> = policy
+        .write_paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    broker.expect_ok(&Req::Acl { read, write })?;
+
+    // Spawn the child under Seatbelt (fs confinement + outbound allowed); pf +
+    // the relay enforce the network policy.
+    let sbpl = super::backend::sbpl_net_for_broker(policy);
+    let want_stdin = req.stdin.is_some();
+    let pid = {
+        let mut s = broker.stream.lock().unwrap();
+        write_msg(
+            &mut *s,
+            &Req::Spawn {
+                bin: req.bin.clone(),
+                args: req.args.clone(),
+                cwd: req.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                sbpl,
+                want_stdin,
+            },
+        )
+        .map_err(|e| ShellError::Sandbox(format!("spawn send: {e}")))?;
+        let reply = read_msg::<_, Resp>(&mut *s)
+            .map_err(|e| ShellError::Sandbox(format!("spawn reply: {e}")))?;
+        let pid = match reply {
+            Resp::Spawned { pid } => pid,
+            Resp::Err { kind, msg } => return Err(broker_error(kind, msg)),
+            other => return Err(ShellError::Sandbox(format!("spawn reply: {other:?}"))),
+        };
+        // Receive the child's stdio fds over SCM_RIGHTS on the same socket.
+        let fds = recv_fds(&s, if want_stdin { 3 } else { 2 })
+            .map_err(|e| ShellError::Sandbox(format!("recv stdio fds: {e}")))?;
+        drop(s);
+        // Order matches the broker's send: [stdin_wr?, stdout_rd, stderr_rd].
+        let mut it = fds.into_iter();
+        let stdin_wr = if want_stdin { Some(it.next().unwrap()) } else { None };
+        let stdout_rd = it.next().unwrap();
+        let stderr_rd = it.next().unwrap();
+        Some((pid, stdin_wr, stdout_rd, stderr_rd))
+    };
+    let (_pid, stdin_wr, stdout_rd, stderr_rd) = pid.unwrap();
+
+    // Shared permitted set, seeded with literal IP grants (identical to Linux).
+    let set: SharedSet = {
+        let mut ps = PermitSet::new(SetConfig::default());
+        for ip in &literal_ips {
+            ps.allow_literal(*ip);
+        }
+        Arc::new(Mutex::new(ps))
+    };
+
+    // DNS server task.
+    let dns_set = set.clone();
+    let dns_grants = host_grants.clone();
+    let udp = tokio::net::UdpSocket::from_std(udp).map_err(io_sb)?;
+    let dns_task = tokio::spawn(async move { dns_loop(udp, dns_grants, dns_set).await });
+
+    // TCP relay task.
+    let relay_set = set.clone();
+    let relay_broker = broker.clone();
+    let tcp = tokio::net::TcpListener::from_std(tcp).map_err(io_sb)?;
+    let relay_task = tokio::spawn(async move { relay_loop(tcp, relay_broker, relay_set).await });
+
+    // Feed stdin (if any), drain stdout/stderr to completion (EOF = child done).
+    if let (Some(input), Some(fd)) = (&req.stdin, stdin_wr) {
+        let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+        use std::io::Write;
+        let _ = f.write_all(input.as_bytes());
+        // drop closes the child's stdin.
+    } else if let Some(fd) = stdin_wr {
+        unsafe { libc::close(fd) };
+    }
+    let out_task = tokio::task::spawn_blocking(move || read_fd_to_end(stdout_rd));
+    let err_task = tokio::task::spawn_blocking(move || read_fd_to_end(stderr_rd));
+    let stdout = String::from_utf8_lossy(&out_task.await.unwrap_or_default()).into_owned();
+    let stderr_text = String::from_utf8_lossy(&err_task.await.unwrap_or_default()).into_owned();
+
+    // Child's stdio closed → reap it via the broker for the exit code.
+    let exit_code = match broker.call(&Req::Wait)? {
+        Resp::Exit { code } => code,
+        Resp::Err { kind, msg } => return Err(broker_error(kind, msg)),
+        other => return Err(ShellError::Sandbox(format!("wait reply: {other:?}"))),
+    };
+
+    // Dropping the broker connection triggers broker-side teardown (flush
+    // anchor, remove ACLs, release uid). Stop the relay/DNS tasks.
+    relay_task.abort();
+    dns_task.abort();
+    drop(broker);
+
+    let (stdout, stderr) = if req.separate_stderr {
+        (stdout, stderr_text)
+    } else {
+        let mut merged = stdout;
+        if !stderr_text.is_empty() {
+            if !merged.is_empty() && !merged.ends_with('\n') {
+                merged.push('\n');
+            }
+            merged.push_str(&stderr_text);
+        }
+        (merged, String::new())
+    };
+    Ok(ExecResult { exit_code, stdout, stderr })
+}
+
+fn io_sb(e: std::io::Error) -> ShellError {
+    ShellError::Sandbox(e.to_string())
+}
+
+fn read_fd_to_end(fd: RawFd) -> Vec<u8> {
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut v = Vec::new();
+    let _ = f.read_to_end(&mut v);
+    v
+}
+
+/// Receive `n` file descriptors via `SCM_RIGHTS` (plus the broker's dummy byte).
+fn recv_fds(stream: &UnixStream, n: usize) -> std::io::Result<Vec<RawFd>> {
+    use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
+    use std::os::fd::AsRawFd;
+    let mut buf = [0u8; 1];
+    let mut iov = [std::io::IoSliceMut::new(&mut buf)];
+    let mut cmsg_space = nix::cmsg_space!([RawFd; 8]);
+    let msg = recvmsg::<()>(
+        stream.as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsg_space),
+        MsgFlags::empty(),
+    )
+    .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut fds = Vec::new();
+    if let Ok(cmsgs) = msg.cmsgs() {
+        for c in cmsgs {
+            if let ControlMessageOwned::ScmRights(got) = c {
+                fds.extend(got);
+            }
+        }
+    }
+    if fds.len() != n {
+        for fd in &fds {
+            unsafe { libc::close(*fd) };
+        }
+        return Err(std::io::Error::other(format!(
+            "expected {n} fds, got {}",
+            fds.len()
+        )));
+    }
+    Ok(fds)
+}
+
+/// Accept intercepted connections; natlook each via the broker, admit iff the
+/// permitted set allows the original destination, then splice.
+async fn relay_loop(listener: tokio::net::TcpListener, broker: Arc<Broker>, set: SharedSet) {
+    loop {
+        let (inbound, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(_) => break,
+        };
+        let local = match inbound.local_addr() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let broker = broker.clone();
+        let set = set.clone();
+        tokio::spawn(async move {
+            let orig = match natlook(&broker, peer, local).await {
+                Some(d) => d,
+                None => return, // no original dst → drop
+            };
+            if !admit(orig.ip(), &set) {
+                return; // not granted → drop (fail closed)
+            }
+            let mut inbound = inbound;
+            let mut upstream = match tokio::net::TcpStream::connect(orig).await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut upstream).await;
+        });
+    }
+}
+
+/// Natlook via the broker (blocking request/response, run off the async
+/// executor to avoid stalling other tasks under the connection mutex).
+async fn natlook(broker: &Arc<Broker>, peer: SocketAddr, local: SocketAddr) -> Option<SocketAddr> {
+    let broker = broker.clone();
+    tokio::task::spawn_blocking(move || {
+        match broker.call(&Req::Natlook {
+            proto: Proto::Tcp,
+            src: peer.to_string(),
+            dst: local.to_string(),
+        }) {
+            Ok(Resp::NatlookResult { orig }) => orig.parse().ok(),
+            _ => None,
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Serve DNS queries from the child: resolve allowed names, commit IPs to the
+/// set BEFORE answering, NXDOMAIN otherwise. Identical policy to Linux.
+async fn dns_loop(udp: tokio::net::UdpSocket, host_grants: Vec<Permission>, set: SharedSet) {
+    let resolver = crate::dns_pin::SystemResolver;
+    let mut buf = [0u8; 1500];
+    loop {
+        let (n, src) = match udp.recv_from(&mut buf).await {
+            Ok(x) => x,
+            Err(_) => break,
+        };
+        let resp = handle_dns(&buf[..n], &host_grants, &set, &resolver, PIN_TTL).unwrap_or_default();
+        if !resp.is_empty() {
+            let _ = udp.send_to(&resp, src).await;
+        }
+    }
+}

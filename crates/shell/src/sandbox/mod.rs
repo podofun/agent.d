@@ -18,10 +18,13 @@ mod backend;
 mod backend;
 
 #[cfg(target_os = "macos")]
-pub use backend::{run_contained as macos_run_contained, wrap_argv};
+pub use backend::wrap_argv;
 
 #[cfg(target_os = "macos")]
-pub mod macos_pf;
+pub mod macos_transparent;
+
+#[cfg(target_os = "macos")]
+pub use macos_transparent::run_contained as macos_run_contained;
 
 #[cfg(unix)]
 pub mod macos_broker;

@@ -113,9 +113,16 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
         // child's AppContainer package SID (handled inside run_contained).
         #[cfg(target_os = "windows")]
         return sandbox::windows_run_contained(&req, &policy).await;
-        // macOS enforces via pf scoped to a dedicated UID.
+        // macOS enforces via the transparent pf-broker path: same DNS-pin +
+        // PermitSet core as Linux, capture via pf redirect to a daemon relay.
         #[cfg(target_os = "macos")]
-        return sandbox::macos_run_contained(&req, &policy).await;
+        {
+            if !sandbox::net_supported() {
+                return Err(ShellError::SandboxUnavailable);
+            }
+            let (host_grants, literal_ips) = dns_pin::split_grants(&policy.net_hosts);
+            return sandbox::macos_run_contained(&req, &policy, host_grants, literal_ips).await;
+        }
         #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
         return Err(ShellError::SandboxUnavailable);
     }

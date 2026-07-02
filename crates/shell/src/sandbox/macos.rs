@@ -1,20 +1,21 @@
 //! macOS Seatbelt backend. Enforced by wrapping argv in `sandbox-exec`, not by
 //! self-restriction, so `apply` returns an error and `exec` calls `wrap_argv`.
 //!
-//! Host-granular network (when the policy permits it) is enforced by `pf` scoped
-//! to a dedicated UID (see [`super::macos_pf`]); the Seatbelt profile then
-//! *allows* outbound and `pf` does the IP allowlisting.
+//! The no-network path is pure Seatbelt (`deny default`, no network-outbound
+//! allow). Host-granular network is enforced by the transparent pf-broker path
+//! (see [`super::macos_transparent`]): the child runs under a Seatbelt profile
+//! that *allows* outbound ([`sbpl_net_for_broker`]) while `pf` — scoped to the
+//! broker-leased uid — redirects its traffic to the daemon's policy relay.
 
 use crate::policy::{READ_BASELINE, SandboxError, SandboxPolicy, WRITE_SCRATCH};
-use crate::{ExecRequest, ExecResult, ShellError};
 
 pub fn is_supported() -> bool {
     std::path::Path::new("/usr/bin/sandbox-exec").exists()
 }
 
-/// Net containment uses the same Seatbelt wrapper, so support tracks `is_supported`.
+/// Host-granular net requires the pf broker to be reachable; support tracks it.
 pub fn net_supported() -> bool {
-    is_supported()
+    is_supported() && super::macos_transparent::broker_available()
 }
 
 /// Unused on macOS (wrapper model); kept for the dispatch signature parity.
@@ -96,132 +97,15 @@ pub fn wrap_argv(policy: &SandboxPolicy, bin: &str, args: &[String]) -> (String,
     ("/usr/bin/sandbox-exec".to_string(), new_args)
 }
 
-// ---- host-granular network path (pf + dedicated UID) ----
 
-/// Dedicated sandbox UID for `pf` scoping, from `AGENTD_SANDBOX_UID` (the
-/// operator provisions an unprivileged user). Without it, `pf` can't scope to a
-/// single process tree, so the net sandbox fails closed.
-fn sandbox_uid() -> Result<u32, ShellError> {
-    std::env::var("AGENTD_SANDBOX_UID")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| {
-            ShellError::Sandbox(
-                "macOS net sandbox requires AGENTD_SANDBOX_UID (a dedicated unprivileged uid)"
-                    .into(),
-            )
-        })
-}
-
-/// SBPL that confines the filesystem but ALLOWS outbound network — `pf` enforces
-/// the host/IP allowlist for net children.
-fn sbpl_net_allowed(policy: &SandboxPolicy) -> String {
+/// SBPL for a broker-spawned net child: confine the filesystem but ALLOW
+/// outbound network — `pf` (scoped to the child's dedicated uid) enforces the
+/// host/IP allowlist, and the daemon's relay does the per-connection admit
+/// decision. Built here, sent to the broker over the wire.
+pub fn sbpl_net_for_broker(policy: &SandboxPolicy) -> String {
     let mut sbpl = sbpl_fs(policy);
     // mach-lookup: DNS on macOS goes through mDNSResponder's mach service.
     sbpl.push_str("(allow network-outbound)\n(allow network-bind)\n(allow mach-lookup)\n(allow system-socket)\n");
     sbpl
 }
 
-/// Pre-resolve the policy's net grants to IPs (concrete hostnames + literals;
-/// wildcards are skipped — no L7 on this path).
-fn preresolve(policy: &SandboxPolicy) -> Vec<std::net::IpAddr> {
-    use crate::dns_pin::{Resolve, SystemResolver, split_grants};
-    let (host_grants, mut ips) = split_grants(&policy.net_hosts);
-    let resolver = SystemResolver;
-    for g in &host_grants {
-        if let ("net", Some(name)) = g.parts()
-            && !name.contains('*')
-            && let Ok(addrs) = resolver.resolve(name)
-        {
-            ips.extend(addrs);
-        }
-    }
-    ips
-}
-
-/// Run `req` with host-granular network: `pf` allowlist scoped to a dedicated
-/// UID; the child runs as that UID under Seatbelt (fs) with outbound allowed.
-pub async fn run_contained(
-    req: &ExecRequest,
-    policy: &SandboxPolicy,
-) -> Result<ExecResult, ShellError> {
-    use super::macos_pf::PfFilter;
-    use crate::netfilter::NetFilter;
-    use std::process::Stdio;
-
-    let uid = sandbox_uid()?;
-    let filter = PfFilter::new(uid);
-    let ips = preresolve(policy);
-    let handle = filter
-        .provision(&ips)
-        .map_err(|e| ShellError::Sandbox(format!("pf provision: {e}")))?;
-
-    let sbpl = sbpl_net_allowed(policy);
-    let mut argv = vec!["-p".to_string(), sbpl, "--".to_string(), req.bin.clone()];
-    argv.extend(req.args.iter().cloned());
-
-    let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
-    cmd.args(&argv);
-    if let Some(cwd) = &req.cwd {
-        cmd.current_dir(cwd);
-    }
-    // Drop to the dedicated UID in the forked child before exec, so `pf`'s
-    // `user`-match scopes to exactly this process tree.
-    // SAFETY: pre_exec runs in the forked child; raw setgid/setuid syscalls only.
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::setgid(uid) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::setuid(uid) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let result = run_cmd(cmd, req).await;
-    filter.teardown(handle);
-    result
-}
-
-async fn run_cmd(
-    mut cmd: tokio::process::Command,
-    req: &ExecRequest,
-) -> Result<ExecResult, ShellError> {
-    use tokio::io::AsyncWriteExt;
-    let mut child = cmd.spawn().map_err(|e| ShellError::Spawn {
-        bin: req.bin.clone(),
-        source: e,
-    })?;
-    if let (Some(input), Some(mut stdin)) = (req.stdin.as_ref(), child.stdin.take()) {
-        stdin.write_all(input.as_bytes()).await?;
-        stdin.shutdown().await?;
-    } else {
-        drop(child.stdin.take());
-    }
-    let output = child.wait_with_output().await?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr_text = String::from_utf8_lossy(&output.stderr).into_owned();
-    let exit_code = output.status.code().unwrap_or(-1);
-    let (stdout, stderr) = if req.separate_stderr {
-        (stdout, stderr_text)
-    } else {
-        let mut merged = stdout;
-        if !stderr_text.is_empty() {
-            if !merged.is_empty() && !merged.ends_with('\n') {
-                merged.push('\n');
-            }
-            merged.push_str(&stderr_text);
-        }
-        (merged, String::new())
-    };
-    Ok(ExecResult {
-        exit_code,
-        stdout,
-        stderr,
-    })
-}
