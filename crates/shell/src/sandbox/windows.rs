@@ -278,22 +278,36 @@ mod imp {
         }
     }
 
-    /// Resolve `bin` to the directory that holds it, so we can grant the
-    /// AppContainer read+execute there. Absolute paths are used directly;
-    /// otherwise `bin` (with and without a `.exe` suffix) is looked up on `PATH`,
-    /// matching how `CreateProcessW` resolves a bare name.
-    fn resolve_bin_dir(bin: &str) -> Option<std::path::PathBuf> {
+    /// Resolve `bin` to the absolute executable path. Absolute inputs are used
+    /// as-is (trying a `.exe` suffix if the literal path isn't a file);
+    /// otherwise `bin` (with and without `.exe`) is looked up on the daemon's
+    /// `PATH`.
+    ///
+    /// Resolving here — in the full-privilege daemon — is REQUIRED, not just an
+    /// optimization: the child runs in an AppContainer whose lowbox token cannot
+    /// stat most `PATH` directories, so `CreateProcessW`'s own bare-name search
+    /// fails with "file not found" even for a binary that is plainly on `PATH`.
+    /// We hand `CreateProcessW` the resolved absolute path instead.
+    fn resolve_bin_path(bin: &str) -> Option<std::path::PathBuf> {
         let p = std::path::Path::new(bin);
-        let file = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            std::env::split_paths(&std::env::var_os("PATH")?).find_map(|d| {
-                [d.join(bin), d.join(format!("{bin}.exe"))]
-                    .into_iter()
-                    .find(|c| c.is_file())
-            })?
-        };
-        file.parent().map(|d| d.to_path_buf())
+        if p.is_absolute() {
+            if p.is_file() {
+                return Some(p.to_path_buf());
+            }
+            let with_exe = p.with_extension("exe");
+            return with_exe.is_file().then_some(with_exe);
+        }
+        std::env::split_paths(&std::env::var_os("PATH")?).find_map(|d| {
+            [d.join(bin), d.join(format!("{bin}.exe"))]
+                .into_iter()
+                .find(|c| c.is_file())
+        })
+    }
+
+    /// The directory holding `bin`, so we can grant the AppContainer
+    /// read+execute there (the binary and the DLLs beside it).
+    fn resolve_bin_dir(bin: &str) -> Option<std::path::PathBuf> {
+        resolve_bin_path(bin).and_then(|f| f.parent().map(|d| d.to_path_buf()))
     }
 
     /// Whether `path`'s DACL already carries an allow-ACE for any SID in `sids`.
@@ -500,7 +514,19 @@ mod imp {
         let err = make_pipe(false, pipe_sd)?;
         let inp = make_pipe(true, pipe_sd)?;
 
-        // Command line: "bin" "arg" "arg"...
+        // Resolve the executable to an absolute path in the daemon (the child's
+        // AppContainer can't search PATH — see `resolve_bin_path`). Passed as
+        // `lpApplicationName` so no PATH search happens at spawn.
+        let bin_path = resolve_bin_path(&req.bin).ok_or_else(|| {
+            ShellError::Sandbox(format!(
+                "executable not found: `{}` is not an absolute path and was not found on PATH",
+                req.bin
+            ))
+        })?;
+        let mut app_name_w = to_wide(&bin_path.to_string_lossy());
+
+        // Command line: "bin" "arg" "arg"... The first token is argv[0]; the
+        // actual image is `lpApplicationName` above.
         let mut cmdline = String::new();
         cmdline.push('"');
         cmdline.push_str(&req.bin);
@@ -579,7 +605,7 @@ mod imp {
 
         let spawn = unsafe {
             CreateProcessW(
-                PCWSTR::null(),
+                PCWSTR(app_name_w.as_mut_ptr()),
                 PWSTR(cmdline_w.as_mut_ptr()),
                 None,
                 None,
@@ -600,7 +626,9 @@ mod imp {
         }
 
         let result = (|| -> Result<ExecResult, ShellError> {
-            spawn.map_err(sb)?;
+            spawn.map_err(|e| {
+                ShellError::Sandbox(format!("CreateProcessW `{}`: {e}", bin_path.display()))
+            })?;
 
             // Feed stdin, if any, then close.
             if let Some(input) = &req.stdin {
