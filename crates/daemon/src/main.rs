@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
 
 mod config;
+#[cfg(target_os = "windows")]
+mod elevate;
 mod runtime;
 mod watch;
 use config::{Cli, Config};
@@ -29,13 +31,35 @@ fn main() -> Result<()> {
     sandbox::run_netns_supervisor_if_requested();
 
     let cli = Cli::parse();
-    // Privileged one-time setup runs synchronously and exits — no server, no
-    // async runtime. This is the only path expected to run elevated.
+    // One-time sandbox setup runs synchronously and exits. The daemon itself
+    // never elevates: it creates the (non-privileged) sandbox profiles, then
+    // launches the separate broker binary through UAC to register the SYSTEM
+    // service that performs privileged network filtering.
     if cli.install_sandbox {
-        sandbox::install()?;
-        println!(
-            "Windows sandbox installed successfully! You can now run agentd as documented.\nhttps://docs.podo.fun/agentd/v0/guide/quick-start"
-        );
+        sandbox::install().map_err(|e| anyhow!("sandbox profile setup failed: {e}"))?;
+        #[cfg(target_os = "windows")]
+        {
+            let broker = std::env::current_exe()?
+                .parent()
+                .ok_or_else(|| anyhow!("cannot locate the daemon's directory"))?
+                .join("agentd-netbroker.exe");
+            if !broker.exists() {
+                return Err(anyhow!(
+                    "agentd-netbroker.exe not found next to daemon.exe (looked in {})",
+                    broker.display()
+                ));
+            }
+            match elevate::run_elevated(&broker, "--install")? {
+                true => println!(
+                    "Network sandbox installed. The daemon runs without Administrator."
+                ),
+                false => {
+                    return Err(anyhow!("Administrator approval was declined; nothing was changed."));
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        println!("Sandbox setup complete.");
         return Ok(());
     }
     run(cli)
