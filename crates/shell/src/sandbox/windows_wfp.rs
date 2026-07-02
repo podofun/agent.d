@@ -22,7 +22,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_ACTION_TYPE, FWP_BYTE_ARRAY16, FWP_BYTE_ARRAY16_TYPE,
-    FWP_BYTE_BLOB, FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_SID,
+    FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_SID,
     FWP_UINT8, FWP_UINT32, FWP_VALUE0, FWP_VALUE0_0, FWPM_CONDITION_ALE_PACKAGE_ID,
     FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_FILTER_CONDITION0, FWPM_FILTER0,
     FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_SESSION_FLAG_DYNAMIC,
@@ -67,16 +67,18 @@ fn wfp_err(code: u32, what: &str) -> FilterError {
     FilterError::Apply(format!("{what}: WFP error {code:#x}"))
 }
 
-/// The package-SID match condition. `blob` must outlive the filter-add call.
-/// The value encoding for `ALE_PACKAGE_ID` is `FWP_SID` + a byte blob.
-fn pkg_condition(blob: &FWP_BYTE_BLOB) -> FWPM_FILTER_CONDITION0 {
+/// The package-SID match condition. `sid_bytes` (the raw SID) must outlive the
+/// filter-add call. For an `FWP_SID`-typed value WFP reads the `sid` union
+/// member — a pointer to a real `SID` — not a byte blob; passing a blob there
+/// makes WFP parse it as a SID and fail with ERROR_INVALID_SID (0x539).
+fn pkg_condition(sid_bytes: &[u8]) -> FWPM_FILTER_CONDITION0 {
     let mut c = FWPM_FILTER_CONDITION0::default();
     c.fieldKey = FWPM_CONDITION_ALE_PACKAGE_ID;
     c.matchType = FWP_MATCH_EQUAL;
     c.conditionValue = FWP_CONDITION_VALUE0 {
         r#type: FWP_SID,
         Anonymous: FWP_CONDITION_VALUE0_0 {
-            byteBlob: blob as *const _ as *mut FWP_BYTE_BLOB,
+            sid: sid_bytes.as_ptr() as *mut windows::Win32::Security::SID,
         },
     };
     c
@@ -162,19 +164,10 @@ impl NetFilter for WfpFilter {
 }
 
 impl WfpFilter {
-    fn pkg_blob(&self) -> FWP_BYTE_BLOB {
-        FWP_BYTE_BLOB {
-            size: self.package_sid.len() as u32,
-            // Points into `self.package_sid` (owned by self, stable for the
-            // lifetime of every filter call).
-            data: self.package_sid.as_ptr() as *mut u8,
-        }
-    }
-
     fn add_block_all(&self, h: &WfpHandle) -> Result<(), FilterError> {
-        // `blob` must outlive the FwpmFilterAdd0 calls below — keep it here.
-        let blob = self.pkg_blob();
-        let pkg = pkg_condition(&blob);
+        // `self.package_sid` (owned by self, stable) backs the SID pointer for
+        // the FwpmFilterAdd0 calls below.
+        let pkg = pkg_condition(&self.package_sid);
         for layer in [
             FWPM_LAYER_ALE_AUTH_CONNECT_V4,
             FWPM_LAYER_ALE_AUTH_CONNECT_V6,
@@ -185,9 +178,8 @@ impl WfpFilter {
     }
 
     fn add_permit_ip(&self, h: &WfpHandle, ip: IpAddr) -> Result<(), FilterError> {
-        // `blob` (and `arr` for v6) must outlive the FwpmFilterAdd0 call.
-        let blob = self.pkg_blob();
-        let pkg = pkg_condition(&blob);
+        // `self.package_sid` (and `arr` for v6) must outlive the FwpmFilterAdd0 call.
+        let pkg = pkg_condition(&self.package_sid);
         let mut addr = FWPM_FILTER_CONDITION0::default();
         addr.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
         addr.matchType = FWP_MATCH_EQUAL;
