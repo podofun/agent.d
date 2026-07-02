@@ -26,6 +26,9 @@ pub mod macos_pf;
 #[cfg(unix)]
 pub mod macos_broker;
 
+#[cfg(unix)]
+pub mod macos_pf_rules;
+
 #[cfg(target_os = "windows")]
 pub use backend::run_contained as windows_run_contained;
 
