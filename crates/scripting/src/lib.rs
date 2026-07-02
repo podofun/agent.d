@@ -1739,6 +1739,55 @@ fn is_confinable_path(s: &str) -> bool {
     s.starts_with('/') || std::path::Path::new(s).is_absolute()
 }
 
+/// Canonicalize the concrete (pre-glob) prefix of a path grant spec, so grants
+/// written against a symlinked path (`/var` -> `/private/var`, `/tmp` ->
+/// `/private/tmp` on macOS) match the canonicalized paths the `fs.*`/shell
+/// bindings check (see [`resolve_path`]). Returns `None` when nothing resolves
+/// or the canonical form is identical.
+fn canonicalize_grant_spec(spec: &str) -> Option<String> {
+    let (prefix, suffix) = match spec.find(['*', '?', '[']) {
+        // Split before the last separator preceding the first glob metachar,
+        // so the prefix is a real filesystem path and the suffix keeps its
+        // leading '/'.
+        Some(i) => {
+            let cut = spec[..i].rfind('/')?;
+            (&spec[..cut], &spec[cut..])
+        }
+        None => (spec, ""),
+    };
+    if prefix.is_empty() {
+        return None;
+    }
+    let p = std::path::Path::new(prefix);
+    let canon = p.canonicalize().ok().or_else(|| {
+        // Leaf may not exist yet (e.g. `fs.write:<dir>/new.txt`): resolve the
+        // parent and re-attach the leaf, mirroring `resolve_path`.
+        let (parent, name) = (p.parent()?, p.file_name()?);
+        Some(parent.canonicalize().ok()?.join(name))
+    })?;
+    let mut out = strip_verbatim(canon).to_str()?.to_owned();
+    out.push_str(suffix);
+    (out != spec).then_some(out)
+}
+
+/// Add a canonical-form twin for every path-scoped grant (`fs.read`,
+/// `fs.write`, `shell.exec`). Purely additive: the canonical spec names the
+/// same subtree the grantor already granted, it just survives the symlink
+/// resolution the op-side check performs.
+pub(crate) fn normalize_path_grants(grants: &PermissionSet) -> PermissionSet {
+    let mut out = grants.clone();
+    for p in grants.iter() {
+        if let Some((domain, spec)) = p.as_str().split_once(':')
+            && matches!(domain, "fs.read" | "fs.write" | "shell.exec")
+            && is_confinable_path(spec)
+            && let Some(canon) = canonicalize_grant_spec(spec)
+        {
+            out.insert(Permission::new(format!("{domain}:{canon}")));
+        }
+    }
+    out
+}
+
 /// Translate an execution's effective grants into a child-process sandbox
 /// policy. `fs.read`/`fs.write` slugs become readable/writable subtrees (globs
 /// collapsed to the concrete ancestor dir), any `net:` grant flips coarse
@@ -3134,7 +3183,7 @@ impl Registry for LuaHost {
         let lua = self.lua.clone();
         let catalog = self.catalog.clone();
         let ActionCall { action, args } = call;
-        let effective_grants = ctx.effective_grants.clone();
+        let effective_grants = normalize_path_grants(&ctx.effective_grants);
         let call_chain = ctx.call_chain.clone();
 
         // Snapshot the declared schemas (if any) so we can validate args before
@@ -3219,7 +3268,7 @@ impl Registry for LuaHost {
         let svc_name = name.to_string();
         let ctx_for_drive = ActiveContext {
             caller: ctx.caller.clone(),
-            effective_grants: ctx.effective_grants.clone(),
+            effective_grants: normalize_path_grants(&ctx.effective_grants),
             call_chain: ctx.call_chain.clone(),
             grant_kind: Some("service".to_string()),
             grant_name: Some(svc_name.clone()),

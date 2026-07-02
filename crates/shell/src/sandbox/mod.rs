@@ -1,5 +1,6 @@
-//! Native-OS sandbox backend dispatch. Phase 1: filesystem confinement +
-//! coarse network on/off. Applied in the forked child (Linux) or via wrapper.
+//! Native-OS sandbox backend dispatch: filesystem confinement + host/IP-granular
+//! network. Enforcement is per-backend — a re-exec'd netns supervisor (Linux),
+//! an argv wrapper + pf (macOS), and a custom AppContainer + WFP spawn (Windows).
 
 use crate::policy::{SandboxError, SandboxPolicy};
 
@@ -19,11 +20,29 @@ mod backend;
 #[cfg(target_os = "macos")]
 pub use backend::wrap_argv;
 
+#[cfg(target_os = "macos")]
+pub mod macos_transparent;
+
+#[cfg(target_os = "macos")]
+pub use macos_transparent::run_contained as macos_run_contained;
+
+#[cfg(unix)]
+pub mod macos_broker;
+
+#[cfg(unix)]
+pub mod macos_pf_rules;
+
 #[cfg(target_os = "windows")]
 pub use backend::run_contained as windows_run_contained;
 
+#[cfg(target_os = "windows")]
+pub mod windows_wfp;
+
 #[cfg(target_os = "linux")]
 pub mod linux_net;
+
+#[cfg(target_os = "linux")]
+pub mod linux_transparent;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod seccomp_linux;
@@ -34,7 +53,7 @@ pub(crate) mod seccomp_linux;
 /// Linux.
 pub fn run_netns_supervisor_if_requested() {
     #[cfg(target_os = "linux")]
-    linux_net::run_supervisor_if_requested();
+    linux_transparent::run_supervisor_if_requested();
 }
 
 /// Apply the policy to the CURRENT process/thread (call site is the forked
@@ -52,17 +71,39 @@ pub fn is_supported() -> bool {
 }
 
 /// Run the platform's one-time privileged network-sandbox setup; a no-op where
-/// none is needed. On Windows it requires Administrator (see `windows::install`).
+/// none is needed. Windows requires Administrator; macOS requires root (sudo)
+/// and installs the pf broker + sandbox users (see `macos_install`). Linux
+/// needs nothing — rootless netns is set up per-exec.
 pub fn install() -> Result<(), SandboxError> {
     #[cfg(target_os = "windows")]
     {
         backend::install().map_err(|e| SandboxError::Apply(e.to_string()))
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_install::install()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         Ok(())
     }
 }
+
+/// Reverse [`install`]. Only macOS/Windows have state to remove; Linux is a
+/// no-op.
+pub fn uninstall() -> Result<(), SandboxError> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_install::uninstall()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub mod macos_install;
 
 /// Whether host-granular network containment can be enforced here.
 pub fn net_supported() -> bool {
