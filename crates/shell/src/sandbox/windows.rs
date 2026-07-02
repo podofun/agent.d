@@ -416,7 +416,13 @@ mod imp {
                 && !name.contains('*')
                 && let Ok(addrs) = resolver.resolve(name)
             {
-                // Only concrete names pre-resolve; wildcards are skipped (no L7).
+                // KNOWN GAP vs Linux/macOS: concrete names are pre-resolved ONCE
+                // here (a staleness window on TTL/round-robin), and WILDCARD host
+                // grants are dropped entirely — a wildcard-granted connection is
+                // fail-closed (denied) on Windows. Closing this needs the same
+                // per-connection relay the mac backend uses (WFP redirect to an
+                // in-daemon relay); macOS covers both via reactive resolution +
+                // forward-confirmed rDNS at connect time.
                 ips.extend(addrs);
             }
         }
