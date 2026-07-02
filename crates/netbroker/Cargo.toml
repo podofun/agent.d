@@ -1,0 +1,15 @@
+[package]
+name = "agentd-netbroker"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "agentd-netbroker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+agentd-shell.workspace = true
+windows-service = "0.8"

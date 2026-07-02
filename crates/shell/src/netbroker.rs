@@ -134,6 +134,16 @@ fn connect() -> Result<HANDLE, ShellError> {
     Ok(h)
 }
 
+/// Poke the pipe to unblock a `ConnectNamedPipe` wait in [`accept_loop`], so the
+/// service can notice a stop request and exit its accept loop promptly.
+pub fn wake() {
+    if let Ok(h) = connect() {
+        unsafe {
+            let _ = CloseHandle(h);
+        }
+    }
+}
+
 /// Whether the broker is reachable (service installed + running). Non-privileged.
 pub fn available() -> bool {
     match connect() {
