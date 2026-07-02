@@ -42,6 +42,11 @@ jobs:
       - name: Build release binaries
         run: cargo build --release -p daemon -p agentd-cli
 
+      # Windows-only helper; built and shipped only in the Windows archive.
+      - name: Build network broker (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release -p agentd-netbroker
+
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -57,6 +62,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/release/daemon.exe dist/
           Copy-Item target/release/agentctl.exe dist/
+          # Ships alongside daemon.exe; the daemon locates it in its own folder.
+          Copy-Item target/release/agentd-netbroker.exe dist/
           Copy-Item README.md, LICENSE dist/
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.archive }}"
 
