@@ -136,7 +136,11 @@ async fn bare_name_on_path_resolves() {
     .await
     .unwrap();
 
-    assert_eq!(res.exit_code, 0, "bare name failed to resolve; stderr: {}", res.stderr);
+    assert_eq!(
+        res.exit_code, 0,
+        "bare name failed to resolve; stderr: {}",
+        res.stderr
+    );
     assert!(
         res.stdout.contains("alive"),
         "expected child stdout, got: {:?}",
