@@ -259,13 +259,94 @@ impl WfpFilter {
 }
 
 /// DNS servers the child is allowed to reach (so name resolution works),
-/// seeded into the permit set. This returns a conservative default set (the
-/// loopback stub + common public resolvers); reading the active interface's
-/// configured resolvers is a planned improvement.
+/// seeded into the permit set. The child does its own `getaddrinfo`, which goes
+/// to the machine's *configured* resolvers — so we must permit exactly those, or
+/// the query is blocked (WFP denies it) and every name fails to resolve.
+///
+/// We enumerate the live adapters' resolvers via `GetAdaptersAddresses` and add
+/// the loopback stub (the Windows DNS Client service often answers there). The
+/// common public resolvers are appended only as a last resort, when enumeration
+/// returned nothing usable.
 pub fn system_dns_servers() -> Vec<IpAddr> {
-    vec![
-        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-    ]
+    let mut out = configured_dns_servers();
+    // The DNS Client service / stub resolver commonly answers on loopback.
+    out.push(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+    // Fallback only if the machine reported no real (non-loopback) resolvers.
+    if out.iter().all(|ip| ip.is_loopback()) {
+        out.push(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        out.push(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Enumerate the DNS resolvers configured on every adapter via
+/// `GetAdaptersAddresses`. Empty vec on any failure (the caller adds fallbacks).
+/// This is what makes resolution actually work inside the AppContainer on a
+/// normal network, where the resolver is the router/ISP, not a hardcoded IP.
+fn configured_dns_servers() -> Vec<IpAddr> {
+    use std::net::Ipv6Addr;
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_FRIENDLY_NAME, GAA_FLAG_SKIP_MULTICAST,
+        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6};
+
+    const ERROR_BUFFER_OVERFLOW: u32 = 111;
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_FRIENDLY_NAME;
+
+    // Size the buffer, then fetch (retry while the required size keeps growing).
+    let mut size: u32 = 16 * 1024;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut rc = ERROR_BUFFER_OVERFLOW;
+    for _ in 0..3 {
+        buf.resize(size as usize, 0);
+        rc = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC.0 as u32,
+                flags,
+                None,
+                Some(buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH),
+                &mut size,
+            )
+        };
+        if rc != ERROR_BUFFER_OVERFLOW {
+            break;
+        }
+    }
+    if rc != 0 {
+        return Vec::new();
+    }
+
+    let mut ips = Vec::new();
+    unsafe {
+        let mut adapter = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+        while !adapter.is_null() {
+            let mut dns = (*adapter).FirstDnsServerAddress;
+            while !dns.is_null() {
+                let sa = (*dns).Address;
+                if !sa.lpSockaddr.is_null() {
+                    let family = (*sa.lpSockaddr).sa_family;
+                    if family == AF_INET {
+                        let v4 = &*(sa.lpSockaddr as *const SOCKADDR_IN);
+                        let octets = v4.sin_addr.S_un.S_addr.to_ne_bytes();
+                        ips.push(IpAddr::V4(Ipv4Addr::from(octets)));
+                    } else if family == AF_INET6 {
+                        let v6 = &*(sa.lpSockaddr as *const SOCKADDR_IN6);
+                        let a = Ipv6Addr::from(v6.sin6_addr.u.Byte);
+                        // Skip link-local (fe80::/10) resolvers: not usable as a
+                        // bare permit target without a scope id.
+                        if (a.segments()[0] & 0xffc0) != 0xfe80 {
+                            ips.push(IpAddr::V6(a));
+                        }
+                    }
+                }
+                dns = (*dns).Next;
+            }
+            adapter = (*adapter).Next;
+        }
+    }
+    ips.retain(|ip| !ip.is_unspecified());
+    ips
 }
