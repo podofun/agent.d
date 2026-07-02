@@ -97,7 +97,6 @@ pub fn wrap_argv(policy: &SandboxPolicy, bin: &str, args: &[String]) -> (String,
     ("/usr/bin/sandbox-exec".to_string(), new_args)
 }
 
-
 /// SBPL for a broker-spawned net child: confine the filesystem but ALLOW
 /// outbound network — `pf` (scoped to the child's dedicated uid) enforces the
 /// host/IP allowlist, and the daemon's relay does the per-connection admit
@@ -115,4 +114,3 @@ pub fn sbpl_net_for_broker(policy: &SandboxPolicy) -> String {
     sbpl.push_str("(allow network-outbound)\n(allow network-bind)\n(allow mach-lookup)\n(allow system-socket)\n");
     sbpl
 }
-

@@ -27,13 +27,13 @@ mod macos {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::process::Command;
 
+    use agentd_shell::sandbox::macos_broker::SOCKET_PATH;
     use agentd_shell::sandbox::macos_broker::config::BrokerConfig;
     use agentd_shell::sandbox::macos_broker::pool::{SandboxUser, UidPool};
     use agentd_shell::sandbox::macos_broker::proto::{
         ErrKind, Proto, Req, Resp, read_msg, write_msg,
     };
     use agentd_shell::sandbox::macos_broker::server::{Backend, Session};
-    use agentd_shell::sandbox::macos_broker::SOCKET_PATH;
     use agentd_shell::sandbox::macos_pf_rules::{
         DIOCNATLOOK, PfiocNatlook, anchor_name, build_anchor_rules,
     };
@@ -160,22 +160,33 @@ mod macos {
                 uid: user.uid,
                 user: user.name.clone(),
             },
-            Req::Provision { tcp_port, dns_port } => {
-                match session.provision(tcp_port, dns_port) {
-                    Ok(()) => Resp::Ok,
-                    Err(e) => Resp::Err { kind: e.kind, msg: e.msg },
-                }
-            }
+            Req::Provision { tcp_port, dns_port } => match session.provision(tcp_port, dns_port) {
+                Ok(()) => Resp::Ok,
+                Err(e) => Resp::Err {
+                    kind: e.kind,
+                    msg: e.msg,
+                },
+            },
             Req::Acl { read, write } => match session.acl(&read, &write) {
                 Ok(()) => Resp::Ok,
-                Err(e) => Resp::Err { kind: e.kind, msg: e.msg },
+                Err(e) => Resp::Err {
+                    kind: e.kind,
+                    msg: e.msg,
+                },
             },
-            Req::Spawn { bin, args, cwd, sbpl, want_stdin } => {
-                match session.spawn(&bin, &args, cwd.as_deref(), &sbpl, want_stdin) {
-                    Ok(pid) => Resp::Spawned { pid },
-                    Err(e) => Resp::Err { kind: e.kind, msg: e.msg },
-                }
-            }
+            Req::Spawn {
+                bin,
+                args,
+                cwd,
+                sbpl,
+                want_stdin,
+            } => match session.spawn(&bin, &args, cwd.as_deref(), &sbpl, want_stdin) {
+                Ok(pid) => Resp::Spawned { pid },
+                Err(e) => Resp::Err {
+                    kind: e.kind,
+                    msg: e.msg,
+                },
+            },
             Req::Natlook { proto, src, dst } => {
                 let (Ok(src), Ok(dst)) = (src.parse::<SocketAddr>(), dst.parse::<SocketAddr>())
                 else {
@@ -185,13 +196,21 @@ mod macos {
                     };
                 };
                 match session.natlook(proto, src, dst) {
-                    Ok(orig) => Resp::NatlookResult { orig: orig.to_string() },
-                    Err(e) => Resp::Err { kind: e.kind, msg: e.msg },
+                    Ok(orig) => Resp::NatlookResult {
+                        orig: orig.to_string(),
+                    },
+                    Err(e) => Resp::Err {
+                        kind: e.kind,
+                        msg: e.msg,
+                    },
                 }
             }
             Req::Wait => match session.wait() {
                 Ok(code) => Resp::Exit { code },
-                Err(e) => Resp::Err { kind: e.kind, msg: e.msg },
+                Err(e) => Resp::Err {
+                    kind: e.kind,
+                    msg: e.msg,
+                },
             },
         }
     }
@@ -204,27 +223,51 @@ mod macos {
 
     impl MacBackend {
         fn new(_conn_fd: RawFd) -> Self {
-            MacBackend { pending_fds: Vec::new() }
+            MacBackend {
+                pending_fds: Vec::new(),
+            }
         }
     }
 
     impl Backend for MacBackend {
-        fn provision(&mut self, user: &SandboxUser, tcp_port: u16, dns_port: u16) -> Result<(), String> {
+        fn provision(
+            &mut self,
+            user: &SandboxUser,
+            tcp_port: u16,
+            dns_port: u16,
+        ) -> Result<(), String> {
             let rules = build_anchor_rules(user.uid, tcp_port, dns_port);
             pfctl_load(&anchor_name(user.uid), &rules)
         }
 
-        fn stamp_acls(&mut self, user: &SandboxUser, read: &[String], write: &[String]) -> Result<(), String> {
+        fn stamp_acls(
+            &mut self,
+            user: &SandboxUser,
+            read: &[String],
+            write: &[String],
+        ) -> Result<(), String> {
             for p in read {
                 chmod_acl_add(&user.name, p, "read,execute,search")?;
             }
             for p in write {
-                chmod_acl_add(&user.name, p, "read,write,execute,search,delete,append,add_file,add_subdirectory")?;
+                chmod_acl_add(
+                    &user.name,
+                    p,
+                    "read,write,execute,search,delete,append,add_file,add_subdirectory",
+                )?;
             }
             Ok(())
         }
 
-        fn spawn(&mut self, user: &SandboxUser, bin: &str, args: &[String], cwd: Option<&str>, sbpl: &str, want_stdin: bool) -> Result<i32, String> {
+        fn spawn(
+            &mut self,
+            user: &SandboxUser,
+            bin: &str,
+            args: &[String],
+            cwd: Option<&str>,
+            sbpl: &str,
+            want_stdin: bool,
+        ) -> Result<i32, String> {
             let (pid, fds) = spawn_as_uid(user.uid, bin, args, cwd, sbpl, want_stdin)?;
             // Stash the daemon-facing stdio ends; the caller sends them via
             // SCM_RIGHTS only AFTER the Spawned reply line is on the wire.
@@ -236,7 +279,12 @@ mod macos {
             std::mem::take(&mut self.pending_fds)
         }
 
-        fn natlook(&self, proto: Proto, src: SocketAddr, dst: SocketAddr) -> Result<SocketAddr, String> {
+        fn natlook(
+            &self,
+            proto: Proto,
+            src: SocketAddr,
+            dst: SocketAddr,
+        ) -> Result<SocketAddr, String> {
             if proto != Proto::Tcp {
                 return Err("only tcp natlook supported".into());
             }
@@ -294,11 +342,16 @@ mod macos {
             .unwrap()
             .write_all(rules.as_bytes())
             .map_err(|e| format!("pfctl stdin: {e}"))?;
-        let out = child.wait_with_output().map_err(|e| format!("pfctl wait: {e}"))?;
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("pfctl wait: {e}"))?;
         if out.status.success() {
             Ok(())
         } else {
-            Err(format!("pfctl: {}", String::from_utf8_lossy(&out.stderr).trim()))
+            Err(format!(
+                "pfctl: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
         }
     }
 
@@ -320,7 +373,10 @@ mod macos {
         if st.status.success() {
             Ok(())
         } else {
-            Err(format!("chmod +a {path}: {}", String::from_utf8_lossy(&st.stderr).trim()))
+            Err(format!(
+                "chmod +a {path}: {}",
+                String::from_utf8_lossy(&st.stderr).trim()
+            ))
         }
     }
 
@@ -468,7 +524,8 @@ mod macos {
         if rc != 0 {
             return Err(format!("DIOCNATLOOK: {}", std::io::Error::last_os_error()));
         }
-        nl.original_dst().ok_or_else(|| "natlook: no original dst".into())
+        nl.original_dst()
+            .ok_or_else(|| "natlook: no original dst".into())
     }
 
     fn peer_uid(stream: &UnixStream) -> Option<u32> {

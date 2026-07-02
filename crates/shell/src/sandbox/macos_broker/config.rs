@@ -55,13 +55,12 @@ impl BrokerConfig {
                 }
                 "sandbox_user" => {
                     let mut it = val.split_whitespace();
-                    let uid = it
-                        .next()
-                        .and_then(|s| s.parse().ok())
-                        .ok_or_else(|| ConfigError::BadValue {
+                    let uid = it.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
+                        ConfigError::BadValue {
                             key: key.into(),
                             val: val.into(),
-                        })?;
+                        }
+                    })?;
                     let name = it
                         .next()
                         .ok_or_else(|| ConfigError::BadValue {
@@ -103,14 +102,23 @@ mod tests {
         .unwrap();
         assert_eq!(c.daemon_uid, 501);
         assert_eq!(c.users.len(), 2);
-        assert_eq!(c.users[0], SandboxUser { uid: 700, name: "_agentd_sbx0".into() });
+        assert_eq!(
+            c.users[0],
+            SandboxUser {
+                uid: 700,
+                name: "_agentd_sbx0".into()
+            }
+        );
     }
 
     #[test]
     fn render_parse_roundtrip() {
         let c = BrokerConfig {
             daemon_uid: 501,
-            users: vec![SandboxUser { uid: 700, name: "_agentd_sbx0".into() }],
+            users: vec![SandboxUser {
+                uid: 700,
+                name: "_agentd_sbx0".into(),
+            }],
         };
         assert_eq!(BrokerConfig::parse(&c.render()).unwrap(), c);
     }
@@ -135,8 +143,9 @@ mod tests {
 
     #[test]
     fn comments_and_blanks_ignored() {
-        let c = BrokerConfig::parse("\n\n# a comment\ndaemon_uid = 1 # inline\nsandbox_user = 700 x\n")
-            .unwrap();
+        let c =
+            BrokerConfig::parse("\n\n# a comment\ndaemon_uid = 1 # inline\nsandbox_user = 700 x\n")
+                .unwrap();
         assert_eq!(c.daemon_uid, 1);
     }
 }

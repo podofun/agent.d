@@ -82,7 +82,10 @@ fn ensure_group() -> Result<u32, SandboxError> {
     let gid = UID_BASE; // reuse the base as the shared gid
     if !dscl_exists(&gpath) {
         run("/usr/bin/dscl", &[".", "-create", &gpath])?;
-        run("/usr/bin/dscl", &[".", "-create", &gpath, "PrimaryGroupID", &gid.to_string()])?;
+        run(
+            "/usr/bin/dscl",
+            &[".", "-create", &gpath, "PrimaryGroupID", &gid.to_string()],
+        )?;
     }
     Ok(gid)
 }
@@ -95,10 +98,22 @@ fn ensure_users(gid: u32) -> Result<Vec<SandboxUser>, SandboxError> {
         let upath = format!("/Users/{name}");
         if !dscl_exists(&upath) {
             run("/usr/bin/dscl", &[".", "-create", &upath])?;
-            run("/usr/bin/dscl", &[".", "-create", &upath, "UniqueID", &uid.to_string()])?;
-            run("/usr/bin/dscl", &[".", "-create", &upath, "PrimaryGroupID", &gid.to_string()])?;
-            run("/usr/bin/dscl", &[".", "-create", &upath, "UserShell", "/usr/bin/false"])?;
-            run("/usr/bin/dscl", &[".", "-create", &upath, "NFSHomeDirectory", "/var/empty"])?;
+            run(
+                "/usr/bin/dscl",
+                &[".", "-create", &upath, "UniqueID", &uid.to_string()],
+            )?;
+            run(
+                "/usr/bin/dscl",
+                &[".", "-create", &upath, "PrimaryGroupID", &gid.to_string()],
+            )?;
+            run(
+                "/usr/bin/dscl",
+                &[".", "-create", &upath, "UserShell", "/usr/bin/false"],
+            )?;
+            run(
+                "/usr/bin/dscl",
+                &[".", "-create", &upath, "NFSHomeDirectory", "/var/empty"],
+            )?;
             run("/usr/bin/dscl", &[".", "-create", &upath, "IsHidden", "1"])?;
         }
         users.push(SandboxUser { uid, name });
@@ -138,7 +153,10 @@ pub fn install() -> Result<(), SandboxError> {
 
     // Config dir + broker.conf.
     std::fs::create_dir_all(CONF_DIR).map_err(|e| err(format!("mkdir {CONF_DIR}: {e}")))?;
-    let cfg = BrokerConfig { daemon_uid: duid, users: users.clone() };
+    let cfg = BrokerConfig {
+        daemon_uid: duid,
+        users: users.clone(),
+    };
     std::fs::write(CONF_PATH, cfg.render()).map_err(|e| err(format!("write {CONF_PATH}: {e}")))?;
 
     // Broker binary: copy from beside the running executable.
@@ -154,7 +172,8 @@ pub fn install() -> Result<(), SandboxError> {
 
     // pf: write our main conf and load it (preserves com.apple anchors + adds
     // agentd hooks), then enable pf.
-    std::fs::write(PF_CONF_PATH, MAIN_CONF).map_err(|e| err(format!("write {PF_CONF_PATH}: {e}")))?;
+    std::fs::write(PF_CONF_PATH, MAIN_CONF)
+        .map_err(|e| err(format!("write {PF_CONF_PATH}: {e}")))?;
     run("/sbin/pfctl", &["-f", PF_CONF_PATH])?;
     let _ = Command::new("/sbin/pfctl").arg("-e").output(); // -e errors if already enabled
 
@@ -171,7 +190,9 @@ pub fn install() -> Result<(), SandboxError> {
     run("/usr/sbin/chown", &["root:wheel", PLIST_PATH])?;
     run("/bin/chmod", &["644", PLIST_PATH])?;
     // bootout first (ignore failure) so re-install reloads cleanly.
-    let _ = Command::new("/bin/launchctl").args(["bootout", "system", PLIST_PATH]).output();
+    let _ = Command::new("/bin/launchctl")
+        .args(["bootout", "system", PLIST_PATH])
+        .output();
     run("/bin/launchctl", &["bootstrap", "system", PLIST_PATH])?;
 
     Ok(())
@@ -181,22 +202,30 @@ pub fn install() -> Result<(), SandboxError> {
 /// partial install can always be cleaned up.
 pub fn uninstall() -> Result<(), SandboxError> {
     require_root()?;
-    let _ = Command::new("/bin/launchctl").args(["bootout", "system", PLIST_PATH]).output();
+    let _ = Command::new("/bin/launchctl")
+        .args(["bootout", "system", PLIST_PATH])
+        .output();
     let _ = std::fs::remove_file(PLIST_PATH);
     let _ = std::fs::remove_file(HELPER_PATH);
     // Flush any agentd anchors and reload stock pf.
     for i in 0..NUM_USERS {
         let anchor = super::macos_pf_rules::anchor_name(UID_BASE + i);
-        let _ = Command::new("/sbin/pfctl").args(["-a", &anchor, "-F", "all"]).output();
+        let _ = Command::new("/sbin/pfctl")
+            .args(["-a", &anchor, "-F", "all"])
+            .output();
     }
-    let _ = Command::new("/sbin/pfctl").args(["-f", "/etc/pf.conf"]).output();
+    let _ = Command::new("/sbin/pfctl")
+        .args(["-f", "/etc/pf.conf"])
+        .output();
     // Remove users + group.
     for i in 0..NUM_USERS {
         let _ = Command::new("/usr/bin/dscl")
             .args([".", "-delete", &format!("/Users/{GROUP}{i}")])
             .output();
     }
-    let _ = Command::new("/usr/bin/dscl").args([".", "-delete", &format!("/Groups/{GROUP}")]).output();
+    let _ = Command::new("/usr/bin/dscl")
+        .args([".", "-delete", &format!("/Groups/{GROUP}")])
+        .output();
     let _ = std::fs::remove_file(CONF_PATH);
     let _ = std::fs::remove_file(PF_CONF_PATH);
     let _ = std::fs::remove_file(SYSCTL_CONF);

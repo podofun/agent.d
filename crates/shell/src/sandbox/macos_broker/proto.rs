@@ -45,7 +45,11 @@ pub enum Req {
     },
     /// `DIOCNATLOOK`: original destination of a redirected TCP connection, as
     /// seen by the relay (`src` = child's ephemeral endpoint, `dst` = relay).
-    Natlook { proto: Proto, src: String, dst: String },
+    Natlook {
+        proto: Proto,
+        src: String,
+        dst: String,
+    },
     /// Block until the spawned child exits; reply is `Exit`. Sent by the daemon
     /// after the child's stdout/stderr reach EOF. Keeps the stream strictly
     /// request/response (no async events racing concurrent natlooks).
@@ -64,12 +68,24 @@ pub enum Proto {
 #[serde(tag = "resp", rename_all = "snake_case")]
 pub enum Resp {
     Ok,
-    Leased { uid: u32, user: String },
-    Spawned { pid: i32 },
-    NatlookResult { orig: String },
+    Leased {
+        uid: u32,
+        user: String,
+    },
+    Spawned {
+        pid: i32,
+    },
+    NatlookResult {
+        orig: String,
+    },
     /// Reply to `Wait`: the reaped child's exit code.
-    Exit { code: i32 },
-    Err { kind: ErrKind, msg: String },
+    Exit {
+        code: i32,
+    },
+    Err {
+        kind: ErrKind,
+        msg: String,
+    },
 }
 
 /// Machine-readable error class so the client can map to distinct
@@ -228,10 +244,7 @@ mod tests {
     #[test]
     fn eof_reported() {
         let mut r = BufReader::new(&b""[..]);
-        assert!(matches!(
-            read_msg::<_, Req>(&mut r),
-            Err(WireError::Eof)
-        ));
+        assert!(matches!(read_msg::<_, Req>(&mut r), Err(WireError::Eof)));
     }
 
     #[test]

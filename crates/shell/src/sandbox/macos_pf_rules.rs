@@ -231,7 +231,11 @@ mod tests {
 
     #[test]
     fn forwarding_sysctls_required() {
-        assert!(REQUIRED_SYSCTLS.iter().any(|(k, _)| *k == "net.inet.ip.forwarding"));
+        assert!(
+            REQUIRED_SYSCTLS
+                .iter()
+                .any(|(k, _)| *k == "net.inet.ip.forwarding")
+        );
         assert!(REQUIRED_SYSCTLS.iter().all(|(_, v)| *v == "1"));
     }
 
@@ -298,7 +302,10 @@ mod tests {
         let dst: std::net::SocketAddr = "[::1]:4321".parse().unwrap();
         let mut n = PfiocNatlook::for_tcp(src, dst);
         assert_eq!(n.af, AF_INET6);
-        n.rdaddr.v = "2606:4700::1111".parse::<std::net::Ipv6Addr>().unwrap().octets();
+        n.rdaddr.v = "2606:4700::1111"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets();
         n.rdxport = PfStateXport::from_port(443);
         assert_eq!(
             n.original_dst().unwrap(),

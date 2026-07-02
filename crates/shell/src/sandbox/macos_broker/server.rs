@@ -14,14 +14,29 @@ use super::proto::{ErrKind, Proto};
 /// testable without root or macOS.
 pub trait Backend {
     /// Load the pf anchor `agentd/sbx_<uid>` redirecting the uid to these ports.
-    fn provision(&mut self, user: &SandboxUser, tcp_port: u16, dns_port: u16) -> Result<(), String>;
+    fn provision(&mut self, user: &SandboxUser, tcp_port: u16, dns_port: u16)
+    -> Result<(), String>;
     /// Stamp per-uid ACLs (paths already canonicalized by the caller).
-    fn stamp_acls(&mut self, user: &SandboxUser, read: &[String], write: &[String]) -> Result<(), String>;
+    fn stamp_acls(
+        &mut self,
+        user: &SandboxUser,
+        read: &[String],
+        write: &[String],
+    ) -> Result<(), String>;
     /// Spawn `bin` as the uid under Seatbelt; return the child pid. Stdio fd
     /// passing is handled by the binary out-of-band, not modeled here.
-    fn spawn(&mut self, user: &SandboxUser, bin: &str, args: &[String], cwd: Option<&str>, sbpl: &str, want_stdin: bool) -> Result<i32, String>;
+    fn spawn(
+        &mut self,
+        user: &SandboxUser,
+        bin: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        sbpl: &str,
+        want_stdin: bool,
+    ) -> Result<i32, String>;
     /// DIOCNATLOOK: original destination of a redirected connection.
-    fn natlook(&self, proto: Proto, src: SocketAddr, dst: SocketAddr) -> Result<SocketAddr, String>;
+    fn natlook(&self, proto: Proto, src: SocketAddr, dst: SocketAddr)
+    -> Result<SocketAddr, String>;
     /// Stdio fds produced by the most recent `spawn`, to hand to the daemon
     /// out-of-band AFTER its reply is written (so the reply line and the
     /// SCM_RIGHTS dummy byte don't interleave). Default: none.
@@ -64,7 +79,10 @@ pub struct SessionError {
 }
 
 fn backend_err(msg: String) -> SessionError {
-    SessionError { kind: ErrKind::Backend, msg }
+    SessionError {
+        kind: ErrKind::Backend,
+        msg,
+    }
 }
 
 impl<'u, B: Backend> Session<'u, B> {
@@ -197,11 +215,24 @@ mod tests {
             self.push(&format!("provision {t} {d}"));
             Ok(())
         }
-        fn stamp_acls(&mut self, _u: &SandboxUser, r: &[String], w: &[String]) -> Result<(), String> {
+        fn stamp_acls(
+            &mut self,
+            _u: &SandboxUser,
+            r: &[String],
+            w: &[String],
+        ) -> Result<(), String> {
             self.push(&format!("acl r={} w={}", r.len(), w.len()));
             Ok(())
         }
-        fn spawn(&mut self, _u: &SandboxUser, bin: &str, _a: &[String], _c: Option<&str>, _s: &str, _si: bool) -> Result<i32, String> {
+        fn spawn(
+            &mut self,
+            _u: &SandboxUser,
+            bin: &str,
+            _a: &[String],
+            _c: Option<&str>,
+            _s: &str,
+            _si: bool,
+        ) -> Result<i32, String> {
             if self.0.borrow().fail_spawn {
                 return Err("spawn boom".into());
             }
@@ -227,7 +258,10 @@ mod tests {
     }
 
     fn user() -> SandboxUser {
-        SandboxUser { uid: 700, name: "_agentd_sbx0".into() }
+        SandboxUser {
+            uid: 700,
+            name: "_agentd_sbx0".into(),
+        }
     }
 
     #[test]
@@ -238,7 +272,9 @@ mod tests {
             let mut s = Session::new(be, &u);
             s.provision(4321, 5353).unwrap();
             s.acl(&["/a".into()], &["/b".into()]).unwrap();
-            let pid = s.spawn("/usr/bin/curl", &[], None, "(sbpl)", false).unwrap();
+            let pid = s
+                .spawn("/usr/bin/curl", &[], None, "(sbpl)", false)
+                .unwrap();
             assert_eq!(pid, 4242);
         } // drop → teardown
         assert_eq!(
@@ -281,7 +317,12 @@ mod tests {
         }
         assert_eq!(
             log.borrow().events,
-            vec!["provision 1 2", "acl r=0 w=0", "flush_anchor", "remove_acls"],
+            vec![
+                "provision 1 2",
+                "acl r=0 w=0",
+                "flush_anchor",
+                "remove_acls"
+            ],
             "no kill (spawn failed) but anchor+acls undone"
         );
     }
@@ -298,7 +339,10 @@ mod tests {
         }
         let ev = log.borrow();
         assert!(ev.events.contains(&"wait 4242".to_string()));
-        assert!(!ev.events.iter().any(|e| e.starts_with("kill")), "no kill after wait");
+        assert!(
+            !ev.events.iter().any(|e| e.starts_with("kill")),
+            "no kill after wait"
+        );
         assert!(ev.events.contains(&"flush_anchor".to_string()));
     }
 
@@ -322,7 +366,11 @@ mod tests {
         s.teardown();
         drop(s);
         assert_eq!(
-            log.borrow().events.iter().filter(|e| *e == "flush_anchor").count(),
+            log.borrow()
+                .events
+                .iter()
+                .filter(|e| *e == "flush_anchor")
+                .count(),
             1,
             "teardown runs exactly once"
         );

@@ -75,8 +75,14 @@ mod tests {
 
     fn pool() -> UidPool {
         UidPool::new(vec![
-            SandboxUser { uid: 700, name: "_agentd_sbx0".into() },
-            SandboxUser { uid: 701, name: "_agentd_sbx1".into() },
+            SandboxUser {
+                uid: 700,
+                name: "_agentd_sbx0".into(),
+            },
+            SandboxUser {
+                uid: 701,
+                name: "_agentd_sbx1".into(),
+            },
         ])
     }
 

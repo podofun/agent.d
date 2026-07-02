@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 
 use agentd_permissions::Permission;
 
-use super::macos_broker::proto::{ErrKind, Proto, Req, Resp, read_msg, write_msg};
 use super::macos_broker::SOCKET_PATH;
+use super::macos_broker::proto::{ErrKind, Proto, Req, Resp, read_msg, write_msg};
 use crate::gateway::{SharedSet, admit, handle_dns};
 use crate::netfilter::{PermitSet, SetConfig};
 use crate::{ExecRequest, ExecResult, SandboxPolicy, ShellError};
@@ -76,7 +76,9 @@ impl Broker {
         match self.call(req)? {
             Resp::Ok => Ok(()),
             Resp::Err { kind, msg } => Err(broker_error(kind, msg)),
-            other => Err(ShellError::Sandbox(format!("unexpected broker reply: {other:?}"))),
+            other => Err(ShellError::Sandbox(format!(
+                "unexpected broker reply: {other:?}"
+            ))),
         }
     }
 }
@@ -193,7 +195,11 @@ pub async fn run_contained(
         drop(s);
         // Order matches the broker's send: [stdin_wr?, stdout_rd, stderr_rd].
         let mut it = fds.into_iter();
-        let stdin_wr = if want_stdin { Some(it.next().unwrap()) } else { None };
+        let stdin_wr = if want_stdin {
+            Some(it.next().unwrap())
+        } else {
+            None
+        };
         let stdout_rd = it.next().unwrap();
         let stderr_rd = it.next().unwrap();
         Some((pid, stdin_wr, stdout_rd, stderr_rd))
@@ -267,7 +273,11 @@ pub async fn run_contained(
         }
         (merged, String::new())
     };
-    Ok(ExecResult { exit_code, stdout, stderr })
+    Ok(ExecResult {
+        exit_code,
+        stdout,
+        stderr,
+    })
 }
 
 fn io_sb(e: std::io::Error) -> ShellError {
@@ -352,7 +362,9 @@ async fn admit_dst(ip: IpAddr, set: &SharedSet, host_grants: &[Permission]) -> b
         .await
         .unwrap_or(false);
     if matched {
-        set.lock().unwrap().allow_resolved(ip, PIN_TTL, Instant::now());
+        set.lock()
+            .unwrap()
+            .allow_resolved(ip, PIN_TTL, Instant::now());
     }
     matched
 }
@@ -388,7 +400,10 @@ fn resolve_admit(ip: IpAddr, host_grants: &[Permission]) -> bool {
             // Forward-confirm: the reverse name must be covered by a grant AND
             // resolve back to this IP, so a forged PTR cannot widen access.
             if name_allowed(host_grants, &name)
-                && resolver.resolve(&name).map(|ips| ips.contains(&ip)).unwrap_or(false)
+                && resolver
+                    .resolve(&name)
+                    .map(|ips| ips.contains(&ip))
+                    .unwrap_or(false)
             {
                 return true;
             }
@@ -417,7 +432,10 @@ fn reverse_lookup(ip: IpAddr) -> Vec<String> {
                     std::mem::size_of::<libc::sockaddr_in>(),
                 )
             };
-            (st, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
+            (
+                st,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
         }
         IpAddr::V6(v6) => {
             let mut s: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
@@ -431,7 +449,10 @@ fn reverse_lookup(ip: IpAddr) -> Vec<String> {
                     std::mem::size_of::<libc::sockaddr_in6>(),
                 )
             };
-            (st, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+            (
+                st,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
         }
     };
     // SAFETY: getnameinfo reads `len` bytes of the sockaddr we just initialized
@@ -457,7 +478,11 @@ fn reverse_lookup(ip: IpAddr) -> Vec<String> {
         .to_string_lossy()
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    if name.is_empty() { Vec::new() } else { vec![name] }
+    if name.is_empty() {
+        Vec::new()
+    } else {
+        vec![name]
+    }
 }
 
 /// Accept intercepted connections; natlook each via the broker, admit iff the
@@ -532,7 +557,8 @@ async fn dns_loop(udp: tokio::net::UdpSocket, host_grants: Vec<Permission>, set:
             Ok(x) => x,
             Err(_) => break,
         };
-        let resp = handle_dns(&buf[..n], &host_grants, &set, &resolver, PIN_TTL).unwrap_or_default();
+        let resp =
+            handle_dns(&buf[..n], &host_grants, &set, &resolver, PIN_TTL).unwrap_or_default();
         if !resp.is_empty() {
             let _ = udp.send_to(&resp, src).await;
         }

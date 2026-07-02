@@ -46,7 +46,10 @@ async fn raw_tcp_allowed_ip_reaches_server() {
     };
     req.sandbox = Some(policy(vec!["net:1.1.1.1"]));
     let res = agentd_shell::exec(req).await.expect("exec");
-    assert!(res.stdout.starts_with("HTTP"), "allowed literal IP must reach host + exchange data: {res:?}");
+    assert!(
+        res.stdout.starts_with("HTTP"),
+        "allowed literal IP must reach host + exchange data: {res:?}"
+    );
 }
 
 /// A connection to an IP no grant covers is dropped by the relay.
@@ -68,7 +71,10 @@ async fn raw_tcp_denied_ip_is_blocked() {
     };
     req.sandbox = Some(policy(vec!["net:203.0.113.77"]));
     let res = agentd_shell::exec(req).await.expect("exec");
-    assert!(!res.stdout.starts_with("HTTP"), "denied IP must NOT exchange data: {res:?}");
+    assert!(
+        !res.stdout.starts_with("HTTP"),
+        "denied IP must NOT exchange data: {res:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -91,7 +97,10 @@ async fn dns_denied_name_does_not_resolve() {
     };
     req.sandbox = Some(policy(vec!["net:allowed.example.com"]));
     let res = agentd_shell::exec(req).await.expect("exec");
-    assert!(!res.stdout.contains("REACHED"), "denied name must not resolve: {res:?}");
+    assert!(
+        !res.stdout.contains("REACHED"),
+        "denied name must not resolve: {res:?}"
+    );
 }
 
 /// Name-grant parity: a host grant (`net:one.one.one.one`) lets the child
