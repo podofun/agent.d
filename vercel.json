@@ -7,12 +7,12 @@
   "redirects": [
     {
       "source": "/",
-      "destination": "/agentd",
+      "destination": "/agentd/",
       "permanent": false
     },
     {
-      "source": "/:path+/",
-      "destination": "/:path+",
+      "source": "/agentd/:path+/",
+      "destination": "/agentd/:path+",
       "permanent": false
     }
   ]
