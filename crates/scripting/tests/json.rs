@@ -47,6 +47,7 @@ async fn encode_decode_round_trip() {
                 caller,
                 effective_grants: PermissionSet::empty(),
                 call_chain: vec!["j.run".into()],
+                cwd: None,
             },
             ActionCall {
                 action: "j.run".into(),
@@ -82,6 +83,7 @@ async fn decode_invalid_errors() {
                 caller: Caller::default(),
                 effective_grants: PermissionSet::empty(),
                 call_chain: vec!["j.bad".into()],
+                cwd: None,
             },
             ActionCall {
                 action: "j.bad".into(),

@@ -59,6 +59,7 @@ async fn sleep_yields_so_async_peers_make_progress() {
                 caller: Caller::default(),
                 effective_grants: PermissionSet::empty(),
                 call_chain: vec!["demo.par_sleep".into()],
+                cwd: None,
             },
             ActionCall {
                 action: "demo.par_sleep".into(),

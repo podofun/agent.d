@@ -540,10 +540,20 @@ impl Executor {
             effective_grants.insert(p.clone());
         }
 
+        // A runner-initiated call inherits the runner's cwd (the action's own
+        // `cwd`, if any, overrides it registry-side). Non-runner callers inherit
+        // nothing → the registry falls back to the workspace root.
+        let inherited_cwd = caller
+            .runner
+            .as_ref()
+            .and_then(|r| self.runners.get(r.as_str()))
+            .and_then(|def| def.cwd);
+
         let ctx = CallContext {
             caller: caller.clone(),
             effective_grants,
             call_chain: vec![action_name.clone()],
+            cwd: inherited_cwd,
         };
 
         let outcome = self.registry.call(ctx, call).await;
@@ -1021,6 +1031,7 @@ impl Executor {
                     caller: Caller::service(svc_name.clone()),
                     effective_grants: granted.clone(),
                     call_chain: vec![format!("service:{svc_name}")],
+                    cwd: None,
                 };
                 let outcome = registry.call_service(ctx, &svc_name).await;
                 let crashed = outcome.is_err();

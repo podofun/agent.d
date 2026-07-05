@@ -197,7 +197,7 @@ pub async fn drive(
     lua: Arc<Mutex<Lua>>,
     thread: Thread,
     initial_args: Vec<serde_json::Value>,
-    ctx: crate::ActiveContext,
+    mut ctx: crate::ActiveContext,
 ) -> Result<serde_json::Value, DriveError> {
     let mut next: Vec<serde_json::Value> = initial_args;
     loop {
@@ -210,37 +210,49 @@ pub async fn drive(
         let args_in = std::mem::take(&mut next);
         let ctx_step = ctx.clone();
 
-        let step = tokio::task::spawn_blocking(move || -> Result<StepOutcome, mlua::Error> {
-            let lua = lua_handle.lock().unwrap();
-            // Bind THIS coroutine's ActiveContext for the duration of this
-            // resume. Restored to default at the end of the step so a
-            // concurrent runner / service that resumes between our yields
-            // can swap in its own context without seeing leftover state.
-            lua.set_app_data(ctx_step);
-            let _restore = AppDataGuard::new(&lua);
-            let args = json_to_multivalue(&lua, args_in)?;
-            let yielded: MultiValue = thread_handle.resume(args)?;
-            let status = thread_handle.status();
-            if status == ThreadStatus::Resumable {
-                // First yielded value should be our OpMarker userdata.
-                if let Some(first) = yielded.into_iter().next()
-                    && let Value::UserData(ud) = first
-                    && let Ok(marker) = ud.borrow::<OpMarker>()
-                    && let Some(op) = marker.take()
-                {
-                    return Ok(StepOutcome::Yielded(op));
+        let step = tokio::task::spawn_blocking(
+            move || -> Result<(StepOutcome, crate::ActiveContext), mlua::Error> {
+                let lua = lua_handle.lock().unwrap();
+                // Bind THIS coroutine's ActiveContext for the duration of this
+                // resume. Restored to default at the end of the step so a
+                // concurrent runner / service that resumes between our yields
+                // can swap in its own context without seeing leftover state.
+                lua.set_app_data(ctx_step);
+                let _restore = AppDataGuard::new(&lua);
+                let args = json_to_multivalue(&lua, args_in)?;
+                let yielded: MultiValue = thread_handle.resume(args)?;
+                let status = thread_handle.status();
+                // Snapshot the (possibly mutated) context BEFORE the guard
+                // resets it, so cwd changes made this step — `ctx.fs.chdir` or a
+                // nested-call cwd override — persist into the next resume.
+                let evolved = lua
+                    .app_data_ref::<crate::ActiveContext>()
+                    .map(|c| (*c).clone())
+                    .unwrap_or_default();
+                if status == ThreadStatus::Resumable {
+                    // First yielded value should be our OpMarker userdata.
+                    if let Some(first) = yielded.into_iter().next()
+                        && let Value::UserData(ud) = first
+                        && let Ok(marker) = ud.borrow::<OpMarker>()
+                        && let Some(op) = marker.take()
+                    {
+                        return Ok((StepOutcome::Yielded(op), evolved));
+                    }
+                    return Err(mlua::Error::external(
+                        "scheduler: coroutine yielded a non-op value",
+                    ));
                 }
-                return Err(mlua::Error::external(
-                    "scheduler: coroutine yielded a non-op value",
-                ));
-            }
-            let json = multivalue_to_json(&lua, yielded)?;
-            Ok(StepOutcome::Done(json))
-        })
+                let json = multivalue_to_json(&lua, yielded)?;
+                Ok((StepOutcome::Done(json), evolved))
+            },
+        )
         .await
         .map_err(DriveError::Join)?
         .map_err(DriveError::Lua)?;
 
+        let (step, evolved) = step;
+        // Carry cwd (and call_chain) mutations forward across the yield.
+        ctx = evolved;
         match step {
             StepOutcome::Done(v) => return Ok(v),
             StepOutcome::Yielded(op) => {

@@ -47,7 +47,7 @@ Slugs follow the form `domain` or `domain:specifier`. The domains relevant to th
 Wildcards are supported on the specifier: `net:*` allows all hosts, `fs.write:/tmp/**` allows all writes under `/tmp`.
 
 ::: info Filesystem grants are resolved
-Path globs in `fs.read` and `fs.write` grants are resolved (symlinks, `..` expanded) before matching, so you cannot bypass them with aliases.
+Path globs in `fs.read` and `fs.write` grants are resolved (symlinks, `..` expanded) before matching, so a tool cannot reach past them with aliases.
 :::
 
 ## The other grant sections
