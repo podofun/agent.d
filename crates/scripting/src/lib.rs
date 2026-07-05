@@ -33,6 +33,10 @@ struct ActionMeta {
     tool: Option<String>,
     requires: Vec<String>,
     confirm: bool,
+    /// Working directory relative `fs.*` paths resolve against while this action
+    /// runs, inherited by nested calls that don't set their own. Relative values
+    /// anchor to the workspace root. `None` inherits the caller's cwd.
+    cwd: Option<String>,
     /// Compiled JSON Schema for the action's args (`input` table), or `None`
     /// if the action declared no schema. Surfaced to LLMs and validated
     /// against incoming args before the handler runs.
@@ -69,11 +73,26 @@ pub(crate) struct ActiveContext {
     pub(crate) call_chain: Vec<String>,
     pub(crate) grant_kind: Option<String>,
     pub(crate) grant_name: Option<String>,
+    /// Working directory relative `fs.*` paths resolve against. `None` falls
+    /// back to the workspace root. Set from the executing action/runner's `cwd`
+    /// (inherited by nested calls that don't declare their own), and mutated by
+    /// `ctx.fs.chdir`. The scheduler threads its value across coroutine yields.
+    pub(crate) cwd: Option<PathBuf>,
+    /// Saved-cwd stack for nested inline `ctx.call`: each resolve pushes the
+    /// caller's cwd, each pop restores it, so a callee's `cwd` override lasts
+    /// exactly for the duration of that nested call.
+    pub(crate) cwd_stack: Vec<Option<PathBuf>>,
 }
 
 /// Where `import("name")` resolves installed packages. Set by the daemon.
 #[derive(Clone, Default)]
 struct PackagesRoot(Option<PathBuf>);
+
+/// The userland workspace root (init.lua's folder). Default base for relative
+/// `fs.*` paths and relative grant specs when no per-execution cwd is set.
+/// Set by the daemon before `init.lua` runs.
+#[derive(Clone, Default)]
+struct WorkspaceRoot(Option<PathBuf>);
 
 /// Tracks the active package-import nesting + everything each package
 /// registered, so the daemon can desugar grants after load.
@@ -219,6 +238,7 @@ impl LuaHost {
         lua.set_app_data(StateStore::default());
         lua.set_app_data(RunnerDispatcherHolder::default());
         lua.set_app_data(PackagesRoot::default());
+        lua.set_app_data(WorkspaceRoot::default());
         lua.set_app_data(PackageScope::default());
 
         install_agentd_globals(&lua, &catalog)?;
@@ -246,6 +266,14 @@ impl LuaHost {
     pub fn set_packages_root(&self, root: impl Into<PathBuf>) {
         let lua = self.lua.lock().unwrap();
         lua.set_app_data(PackagesRoot(Some(root.into())));
+    }
+
+    /// Configure the userland workspace root — the default cwd base for relative
+    /// `fs.*` paths and the anchor for relative grant specs. Set by the daemon
+    /// before `init.lua` runs.
+    pub fn set_workspace_root(&self, root: impl Into<PathBuf>) {
+        let lua = self.lua.lock().unwrap();
+        lua.set_app_data(WorkspaceRoot(Some(root.into())));
     }
 
     /// Snapshot of every package loaded this session, for grant desugaring.
@@ -693,6 +721,7 @@ fn parse_register_table(t: Table) -> mlua::Result<(String, Function, ActionMeta)
     })?;
     let requires = read_string_array(&t, "requires")?;
     let confirm: bool = t.get::<Option<bool>>("confirm")?.unwrap_or(false);
+    let cwd: Option<String> = t.get::<Option<String>>("cwd")?;
     let tool: Option<String> = t.get::<Option<String>>("tool")?;
     let inferred_tool = tool.or_else(|| name.split_once('.').map(|(t, _)| t.to_string()));
     // `strict` (default true) controls additionalProperties on the compiled
@@ -713,6 +742,7 @@ fn parse_register_table(t: Table) -> mlua::Result<(String, Function, ActionMeta)
             tool: inferred_tool,
             requires,
             confirm,
+            cwd,
             input_schema,
             output_schema,
         },
@@ -801,12 +831,14 @@ fn register_runner(lua: &Lua, t: Table) -> mlua::Result<()> {
             .collect();
     }
 
+    let cwd: Option<String> = t.get::<Option<String>>("cwd")?;
     let def = RunnerDef {
         name: name.clone(),
         system,
         model,
         skills,
         allowed_actions,
+        cwd,
     };
     let runners = lua
         .app_data_ref::<RunnerRegistry>()
@@ -1788,6 +1820,77 @@ pub(crate) fn normalize_path_grants(grants: &PermissionSet) -> PermissionSet {
     out
 }
 
+/// Resolve a component's `cwd` value to an absolute path. Absolute values pass
+/// through; relative ones resolve against the workspace `root` (single-folder
+/// userland). With no root known, a relative value is returned as-is.
+fn resolve_cwd(root: Option<&Path>, cwd: &str) -> PathBuf {
+    let p = Path::new(cwd);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else if let Some(r) = root {
+        lexical_clean(r.join(p))
+    } else {
+        p.to_path_buf()
+    }
+}
+
+/// Strip `.`/`..` segments lexically (no disk access), mirroring the fallback in
+/// [`resolve_path`]. Keeps joined cwd + grant specs free of `./` noise so the
+/// derived slugs compare cleanly.
+fn lexical_clean(p: PathBuf) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Expand relative path grants against a base cwd (additive). A relative
+/// `fs.read`/`fs.write` spec, or a `shell.exec` spec that names a path (has a
+/// separator), gets an absolute twin joined to `base` — so a portable relative
+/// grant covers the absolute path a relative `ctx.fs.*` call resolves to under
+/// the same cwd. Bare `shell.exec` binaries (`python`) are PATH lookups, not
+/// cwd files, and are left untouched. No-op when `base` is `None`.
+pub(crate) fn resolve_relative_grants(
+    grants: &PermissionSet,
+    base: Option<&Path>,
+) -> PermissionSet {
+    let mut out = grants.clone();
+    let Some(base) = base else {
+        return out;
+    };
+    for p in grants.iter() {
+        let Some((domain, spec)) = p.as_str().split_once(':') else {
+            continue;
+        };
+        let is_fs = matches!(domain, "fs.read" | "fs.write");
+        let is_shell = domain == "shell.exec";
+        if !(is_fs || is_shell) {
+            continue;
+        }
+        // Already an absolute path — nothing to anchor.
+        if is_confinable_path(spec) {
+            continue;
+        }
+        // A `shell.exec` spec without a separator is a bare binary name resolved
+        // via PATH, not a file under cwd. Leave it alone.
+        if is_shell && !spec.contains('/') && !spec.contains('\\') {
+            continue;
+        }
+        let joined = lexical_clean(base.join(spec));
+        if let Some(s) = joined.to_str() {
+            out.insert(Permission::new(format!("{domain}:{s}")));
+        }
+    }
+    out
+}
+
 /// Translate an execution's effective grants into a child-process sandbox
 /// policy. `fs.read`/`fs.write` slugs become readable/writable subtrees (globs
 /// collapsed to the concrete ancestor dir), any `net:` grant flips coarse
@@ -1971,17 +2074,57 @@ fn build_fs_table(lua: &Lua) -> mlua::Result<Table> {
     t.set("stat", lua.create_function(fs_stat_binding)?)?;
     t.set("list_dir", lua.create_function(fs_list_dir_binding)?)?;
     t.set("remove", lua.create_function(fs_remove_binding)?)?;
+    t.set("getcwd", lua.create_function(fs_getcwd_binding)?)?;
+    t.set("chdir", lua.create_function(fs_chdir_binding)?)?;
+    // `with_cwd(dir, fn)` runs `fn` with cwd temporarily set to `dir`, restoring
+    // the previous cwd on the way out (even if `fn` errors or yields for IO).
+    // Defined in Lua so the inner `fn` may yield across `pcall` — a Rust binding
+    // calling `fn` directly would hit "attempt to yield across a C-call boundary".
+    lua.load(
+        r#"
+        local fs = ...
+        fs.with_cwd = function(dir, fn)
+          local saved = fs.getcwd()
+          fs.chdir(dir)
+          local ok, res = pcall(fn)
+          fs.chdir(saved)
+          if not ok then error(res, 0) end
+          return res
+        end
+        "#,
+    )
+    .set_name("fs.with_cwd")
+    .call::<()>(t.clone())?;
     Ok(t)
 }
 
-fn abs_path(path: String) -> std::path::PathBuf {
+/// The base directory relative `fs.*` paths resolve against for the current
+/// execution: the per-execution `cwd` if set (from a component's `cwd`, an
+/// inherited caller cwd, or a `ctx.fs.chdir`), else the workspace root, else
+/// the process cwd as a last resort. Deliberately never reads the daemon's
+/// launch dir unless nothing else is configured.
+fn active_cwd(lua: &Lua) -> std::path::PathBuf {
+    if let Some(active) = lua.app_data_ref::<ActiveContext>()
+        && let Some(cwd) = &active.cwd
+    {
+        return cwd.clone();
+    }
+    if let Some(root) = lua.app_data_ref::<WorkspaceRoot>()
+        && let Some(dir) = &root.0
+    {
+        return dir.clone();
+    }
+    std::env::current_dir().unwrap_or_default()
+}
+
+fn abs_path(lua: &Lua, path: String) -> std::path::PathBuf {
     let p = std::path::PathBuf::from(&path);
     if p.is_absolute() {
         p
     } else {
-        // Resolve relative paths against CWD so the permission slug we check
-        // matches a stable absolute path.
-        std::env::current_dir().unwrap_or_default().join(p)
+        // Resolve relative paths against the active cwd so the permission slug
+        // we check matches a stable absolute path.
+        active_cwd(lua).join(p)
     }
 }
 
@@ -2008,8 +2151,8 @@ fn strip_verbatim(p: std::path::PathBuf) -> std::path::PathBuf {
 /// the slug is derived is what stops a `..` segment or a symlink from pointing
 /// the real operation somewhere a path-scoped grant would never have allowed
 /// (e.g. `fs.write:/tmp/**` writing through `/tmp/link -> /etc/passwd`).
-fn resolve_path(path: String) -> std::path::PathBuf {
-    let p = abs_path(path);
+fn resolve_path(lua: &Lua, path: String) -> std::path::PathBuf {
+    let p = abs_path(lua, path);
     if let Ok(canon) = p.canonicalize() {
         return strip_verbatim(canon);
     }
@@ -2041,8 +2184,35 @@ pub(crate) fn block_on<F: std::future::Future<Output = T>, T>(fut: F) -> mlua::R
         .map(|h| h.block_on(fut))
 }
 
+/// `ctx.fs.getcwd()` — the absolute directory relative `fs.*` paths currently
+/// resolve against for this execution.
+fn fs_getcwd_binding(lua: &Lua, _: ()) -> mlua::Result<String> {
+    Ok(active_cwd(lua).to_string_lossy().into_owned())
+}
+
+/// `ctx.fs.chdir(dir)` — set the working directory for the rest of this
+/// execution. Absolute `dir` is used as-is; a relative one resolves against the
+/// current cwd (POSIX `cd` semantics). Returns the new absolute cwd.
+///
+/// chdir only rebases *name resolution*; it grants nothing. Every subsequent
+/// `fs.*` path is still resolved to an absolute, symlink-free form and gated by
+/// the same grants, so a `chdir` into a granted subtree followed by `../` cannot
+/// escape confinement.
+fn fs_chdir_binding(lua: &Lua, path: String) -> mlua::Result<String> {
+    let p = Path::new(&path);
+    let new = if p.is_absolute() {
+        lexical_clean(p.to_path_buf())
+    } else {
+        lexical_clean(active_cwd(lua).join(p))
+    };
+    if let Some(mut active) = lua.app_data_mut::<ActiveContext>() {
+        active.cwd = Some(new.clone());
+    }
+    Ok(new.to_string_lossy().into_owned())
+}
+
 fn fs_read_binding(lua: &Lua, path: String) -> mlua::Result<String> {
-    let p = resolve_path(path);
+    let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.read:{}", p.display())))?;
     block_on(fs::read_to_string(&p))?.map_err(|e| mlua::Error::external(e.to_string()))
 }
@@ -2057,7 +2227,7 @@ fn fs_write_binding(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
         it.next()
             .ok_or_else(|| mlua::Error::external("fs.write: content required"))?,
     )?;
-    let p = resolve_path(path);
+    let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
     block_on(fs::write(&p, content.as_bytes()))?
         .map_err(|e| mlua::Error::external(e.to_string()))?;
@@ -2074,7 +2244,7 @@ fn fs_append_binding(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
         it.next()
             .ok_or_else(|| mlua::Error::external("fs.append: content required"))?,
     )?;
-    let p = resolve_path(path);
+    let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
     block_on(fs::append(&p, content.as_bytes()))?
         .map_err(|e| mlua::Error::external(e.to_string()))?;
@@ -2082,14 +2252,14 @@ fn fs_append_binding(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
 }
 
 fn fs_exists_binding(lua: &Lua, path: String) -> mlua::Result<bool> {
-    let p = resolve_path(path);
+    let p = resolve_path(lua, path);
     // `exists` reveals presence; gate as read.
     check_permission_inline(lua, &Permission::new(format!("fs.read:{}", p.display())))?;
     block_on(fs::exists(&p))
 }
 
 fn fs_stat_binding(lua: &Lua, path: String) -> mlua::Result<Table> {
-    let p = resolve_path(path);
+    let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.read:{}", p.display())))?;
     let st = block_on(fs::stat(&p))?.map_err(|e| mlua::Error::external(e.to_string()))?;
     let t = lua.create_table()?;
@@ -2112,7 +2282,7 @@ fn fs_stat_binding(lua: &Lua, path: String) -> mlua::Result<Table> {
 }
 
 fn fs_list_dir_binding(lua: &Lua, path: String) -> mlua::Result<Table> {
-    let p = resolve_path(path);
+    let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.read:{}", p.display())))?;
     let entries = block_on(fs::list_dir(&p))?.map_err(|e| mlua::Error::external(e.to_string()))?;
     let arr = lua.create_table()?;
@@ -2135,7 +2305,7 @@ fn fs_list_dir_binding(lua: &Lua, path: String) -> mlua::Result<Table> {
 }
 
 fn fs_remove_binding(lua: &Lua, path: String) -> mlua::Result<()> {
-    let p = resolve_path(path);
+    let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
     block_on(fs::remove_file(&p))?.map_err(|e| mlua::Error::external(e.to_string()))?;
     Ok(())
@@ -2962,11 +3132,26 @@ fn tools_resolve_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Function> 
             }
         }
     }
+    // A nested callee with its own `cwd` overrides the caller's for the duration
+    // of the call; resolve it (relative → workspace root) before mutating state.
+    let callee_cwd = action_meta.cwd.as_ref().map(|s| {
+        let ws = lua
+            .app_data_ref::<WorkspaceRoot>()
+            .and_then(|w| w.0.clone());
+        resolve_cwd(ws.as_deref(), s)
+    });
     {
         let mut active = lua
             .app_data_mut::<ActiveContext>()
             .ok_or_else(|| mlua::Error::external("active context missing"))?;
         active.call_chain.push(name);
+        // Save the caller's cwd so the matching pop restores it, then apply the
+        // callee's override if it declared one (else inherit — no change).
+        let saved = active.cwd.clone();
+        active.cwd_stack.push(saved);
+        if let Some(c) = callee_cwd {
+            active.cwd = Some(c);
+        }
     }
     Ok(handler)
 }
@@ -2974,6 +3159,9 @@ fn tools_resolve_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Function> 
 fn tools_pop_chain_binding(lua: &Lua, _: MultiValue) -> mlua::Result<()> {
     if let Some(mut active) = lua.app_data_mut::<ActiveContext>() {
         active.call_chain.pop();
+        if let Some(prev) = active.cwd_stack.pop() {
+            active.cwd = prev;
+        }
     }
     Ok(())
 }
@@ -3183,8 +3371,11 @@ impl Registry for LuaHost {
         let lua = self.lua.clone();
         let catalog = self.catalog.clone();
         let ActionCall { action, args } = call;
-        let effective_grants = normalize_path_grants(&ctx.effective_grants);
         let call_chain = ctx.call_chain.clone();
+        // The caller-inherited cwd (from a runner/action higher up). The action's
+        // own `cwd`, if it declares one, overrides this — resolved in setup below
+        // where we hold the Lua lock and can read the workspace root.
+        let inherited_cwd = ctx.cwd.clone();
 
         // Snapshot the declared schemas (if any) so we can validate args before
         // the handler runs and the return value after — without holding the
@@ -3212,32 +3403,53 @@ impl Registry for LuaHost {
             let catalog = catalog.clone();
             let action = action.clone();
             tokio::task::spawn_blocking(
-                move || -> Result<(mlua::Thread, Option<String>), RegistryError> {
+                move || -> Result<(mlua::Thread, Option<String>, Option<PathBuf>), RegistryError> {
                     let lua_g = lua.lock().unwrap();
                     let cat = catalog.read().unwrap();
                     let key = cat
                         .actions
                         .get(&action)
                         .ok_or_else(|| RegistryError::NotFound(action.clone()))?;
-                    let grant_name = cat.action_meta.get(&action).and_then(|m| m.tool.clone());
+                    let meta = cat.action_meta.get(&action);
+                    let grant_name = meta.and_then(|m| m.tool.clone());
+                    // Effective cwd: the action's own `cwd` wins, else inherit the
+                    // caller's. Relative values resolve against the workspace root.
+                    let ws_root = lua_g.app_data_ref::<WorkspaceRoot>().and_then(|w| w.0.clone());
+                    // Own `cwd` wins, else inherit the caller's, else default to
+                    // the workspace root — so relative paths + relative grants
+                    // always share a concrete base.
+                    let cwd = meta
+                        .and_then(|m| m.cwd.clone())
+                        .or(inherited_cwd)
+                        .map(|s| resolve_cwd(ws_root.as_deref(), &s))
+                        .or_else(|| ws_root.clone());
                     let func: Function = lua_g
                         .registry_value(key)
                         .map_err(|e| RegistryError::Invocation(e.to_string()))?;
                     let thread = ctx_thread(&lua_g, func, true)
                         .map_err(|e| RegistryError::Invocation(e.to_string()))?;
-                    Ok((thread, grant_name))
+                    Ok((thread, grant_name, cwd))
                 },
             )
             .await
             .map_err(|e| RegistryError::Invocation(format!("join: {e}")))?
         };
-        let (thread, grant_name) = setup?;
+        let (thread, grant_name, cwd) = setup?;
+        // Expand relative grant specs against the effective cwd (additive), then
+        // add canonical twins. A relative `fs.read:data/x` grant therefore covers
+        // the absolute path a relative `ctx.fs.read("data/x")` resolves to.
+        let effective_grants = normalize_path_grants(&resolve_relative_grants(
+            &ctx.effective_grants,
+            cwd.as_deref(),
+        ));
         let ctx_for_drive = ActiveContext {
             caller: ctx.caller.clone(),
             effective_grants,
             call_chain,
             grant_kind: grant_name.as_ref().map(|_| "tool".to_string()),
             grant_name,
+            cwd,
+            cwd_stack: Vec::new(),
         };
 
         // Phase 2: drive. Scheduler swaps ActiveContext into app-data on
@@ -3266,12 +3478,29 @@ impl Registry for LuaHost {
         let lua = self.lua.clone();
         let catalog = self.catalog.clone();
         let svc_name = name.to_string();
+        // Services don't declare a cwd of their own yet; inherit the caller's
+        // (usually none → falls back to the workspace root at resolve time).
+        let cwd = {
+            let lua_g = lua.lock().unwrap();
+            let ws = lua_g
+                .app_data_ref::<WorkspaceRoot>()
+                .and_then(|w| w.0.clone());
+            ctx.cwd
+                .clone()
+                .map(|s| resolve_cwd(ws.as_deref(), &s))
+                .or(ws)
+        };
         let ctx_for_drive = ActiveContext {
             caller: ctx.caller.clone(),
-            effective_grants: normalize_path_grants(&ctx.effective_grants),
+            effective_grants: normalize_path_grants(&resolve_relative_grants(
+                &ctx.effective_grants,
+                cwd.as_deref(),
+            )),
             call_chain: ctx.call_chain.clone(),
             grant_kind: Some("service".to_string()),
             grant_name: Some(svc_name.clone()),
+            cwd,
+            cwd_stack: Vec::new(),
         };
 
         let thread = {
@@ -3301,6 +3530,82 @@ impl Registry for LuaHost {
         outcome
             .map(|_| ())
             .map_err(|e| RegistryError::Invocation(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod cwd_grant_tests {
+    use super::{lexical_clean, resolve_cwd, resolve_relative_grants};
+    use agentd_permissions::{Permission, PermissionSet};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn resolve_cwd_absolute_passes_through() {
+        let abs = if cfg!(windows) { r"C:\srv\x" } else { "/srv/x" };
+        assert_eq!(
+            resolve_cwd(Some(Path::new("/root")), abs),
+            PathBuf::from(abs)
+        );
+    }
+
+    #[test]
+    fn resolve_cwd_relative_anchors_to_root() {
+        let got = resolve_cwd(Some(Path::new("/root")), "sub/dir");
+        assert_eq!(got, PathBuf::from("/root/sub/dir"));
+    }
+
+    #[test]
+    fn resolve_cwd_strips_dot_segments() {
+        let got = resolve_cwd(Some(Path::new("/root")), "./a/../b");
+        assert_eq!(got, PathBuf::from("/root/b"));
+    }
+
+    #[test]
+    fn lexical_clean_removes_traversal() {
+        assert_eq!(
+            lexical_clean(PathBuf::from("/a/./b/../c")),
+            PathBuf::from("/a/c")
+        );
+    }
+
+    #[test]
+    fn relative_fs_grant_gets_absolute_twin() {
+        let grants = PermissionSet::from_iter(["fs.read:data/x.txt"]);
+        let out = resolve_relative_grants(&grants, Some(Path::new("/root")));
+        // Original kept (additive) + absolute twin added.
+        assert!(out.contains(&Permission::new("fs.read:data/x.txt")));
+        assert!(out.contains(&Permission::new("fs.read:/root/data/x.txt")));
+    }
+
+    #[test]
+    fn absolute_fs_grant_untouched() {
+        let grants = PermissionSet::from_iter(["fs.read:/etc/hosts"]);
+        let out = resolve_relative_grants(&grants, Some(Path::new("/root")));
+        // No spurious /root/etc/hosts twin.
+        assert!(!out.contains(&Permission::new("fs.read:/root/etc/hosts")));
+    }
+
+    #[test]
+    fn shell_exec_bare_binary_not_anchored() {
+        let grants = PermissionSet::from_iter(["shell.exec:python"]);
+        let out = resolve_relative_grants(&grants, Some(Path::new("/root")));
+        // Bare binary is a PATH lookup, not a cwd file — leave it alone.
+        assert!(!out.contains(&Permission::new("shell.exec:/root/python")));
+        assert!(out.contains(&Permission::new("shell.exec:python")));
+    }
+
+    #[test]
+    fn shell_exec_path_is_anchored() {
+        let grants = PermissionSet::from_iter(["shell.exec:scripts/run.sh"]);
+        let out = resolve_relative_grants(&grants, Some(Path::new("/root")));
+        assert!(out.contains(&Permission::new("shell.exec:/root/scripts/run.sh")));
+    }
+
+    #[test]
+    fn no_base_is_noop() {
+        let grants = PermissionSet::from_iter(["fs.read:data/x.txt"]);
+        let out = resolve_relative_grants(&grants, None);
+        assert_eq!(out, grants);
     }
 }
 
