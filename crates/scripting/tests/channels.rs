@@ -51,6 +51,7 @@ async fn anon_channel_round_trip() {
         caller: Caller::default(),
         effective_grants: PermissionSet::empty(),
         call_chain: vec!["demo.echo".into()],
+        cwd: None,
     };
     let res = host
         .call(

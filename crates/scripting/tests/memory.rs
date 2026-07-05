@@ -27,6 +27,7 @@ fn ctx(grants: &[&str], chain: &[&str]) -> CallContext {
         caller: Caller::interface("test"),
         effective_grants: PermissionSet::from_iter(grants.iter().copied()),
         call_chain: chain.iter().map(|s| s.to_string()).collect(),
+        cwd: None,
     }
 }
 

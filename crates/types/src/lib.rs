@@ -62,6 +62,10 @@ pub struct CallContext {
     /// Action names in invocation order. `call_chain.first()` is the outermost
     /// action; `call_chain.last()` is the action currently executing.
     pub call_chain: Vec<String>,
+    /// Working directory (unresolved: may be relative to the workspace root)
+    /// inherited by the dispatched action. The registry resolves it and lets the
+    /// action's own `cwd` override it. `None` falls back to the workspace root.
+    pub cwd: Option<String>,
 }
 
 /// Bridge surface for code that needs to dispatch an action without depending

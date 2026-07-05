@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -115,6 +115,10 @@ pub struct RawRuntime {
 pub struct Config {
     /// Lua entry point. Sandboxed `agentd.import` resolves against its parent.
     pub init_file: PathBuf,
+    /// The userland folder init.lua lives in. Default cwd for relative `fs.*`
+    /// paths and the anchor for relative grant specs. Not tied to the daemon's
+    /// launch dir.
+    pub workspace_root: PathBuf,
     pub trace_file: PathBuf,
     pub grants_file: PathBuf,
     pub addr: String,
@@ -182,14 +186,48 @@ impl Config {
             .or_else(|| std::env::var("RUST_LOG").ok())
             .unwrap_or_else(|| "warn".to_string());
 
-        let init_file = cli
+        // init.lua + grants.toml live in the same userland folder, so supplying
+        // one lets us infer the other rather than forcing both. Explicit values
+        // (CLI/env/config) always win; inference only fills a hole.
+        let init_given = cli
             .init
-            .or_else(|| runtime.init.as_deref().map(expand_tilde))
-            .unwrap_or_else(|| default_init_file().expect("init default"));
+            .or_else(|| runtime.init.as_deref().map(expand_tilde));
+        let grants_given = cli.grants_file;
 
-        let grants_file = cli
-            .grants_file
-            .unwrap_or_else(|| default_grants_file().expect("grants default"));
+        let (init_file, grants_file) = match (init_given, grants_given) {
+            (Some(init), Some(grants)) => {
+                if init.parent() != grants.parent() {
+                    tracing::warn!(
+                        init = %init.display(),
+                        grants = %grants.display(),
+                        "init.lua and grants.toml are in different folders; relative grants resolve against the workspace root (init.lua's folder)"
+                    );
+                }
+                (init, grants)
+            }
+            // Only init given: grants.toml sits next to it.
+            (Some(init), None) => {
+                let grants = sibling(&init, "grants.toml");
+                (init, grants)
+            }
+            // Only grants given: init.lua sits next to it.
+            (None, Some(grants)) => {
+                let init = sibling(&grants, "init.lua");
+                (init, grants)
+            }
+            (None, None) => (
+                default_init_file().expect("init default"),
+                default_grants_file().expect("grants default"),
+            ),
+        };
+
+        // The workspace root is the folder init.lua lives in. It anchors config
+        // discovery and is the default cwd for relative fs paths + relative
+        // grant specs. Deliberately independent of the daemon's launch dir.
+        let workspace_root = init_file
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
 
         let max_turns = runtime.max_turns.unwrap_or(16);
         let yolo = runtime.yolo.unwrap_or(false);
@@ -212,6 +250,7 @@ impl Config {
 
         Ok(Self {
             init_file,
+            workspace_root,
             trace_file,
             grants_file,
             addr,
@@ -257,6 +296,15 @@ pub fn expand_tilde(raw: &str) -> PathBuf {
         return home.join(rest);
     }
     PathBuf::from(raw)
+}
+
+/// Sibling path: `<dir of `base`>/<name>`. Used to infer init.lua from
+/// grants.toml or vice-versa when only one is supplied.
+fn sibling(base: &Path, name: &str) -> PathBuf {
+    match base.parent() {
+        Some(dir) => dir.join(name),
+        None => PathBuf::from(name),
+    }
 }
 
 fn default_config_path() -> Result<PathBuf> {
@@ -404,6 +452,45 @@ mod tests {
         assert_eq!(resolved.log_level, "warn");
         assert_eq!(resolved.max_turns, 16);
         assert!(!resolved.yolo);
+    }
+
+    #[test]
+    fn init_infers_grants_sibling_and_workspace_root() {
+        let td = tempdir().unwrap();
+        let init = td.path().join("proj").join("init.lua");
+        let cli = Cli {
+            config: Some(td.path().join("absent.toml")),
+            init: Some(init.clone()),
+            ..Cli::default()
+        };
+        let resolved = Config::resolve(cli).unwrap();
+        // grants.toml is inferred next to init.lua.
+        assert_eq!(
+            resolved.grants_file,
+            init.parent().unwrap().join("grants.toml")
+        );
+        // workspace root is init.lua's folder.
+        assert_eq!(resolved.workspace_root, init.parent().unwrap());
+        assert_eq!(resolved.init_file, init);
+    }
+
+    #[test]
+    fn grants_infers_init_sibling() {
+        let td = tempdir().unwrap();
+        let grants = td.path().join("proj").join("grants.toml");
+        let cli = Cli {
+            config: Some(td.path().join("absent.toml")),
+            grants_file: Some(grants.clone()),
+            ..Cli::default()
+        };
+        let resolved = Config::resolve(cli).unwrap();
+        // init.lua is inferred next to grants.toml.
+        assert_eq!(
+            resolved.init_file,
+            grants.parent().unwrap().join("init.lua")
+        );
+        assert_eq!(resolved.grants_file, grants);
+        assert_eq!(resolved.workspace_root, grants.parent().unwrap());
     }
 
     #[test]

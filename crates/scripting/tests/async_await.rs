@@ -53,6 +53,7 @@ async fn async_await_returns_value() {
         caller: Caller::default(),
         effective_grants: PermissionSet::empty(),
         call_chain: vec!["demo.async_smoke".into()],
+        cwd: None,
     };
     let res = host
         .call(
@@ -146,6 +147,7 @@ async fn async_runs_concurrently_with_ai_yield() {
         caller: Caller::default(),
         effective_grants: PermissionSet::from_iter(["ai:mock"]),
         call_chain: vec!["demo.par".into()],
+        cwd: None,
     };
     let res = tokio::time::timeout(
         Duration::from_secs(5),
