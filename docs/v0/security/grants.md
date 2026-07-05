@@ -1,20 +1,24 @@
 # grants.toml reference
 
-`grants.toml` is the only source of capability grants in agent.d. Every component declares what it *needs* in its manifest, but nothing is ever self-granted — this file is where you, the operator, approve those needs.
+`grants.toml` is the only source of capability grants in agent.d. Every component declares what it _needs_ in its manifest, but nothing is ever self-granted — this file is where you, the operator, approve those needs.
 
 ## Location and loading
 
 The default path is `$XDG_CONFIG_HOME/agentd/grants.toml`. Override it with `--grants-file <path>` or `AGENTD_GRANTS_FILE`. The file is reloaded automatically when you run with `--watch`.
+
+`init.lua` and `grants.toml` live in the same folder - that folder is serves as the **workspace root**. Supplying one option lets agent.d infer the other: pass just `--init path/to/init.lua` and it reads `grants.toml` beside it, or pass just `--grants-file path/to/grants.toml` and it loads `init.lua` beside it. You only need both flags if they live in different folders.
 
 ## The five-layer engine
 
 Every action call passes through five intersecting layers in order:
 
 ```
-tool/package grants ∩ action.requires ∩ runner.allowed_actions
-                                      ∩ interface.allowed_actions
-                                      ∩ policy
-                    = Decision
+tool/package grants
+        ∩ action.requires
+        ∩ runner.allowed_actions
+        ∩ interface.allowed_actions
+        ∩ policy
+        = Decision
 ```
 
 The result is **default-deny**: a call succeeds only when every applicable layer permits it. `grants.toml` controls the first and last layers.
@@ -145,7 +149,8 @@ auto_confirm     = []
 - An explicit `[tool.<name>]` or `[service.<name>]` entry always overrides an inherited package grant for that specific component.
 - An empty `allowed_actions` list means **no constraint** at that layer, not "block everything".
 - Filesystem path grants are resolved (symlinks, `..` segments) before checking, so aliases cannot bypass a glob restriction.
-- Specifiers support wildcards: `net:*`, `fs.write:/tmp/**`, `memory.read:discord/**`.
+- A **relative** `fs.read`/`fs.write` path grant resolves against the granted component's working directory (the workspace root by default), so `fs.read:notes/**` is portable across machines. An absolute grant is honored as-is. A bare `shell.exec:python` stays a `PATH` lookup — only `shell.exec` specifiers containing a path separator are treated as cwd-relative.
+- Specifiers support wildcards: `net:*`, `fs.write:tmp/**`, `memory.read:discord/**`.
 
 ## See also
 
