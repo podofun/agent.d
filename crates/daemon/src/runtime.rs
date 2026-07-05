@@ -57,6 +57,9 @@ pub fn build_runtime(cfg: &Config, shared: &Shared) -> Result<BuiltRuntime> {
     if let Some(root) = cfg.init_file.parent() {
         host.set_root(root);
     }
+    // The workspace root is the default cwd for relative `fs.*` paths and the
+    // anchor for relative grant specs.
+    host.set_workspace_root(&cfg.workspace_root);
     host.set_packages_root(&shared.packages_root);
     host.start_async_runtime(shared.async_handle.clone());
     host.set_secrets(shared.keyring.clone());

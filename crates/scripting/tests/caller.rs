@@ -29,6 +29,7 @@ async fn call(
             caller,
             effective_grants: PermissionSet::from_iter(grants.iter().copied()),
             call_chain: vec![name.to_string()],
+            cwd: None,
         },
         ActionCall {
             action: name.to_string(),

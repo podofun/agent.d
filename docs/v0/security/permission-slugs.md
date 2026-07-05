@@ -139,7 +139,7 @@ OAuth grant for a provider. The specifier is the **provider name**. Declare this
 
 - `*` matches any single path segment or any single value (e.g. `net:*` matches all hostnames).
 - `**` matches zero or more path segments in filesystem and memory globs (e.g. `fs.read:/data/**`, `memory.read:ns/**`).
-- Path grants are always resolved before matching — you cannot bypass a glob with aliases or `..` traversal.
+- Path grants are always resolved before matching — a tool cannot reach past a glob with aliases or `..` traversal.
 
 ## See also
 

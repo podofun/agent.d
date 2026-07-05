@@ -47,6 +47,7 @@ fn ctx() -> CallContext {
         caller: Caller::default(),
         effective_grants: PermissionSet::empty(),
         call_chain: vec!["t.echo".into()],
+        cwd: None,
     }
 }
 

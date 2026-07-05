@@ -23,6 +23,7 @@ async fn run_action(host: &LuaHost, name: &str) -> serde_json::Value {
             caller: Caller::default(),
             effective_grants: PermissionSet::empty(),
             call_chain: vec![name.to_string()],
+            cwd: None,
         },
         ActionCall {
             action: name.to_string(),
