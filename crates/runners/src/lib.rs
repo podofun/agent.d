@@ -46,6 +46,11 @@ pub struct RunnerDef {
     /// tooling that wants to know what a runner *says* it can call.
     #[serde(default)]
     pub allowed_actions: Vec<String>,
+    /// Working directory relative `fs.*` paths resolve against for actions this
+    /// runner dispatches, unless the action declares its own `cwd`. Relative
+    /// values anchor to the workspace root. `None` inherits/defaults to it.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Error)]

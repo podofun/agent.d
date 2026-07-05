@@ -28,6 +28,7 @@ fn ctx(grants: &[&str], chain: &[&str]) -> CallContext {
         caller: Caller::interface("test"),
         effective_grants: PermissionSet::from_iter(grants.iter().copied()),
         call_chain: chain.iter().map(|s| s.to_string()).collect(),
+        cwd: None,
     }
 }
 
@@ -411,6 +412,7 @@ async fn shell_child_confined_to_fs_write_grant() {
         caller: Caller::interface("test"),
         effective_grants: grants.clone(),
         call_chain: vec!["w.write".to_string()],
+        cwd: None,
     };
 
     // Inside the grant: write succeeds.

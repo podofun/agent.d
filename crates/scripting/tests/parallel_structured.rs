@@ -33,6 +33,7 @@ async fn call(host: &Arc<LuaHost>, action: &str) -> serde_json::Value {
         caller: Caller::default(),
         effective_grants: PermissionSet::empty(),
         call_chain: vec![action.into()],
+        cwd: None,
     };
     host.call(
         ctx,
