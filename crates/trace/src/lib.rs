@@ -29,6 +29,25 @@ pub struct TraceEvent {
     pub kind: Option<String>,
 }
 
+/// Replace every leaf value with a `<type:size>` placeholder so secrets
+/// (tokens, passwords, message bodies) never reach the trace file. Object
+/// keys and array shapes survive — enough to debug call flow, nothing more.
+pub fn redact(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), redact(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(redact).collect()),
+        Value::String(s) => Value::String(format!("<string:{}b>", s.len())),
+        Value::Number(_) => Value::String("<number>".into()),
+        Value::Bool(_) => Value::String("<bool>".into()),
+        Value::Null => Value::Null,
+    }
+}
+
 impl TraceEvent {
     pub fn ok(
         action: &str,
@@ -39,9 +58,9 @@ impl TraceEvent {
         Self {
             ts: Utc::now().to_rfc3339(),
             action: action.to_string(),
-            args,
+            args: redact(&args),
             duration_ms: dur_ms,
-            result: Some(result),
+            result: Some(redact(&result)),
             error: None,
             execution: None,
             kind: None,
@@ -51,7 +70,7 @@ impl TraceEvent {
         Self {
             ts: Utc::now().to_rfc3339(),
             action: action.to_string(),
-            args,
+            args: redact(&args),
             duration_ms: dur_ms,
             result: None,
             error: Some(err),
@@ -122,5 +141,43 @@ impl TraceSink for JsonlSink {
             eprintln!("trace write failed: {e}");
         }
         let _ = f.flush().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn redact_strips_all_leaf_values() {
+        let args = json!({
+            "token": "xoxb-super-secret",
+            "nested": { "password": "hunter2", "count": 3 },
+            "list": ["a", true, null]
+        });
+        let red = redact(&args);
+        assert_eq!(
+            red,
+            json!({
+                "token": "<string:17b>",
+                "nested": { "password": "<string:7b>", "count": "<number>" },
+                "list": ["<string:1b>", "<bool>", null]
+            })
+        );
+        let s = serde_json::to_string(&red).unwrap();
+        assert!(!s.contains("secret") && !s.contains("hunter2"));
+    }
+
+    #[test]
+    fn constructors_redact_args_and_result() {
+        let ev = TraceEvent::ok(
+            "set_discord_token",
+            json!({ "token": "xoxb-abc" }),
+            5,
+            json!({ "stored": true }),
+        );
+        assert_eq!(ev.args, json!({ "token": "<string:8b>" }));
+        assert_eq!(ev.result, Some(json!({ "stored": "<bool>" })));
     }
 }
