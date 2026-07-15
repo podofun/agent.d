@@ -35,11 +35,9 @@ pub struct TraceEvent {
 pub fn redact(value: &serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
     match value {
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .map(|(k, v)| (k.clone(), redact(v)))
-                .collect(),
-        ),
+        Value::Object(map) => {
+            Value::Object(map.iter().map(|(k, v)| (k.clone(), redact(v))).collect())
+        }
         Value::Array(items) => Value::Array(items.iter().map(redact).collect()),
         Value::String(s) => Value::String(format!("<string:{}b>", s.len())),
         Value::Number(_) => Value::String("<number>".into()),
