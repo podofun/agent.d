@@ -34,3 +34,29 @@ max_turns = 16
 # NOTE: reserved. Setting this to true today emits a warning and is
 # otherwise ignored.
 yolo = false
+# Provider used when a model string has no `provider/` prefix. Any built-in
+# or [providers.<name>] entry. Default "anthropic".
+# default_provider = "ollama"
+
+# Custom providers: any OpenAI- or Anthropic-compatible endpoint becomes a
+# named prefix. `kind` picks the wire format ("openai" | "anthropic").
+# `base_url` is forgiving: with or without the /chat/completions suffix.
+# Auth is explicit: either `api_key_secret` (key name in the OS keyring) or
+# `auth = "none"` for local servers without authentication.
+
+# [providers.openrouter]
+# kind = "openai"
+# base_url = "https://openrouter.ai/api/v1"
+# api_key_secret = "openrouter_api_key"
+# default_model = "meta-llama/llama-3.3-70b-instruct"
+
+# [providers.groq]
+# kind = "openai"
+# base_url = "https://api.groq.com/openai/v1"
+# api_key_secret = "groq_api_key"
+
+# [providers.ollama]
+# kind = "openai"
+# base_url = "http://localhost:11434/v1"
+# auth = "none"
+# default_model = "qwen3:14b"

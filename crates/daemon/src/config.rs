@@ -465,6 +465,41 @@ mod tests {
     }
 
     #[test]
+    fn shipped_example_config_parses_with_providers_uncommented() {
+        let example = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/config.toml"
+        ))
+        .expect("examples/config.toml exists");
+        // As shipped (providers commented out).
+        let _: RawConfig = toml::from_str(&example).expect("example parses");
+        // With the commented-out [providers.*] examples + default_provider
+        // enabled. Only lines that are actual config (section headers or
+        // `key = value`) get uncommented; prose comments stay comments.
+        let uncommented: String = example
+            .lines()
+            .map(|l| {
+                match l.strip_prefix("# ") {
+                    Some(r)
+                        if r.starts_with("[providers.")
+                            || (r.split_once(" = ").is_some_and(|(k, _)| {
+                                !k.is_empty()
+                                    && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            })) =>
+                    {
+                        r
+                    }
+                    _ => l,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let raw: RawConfig =
+            toml::from_str(&uncommented).expect("uncommented example parses");
+        assert!(raw.providers.unwrap().contains_key("ollama"));
+    }
+
+    #[test]
     fn parses_providers_table() {
         let src = r#"
             [providers.openrouter]
