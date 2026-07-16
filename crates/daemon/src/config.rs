@@ -478,24 +478,21 @@ mod tests {
         // `key = value`) get uncommented; prose comments stay comments.
         let uncommented: String = example
             .lines()
-            .map(|l| {
-                match l.strip_prefix("# ") {
-                    Some(r)
-                        if r.starts_with("[providers.")
-                            || (r.split_once(" = ").is_some_and(|(k, _)| {
-                                !k.is_empty()
-                                    && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                            })) =>
-                    {
-                        r
-                    }
-                    _ => l,
+            .map(|l| match l.strip_prefix("# ") {
+                Some(r)
+                    if r.starts_with("[providers.")
+                        || (r.split_once(" = ").is_some_and(|(k, _)| {
+                            !k.is_empty()
+                                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        })) =>
+                {
+                    r
                 }
+                _ => l,
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let raw: RawConfig =
-            toml::from_str(&uncommented).expect("uncommented example parses");
+        let raw: RawConfig = toml::from_str(&uncommented).expect("uncommented example parses");
         assert!(raw.providers.unwrap().contains_key("ollama"));
     }
 

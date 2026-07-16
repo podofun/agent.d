@@ -89,7 +89,10 @@ async fn no_auth_sends_no_authorization_header() {
         .with_endpoint(format!("http://{addr}/v1"))
         .with_no_auth();
 
-    let res = p.complete(CompletionRequest::prompt("hello")).await.unwrap();
+    let res = p
+        .complete(CompletionRequest::prompt("hello"))
+        .await
+        .unwrap();
     assert_eq!(res.text, "hi");
 
     let captured = log.lock().unwrap();
@@ -111,7 +114,9 @@ async fn keyed_provider_sends_bearer_token() {
         .with_endpoint(format!("http://{addr}/v1"))
         .with_secret_key("openrouter_api_key");
 
-    p.complete(CompletionRequest::prompt("hello")).await.unwrap();
+    p.complete(CompletionRequest::prompt("hello"))
+        .await
+        .unwrap();
 
     let captured = log.lock().unwrap();
     assert_eq!(
@@ -129,7 +134,9 @@ async fn default_model_fills_requests_without_one() {
         .with_no_auth()
         .with_default_model("qwen3:14b");
 
-    p.complete(CompletionRequest::prompt("hello")).await.unwrap();
+    p.complete(CompletionRequest::prompt("hello"))
+        .await
+        .unwrap();
 
     let captured = log.lock().unwrap();
     assert_eq!(captured[0].body["model"], "qwen3:14b");
@@ -177,13 +184,15 @@ async fn tool_call_round_trip_decodes_arguments() {
     // Canonical stop_reason vocabulary (wire "tool_calls" is normalized).
     assert_eq!(res.stop_reason.as_deref(), Some("tool_use"));
 
-    // The input schema traveled to the wire as function.parameters.
-    let captured = log.lock().unwrap();
-    let sent = &captured[0].body["tools"][0]["function"]["parameters"];
-    assert_eq!(sent["required"][0], "q");
+    // The input schema traveled to the wire as function.parameters. Scoped so
+    // the guard is gone before the next await (clippy: await_holding_lock).
+    {
+        let captured = log.lock().unwrap();
+        let sent = &captured[0].body["tools"][0]["function"]["parameters"];
+        assert_eq!(sent["required"][0], "q");
+    }
 
     // Feed the tool result back — second turn must succeed.
-    drop(captured);
     let follow_up = CompletionRequest {
         messages: vec![
             Message::user("look up x"),
