@@ -174,7 +174,8 @@ async fn tool_call_round_trip_decodes_arguments() {
     assert_eq!(res.tool_calls.len(), 1);
     assert_eq!(res.tool_calls[0].name, "notes.lookup");
     assert_eq!(res.tool_calls[0].arguments["q"], "x");
-    assert_eq!(res.stop_reason.as_deref(), Some("tool_calls"));
+    // Canonical stop_reason vocabulary (wire "tool_calls" is normalized).
+    assert_eq!(res.stop_reason.as_deref(), Some("tool_use"));
 
     // The input schema traveled to the wire as function.parameters.
     let captured = log.lock().unwrap();

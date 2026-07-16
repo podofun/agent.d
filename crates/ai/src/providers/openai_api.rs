@@ -323,9 +323,21 @@ fn translate_response(
     Ok(CompletionResponse {
         text,
         model: parsed.model.or(requested_model),
-        stop_reason: choice.finish_reason,
+        stop_reason: choice.finish_reason.map(normalize_stop_reason),
         tool_calls,
     })
+}
+
+/// Map OpenAI `finish_reason` vocabulary onto the canonical (Anthropic-style)
+/// `stop_reason` values so wire-format differences never leak past the
+/// `Provider` trait — Lua sees identical strings whatever the provider.
+fn normalize_stop_reason(finish_reason: String) -> String {
+    match finish_reason.as_str() {
+        "stop" => "end_turn".into(),
+        "tool_calls" | "function_call" => "tool_use".into(),
+        "length" => "max_tokens".into(),
+        _ => finish_reason,
+    }
 }
 
 #[cfg(test)]
@@ -457,7 +469,8 @@ mod tests {
         assert_eq!(r.tool_calls.len(), 1);
         assert_eq!(r.tool_calls[0].name, "notes.lookup");
         assert_eq!(r.tool_calls[0].arguments["q"], "x");
-        assert_eq!(r.stop_reason.as_deref(), Some("tool_calls"));
+        // Canonical vocabulary, not the OpenAI wire value ("tool_calls").
+        assert_eq!(r.stop_reason.as_deref(), Some("tool_use"));
     }
 
     #[test]
