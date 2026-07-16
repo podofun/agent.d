@@ -76,6 +76,39 @@ pub struct RawConfig {
     pub daemon: Option<RawDaemon>,
     #[serde(default)]
     pub runtime: Option<RawRuntime>,
+    /// User-defined providers keyed by registry name. Registered on top of
+    /// the built-ins at daemon startup.
+    #[serde(default)]
+    pub providers: Option<std::collections::HashMap<String, RawProvider>>,
+}
+
+/// Wire format a config-driven provider speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    /// OpenAI Chat Completions wire format (OpenRouter, Groq, Together,
+    /// vLLM, Ollama, LM Studio, ...).
+    OpenAi,
+    /// Anthropic Messages wire format (proxies/gateways).
+    Anthropic,
+}
+
+/// One `[providers.<name>]` entry. `kind` + `base_url` are mandatory (toml
+/// parse error when absent); auth must be either `api_key_secret` or
+/// `auth = "none"` — validated in [`Config::resolve`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawProvider {
+    pub kind: ProviderKind,
+    pub base_url: String,
+    /// SecretStore key holding the API key. Mutually exclusive with `auth = "none"`.
+    #[serde(default)]
+    pub api_key_secret: Option<String>,
+    /// `"none"` disables the auth header (local servers).
+    #[serde(default)]
+    pub auth: Option<String>,
+    #[serde(default)]
+    pub default_model: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -108,6 +141,9 @@ pub struct RawRuntime {
     pub yolo: Option<bool>,
     #[serde(default)]
     pub watch: Option<bool>,
+    /// Registry default when a model string has no `provider/` prefix.
+    #[serde(default)]
+    pub default_provider: Option<String>,
 }
 
 /// Final, fully-resolved daemon config.
@@ -140,7 +176,21 @@ pub struct Config {
     pub yolo: bool,
     /// Dev hot reload: watch the used file set and rebuild the runtime in place.
     pub watch: bool,
+    /// User-defined providers, sorted by name for deterministic registration.
+    pub providers: Vec<(String, RawProvider)>,
+    /// Registry default provider name (built-in or configured).
+    pub default_provider: String,
 }
+
+/// Provider names claimed by built-ins registered in `main.rs`.
+const BUILTIN_PROVIDERS: &[&str] = &[
+    "anthropic",
+    "anthropic-cli",
+    "openai",
+    "codex",
+    "openai-cli",
+    "mock",
+];
 
 impl Config {
     /// Resolve a `Config` from CLI args + env + `config.toml` + defaults.
@@ -243,6 +293,49 @@ impl Config {
             .or(daemon.approval_timeout_ms)
             .unwrap_or(120_000);
 
+        // Validate user-defined providers; sorted for deterministic
+        // registration order.
+        let mut providers: Vec<(String, RawProvider)> =
+            raw.providers.unwrap_or_default().into_iter().collect();
+        providers.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, spec) in &providers {
+            if BUILTIN_PROVIDERS.contains(&name.as_str()) {
+                anyhow::bail!(
+                    "provider name `{name}` is reserved for a built-in ({})",
+                    BUILTIN_PROVIDERS.join(", ")
+                );
+            }
+            if spec.base_url.trim().is_empty() {
+                anyhow::bail!("provider `{name}`: base_url must not be empty");
+            }
+            match (&spec.api_key_secret, spec.auth.as_deref()) {
+                (Some(_), Some(_)) => anyhow::bail!(
+                    "provider `{name}`: api_key_secret and auth = \"none\" are mutually exclusive"
+                ),
+                (None, None) => anyhow::bail!(
+                    "provider `{name}`: set api_key_secret = \"<secret name>\" or auth = \"none\""
+                ),
+                (None, Some(a)) if a != "none" => anyhow::bail!(
+                    "provider `{name}`: auth = \"{a}\" is invalid; the only value is \"none\""
+                ),
+                _ => {}
+            }
+        }
+        let default_provider = runtime
+            .default_provider
+            .unwrap_or_else(|| "anthropic".to_string());
+        if !BUILTIN_PROVIDERS.contains(&default_provider.as_str())
+            && !providers.iter().any(|(n, _)| *n == default_provider)
+        {
+            let mut names: Vec<&str> = BUILTIN_PROVIDERS.to_vec();
+            let configured: Vec<&str> = providers.iter().map(|(n, _)| n.as_str()).collect();
+            names.extend(configured);
+            anyhow::bail!(
+                "runtime.default_provider = \"{default_provider}\" names no known provider (available: {})",
+                names.join(", ")
+            );
+        }
+
         // Note on `yolo`: callers should emit the reserved-key warning
         // AFTER initializing the tracing subscriber. `Config::resolve` is
         // typically called before the subscriber exists; a warn here
@@ -262,6 +355,8 @@ impl Config {
             admin_token,
             approval_timeout_ms,
             watch,
+            providers,
+            default_provider,
         })
     }
 }
@@ -367,6 +462,157 @@ mod tests {
         let raw: RawConfig = toml::from_str("").expect("empty parse");
         assert!(raw.daemon.is_none());
         assert!(raw.runtime.is_none());
+    }
+
+    #[test]
+    fn parses_providers_table() {
+        let src = r#"
+            [providers.openrouter]
+            kind = "openai"
+            base_url = "https://openrouter.ai/api/v1"
+            api_key_secret = "openrouter_api_key"
+            default_model = "meta-llama/llama-3.3-70b-instruct"
+
+            [providers.ollama]
+            kind = "openai"
+            base_url = "http://localhost:11434/v1"
+            auth = "none"
+        "#;
+        let raw: RawConfig = toml::from_str(src).expect("parse");
+        let provs = raw.providers.unwrap();
+        assert_eq!(provs["openrouter"].kind, ProviderKind::OpenAi);
+        assert_eq!(
+            provs["openrouter"].api_key_secret.as_deref(),
+            Some("openrouter_api_key")
+        );
+        assert_eq!(provs["ollama"].auth.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn provider_missing_base_url_is_a_parse_error() {
+        let src = r#"
+            [providers.x]
+            kind = "openai"
+            auth = "none"
+        "#;
+        assert!(toml::from_str::<RawConfig>(src).is_err());
+    }
+
+    fn resolve_with_providers(body: &str) -> Result<Config> {
+        let td = tempdir().unwrap();
+        let cfg = write_config(td.path(), body);
+        Config::resolve(Cli {
+            config: Some(cfg),
+            ..Cli::default()
+        })
+    }
+
+    #[test]
+    fn provider_empty_base_url_is_rejected_on_resolve() {
+        let err = resolve_with_providers(
+            r#"
+            [providers.x]
+            kind = "openai"
+            base_url = ""
+            auth = "none"
+        "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("x"), "must name the provider");
+    }
+
+    #[test]
+    fn provider_name_colliding_with_builtin_is_rejected() {
+        let err = resolve_with_providers(
+            r#"
+            [providers.anthropic]
+            kind = "openai"
+            base_url = "https://example.com/v1"
+            auth = "none"
+        "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("reserved"));
+    }
+
+    #[test]
+    fn provider_auth_contradiction_is_rejected() {
+        let err = resolve_with_providers(
+            r#"
+            [providers.x]
+            kind = "openai"
+            base_url = "https://example.com/v1"
+            api_key_secret = "k"
+            auth = "none"
+        "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("x"));
+    }
+
+    #[test]
+    fn provider_without_auth_choice_is_rejected() {
+        let err = resolve_with_providers(
+            r#"
+            [providers.x]
+            kind = "openai"
+            base_url = "https://example.com/v1"
+        "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("api_key_secret"));
+    }
+
+    #[test]
+    fn provider_bad_auth_value_is_rejected() {
+        let err = resolve_with_providers(
+            r#"
+            [providers.x]
+            kind = "openai"
+            base_url = "https://example.com/v1"
+            auth = "bearer"
+        "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("none"));
+    }
+
+    #[test]
+    fn default_provider_parses_and_resolves() {
+        let cfg = resolve_with_providers(
+            r#"
+            [runtime]
+            default_provider = "ollama"
+
+            [providers.ollama]
+            kind = "openai"
+            base_url = "http://localhost:11434/v1"
+            auth = "none"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.default_provider, "ollama");
+        assert_eq!(cfg.providers.len(), 1);
+        assert_eq!(cfg.providers[0].0, "ollama");
+    }
+
+    #[test]
+    fn default_provider_unknown_name_is_rejected() {
+        let err = resolve_with_providers(
+            r#"
+            [runtime]
+            default_provider = "nope"
+        "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("nope"));
+    }
+
+    #[test]
+    fn default_provider_defaults_to_anthropic() {
+        let cfg = resolve_with_providers("").unwrap();
+        assert_eq!(cfg.default_provider, "anthropic");
+        assert!(cfg.providers.is_empty());
     }
 
     // ---------- expand_tilde ----------
