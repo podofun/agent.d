@@ -19,12 +19,16 @@ const SECRET_KEY: &str = "anthropic_api_key";
 pub struct ClaudeApiProvider {
     name: String,
     secrets: Arc<dyn SecretStore>,
-    /// Override endpoint (used in tests w/ a local mock server). Falls back
-    /// to `ANTHROPIC_URL` when `None`.
+    /// Override endpoint (tests use a local mock server; config-driven
+    /// providers point it at a compatible gateway). Falls back to
+    /// `ANTHROPIC_URL` when `None`.
     endpoint: Option<String>,
-    /// Override secret key name. Tests use this to inject a fake key without
-    /// touching the OS keyring.
-    secret_key: String,
+    /// Secret key name for the API key. `None` disables the `x-api-key`
+    /// header entirely (unauthenticated local proxies).
+    secret_key: Option<String>,
+    /// Model used when the request carries none. Per-instance so compatible
+    /// gateways can pick their own default.
+    default_model: String,
 }
 
 impl ClaudeApiProvider {
@@ -33,8 +37,15 @@ impl ClaudeApiProvider {
             name: "anthropic".into(),
             secrets,
             endpoint: None,
-            secret_key: SECRET_KEY.into(),
+            secret_key: Some(SECRET_KEY.into()),
+            default_model: DEFAULT_MODEL.into(),
         }
+    }
+
+    /// Registry name for a config-driven instance (e.g. `"my-gateway"`).
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
     }
 
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
@@ -43,12 +54,38 @@ impl ClaudeApiProvider {
     }
 
     pub fn with_secret_key(mut self, key: impl Into<String>) -> Self {
-        self.secret_key = key.into();
+        self.secret_key = Some(key.into());
+        self
+    }
+
+    /// Send no `x-api-key` header at all (unauthenticated local proxies).
+    pub fn with_no_auth(mut self) -> Self {
+        self.secret_key = None;
+        self
+    }
+
+    pub fn with_default_model(mut self, model: impl Into<String>) -> Self {
+        self.default_model = model.into();
         self
     }
 
     fn endpoint(&self) -> &str {
         self.endpoint.as_deref().unwrap_or(ANTHROPIC_URL)
+    }
+
+    fn default_model(&self) -> &str {
+        &self.default_model
+    }
+
+    fn api_key(&self) -> Result<Option<String>, ProviderError> {
+        match &self.secret_key {
+            None => Ok(None),
+            Some(k) => self
+                .secrets
+                .get(k)
+                .map(Some)
+                .map_err(|e| ProviderError::Config(format!("read `{k}`: {e}"))),
+        }
     }
 }
 
@@ -63,12 +100,9 @@ impl Provider for ClaudeApiProvider {
     }
 
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
-        let api_key = self
-            .secrets
-            .get(&self.secret_key)
-            .map_err(|e| ProviderError::Config(format!("read `{}`: {e}", self.secret_key)))?;
+        let api_key = self.api_key()?;
 
-        let body = build_request_body(&req);
+        let body = build_request_body(&req, self.default_model());
 
         let mut http_req = HttpRequest {
             method: "POST".into(),
@@ -76,7 +110,9 @@ impl Provider for ClaudeApiProvider {
             json: Some(body),
             ..Default::default()
         };
-        http_req.headers.insert("x-api-key".into(), api_key);
+        if let Some(key) = api_key {
+            http_req.headers.insert("x-api-key".into(), key);
+        }
         http_req
             .headers
             .insert("anthropic-version".into(), ANTHROPIC_VERSION.into());
@@ -103,8 +139,8 @@ impl Provider for ClaudeApiProvider {
     }
 }
 
-fn build_request_body(req: &CompletionRequest) -> serde_json::Value {
-    let model = req.model.clone().unwrap_or_else(|| DEFAULT_MODEL.into());
+fn build_request_body(req: &CompletionRequest, default_model: &str) -> serde_json::Value {
+    let model = req.model.clone().unwrap_or_else(|| default_model.into());
     let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
     let mut messages_out: Vec<serde_json::Value> = Vec::new();
@@ -279,7 +315,7 @@ mod tests {
             model: Some("claude-foo".into()),
             ..Default::default()
         };
-        let body = build_request_body(&req);
+        let body = build_request_body(&req, DEFAULT_MODEL);
         assert_eq!(body["system"], "be terse");
         assert_eq!(body["model"], "claude-foo");
         assert_eq!(body["tools"][0]["name"], "notes.lookup");
@@ -294,6 +330,31 @@ mod tests {
         let tr = &msgs[2]["content"][0];
         assert_eq!(tr["type"], "tool_result");
         assert_eq!(tr["tool_use_id"], "c1");
+    }
+
+    #[test]
+    fn builder_overrides_name_and_default_model() {
+        let secrets = Arc::new(MemoryStore::default());
+        let p = ClaudeApiProvider::new(secrets)
+            .with_name("my-gateway")
+            .with_default_model("claude-custom");
+        assert_eq!(p.name(), "my-gateway");
+        let body = build_request_body(&CompletionRequest::default(), p.default_model());
+        assert_eq!(body["model"], "claude-custom");
+    }
+
+    #[test]
+    fn no_auth_mode_needs_no_secret() {
+        let secrets = Arc::new(MemoryStore::default());
+        let p = ClaudeApiProvider::new(secrets).with_no_auth();
+        assert!(p.api_key().unwrap().is_none());
+    }
+
+    #[test]
+    fn missing_secret_is_a_config_error_when_auth_required() {
+        let secrets = Arc::new(MemoryStore::default());
+        let p = ClaudeApiProvider::new(secrets);
+        assert!(matches!(p.api_key(), Err(ProviderError::Config(_))));
     }
 
     #[test]
