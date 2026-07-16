@@ -49,7 +49,7 @@ impl ClaudeApiProvider {
     }
 
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.endpoint = Some(endpoint.into());
+        self.endpoint = Some(normalize_anthropic_endpoint(&endpoint.into()));
         self
     }
 
@@ -136,6 +136,20 @@ impl Provider for ClaudeApiProvider {
         })?;
 
         Ok(translate_response(parsed, req.model))
+    }
+}
+
+/// Accepts a full `/v1/messages` URL, a `.../v1` base, or a bare host, and
+/// returns the full Messages endpoint. Forgiving on purpose: users paste
+/// whatever their gateway's docs show.
+pub fn normalize_anthropic_endpoint(raw: &str) -> String {
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.ends_with("/v1/messages") {
+        trimmed.to_string()
+    } else if trimmed.ends_with("/v1") {
+        format!("{trimmed}/messages")
+    } else {
+        format!("{trimmed}/v1/messages")
     }
 }
 
@@ -330,6 +344,32 @@ mod tests {
         let tr = &msgs[2]["content"][0];
         assert_eq!(tr["type"], "tool_result");
         assert_eq!(tr["tool_use_id"], "c1");
+    }
+
+    #[test]
+    fn normalize_endpoint_handles_all_shapes() {
+        // full URL passes through
+        assert_eq!(
+            normalize_anthropic_endpoint("https://gw.example/v1/messages"),
+            "https://gw.example/v1/messages"
+        );
+        // base ending in /v1 gets /messages
+        assert_eq!(
+            normalize_anthropic_endpoint("https://gw.example/v1/"),
+            "https://gw.example/v1/messages"
+        );
+        // bare host gets the full path
+        assert_eq!(
+            normalize_anthropic_endpoint("https://gw.example"),
+            "https://gw.example/v1/messages"
+        );
+    }
+
+    #[test]
+    fn with_endpoint_normalizes() {
+        let secrets = Arc::new(MemoryStore::default());
+        let p = ClaudeApiProvider::new(secrets).with_endpoint("https://gw.example/v1");
+        assert_eq!(p.endpoint(), "https://gw.example/v1/messages");
     }
 
     #[test]

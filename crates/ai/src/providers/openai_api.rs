@@ -52,7 +52,7 @@ impl OpenAiApiProvider {
     }
 
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.endpoint = Some(endpoint.into());
+        self.endpoint = Some(normalize_openai_endpoint(&endpoint.into()));
         self
     }
 
@@ -135,6 +135,18 @@ impl Provider for OpenAiApiProvider {
         })?;
 
         translate_response(parsed, req.model)
+    }
+}
+
+/// Accepts a base URL (`.../v1`), with or without trailing slash, or a full
+/// chat-completions URL, and returns the full endpoint. Forgiving on purpose:
+/// users paste whatever their vendor's docs show.
+pub fn normalize_openai_endpoint(raw: &str) -> String {
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/chat/completions")
     }
 }
 
@@ -321,6 +333,30 @@ mod tests {
     use super::*;
     use crate::types::ToolDef;
     use agentd_secrets::MemoryStore;
+
+    #[test]
+    fn normalize_endpoint_appends_chat_completions() {
+        assert_eq!(
+            normalize_openai_endpoint("https://openrouter.ai/api/v1"),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+        assert_eq!(
+            normalize_openai_endpoint("http://localhost:11434/v1/"),
+            "http://localhost:11434/v1/chat/completions"
+        );
+        // already-full URL passes through untouched
+        assert_eq!(
+            normalize_openai_endpoint("https://api.groq.com/openai/v1/chat/completions"),
+            "https://api.groq.com/openai/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn with_endpoint_normalizes() {
+        let secrets = Arc::new(MemoryStore::default());
+        let p = OpenAiApiProvider::new(secrets).with_endpoint("http://localhost:11434/v1");
+        assert_eq!(p.endpoint(), "http://localhost:11434/v1/chat/completions");
+    }
 
     #[test]
     fn builder_overrides_name_and_default_model() {
