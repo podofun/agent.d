@@ -241,10 +241,6 @@ agentctl secret peek my_key
 
 Short values are fully masked. The full value is never printed.
 
-::: info No `ls` subcommand
-OS keyrings cannot enumerate their entries portably, so there is no `secret ls`. Use `peek` to check whether a specific key is stored.
-:::
-
 ---
 
 ### `agentctl package ls`
