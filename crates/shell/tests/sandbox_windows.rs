@@ -305,7 +305,7 @@ async fn net_host_allowlist_is_enforced() {
     let _serial = SANDBOX_SERIAL.lock().await;
     assert!(is_supported(), "windows sandbox must be supported");
 
-    // Requires the broker service (installed via `daemon --install-sandbox`).
+    // Requires the broker service (installed via `agentd --install-sandbox`).
     if !agentd_shell::netbroker::available() {
         eprintln!("network broker not installed; skipping");
         return;

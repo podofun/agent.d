@@ -8,15 +8,15 @@ Start the daemon with the `--watch` flag:
 
 ::: code-group
 ```bash [release]
-daemon \
+agentd \
   --init ~/projects/git-reviewer/init.lua \
-  --grants-file ~/projects/git-reviewer/grants.toml \
+  --grants ~/projects/git-reviewer/grants.toml \
   --watch
 ```
 ```bash [cargo]
 cargo run -p daemon -- \
   --init ~/projects/git-reviewer/init.lua \
-  --grants-file ~/projects/git-reviewer/grants.toml \
+  --grants ~/projects/git-reviewer/grants.toml \
   --watch
 ```
 :::

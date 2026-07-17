@@ -8,10 +8,10 @@ Every action call, runner invocation, permission decision, and service event is 
 
 **Default path:** `$XDG_STATE_HOME/agentd/trace.jsonl`
 
-Override it with `--trace-file` or `AGENTD_TRACE_FILE`:
+Override it with `--trace` or `AGENTD_TRACE` (the old `--trace-file` / `AGENTD_TRACE_FILE` names still work as deprecated aliases):
 
 ```bash
-daemon --trace-file /var/log/agentd/trace.jsonl
+agentd --trace /var/log/agentd/trace.jsonl
 ```
 
 Or in `config.toml`:
@@ -38,7 +38,7 @@ agentctl trace --file /var/log/agentd/trace.jsonl -f -n 100
 ```
 
 ::: tip
-`agentctl trace` reads the JSONL trace file directly from local disk — it does not connect to the daemon. The `--file` flag overrides the local path to read from (default: the state-dir `trace.jsonl`). Use it when the daemon was started with a custom `--trace-file` pointing to a different location.
+`agentctl trace` reads the JSONL trace file directly from local disk — it does not connect to the daemon. The `--file` flag overrides the local path to read from (default: the state-dir `trace.jsonl`). Use it when the daemon was started with a custom `--trace` pointing to a different location.
 :::
 
 ## Log level
@@ -59,7 +59,7 @@ The daemon emits structured tracing output to stderr. The log level is controlle
 Set it at launch:
 
 ```bash
-daemon --log info
+agentd --log info
 # or
 export AGENTD_LOG=info
 ```

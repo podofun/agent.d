@@ -53,7 +53,7 @@ granted = ["shell.exec:git"]
 Run it and call the action:
 
 ```bash
-daemon --init init.lua --grants-file grants.toml
+agentd --init init.lua --grants grants.toml
 agentctl call git.status
 ```
 
@@ -68,7 +68,7 @@ Download a pre-built binary for Linux, macOS or Windows from the
 ```bash
 git clone https://github.com/podofun/agent.d
 cd agent.d
-cargo build --release   # produces target/release/{daemon,agentctl}
+cargo build --release   # produces target/release/{agentd,agentctl}
 ```
 
 See [Installation](https://docs.podo.fun/agentd/v0/guide/installation) for details.

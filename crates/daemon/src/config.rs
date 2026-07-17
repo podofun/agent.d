@@ -7,35 +7,47 @@ use serde::Deserialize;
 /// CLI args. clap reads `env = "..."` automatically, so env var fallback
 /// is folded into this struct before [`Config::resolve`] sees it.
 #[derive(Parser, Debug, Clone, Default)]
-#[command(name = "daemon", version, about = "agentd runtime")]
+#[command(name = "agentd", version, about = "agentd runtime")]
 pub struct Cli {
     /// Path to `config.toml`. Defaults to `$XDG_CONFIG_HOME/agentd/config.toml`.
-    #[arg(long, env = "AGENTD_CONFIG")]
+    #[arg(short = 'c', long, env = "AGENTD_CONFIG")]
     pub config: Option<PathBuf>,
 
     /// Path to `init.lua` (Lua userland entry). Overrides `runtime.init`.
-    #[arg(long, env = "AGENTD_INIT")]
+    #[arg(short = 'i', long, env = "AGENTD_INIT")]
     pub init: Option<PathBuf>,
 
     /// WebSocket + HTTP /health bind address. Overrides `daemon.addr`.
-    #[arg(long, env = "AGENTD_ADDR")]
+    #[arg(short = 'a', long, env = "AGENTD_ADDR")]
     pub addr: Option<String>,
 
     /// JSONL trace sink path. Overrides `daemon.trace_file`.
-    #[arg(long, env = "AGENTD_TRACE_FILE")]
-    pub trace_file: Option<PathBuf>,
+    #[arg(long, alias = "trace-file", env = "AGENTD_TRACE")]
+    pub trace: Option<PathBuf>,
+
+    /// Hidden env-only fallback for the pre-rename `AGENTD_TRACE_FILE`.
+    #[arg(long = "trace-file-env-compat", hide = true, env = "AGENTD_TRACE_FILE")]
+    pub trace_file_compat: Option<PathBuf>,
 
     /// tracing-subscriber filter. Overrides `daemon.log_level`.
-    #[arg(long, env = "AGENTD_LOG")]
+    #[arg(short = 'l', long, env = "AGENTD_LOG")]
     pub log: Option<String>,
 
     /// Path to `grants.toml`. Defaults to `$XDG_CONFIG_HOME/agentd/grants.toml`.
-    #[arg(long, env = "AGENTD_GRANTS_FILE")]
-    pub grants_file: Option<PathBuf>,
+    #[arg(short = 'g', long, alias = "grants-file", env = "AGENTD_GRANTS")]
+    pub grants: Option<PathBuf>,
+
+    /// Hidden env-only fallback for the pre-rename `AGENTD_GRANTS_FILE`.
+    #[arg(
+        long = "grants-file-env-compat",
+        hide = true,
+        env = "AGENTD_GRANTS_FILE"
+    )]
+    pub grants_file_compat: Option<PathBuf>,
 
     /// Bearer token clients must present on the `/ws` handshake. If unset and
     /// auth is enabled, the daemon generates one at startup. Overrides `daemon.token`.
-    #[arg(long, env = "AGENTD_TOKEN")]
+    #[arg(short = 't', long, env = "AGENTD_TOKEN")]
     pub token: Option<String>,
 
     /// Disable `/ws` authentication entirely (any local client may connect).
@@ -50,12 +62,16 @@ pub struct Cli {
 
     /// How long (ms) an escalated permission request waits for an operator
     /// verdict before failing closed. Overrides `daemon.approval_timeout_ms`.
-    #[arg(long, env = "AGENTD_APPROVAL_TIMEOUT_MS")]
+    #[arg(
+        long = "approval-timeout",
+        alias = "approval-timeout-ms",
+        env = "AGENTD_APPROVAL_TIMEOUT_MS"
+    )]
     pub approval_timeout_ms: Option<u64>,
 
     /// Dev hot reload: watch init.lua plus the files it imports, loaded skill
     /// sources, and grants.toml, and rebuild the runtime in place on change.
-    #[arg(long, env = "AGENTD_WATCH")]
+    #[arg(short = 'w', long, env = "AGENTD_WATCH")]
     pub watch: bool,
 
     /// Run one-time network-sandbox setup (elevated on Windows/macOS), then exit.
@@ -226,7 +242,8 @@ impl Config {
             .unwrap_or_else(|| "127.0.0.1:7777".to_string());
 
         let trace_file = cli
-            .trace_file
+            .trace
+            .or(cli.trace_file_compat)
             .or_else(|| daemon.trace_file.as_deref().map(expand_tilde))
             .unwrap_or_else(|| default_trace_file().expect("trace default"));
 
@@ -242,7 +259,7 @@ impl Config {
         let init_given = cli
             .init
             .or_else(|| runtime.init.as_deref().map(expand_tilde));
-        let grants_given = cli.grants_file;
+        let grants_given = cli.grants.or(cli.grants_file_compat);
 
         let (init_file, grants_file) = match (init_given, grants_given) {
             (Some(init), Some(grants)) => {
@@ -758,7 +775,7 @@ mod tests {
         let grants = td.path().join("proj").join("grants.toml");
         let cli = Cli {
             config: Some(td.path().join("absent.toml")),
-            grants_file: Some(grants.clone()),
+            grants: Some(grants.clone()),
             ..Cli::default()
         };
         let resolved = Config::resolve(cli).unwrap();
@@ -785,6 +802,92 @@ mod tests {
             msg.contains("config.toml"),
             "error must mention file: {msg}"
         );
+    }
+
+    // ---------- CLI flag surface ----------
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("agentd").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn short_flags_parse() {
+        let c = parse(&[
+            "-c",
+            "/c.toml",
+            "-i",
+            "/i.lua",
+            "-a",
+            "0.0.0.0:1",
+            "-g",
+            "/g.toml",
+            "-t",
+            "tok",
+            "-l",
+            "debug",
+            "-w",
+        ]);
+        assert_eq!(c.config.unwrap(), PathBuf::from("/c.toml"));
+        assert_eq!(c.init.unwrap(), PathBuf::from("/i.lua"));
+        assert_eq!(c.addr.unwrap(), "0.0.0.0:1");
+        assert_eq!(c.grants.unwrap(), PathBuf::from("/g.toml"));
+        assert_eq!(c.token.unwrap(), "tok");
+        assert_eq!(c.log.unwrap(), "debug");
+        assert!(c.watch);
+    }
+
+    #[test]
+    fn renamed_long_flags_parse() {
+        let c = parse(&[
+            "--grants",
+            "/g.toml",
+            "--trace",
+            "/t.jsonl",
+            "--approval-timeout",
+            "5000",
+        ]);
+        assert_eq!(c.grants.unwrap(), PathBuf::from("/g.toml"));
+        assert_eq!(c.trace.unwrap(), PathBuf::from("/t.jsonl"));
+        assert_eq!(c.approval_timeout_ms.unwrap(), 5000);
+    }
+
+    #[test]
+    fn old_long_flags_still_parse() {
+        let c = parse(&[
+            "--grants-file",
+            "/g.toml",
+            "--trace-file",
+            "/t.jsonl",
+            "--approval-timeout-ms",
+            "5000",
+        ]);
+        assert_eq!(c.grants.unwrap(), PathBuf::from("/g.toml"));
+        assert_eq!(c.trace.unwrap(), PathBuf::from("/t.jsonl"));
+        assert_eq!(c.approval_timeout_ms.unwrap(), 5000);
+    }
+
+    #[test]
+    fn old_env_compat_fields_flow_into_resolve_and_new_wins() {
+        let td = tempdir().unwrap();
+        let old = td.path().join("old").join("grants.toml");
+        let new = td.path().join("new").join("grants.toml");
+        // Old-name compat alone is honored.
+        let r = Config::resolve(Cli {
+            config: Some(td.path().join("absent.toml")),
+            grants_file_compat: Some(old.clone()),
+            ..Cli::default()
+        })
+        .unwrap();
+        assert_eq!(r.grants_file, old);
+        // New name wins over old when both set (deliberate precedence).
+        let r = Config::resolve(Cli {
+            config: Some(td.path().join("absent.toml")),
+            grants: Some(new.clone()),
+            grants_file_compat: Some(old),
+            ..Cli::default()
+        })
+        .unwrap();
+        assert_eq!(r.grants_file, new);
     }
 
     #[test]

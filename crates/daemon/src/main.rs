@@ -45,7 +45,7 @@ fn main() -> Result<()> {
                 .join("agentd-netbroker.exe");
             if !broker.exists() {
                 return Err(anyhow!(
-                    "agentd-netbroker.exe not found next to daemon.exe (looked in {})",
+                    "agentd-netbroker.exe not found next to agentd.exe (looked in {})",
                     broker.display()
                 ));
             }

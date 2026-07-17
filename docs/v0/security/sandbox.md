@@ -45,7 +45,7 @@ sudo agentd --install-sandbox    # sudo agentd --uninstall-sandbox to reverse
 **Windows** (elevated terminal):
 
 ```powershell
-daemon --install-sandbox
+agentd --install-sandbox
 ```
 
 Each prints a confirmation and exits. Until you run it, `ctx.shell` calls that need network fail closed with a message pointing here; calls that don't use the network are unaffected. **Linux needs no setup.**

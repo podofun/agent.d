@@ -4,14 +4,14 @@ Common problems running agent.d in production and how to fix them.
 
 ## Daemon won't start
 
-**Symptom:** The `daemon` process exits immediately after launch.
+**Symptom:** The `agentd` process exits immediately after launch.
 
 | Cause | Fix |
 |---|---|
 | Bad `--init` path | Verify the path exists and is readable. The default is `$XDG_CONFIG_HOME/agentd/init.lua`. |
 | Lua syntax error in entry file | Run `lua -e 'dofile("init.lua")'` (or equivalent) locally to surface parse errors. Check the daemon's stderr for the error line. |
 | Malformed `config.toml` | `config.toml` is parsed at startup and any TOML error is fatal. Validate with `cat config.toml | python3 -c "import tomllib,sys; tomllib.loads(sys.stdin.read())"` or a TOML linter. |
-| Bad `--grants-file` path | Verify the path exists. An unreadable grants file prevents the permission engine from initialising. |
+| Bad `--grants` path | Verify the path exists. An unreadable grants file prevents the permission engine from initialising. |
 | Port already in use | Another process is bound to `127.0.0.1:7777`. Change the address with `--addr` or stop the conflicting process. |
 
 Check stderr output — startup errors are printed there before the process exits.
@@ -24,7 +24,7 @@ Check stderr output — startup errors are printed there before the process exit
 |---|---|
 | Wrong URL | `agentctl` defaults to `http://127.0.0.1:7777`. If the daemon binds elsewhere, pass `--url` or set `AGENTD_URL`. |
 | Token mismatch | Auto-minted tokens are written to `$XDG_STATE_HOME/agentd/token` (ws) and `$XDG_STATE_HOME/agentd/admin-token` (control). `agentctl` reads these automatically for local use. If the daemon was started with an explicit `--token`, set the same value in `AGENTD_TOKEN` or pass it directly. |
-| Daemon not running | Confirm the process is up: `systemctl status agentd` or `ps aux | grep daemon`. |
+| Daemon not running | Confirm the process is up: `systemctl status agentd` or `ps aux | grep agentd`. |
 
 ::: tip
 For quick local debugging, start the daemon with `--no-auth` (`AGENTD_NO_AUTH=1`) to skip token checks entirely. Never use this in production.

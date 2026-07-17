@@ -49,7 +49,7 @@ Each approval request contains:
 
 ## Timeout behavior
 
-If no approver responds within `approval_timeout_ms` (default 120 000 ms / 2 minutes), the request **fails closed** — the call is denied. The timeout is configurable via `--approval-timeout-ms` or `AGENTD_APPROVAL_TIMEOUT_MS`.
+If no approver responds within `approval_timeout_ms` (default 120 000 ms / 2 minutes), the request **fails closed** — the call is denied. The timeout is configurable via `--approval-timeout` or `AGENTD_APPROVAL_TIMEOUT_MS`.
 
 ::: warning
 There is no retry or queuing after a timeout. The calling action receives an error, and the client must retry the operation if appropriate.
