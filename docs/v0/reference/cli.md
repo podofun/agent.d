@@ -25,6 +25,7 @@
 | `skill` | `skills` |
 | `service` | `services`, `svc` |
 | `package` | `packages`, `pkg` |
+| `secret` | `secrets` |
 
 `agentctl pkg ls` and `agentctl runners ls` are equivalent to `agentctl package ls` and `agentctl runner ls`.
 
@@ -195,6 +196,60 @@ agentctl grants listen
 ```
 
 Uses `AGENTD_ADMIN_TOKEN` / `$XDG_STATE_HOME/agentd/admin-token` for authentication.
+
+---
+
+### `agentctl secret set`
+
+Store a provider API key (or any secret) in the OS keyring, under the same `agentd` service the daemon reads. A running daemon sees the change immediately — providers read the keyring at call time, so no restart is needed.
+
+```bash
+agentctl secret set <name> [value]
+```
+
+The value is optional. When omitted, it is read from stdin — the recommended form, since it keeps keys out of shell history:
+
+```bash
+echo "$ANTHROPIC_API_KEY" | agentctl secret set anthropic_api_key
+```
+
+On success:
+
+```
+stored `anthropic_api_key` — available to the daemon immediately
+```
+
+::: info Local operation
+`secret` commands write to the OS keyring directly — they do not talk to a running daemon, and no daemon needs to be up.
+:::
+
+---
+
+### `agentctl secret unset <name>`
+
+Remove a secret from the keyring. `rm` is an alias for `unset`.
+
+```bash
+agentctl secret unset anthropic_api_key
+agentctl secrets rm anthropic_api_key
+```
+
+---
+
+### `agentctl secret peek <name>`
+
+Print a half-obfuscated preview of a stored secret — enough to confirm which key is stored, without exposing it:
+
+```bash
+agentctl secret peek my_key
+# sk-t************ef (24 chars)
+```
+
+Short values are fully masked. The full value is never printed.
+
+::: info No `ls` subcommand
+OS keyrings cannot enumerate their entries portably, so there is no `secret ls`. Use `peek` to check whether a specific key is stored.
+:::
 
 ---
 

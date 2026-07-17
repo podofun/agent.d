@@ -83,6 +83,7 @@ version = "0.7.0-alpha"
 dependencies = [
  "agentd-luals",
  "agentd-packages",
+ "agentd-secrets",
  "anyhow",
  "clap",
  "dirs",

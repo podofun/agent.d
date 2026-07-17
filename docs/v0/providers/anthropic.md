@@ -4,18 +4,14 @@ The `anthropic` prefix connects agent.d to the **Anthropic Messages API**. It is
 
 ## Credential setup
 
-The provider reads your API key from the OS keyring (secret store) via `ctx.secret`. Store it once:
+The provider reads your API key from the OS keyring (secret store). Store it once with `agentctl secret set` — a running daemon picks it up immediately:
 
-```lua
--- one-time setup action, or run via agentctl call
-agentd.action("setup.anthropic_key", function(args, ctx)
-  ctx.secret.set("anthropic_api_key", args.key)
-  return "stored"
-end)
+```bash
+echo "$ANTHROPIC_API_KEY" | agentctl secret set anthropic_api_key
 ```
 
 ::: info
-The exact secret key name the provider looks up is an internal implementation detail. Storing credentials through `ctx.secret` (backed by the OS keyring) keeps them out of your Lua files and config. See [Credentials](/v0/providers/credentials) for the full pattern.
+The exact secret key name the provider looks up is an internal implementation detail. Storing credentials in the OS keyring keeps them out of your Lua files and config. See [Credentials](/v0/providers/credentials) for the full pattern, including managing keys programmatically via `ctx.secret`.
 :::
 
 ::: warning Never hardcode API keys

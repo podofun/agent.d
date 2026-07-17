@@ -64,7 +64,7 @@ This is expected behaviour. `ctx.call()` from inside another action does **not**
 
 | Cause | Fix |
 |---|---|
-| Missing API key | The `anthropic` and `openai` providers read credentials from the OS keyring via the secret store. Seed the key by calling a setup action you define that uses `ctx.secret.set` — see [Providers: credentials](/v0/providers/credentials). |
+| Missing API key | The `anthropic` and `openai` providers read credentials from the OS keyring via the secret store. Seed the key with `agentctl secret set` (e.g. `echo "$KEY" | agentctl secret set anthropic_api_key`) — see [Providers: credentials](/v0/providers/credentials). |
 | Missing `ai:` grant | The action or service needs an `ai:<provider>` grant in `grants.toml`. Example: `granted = ["ai:anthropic"]`. |
 | Wrong model string | Model strings must use the `"<provider>/<model_id>"` format (e.g. `anthropic/claude-opus-4-7`). Omitting the prefix defaults to `anthropic`. |
 | CLI backend not on PATH | `anthropic-cli` requires `claude` to be installed and executable; `codex` / `openai-cli` require `codex`. |

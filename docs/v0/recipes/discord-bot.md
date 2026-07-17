@@ -326,19 +326,19 @@ Each message is handled in its own coroutine so the receive loop does not block 
 
 ## How to run
 
-Seed your bot token once (requires the daemon to be running):
+Seed your bot token once (no daemon needed for this step), then start the daemon:
 
 ```bash [release]
+echo '<your-bot-token>' | agentctl secret set discord_token
 agentd --init examples/discord/init.lua --grants examples/discord/grants.toml
-agentctl call discord.set_token -d token='<your-bot-token>' --result-only
 ```
 
 ```bash [cargo]
+echo '<your-bot-token>' | agentctl secret set discord_token
 cargo run -p daemon -- --init examples/discord/init.lua --grants examples/discord/grants.toml
-agentctl call discord.set_token -d token='<your-bot-token>' --result-only
 ```
 
-The token is stored in the OS keyring under the key `discord_token`. You only need to set it once; it persists across restarts.
+The token is stored in the OS keyring under the key `discord_token`. You only need to set it once; it persists across restarts. The `discord.set_token` action in the recipe does the same thing from Lua, if you prefer to seed the token through the daemon (`agentctl call discord.set_token -d token='…'`).
 
 ## Verify
 

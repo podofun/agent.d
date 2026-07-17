@@ -4,13 +4,10 @@ The `openai` prefix connects agent.d to an **OpenAI-compatible Messages API**. U
 
 ## Credential setup
 
-The provider reads your API key from the OS keyring (secret store). Store it once through a setup action:
+The provider reads your API key from the OS keyring (secret store). Store it once with `agentctl secret set` — a running daemon picks it up immediately:
 
-```lua
-agentd.action("setup.openai_key", function(args, ctx)
-  ctx.secret.set("openai_api_key", args.key)
-  return "stored"
-end)
+```bash
+echo "$OPENAI_API_KEY" | agentctl secret set openai_api_key
 ```
 
 ::: info
