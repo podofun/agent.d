@@ -38,7 +38,11 @@ pub struct Cli {
     pub grants: Option<PathBuf>,
 
     /// Hidden env-only fallback for the pre-rename `AGENTD_GRANTS_FILE`.
-    #[arg(long = "grants-file-env-compat", hide = true, env = "AGENTD_GRANTS_FILE")]
+    #[arg(
+        long = "grants-file-env-compat",
+        hide = true,
+        env = "AGENTD_GRANTS_FILE"
+    )]
     pub grants_file_compat: Option<PathBuf>,
 
     /// Bearer token clients must present on the `/ws` handshake. If unset and
@@ -809,8 +813,19 @@ mod tests {
     #[test]
     fn short_flags_parse() {
         let c = parse(&[
-            "-c", "/c.toml", "-i", "/i.lua", "-a", "0.0.0.0:1", "-g", "/g.toml", "-t", "tok",
-            "-l", "debug", "-w",
+            "-c",
+            "/c.toml",
+            "-i",
+            "/i.lua",
+            "-a",
+            "0.0.0.0:1",
+            "-g",
+            "/g.toml",
+            "-t",
+            "tok",
+            "-l",
+            "debug",
+            "-w",
         ]);
         assert_eq!(c.config.unwrap(), PathBuf::from("/c.toml"));
         assert_eq!(c.init.unwrap(), PathBuf::from("/i.lua"));

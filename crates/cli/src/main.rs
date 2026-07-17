@@ -24,7 +24,12 @@ use tokio_tungstenite::tungstenite::Message;
 )]
 struct Cli {
     /// Daemon base URL.
-    #[arg(short = 'u', long, env = "AGENTD_URL", default_value = "http://127.0.0.1:7777")]
+    #[arg(
+        short = 'u',
+        long,
+        env = "AGENTD_URL",
+        default_value = "http://127.0.0.1:7777"
+    )]
     url: String,
 
     /// Connect timeout (ms).
