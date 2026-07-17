@@ -549,7 +549,8 @@ mod tests {
             RunnerError::Provider {
                 provider: "github".into(),
                 source: agentd_ai::ProviderError::Config(
-                    "missing API key — store secret `github_models_token` in the keyring first"
+                    "provider `github` is not configured — store the API key in the \
+                     `github_models_token` secret to use it"
                         .into(),
                 ),
             },
@@ -557,8 +558,9 @@ mod tests {
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["code"], "provider_misconfigured");
         let msg = v["error"].as_str().unwrap();
-        assert_eq!(msg.matches(':').count(), 1, "≤2 colons, got: {msg}");
-        assert!(!msg.contains("provider misconfigured"), "{msg}");
+        // Config messages pass through bare — one sentence, provider named once.
+        assert_eq!(msg.matches("`github`").count(), 1, "{msg}");
+        assert_eq!(msg.matches(':').count(), 0, "no colon chains, got: {msg}");
         assert!(v["tip"].as_str().unwrap().contains("docs.podo.fun"));
     }
 

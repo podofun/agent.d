@@ -85,9 +85,13 @@ impl OpenAiApiProvider {
             None => Ok(None),
             Some(k) => self.secrets.get(k).map(Some).map_err(|e| match e {
                 agentd_secrets::SecretError::NotFound(_) => ProviderError::Config(format!(
-                    "missing API key — store secret `{k}` in the keyring first"
+                    "provider `{}` is not configured — store the API key in the `{k}` secret to use it",
+                    self.name
                 )),
-                e => ProviderError::Config(format!("could not read secret `{k}`: {e}")),
+                e => ProviderError::Config(format!(
+                    "provider `{}` could not read the `{k}` secret ({e})",
+                    self.name
+                )),
             }),
         }
     }

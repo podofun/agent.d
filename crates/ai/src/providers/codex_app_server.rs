@@ -200,8 +200,11 @@ impl Provider for CodexAppServerProvider {
             .client
             .request(
                 "thread/start",
-                serde_json::to_value(thread_params)
-                    .map_err(|e| ProviderError::Config(format!("thread/start params: {e}")))?,
+                serde_json::to_value(thread_params).map_err(|e| {
+                    ProviderError::Config(format!(
+                        "codex app-server rejected thread/start params ({e})"
+                    ))
+                })?,
             )
             .await
             .map_err(map_err)?;
@@ -226,8 +229,11 @@ impl Provider for CodexAppServerProvider {
             .client
             .request(
                 "turn/start",
-                serde_json::to_value(turn_params)
-                    .map_err(|e| ProviderError::Config(format!("turn/start params: {e}")))?,
+                serde_json::to_value(turn_params).map_err(|e| {
+                    ProviderError::Config(format!(
+                        "codex app-server rejected turn/start params ({e})"
+                    ))
+                })?,
             )
             .await
             .map_err(map_err)?;
@@ -323,7 +329,11 @@ impl CodexAppServerProvider {
                         version: env!("CARGO_PKG_VERSION").into(),
                     },
                 })
-                .map_err(|e| ProviderError::Config(format!("initialize params: {e}")))?,
+                .map_err(|e| {
+                    ProviderError::Config(format!(
+                        "codex app-server rejected initialize params ({e})"
+                    ))
+                })?,
             )
             .await
             .map_err(map_err)?;
@@ -537,7 +547,7 @@ fn map_err(e: CodexError) -> ProviderError {
         CodexError::Spawn(io) => ProviderError::Transport(format!("spawn codex app-server: {io}")),
         CodexError::Io(io) => ProviderError::Transport(format!("io: {io}")),
         CodexError::Serde(s) => {
-            ProviderError::Config(format!("invalid codex-app-server message: {s}"))
+            ProviderError::Config(format!("invalid codex app-server message ({s})"))
         }
         CodexError::Transport(s) => ProviderError::Transport(s),
         CodexError::Rpc { code, message } => {

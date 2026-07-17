@@ -61,12 +61,22 @@ pub enum RunnerError {
     UnknownSkill { name: String, skill: String },
     #[error("runner `{name}` could not resolve a provider for model `{}`", model.as_deref().unwrap_or("(none configured)"))]
     NoProvider { name: String, model: Option<String> },
-    #[error("provider `{provider}`: {source}")]
+    #[error("{}", provider_message(provider, source))]
     Provider {
         provider: String,
         #[source]
         source: ProviderError,
     },
+}
+
+/// Render a provider failure. `Config` messages are complete sentences that
+/// already name the provider — pass them through bare; transport/upstream
+/// failures get the `provider `<name>`` context added here.
+fn provider_message(provider: &str, source: &ProviderError) -> String {
+    match source {
+        ProviderError::Config(msg) => msg.clone(),
+        other => format!("provider `{provider}`: {other}"),
+    }
 }
 
 /// Composed view of a runner ready to execute.
