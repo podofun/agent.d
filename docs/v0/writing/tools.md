@@ -108,6 +108,16 @@ Describing the arguments has two benefits:
   the offending field (for example, `/assignees: array exceeds maxItems 10`)
   and the handler never runs on bad input.
 
+::: tip Reuse the output schema for model replies
+If your handler asks a model to produce the action's result, don't restate the
+shape in a `validate` function — pass `validate = "inherit"` to
+`ctx.structured` and the reply is checked against the action's own `output`
+schema, with automatic reprompting on mismatch. One schema, three jobs: models
+see the contract, the model's reply is held to it, and the handler's return
+value is gated by it. See
+[ctx.structured](/v0/reference/ctx/calls#validate-inherit).
+:::
+
 ### Writing a schema
 
 Each entry in an `input` (or `output`) table is one field. The key is the field

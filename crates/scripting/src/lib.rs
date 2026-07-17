@@ -601,6 +601,13 @@ fn build_and_store_ctx(lua: &Lua) -> mlua::Result<()> {
     ctx.set("memory", build_memory_table(lua)?)?;
     ctx.set("caller", build_caller_table(lua)?)?;
     ctx.set("tools", lua.create_function(tools_list_binding)?)?;
+    // `ctx.validate_output(value)` — check a value against the enclosing
+    // action's declared output schema. Also powers
+    // `ctx.structured{ validate = "inherit" }` in helpers.lua.
+    ctx.set(
+        "validate_output",
+        lua.create_function(validate_output_binding)?,
+    )?;
 
     // `ctx.run(name, prompt_or_opts)` — coercion wrapper over the yieldable
     // runner dispatch binding (reuse the same wrap, no double-wrap).
@@ -2816,16 +2823,26 @@ fn build_completion_request(
 }
 
 fn do_ai(lua: &Lua, (req, provider_name): (CompletionRequest, String)) -> mlua::Result<Value> {
-    check_permission_inline(lua, &Permission::new(format!("ai:{provider_name}")))?;
+    // Existence before permission: a typo'd provider should say "not
+    // registered", not tell the user to grant `ai:<typo>`. Provider names
+    // aren't secret (`ctx.ai.providers()` lists them ungated).
     let provider = {
         let holder = lua
             .app_data_ref::<AiHolder>()
             .ok_or_else(|| mlua::Error::external("ai: holder missing"))?;
-        holder.providers.get(&provider_name).cloned()
+        match holder.providers.get(&provider_name).cloned() {
+            Some(p) => p,
+            None => {
+                let mut names: Vec<&str> = holder.providers.keys().map(String::as_str).collect();
+                names.sort_unstable();
+                return Err(mlua::Error::external(format!(
+                    "ai: provider `{provider_name}` not registered (available: {})",
+                    names.join(", ")
+                )));
+            }
+        }
     };
-    let provider = provider.ok_or_else(|| {
-        mlua::Error::external(format!("ai: provider `{provider_name}` not registered"))
-    })?;
+    check_permission_inline(lua, &Permission::new(format!("ai:{provider_name}")))?;
     if scheduler::is_in_coroutine(lua) {
         return scheduler::build_marker(
             lua,
@@ -3230,6 +3247,46 @@ fn tools_list_binding(lua: &Lua, _args: MultiValue) -> mlua::Result<Table> {
 }
 
 // ---------- Permission helper ----------
+
+/// `ctx.validate_output(value)` — validate `value` against the output schema
+/// of the action currently executing (innermost call-chain entry). Returns
+/// `(true)` on success or `(false, why)` on mismatch. Errors (not a soft
+/// `false`) when there is no enclosing action or it declares no output
+/// schema — that's a programming mistake, not a model mistake, so a retry
+/// loop must not swallow it. Powers `ctx.structured{ validate = "inherit" }`.
+fn validate_output_binding(lua: &Lua, value: Value) -> mlua::Result<(bool, Option<String>)> {
+    let action = {
+        let active = lua
+            .app_data_ref::<ActiveContext>()
+            .ok_or_else(|| mlua::Error::external("active context missing"))?;
+        active
+            .call_chain
+            .last()
+            .cloned()
+            .ok_or_else(|| mlua::Error::external("validate_output: no enclosing action"))?
+    };
+    let schema = {
+        let catalog = lua
+            .app_data_ref::<SharedCatalog>()
+            .ok_or_else(|| mlua::Error::external("scripting catalog missing"))?;
+        let cat = catalog
+            .read()
+            .map_err(|e| mlua::Error::external(e.to_string()))?;
+        cat.action_meta
+            .get(&action)
+            .and_then(|m| m.output_schema.clone())
+    };
+    let Some(schema) = schema else {
+        return Err(mlua::Error::external(format!(
+            "validate_output: action `{action}` declares no output schema"
+        )));
+    };
+    let json = lua_to_json_value(value)?;
+    match validate_json(&json, &schema) {
+        Ok(()) => Ok((true, None)),
+        Err(e) => Ok((false, Some(e))),
+    }
+}
 
 pub(crate) fn check_permission_inline(lua: &Lua, req: &Permission) -> mlua::Result<()> {
     let active = lua

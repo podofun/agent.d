@@ -22,11 +22,16 @@ const SECRET_KEY: &str = "openai_api_key";
 pub struct OpenAiApiProvider {
     name: String,
     secrets: Arc<dyn SecretStore>,
-    /// Override endpoint (tests point this at a local mock server). Falls back
-    /// to `OPENAI_URL` when `None`.
+    /// Override endpoint (tests point this at a local mock server; config-driven
+    /// providers point it at a compatible host). Falls back to `OPENAI_URL`
+    /// when `None`.
     endpoint: Option<String>,
-    /// Override secret key name. Tests inject a fake key without the keyring.
-    secret_key: String,
+    /// Secret key name for the API key. `None` disables the `Authorization`
+    /// header entirely (local servers such as Ollama/vLLM without auth).
+    secret_key: Option<String>,
+    /// Model used when the request carries none. Per-instance so compatible
+    /// vendors get a sensible default (`gpt-4.1` means nothing to OpenRouter).
+    default_model: String,
 }
 
 impl OpenAiApiProvider {
@@ -35,22 +40,55 @@ impl OpenAiApiProvider {
             name: "openai".into(),
             secrets,
             endpoint: None,
-            secret_key: SECRET_KEY.into(),
+            secret_key: Some(SECRET_KEY.into()),
+            default_model: DEFAULT_MODEL.into(),
         }
     }
 
+    /// Registry name for a config-driven instance (e.g. `"openrouter"`).
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.endpoint = Some(endpoint.into());
+        self.endpoint = Some(normalize_openai_endpoint(&endpoint.into()));
         self
     }
 
     pub fn with_secret_key(mut self, key: impl Into<String>) -> Self {
-        self.secret_key = key.into();
+        self.secret_key = Some(key.into());
+        self
+    }
+
+    /// Send no `Authorization` header at all (unauthenticated local servers).
+    pub fn with_no_auth(mut self) -> Self {
+        self.secret_key = None;
+        self
+    }
+
+    pub fn with_default_model(mut self, model: impl Into<String>) -> Self {
+        self.default_model = model.into();
         self
     }
 
     fn endpoint(&self) -> &str {
         self.endpoint.as_deref().unwrap_or(OPENAI_URL)
+    }
+
+    fn default_model(&self) -> &str {
+        &self.default_model
+    }
+
+    fn api_key(&self) -> Result<Option<String>, ProviderError> {
+        match &self.secret_key {
+            None => Ok(None),
+            Some(k) => self
+                .secrets
+                .get(k)
+                .map(Some)
+                .map_err(|e| ProviderError::Config(format!("read `{k}`: {e}"))),
+        }
     }
 }
 
@@ -65,12 +103,9 @@ impl Provider for OpenAiApiProvider {
     }
 
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
-        let api_key = self
-            .secrets
-            .get(&self.secret_key)
-            .map_err(|e| ProviderError::Config(format!("read `{}`: {e}", self.secret_key)))?;
+        let api_key = self.api_key()?;
 
-        let body = build_request_body(&req);
+        let body = build_request_body(&req, self.default_model());
 
         let mut http_req = HttpRequest {
             method: "POST".into(),
@@ -78,9 +113,11 @@ impl Provider for OpenAiApiProvider {
             json: Some(body),
             ..Default::default()
         };
-        http_req
-            .headers
-            .insert("authorization".into(), format!("Bearer {api_key}"));
+        if let Some(key) = api_key {
+            http_req
+                .headers
+                .insert("authorization".into(), format!("Bearer {key}"));
+        }
 
         let resp = http_send(http_req)
             .await
@@ -101,8 +138,20 @@ impl Provider for OpenAiApiProvider {
     }
 }
 
-fn build_request_body(req: &CompletionRequest) -> serde_json::Value {
-    let model = req.model.clone().unwrap_or_else(|| DEFAULT_MODEL.into());
+/// Accepts a base URL (`.../v1`), with or without trailing slash, or a full
+/// chat-completions URL, and returns the full endpoint. Forgiving on purpose:
+/// users paste whatever their vendor's docs show.
+pub fn normalize_openai_endpoint(raw: &str) -> String {
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/chat/completions")
+    }
+}
+
+fn build_request_body(req: &CompletionRequest, default_model: &str) -> serde_json::Value {
+    let model = req.model.clone().unwrap_or_else(|| default_model.into());
     let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
     let mut messages_out: Vec<serde_json::Value> = Vec::new();
@@ -274,9 +323,21 @@ fn translate_response(
     Ok(CompletionResponse {
         text,
         model: parsed.model.or(requested_model),
-        stop_reason: choice.finish_reason,
+        stop_reason: choice.finish_reason.map(normalize_stop_reason),
         tool_calls,
     })
+}
+
+/// Map OpenAI `finish_reason` vocabulary onto the canonical (Anthropic-style)
+/// `stop_reason` values so wire-format differences never leak past the
+/// `Provider` trait — Lua sees identical strings whatever the provider.
+fn normalize_stop_reason(finish_reason: String) -> String {
+    match finish_reason.as_str() {
+        "stop" => "end_turn".into(),
+        "tool_calls" | "function_call" => "tool_use".into(),
+        "length" => "max_tokens".into(),
+        _ => finish_reason,
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +345,57 @@ mod tests {
     use super::*;
     use crate::types::ToolDef;
     use agentd_secrets::MemoryStore;
+
+    #[test]
+    fn normalize_endpoint_appends_chat_completions() {
+        assert_eq!(
+            normalize_openai_endpoint("https://openrouter.ai/api/v1"),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+        assert_eq!(
+            normalize_openai_endpoint("http://localhost:11434/v1/"),
+            "http://localhost:11434/v1/chat/completions"
+        );
+        // already-full URL passes through untouched
+        assert_eq!(
+            normalize_openai_endpoint("https://api.groq.com/openai/v1/chat/completions"),
+            "https://api.groq.com/openai/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn with_endpoint_normalizes() {
+        let secrets = Arc::new(MemoryStore::default());
+        let p = OpenAiApiProvider::new(secrets).with_endpoint("http://localhost:11434/v1");
+        assert_eq!(p.endpoint(), "http://localhost:11434/v1/chat/completions");
+    }
+
+    #[test]
+    fn builder_overrides_name_and_default_model() {
+        let secrets = Arc::new(MemoryStore::default());
+        let p = OpenAiApiProvider::new(secrets)
+            .with_name("openrouter")
+            .with_default_model("meta-llama/llama-3.3-70b-instruct");
+        assert_eq!(p.name(), "openrouter");
+        // default model lands in the body when the request has none
+        let body = build_request_body(&CompletionRequest::default(), p.default_model());
+        assert_eq!(body["model"], "meta-llama/llama-3.3-70b-instruct");
+    }
+
+    #[test]
+    fn no_auth_mode_needs_no_secret() {
+        // MemoryStore is empty — with_no_auth() must not try to read a key.
+        let secrets = Arc::new(MemoryStore::default());
+        let p = OpenAiApiProvider::new(secrets).with_no_auth();
+        assert!(p.api_key().unwrap().is_none());
+    }
+
+    #[test]
+    fn missing_secret_is_a_config_error_when_auth_required() {
+        let secrets = Arc::new(MemoryStore::default());
+        let p = OpenAiApiProvider::new(secrets);
+        assert!(matches!(p.api_key(), Err(ProviderError::Config(_))));
+    }
 
     #[test]
     fn request_body_includes_system_tools_and_tool_result() {
@@ -315,7 +427,7 @@ mod tests {
             model: Some("gpt-foo".into()),
             ..Default::default()
         };
-        let body = build_request_body(&req);
+        let body = build_request_body(&req, DEFAULT_MODEL);
         assert_eq!(body["model"], "gpt-foo");
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], "notes.lookup");
@@ -357,7 +469,8 @@ mod tests {
         assert_eq!(r.tool_calls.len(), 1);
         assert_eq!(r.tool_calls[0].name, "notes.lookup");
         assert_eq!(r.tool_calls[0].arguments["q"], "x");
-        assert_eq!(r.stop_reason.as_deref(), Some("tool_calls"));
+        // Canonical vocabulary, not the OpenAI wire value ("tool_calls").
+        assert_eq!(r.stop_reason.as_deref(), Some("tool_use"));
     }
 
     #[test]
