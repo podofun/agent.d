@@ -551,27 +551,27 @@ fn build_collection_table(lua: &Lua, kind: ListKind) -> mlua::Result<Table> {
         ListKind::Tools => lua.create_function(|lua, _: MultiValue| {
             let cat = lua
                 .app_data_ref::<SharedCatalog>()
-                .ok_or_else(|| mlua::Error::external("scripting catalog missing"))?;
+                .ok_or_else(|| mlua::Error::external("the scripting catalog is not available in this Lua state — this is a bug in agentd, please report it"))?;
             let names = cat.read().unwrap().tools.keys().cloned().collect();
             names_to_table(lua, names)
         })?,
         ListKind::Actions => lua.create_function(|lua, _: MultiValue| {
             let cat = lua
                 .app_data_ref::<SharedCatalog>()
-                .ok_or_else(|| mlua::Error::external("scripting catalog missing"))?;
+                .ok_or_else(|| mlua::Error::external("the scripting catalog is not available in this Lua state — this is a bug in agentd, please report it"))?;
             let names = cat.read().unwrap().actions.keys().cloned().collect();
             names_to_table(lua, names)
         })?,
         ListKind::Runners => lua.create_function(|lua, _: MultiValue| {
             let reg = lua
                 .app_data_ref::<RunnerRegistry>()
-                .ok_or_else(|| mlua::Error::external("runner registry missing"))?;
+                .ok_or_else(|| mlua::Error::external("the runner registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
             names_to_table(lua, reg.names())
         })?,
         ListKind::Services => lua.create_function(|lua, _: MultiValue| {
             let reg = lua
                 .app_data_ref::<ServiceRegistry>()
-                .ok_or_else(|| mlua::Error::external("service registry missing"))?;
+                .ok_or_else(|| mlua::Error::external("the service registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
             names_to_table(lua, reg.names())
         })?,
     };
@@ -667,7 +667,7 @@ fn ctx_thread(lua: &Lua, func: Function, with_args: bool) -> mlua::Result<mlua::
     let ctx_tbl: Table = {
         let ctx_key = lua
             .app_data_ref::<CtxTable>()
-            .ok_or_else(|| mlua::Error::external("ctx table missing"))?;
+            .ok_or_else(|| mlua::Error::external("the shared `ctx` table is not available in this Lua state — this is a bug in agentd, please report it"))?;
         lua.registry_value(&ctx_key.0)?
     };
     let shim_src = if with_args {
@@ -696,7 +696,7 @@ fn register_action_dispatch(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
         return register_action(lua, v);
     }
     Err(mlua::Error::external(format!(
-        "agentd.action: expected 1 or 2 args, got {}",
+        "`agentd.action` takes a (name, handler) pair or a single definition table, but got {} arguments",
         args.len()
     )))
 }
@@ -705,14 +705,14 @@ fn register_action(lua: &Lua, args: Value) -> mlua::Result<()> {
     let (name, func, meta) = match args {
         Value::String(s) => {
             return Err(mlua::Error::external(format!(
-                "agentd.action('{}'): handler required as second argument",
+                "`agentd.action('{}')` is missing its handler — pass the handler function as the second argument",
                 s.to_string_lossy()
             )));
         }
         Value::Table(t) => parse_register_table(t)?,
         other => {
             return Err(mlua::Error::external(format!(
-                "agentd.action: expected (name, fn) or table, got {}",
+                "`agentd.action` takes a (name, handler) pair or a definition table, but got a {} value",
                 other.type_name()
             )));
         }
@@ -723,9 +723,9 @@ fn register_action(lua: &Lua, args: Value) -> mlua::Result<()> {
 fn parse_register_table(t: Table) -> mlua::Result<(String, Function, ActionMeta)> {
     let name: String = t
         .get("name")
-        .map_err(|_| mlua::Error::external("agentd.action{...}: `name` is required"))?;
+        .map_err(|_| mlua::Error::external("the `agentd.action{...}` definition table is missing its `name` field — every action needs a name string"))?;
     let func: Function = t.get("handler").map_err(|_| {
-        mlua::Error::external("agentd.action{...}: `handler` (function) is required")
+        mlua::Error::external("the `agentd.action{...}` definition table is missing its `handler` field — provide the handler function that runs the action")
     })?;
     let requires = read_string_array(&t, "requires")?;
     let confirm: bool = t.get::<Option<bool>>("confirm")?.unwrap_or(false);
@@ -779,7 +779,7 @@ fn register_named(
     let key = lua.create_registry_value(func)?;
     let catalog = lua
         .app_data_ref::<SharedCatalog>()
-        .ok_or_else(|| mlua::Error::external("scripting catalog missing"))?;
+        .ok_or_else(|| mlua::Error::external("the scripting catalog is not available in this Lua state — this is a bug in agentd, please report it"))?;
     let mut guard = catalog
         .write()
         .map_err(|e| mlua::Error::external(e.to_string()))?;
@@ -794,12 +794,12 @@ fn register_named(
 fn register_tool(lua: &Lua, t: Table) -> mlua::Result<()> {
     let name: String = t
         .get("name")
-        .map_err(|_| mlua::Error::external("agentd.tool{...}: `name` is required"))?;
+        .map_err(|_| mlua::Error::external("the `agentd.tool{...}` definition table is missing its `name` field — every tool needs a name string"))?;
     let name = record_and_scope(lua, &name, ComponentKind::Tool);
     let requires = read_string_array(&t, "requires")?;
     let catalog = lua
         .app_data_ref::<SharedCatalog>()
-        .ok_or_else(|| mlua::Error::external("scripting catalog missing"))?;
+        .ok_or_else(|| mlua::Error::external("the scripting catalog is not available in this Lua state — this is a bug in agentd, please report it"))?;
     let mut guard = catalog
         .write()
         .map_err(|e| mlua::Error::external(e.to_string()))?;
@@ -813,7 +813,7 @@ fn register_tool(lua: &Lua, t: Table) -> mlua::Result<()> {
 fn register_runner(lua: &Lua, t: Table) -> mlua::Result<()> {
     let name: String = t
         .get("name")
-        .map_err(|_| mlua::Error::external("agentd.runner{...}: `name` is required"))?;
+        .map_err(|_| mlua::Error::external("the `agentd.runner{...}` definition table is missing its `name` field — every runner needs a name string"))?;
     let name = record_and_scope(lua, &name, ComponentKind::Runner);
     let system: Option<String> = t.get::<Option<String>>("system")?;
     // Model carries provider as a prefix: "anthropic/claude-opus-4-7". The
@@ -821,7 +821,7 @@ fn register_runner(lua: &Lua, t: Table) -> mlua::Result<()> {
     // to keep both alive in parallel.
     if t.get::<Option<String>>("provider")?.is_some() {
         return Err(mlua::Error::external(
-            "agentd.runner{...}: `provider` field is gone — use `model = \"<provider>/<model>\"` instead",
+            "the `provider` field of `agentd.runner{...}` has been removed — set `model = \"<provider>/<model>\"` instead",
         ));
     }
     let model: Option<String> = t.get::<Option<String>>("model")?;
@@ -850,7 +850,7 @@ fn register_runner(lua: &Lua, t: Table) -> mlua::Result<()> {
     };
     let runners = lua
         .app_data_ref::<RunnerRegistry>()
-        .ok_or_else(|| mlua::Error::external("runner registry missing"))?;
+        .ok_or_else(|| mlua::Error::external("the runner registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
     runners.insert(def);
     tracing::info!(runner = %name, "registered runner");
     Ok(())
@@ -877,7 +877,11 @@ fn register_service(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
     let mut iter = args.into_iter();
     let name: String = match iter.next() {
         Some(v) => lua.unpack(v)?,
-        None => return Err(mlua::Error::external("service: name is required")),
+        None => {
+            return Err(mlua::Error::external(
+                "`agentd.service` is missing the service name — pass a name string as the first argument",
+            ));
+        }
     };
     let name = record_and_scope(lua, &name, ComponentKind::Service);
     let mut opts_table: Option<Table> = None;
@@ -891,7 +895,7 @@ fn register_service(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
                     Some(Value::Function(f)) => Some(f),
                     Some(other) => {
                         return Err(mlua::Error::external(format!(
-                            "service `{name}`: third arg must be a function, got {}",
+                            "the third argument to service `{name}` must be the handler function, but got a {} value",
                             other.type_name()
                         )));
                     }
@@ -900,14 +904,16 @@ fn register_service(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
             }
             other => {
                 return Err(mlua::Error::external(format!(
-                    "service `{name}`: second arg must be a function or opts table, got {}",
+                    "the second argument to service `{name}` must be a handler function or an options table, but got a {} value",
                     other.type_name()
                 )));
             }
         }
     }
     let func = func.ok_or_else(|| {
-        mlua::Error::external(format!("service `{name}`: handler function is required"))
+        mlua::Error::external(format!(
+            "service `{name}` has no handler — pass the handler function that runs the service body"
+        ))
     })?;
     let mut def = ServiceDef {
         name: name.clone(),
@@ -935,7 +941,7 @@ fn register_service(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
     {
         let catalog = lua
             .app_data_ref::<SharedCatalog>()
-            .ok_or_else(|| mlua::Error::external("scripting catalog missing"))?;
+            .ok_or_else(|| mlua::Error::external("the scripting catalog is not available in this Lua state — this is a bug in agentd, please report it"))?;
         let mut guard = catalog
             .write()
             .map_err(|e| mlua::Error::external(e.to_string()))?;
@@ -945,7 +951,7 @@ fn register_service(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
     }
     let services = lua
         .app_data_ref::<ServiceRegistry>()
-        .ok_or_else(|| mlua::Error::external("service registry missing"))?;
+        .ok_or_else(|| mlua::Error::external("the service registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
     services.insert(def);
     tracing::info!(service = %name, "registered service");
     Ok(())
@@ -962,8 +968,7 @@ fn async_spawn(lua: &Lua, func: Function) -> mlua::Result<scheduler::AsyncHandle
         .app_data_ref::<scheduler::AsyncTaskSpawner>()
         .ok_or_else(|| {
             mlua::Error::external(
-                "async: background runtime not started (daemon must call \
-                 LuaHost::start_async_runtime before init.lua)",
+                "the background async runtime is not running, so `async(...)` cannot spawn tasks — this is a bug in agentd, please report it",
             )
         })?;
     // Inherit caller's ActiveContext so the async body sees the same
@@ -980,7 +985,7 @@ fn async_spawn(lua: &Lua, func: Function) -> mlua::Result<scheduler::AsyncHandle
             state: state.clone(),
             ctx: inherited,
         })
-        .map_err(|e| mlua::Error::external(format!("async: send: {e}")))?;
+        .map_err(|e| mlua::Error::external(format!("the async task could not be handed to the background runtime ({e}) — the daemon may be shutting down")))?;
     Ok(scheduler::AsyncHandle(state))
 }
 
@@ -998,7 +1003,7 @@ fn await_internal(lua: &Lua, handle: mlua::AnyUserData) -> mlua::Result<Value> {
     }
     // Non-coroutine fallback: block. Rare — usually only init.lua does this.
     let handle_rt = tokio::runtime::Handle::try_current()
-        .map_err(|e| mlua::Error::external(format!("await: no tokio runtime: {e}")))?;
+        .map_err(|e| mlua::Error::external(format!("`await` was called outside the daemon runtime ({e}) — this is a bug in agentd, please report it")))?;
     let result = handle_rt.block_on(async move {
         loop {
             if let Some(v) = state.read() {
@@ -1018,7 +1023,7 @@ fn await_internal(lua: &Lua, handle: mlua::AnyUserData) -> mlua::Result<Value> {
 fn register_skill(lua: &Lua, t: Table) -> mlua::Result<()> {
     let name: String = t
         .get("name")
-        .map_err(|_| mlua::Error::external("agentd.skill{...}: `name` is required"))?;
+        .map_err(|_| mlua::Error::external("the `agentd.skill{...}` definition table is missing its `name` field — every skill needs a name string"))?;
     let description: Option<String> = t.get::<Option<String>>("description")?;
     let system: String = t.get::<Option<String>>("system")?.unwrap_or_default();
     let actions = read_string_array(&t, "actions")?;
@@ -1032,7 +1037,7 @@ fn register_skill(lua: &Lua, t: Table) -> mlua::Result<()> {
     };
     let skills = lua
         .app_data_ref::<SkillRegistry>()
-        .ok_or_else(|| mlua::Error::external("skill registry missing"))?;
+        .ok_or_else(|| mlua::Error::external("the skill registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
     skills.insert(def);
     tracing::info!(skill = %name, "registered skill");
     Ok(())
@@ -1052,7 +1057,7 @@ fn skills_load_binding(lua: &Lua, rel: String) -> mlua::Result<String> {
     let resolved = resolve_import_path(lua, &rel)?;
     let skills = lua
         .app_data_ref::<SkillRegistry>()
-        .ok_or_else(|| mlua::Error::external("skill registry missing"))?;
+        .ok_or_else(|| mlua::Error::external("the skill registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
     let def = skills
         .load_file(&resolved)
         .map_err(|e| mlua::Error::external(e.to_string()))?;
@@ -1064,7 +1069,7 @@ fn skills_load_dir_binding(lua: &Lua, rel: String) -> mlua::Result<usize> {
     let resolved = resolve_import_path(lua, &rel)?;
     let skills = lua
         .app_data_ref::<SkillRegistry>()
-        .ok_or_else(|| mlua::Error::external("skill registry missing"))?;
+        .ok_or_else(|| mlua::Error::external("the skill registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
     let n = skills
         .load_dir(&resolved)
         .map_err(|e| mlua::Error::external(e.to_string()))?;
@@ -1075,7 +1080,7 @@ fn skills_load_dir_binding(lua: &Lua, rel: String) -> mlua::Result<usize> {
 fn skills_list_binding(lua: &Lua, _: MultiValue) -> mlua::Result<Table> {
     let skills = lua
         .app_data_ref::<SkillRegistry>()
-        .ok_or_else(|| mlua::Error::external("skill registry missing"))?;
+        .ok_or_else(|| mlua::Error::external("the skill registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
     let names = skills.names();
     let t = lua.create_table()?;
     for (i, n) in names.into_iter().enumerate() {
@@ -1105,21 +1110,21 @@ fn agentd_import(lua: &Lua, rel: String) -> mlua::Result<Value> {
     {
         let cache = lua
             .app_data_ref::<ImportCache>()
-            .ok_or_else(|| mlua::Error::external("import cache missing"))?;
+            .ok_or_else(|| mlua::Error::external("the import cache is not available in this Lua state — this is a bug in agentd, please report it"))?;
         if cache.0.read().unwrap().contains(&canon) {
             return Ok(Value::Boolean(true));
         }
     }
 
     let src = std::fs::read_to_string(&resolved)
-        .map_err(|e| mlua::Error::external(format!("import `{rel}`: {e}")))?;
+        .map_err(|e| mlua::Error::external(format!("could not read the imported file `{rel}` ({e}) — check that the path exists under the script root")))?;
 
     // Mark loaded BEFORE exec so cycles don't loop forever. Same trick Lua's
     // own `require` uses.
     {
         let cache = lua
             .app_data_ref::<ImportCache>()
-            .ok_or_else(|| mlua::Error::external("import cache missing"))?;
+            .ok_or_else(|| mlua::Error::external("the import cache is not available in this Lua state — this is a bug in agentd, please report it"))?;
         cache.0.write().unwrap().insert(canon.clone());
     }
 
@@ -1140,22 +1145,22 @@ fn import_package(lua: &Lua, name: &str) -> mlua::Result<Value> {
         .and_then(|r| r.0.clone())
         .ok_or_else(|| {
             mlua::Error::external(
-                "import: packages root not configured (daemon must call set_packages_root)",
+                "no packages directory is configured, so packages cannot be imported by name — set the packages root in the daemon config",
             )
         })?;
     let dir = root.join(name);
     let manifest = agentd_packages::Manifest::load(&dir.join("package.toml"))
-        .map_err(|e| mlua::Error::external(format!("package `{name}`: {e}")))?;
+        .map_err(|e| mlua::Error::external(format!("could not load package `{name}` ({e}) — check that it is installed and its package.toml is valid")))?;
 
     let scope = lua
         .app_data_ref::<PackageScope>()
         .map(|s| (*s).clone())
-        .ok_or_else(|| mlua::Error::external("package scope missing"))?;
+        .ok_or_else(|| mlua::Error::external("the package scope tracker is not available in this Lua state — this is a bug in agentd, please report it"))?;
     scope.push(&manifest.name, manifest.permissions.clone());
 
     let entry = dir.join(&manifest.entry);
     let result = std::fs::read_to_string(&entry)
-        .map_err(|e| mlua::Error::external(format!("package `{name}` entry: {e}")))
+        .map_err(|e| mlua::Error::external(format!("could not read the entry file of package `{name}` ({e}) — check the `entry` path in its package.toml")))
         .and_then(|src| lua.load(&src).set_name(entry.to_string_lossy()).exec());
     scope.pop();
     result.map(|_| Value::Boolean(true))
@@ -1163,32 +1168,34 @@ fn import_package(lua: &Lua, name: &str) -> mlua::Result<Value> {
 
 fn resolve_import_path(lua: &Lua, rel: &str) -> mlua::Result<PathBuf> {
     if rel.is_empty() {
-        return Err(mlua::Error::external("import: path is empty"));
+        return Err(mlua::Error::external(
+            "`import` was called with an empty path — pass a file path relative to the script root, or a package name",
+        ));
     }
     let root = {
         let r = lua
             .app_data_ref::<Root>()
-            .ok_or_else(|| mlua::Error::external("root holder missing"))?;
+            .ok_or_else(|| mlua::Error::external("the script root holder is not available in this Lua state — this is a bug in agentd, please report it"))?;
         r.0.clone().ok_or_else(|| {
-            mlua::Error::external("import: no root configured (daemon must call set_root)")
+            mlua::Error::external("no script root is configured, so relative imports cannot be resolved — set the script root in the daemon config")
         })?
     };
     let p = Path::new(rel);
     if p.is_absolute() {
         return Err(mlua::Error::external(format!(
-            "import `{rel}`: absolute paths are not allowed"
+            "the import path `{rel}` is absolute — imports must stay relative to the script root"
         )));
     }
     for comp in p.components() {
         match comp {
             Component::ParentDir => {
                 return Err(mlua::Error::external(format!(
-                    "import `{rel}`: `..` traversal is not allowed"
+                    "the import path `{rel}` uses `..` — imports cannot traverse outside the script root"
                 )));
             }
             Component::Prefix(_) | Component::RootDir => {
                 return Err(mlua::Error::external(format!(
-                    "import `{rel}`: prefix/root components are not allowed"
+                    "the import path `{rel}` starts at a filesystem root — imports must stay relative to the script root"
                 )));
             }
             _ => {}
@@ -1209,7 +1216,7 @@ fn compile_object_schema(props: &Table, strict: bool) -> mlua::Result<serde_json
             Value::Table(t) => t,
             other => {
                 return Err(mlua::Error::external(format!(
-                    "schema field `{key}` must be a table, got {}",
+                    "the schema field `{key}` must be a table describing the field, but got a {} value",
                     other.type_name()
                 )));
             }
@@ -1242,7 +1249,7 @@ fn compile_object_schema(props: &Table, strict: bool) -> mlua::Result<serde_json
 /// `required` array).
 fn compile_field(key: &str, spec: &Table, strict: bool) -> mlua::Result<(serde_json::Value, bool)> {
     let ty: String = spec.get::<Option<String>>("type")?.ok_or_else(|| {
-        mlua::Error::external(format!("schema field `{key}`: `type` is required"))
+        mlua::Error::external(format!("the schema field `{key}` is missing its `type` — declare one of string, number, integer, boolean, object, or array"))
     })?;
     let required = spec.get::<Option<bool>>("required")?.unwrap_or(false);
     let desc = spec.get::<Option<String>>("desc")?;
@@ -1279,7 +1286,7 @@ fn compile_field(key: &str, spec: &Table, strict: bool) -> mlua::Result<(serde_j
                 Value::Nil => serde_json::json!({}),
                 other => {
                     return Err(mlua::Error::external(format!(
-                        "schema field `{key}`: `items` must be a type string or table, got {}",
+                        "the `items` of schema field `{key}` must be a type name or a field table, but got a {} value",
                         other.type_name()
                     )));
                 }
@@ -1317,7 +1324,7 @@ fn check_json(
     match ty {
         "object" => {
             let Some(obj) = value.as_object() else {
-                errs.push(format!("{here}: expected object"));
+                errs.push(format!("`{here}` should be an object"));
                 return;
             };
             let props = schema.get("properties").and_then(|p| p.as_object());
@@ -1326,7 +1333,7 @@ fn check_json(
                     if let Some(k) = r.as_str()
                         && !obj.contains_key(k)
                     {
-                        errs.push(format!("{path}/{k}: required field missing"));
+                        errs.push(format!("the required field `{path}/{k}` is missing"));
                     }
                 }
             }
@@ -1338,20 +1345,24 @@ fn check_json(
             for (k, v) in obj {
                 match props.and_then(|p| p.get(k)) {
                     Some(sub) => check_json(v, sub, &format!("{path}/{k}"), errs),
-                    None if strict => errs.push(format!("{path}/{k}: unexpected field")),
+                    None if strict => {
+                        errs.push(format!("the field `{path}/{k}` is not part of the schema"))
+                    }
                     None => {}
                 }
             }
         }
         "array" => {
             let Some(arr) = value.as_array() else {
-                errs.push(format!("{here}: expected array"));
+                errs.push(format!("`{here}` should be an array"));
                 return;
             };
             if let Some(max) = schema.get("maxItems").and_then(|m| m.as_u64())
                 && arr.len() as u64 > max
             {
-                errs.push(format!("{here}: array exceeds maxItems {max}"));
+                errs.push(format!(
+                    "`{here}` has more items than the allowed maximum of {max}"
+                ));
             }
             if let Some(items) = schema.get("items") {
                 for (i, el) in arr.iter().enumerate() {
@@ -1361,23 +1372,25 @@ fn check_json(
         }
         "string" => {
             let Some(s) = value.as_str() else {
-                errs.push(format!("{here}: expected string"));
+                errs.push(format!("`{here}` should be a string"));
                 return;
             };
             if let Some(min) = schema.get("minLength").and_then(|m| m.as_u64())
                 && (s.chars().count() as u64) < min
             {
-                errs.push(format!("{here}: string shorter than minLength {min}"));
+                errs.push(format!(
+                    "`{here}` is shorter than the minimum length of {min}"
+                ));
             }
         }
         "integer" if !(value.is_i64() || value.is_u64()) => {
-            errs.push(format!("{here}: expected integer"));
+            errs.push(format!("`{here}` should be an integer"));
         }
         "number" if !value.is_number() => {
-            errs.push(format!("{here}: expected number"));
+            errs.push(format!("`{here}` should be a number"));
         }
         "boolean" if !value.is_boolean() => {
-            errs.push(format!("{here}: expected boolean"));
+            errs.push(format!("`{here}` should be a boolean"));
         }
         _ => {}
     }
@@ -1390,7 +1403,7 @@ fn read_string_array(t: &Table, key: &str) -> mlua::Result<Vec<String>> {
             .sequence_values::<String>()
             .collect::<mlua::Result<Vec<_>>>(),
         Ok(other) => Err(mlua::Error::external(format!(
-            "`{key}` must be an array of strings, got {}",
+            "the `{key}` field must be an array of strings, but got a {} value",
             other.type_name()
         ))),
         Err(_) => Ok(Vec::new()),
@@ -1417,7 +1430,7 @@ fn build_state_table(lua: &Lua) -> mlua::Result<Table> {
 fn state_get_binding(lua: &Lua, key: String) -> mlua::Result<Value> {
     let store = lua
         .app_data_ref::<StateStore>()
-        .ok_or_else(|| mlua::Error::external("state: store missing"))?;
+        .ok_or_else(|| mlua::Error::external("the shared state store is not available in this Lua state — this is a bug in agentd, please report it"))?;
     let snapshot = store.0.read().unwrap().get(&key).cloned();
     match snapshot {
         Some(v) => lua.to_value(&v),
@@ -1427,19 +1440,22 @@ fn state_get_binding(lua: &Lua, key: String) -> mlua::Result<Value> {
 
 fn state_set_binding(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
     let mut it = args.into_iter();
-    let key: String = lua.unpack(
-        it.next()
-            .ok_or_else(|| mlua::Error::external("state.set: key required"))?,
-    )?;
-    let v = it
-        .next()
-        .ok_or_else(|| mlua::Error::external("state.set: value required"))?;
+    let key: String = lua.unpack(it.next().ok_or_else(|| {
+        mlua::Error::external(
+            "`state.set` is missing the key — pass a key string as the first argument",
+        )
+    })?)?;
+    let v = it.next().ok_or_else(|| {
+        mlua::Error::external(
+            "`state.set` is missing the value — pass the value to store as the second argument",
+        )
+    })?;
     let json: serde_json::Value = lua
         .from_value(v)
-        .map_err(|e| mlua::Error::external(format!("state.set: serialize: {e}")))?;
+        .map_err(|e| mlua::Error::external(format!("the value passed to `state.set` cannot be stored ({e}) — only JSON-compatible values are supported")))?;
     let store = lua
         .app_data_ref::<StateStore>()
-        .ok_or_else(|| mlua::Error::external("state: store missing"))?;
+        .ok_or_else(|| mlua::Error::external("the shared state store is not available in this Lua state — this is a bug in agentd, please report it"))?;
     store.0.write().unwrap().insert(key, json);
     Ok(())
 }
@@ -1447,14 +1463,14 @@ fn state_set_binding(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
 fn state_delete_binding(lua: &Lua, key: String) -> mlua::Result<bool> {
     let store = lua
         .app_data_ref::<StateStore>()
-        .ok_or_else(|| mlua::Error::external("state: store missing"))?;
+        .ok_or_else(|| mlua::Error::external("the shared state store is not available in this Lua state — this is a bug in agentd, please report it"))?;
     Ok(store.0.write().unwrap().remove(&key).is_some())
 }
 
 fn state_keys_binding(lua: &Lua, _: MultiValue) -> mlua::Result<Table> {
     let store = lua
         .app_data_ref::<StateStore>()
-        .ok_or_else(|| mlua::Error::external("state: store missing"))?;
+        .ok_or_else(|| mlua::Error::external("the shared state store is not available in this Lua state — this is a bug in agentd, please report it"))?;
     let g = store.0.read().unwrap();
     let mut keys: Vec<String> = g.keys().cloned().collect();
     keys.sort();
@@ -1468,7 +1484,7 @@ fn state_keys_binding(lua: &Lua, _: MultiValue) -> mlua::Result<Table> {
 fn state_clear_binding(lua: &Lua, _: MultiValue) -> mlua::Result<()> {
     let store = lua
         .app_data_ref::<StateStore>()
-        .ok_or_else(|| mlua::Error::external("state: store missing"))?;
+        .ok_or_else(|| mlua::Error::external("the shared state store is not available in this Lua state — this is a bug in agentd, please report it"))?;
     store.0.write().unwrap().clear();
     Ok(())
 }
@@ -1484,23 +1500,22 @@ fn runner_dispatch_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
     let mut it = args.into_iter();
     let name: String = lua.unpack(
         it.next()
-            .ok_or_else(|| mlua::Error::external("runners.run: name required"))?,
+            .ok_or_else(|| mlua::Error::external("`ctx.run` is missing the runner name — pass a runner name string as the first argument"))?,
     )?;
     let opts_value = it.next().unwrap_or(Value::Nil);
     let opts_json: serde_json::Value = match opts_value {
         Value::Nil => serde_json::Value::Object(Default::default()),
         v => lua
             .from_value(v)
-            .map_err(|e| mlua::Error::external(format!("runners.run: opts: {e}")))?,
+            .map_err(|e| mlua::Error::external(format!("the options passed to `ctx.run` could not be converted ({e}) — use a plain table of JSON-compatible values")))?,
     };
     let dispatcher = {
         let h = lua
             .app_data_ref::<RunnerDispatcherHolder>()
-            .ok_or_else(|| mlua::Error::external("runner dispatcher: holder missing"))?;
+            .ok_or_else(|| mlua::Error::external("the runner dispatcher holder is not available in this Lua state — this is a bug in agentd, please report it"))?;
         h.0.clone().ok_or_else(|| {
             mlua::Error::external(
-                "runners.run: no dispatcher wired \
-                 (daemon must call LuaHost::set_runner_dispatcher)",
+                "no runner dispatcher is wired into this Lua state, so `ctx.run` cannot start runners — this is a bug in agentd, please report it",
             )
         })?
     };
@@ -1514,7 +1529,7 @@ fn runner_dispatch_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
     let caller = {
         let active = lua
             .app_data_ref::<ActiveContext>()
-            .ok_or_else(|| mlua::Error::external("active context missing"))?;
+            .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
         let mut c = active.caller.clone();
         if c.interface.is_none() && c.service.is_none() {
             c.interface = Some(
@@ -1604,10 +1619,11 @@ fn install_json_global(lua: &Lua) -> mlua::Result<()> {
         "decode",
         lua.create_function(move |lua, args: MultiValue| -> mlua::Result<Value> {
             let mut it = args.into_iter();
-            let s: String = lua.unpack(
-                it.next()
-                    .ok_or_else(|| mlua::Error::external("json.decode: input required"))?,
-            )?;
+            let s: String = lua.unpack(it.next().ok_or_else(|| {
+                mlua::Error::external(
+                    "`json.decode` is missing its input — pass a JSON string as the first argument",
+                )
+            })?)?;
             // Optional opts: { nulls = "sentinel" | "nil" }. Default = sentinel.
             let mut nulls_as_nil = false;
             if let Some(Value::Table(opts)) = it.next()
@@ -1670,7 +1686,7 @@ fn lua_to_json_value(v: Value) -> mlua::Result<serde_json::Value> {
                         Value::Number(n) => n.to_string(),
                         other => {
                             return Err(mlua::Error::external(format!(
-                                "json.encode: unsupported key type {}",
+                                "`json.encode` cannot use a {} value as an object key — use string or number keys",
                                 other.type_name()
                             )));
                         }
@@ -1681,7 +1697,7 @@ fn lua_to_json_value(v: Value) -> mlua::Result<serde_json::Value> {
             }
         }
         other => Err(mlua::Error::external(format!(
-            "json.encode: cannot serialize {}",
+            "`json.encode` cannot serialize a {} value — only nil, booleans, numbers, strings, and tables are supported",
             other.type_name()
         ))),
     }
@@ -1949,18 +1965,18 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
     let allowed = {
         let active = lua
             .app_data_ref::<ActiveContext>()
-            .ok_or_else(|| mlua::Error::external("active context missing"))?;
+            .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
         active.effective_grants.contains(&bare_perm) || active.effective_grants.contains(&bin_perm)
     };
     if !allowed {
         let active = lua
             .app_data_ref::<ActiveContext>()
-            .ok_or_else(|| mlua::Error::external("active context missing"))?;
+            .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
         let scoped = format!("shell.exec:{}", req.bin);
         return Err(mlua::Error::external(inline_denial(
             &active,
             &format!(
-                "Lua tried to run binary `{}` but is missing `{}` (or broader `shell.exec`)",
+                "the script tried to run the binary `{}` without the `{}` grant (or the broader `shell.exec` grant)",
                 req.bin, scoped
             ),
             &[scoped],
@@ -1973,7 +1989,7 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
     {
         let active = lua
             .app_data_ref::<ActiveContext>()
-            .ok_or_else(|| mlua::Error::external("active context missing"))?;
+            .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
         req.sandbox = Some(build_sandbox_policy(&active.effective_grants));
     }
 
@@ -1981,7 +1997,7 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
         return scheduler::build_marker(lua, scheduler::Op::Shell(req));
     }
     let handle = tokio::runtime::Handle::try_current()
-        .map_err(|e| mlua::Error::external(format!("no tokio runtime: {e}")))?;
+        .map_err(|e| mlua::Error::external(format!("this call was made outside the daemon runtime ({e}) — this is a bug in agentd, please report it")))?;
     let result = handle
         .block_on(shell_exec(req))
         .map_err(|e| mlua::Error::external(e.to_string()))?;
@@ -1994,21 +2010,23 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
 
 fn parse_shell_args(_lua: &Lua, args: MultiValue) -> mlua::Result<ExecRequest> {
     let mut iter = args.into_iter();
-    let first = iter
-        .next()
-        .ok_or_else(|| mlua::Error::external("context.shell.exec: bin required"))?;
+    let first = iter.next().ok_or_else(|| {
+        mlua::Error::external(
+            "`ctx.shell.exec` is missing the binary to run — pass a binary name or a request table",
+        )
+    })?;
 
     match first {
         Value::Table(t) => {
             let bin: String = t
                 .get("bin")
-                .map_err(|_| mlua::Error::external("shell.exec: `bin` required"))?;
+                .map_err(|_| mlua::Error::external("the `ctx.shell.exec` request table is missing its `bin` field — name the binary to run"))?;
             let args: Vec<String> = match t.get::<Value>("args")? {
                 Value::Nil => Vec::new(),
                 Value::Table(a) => a.sequence_values::<String>().collect::<mlua::Result<_>>()?,
                 other => {
                     return Err(mlua::Error::external(format!(
-                        "shell.exec: `args` must be array, got {}",
+                        "the `args` field of `ctx.shell.exec` must be an array of strings, but got a {} value",
                         other.type_name()
                     )));
                 }
@@ -2034,7 +2052,7 @@ fn parse_shell_args(_lua: &Lua, args: MultiValue) -> mlua::Result<ExecRequest> {
                     .collect::<mlua::Result<Vec<_>>>()?,
                 Some(other) => {
                     return Err(mlua::Error::external(format!(
-                        "shell.exec: argv must be a table, got {}",
+                        "the argument list passed to `ctx.shell.exec` must be a table of strings, but got a {} value",
                         other.type_name()
                     )));
                 }
@@ -2050,7 +2068,7 @@ fn parse_shell_args(_lua: &Lua, args: MultiValue) -> mlua::Result<ExecRequest> {
                 }
                 Some(other) => {
                     return Err(mlua::Error::external(format!(
-                        "shell.exec: opts must be table, got {}",
+                        "the options passed to `ctx.shell.exec` must be a table, but got a {} value",
                         other.type_name()
                     )));
                 }
@@ -2065,7 +2083,7 @@ fn parse_shell_args(_lua: &Lua, args: MultiValue) -> mlua::Result<ExecRequest> {
             })
         }
         other => Err(mlua::Error::external(format!(
-            "shell.exec: first arg must be bin name or table, got {}",
+            "the first argument to `ctx.shell.exec` must be a binary name or a request table, but got a {} value",
             other.type_name()
         ))),
     }
@@ -2188,7 +2206,7 @@ fn resolve_path(lua: &Lua, path: String) -> std::path::PathBuf {
 
 pub(crate) fn block_on<F: std::future::Future<Output = T>, T>(fut: F) -> mlua::Result<T> {
     tokio::runtime::Handle::try_current()
-        .map_err(|e| mlua::Error::external(format!("no tokio runtime: {e}")))
+        .map_err(|e| mlua::Error::external(format!("this call was made outside the daemon runtime ({e}) — this is a bug in agentd, please report it")))
         .map(|h| h.block_on(fut))
 }
 
@@ -2227,14 +2245,16 @@ fn fs_read_binding(lua: &Lua, path: String) -> mlua::Result<String> {
 
 fn fs_write_binding(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
     let mut it = args.into_iter();
-    let path: String = lua.unpack(
-        it.next()
-            .ok_or_else(|| mlua::Error::external("fs.write: path required"))?,
-    )?;
-    let content: String = lua.unpack(
-        it.next()
-            .ok_or_else(|| mlua::Error::external("fs.write: content required"))?,
-    )?;
+    let path: String = lua.unpack(it.next().ok_or_else(|| {
+        mlua::Error::external(
+            "`ctx.fs.write` is missing the file path — pass a path string as the first argument",
+        )
+    })?)?;
+    let content: String = lua.unpack(it.next().ok_or_else(|| {
+        mlua::Error::external(
+            "`ctx.fs.write` is missing the content — pass the text to write as the second argument",
+        )
+    })?)?;
     let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
     block_on(fs::write(&p, content.as_bytes()))?
@@ -2244,13 +2264,14 @@ fn fs_write_binding(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
 
 fn fs_append_binding(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
     let mut it = args.into_iter();
-    let path: String = lua.unpack(
-        it.next()
-            .ok_or_else(|| mlua::Error::external("fs.append: path required"))?,
-    )?;
+    let path: String = lua.unpack(it.next().ok_or_else(|| {
+        mlua::Error::external(
+            "`ctx.fs.append` is missing the file path — pass a path string as the first argument",
+        )
+    })?)?;
     let content: String = lua.unpack(
         it.next()
-            .ok_or_else(|| mlua::Error::external("fs.append: content required"))?,
+            .ok_or_else(|| mlua::Error::external("`ctx.fs.append` is missing the content — pass the text to append as the second argument"))?,
     )?;
     let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
@@ -2340,10 +2361,11 @@ fn build_http_table(lua: &Lua) -> mlua::Result<Table> {
 
 fn http_get_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
     let mut it = args.into_iter();
-    let url: String = lua.unpack(
-        it.next()
-            .ok_or_else(|| mlua::Error::external("http.get: url required"))?,
-    )?;
+    let url: String = lua.unpack(it.next().ok_or_else(|| {
+        mlua::Error::external(
+            "`http.get` is missing the URL — pass a URL string as the first argument",
+        )
+    })?)?;
     let opts = it.next();
     let mut req = parse_http_opts(lua, opts)?;
     req.method = "GET".into();
@@ -2353,10 +2375,11 @@ fn http_get_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
 
 fn http_post_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
     let mut it = args.into_iter();
-    let url: String = lua.unpack(
-        it.next()
-            .ok_or_else(|| mlua::Error::external("http.post: url required"))?,
-    )?;
+    let url: String = lua.unpack(it.next().ok_or_else(|| {
+        mlua::Error::external(
+            "`http.post` is missing the URL — pass a URL string as the first argument",
+        )
+    })?)?;
     let mut req = HttpRequest {
         method: "POST".into(),
         url,
@@ -2368,14 +2391,16 @@ fn http_post_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
             Value::Nil => {}
             Value::String(s) => req.body = Some(s.to_str()?.to_string()),
             Value::Table(_) => {
-                let json: serde_json::Value = lua
-                    .from_value(v)
-                    .map_err(|e| mlua::Error::external(format!("http.post: json: {e}")))?;
+                let json: serde_json::Value = lua.from_value(v).map_err(|e| {
+                    mlua::Error::external(format!(
+                        "the body table passed to `http.post` could not be converted to JSON ({e})"
+                    ))
+                })?;
                 req.json = Some(json);
             }
             other => {
                 return Err(mlua::Error::external(format!(
-                    "http.post: body must be string or table, got {}",
+                    "the body passed to `http.post` must be a string or a table, but got a {} value",
                     other.type_name()
                 )));
             }
@@ -2395,9 +2420,11 @@ fn http_post_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
 }
 
 fn http_request_binding(lua: &Lua, t: Table) -> mlua::Result<Value> {
-    let url: String = t
-        .get("url")
-        .map_err(|_| mlua::Error::external("http.request: `url` required"))?;
+    let url: String = t.get("url").map_err(|_| {
+        mlua::Error::external(
+            "the `http.request` table is missing its `url` field — every request needs a URL",
+        )
+    })?;
     let method: String = t
         .get::<Option<String>>("method")?
         .unwrap_or_else(|| "GET".into());
@@ -2427,7 +2454,7 @@ fn parse_http_opts(lua: &Lua, opts: Option<Value>) -> mlua::Result<HttpRequest> 
                 Ok(v) => {
                     let j: serde_json::Value = lua
                         .from_value(v)
-                        .map_err(|e| mlua::Error::external(format!("http: json: {e}")))?;
+                        .map_err(|e| mlua::Error::external(format!("the `json` option could not be converted to JSON ({e}) — use a plain table of JSON-compatible values")))?;
                     req.json = Some(j);
                 }
             }
@@ -2437,7 +2464,7 @@ fn parse_http_opts(lua: &Lua, opts: Option<Value>) -> mlua::Result<HttpRequest> 
         }
         Some(other) => {
             return Err(mlua::Error::external(format!(
-                "http opts must be table, got {}",
+                "HTTP options must be a table, but got a {} value",
                 other.type_name()
             )));
         }
@@ -2485,10 +2512,10 @@ where
 {
     let h = lua
         .app_data_ref::<SecretsHolder>()
-        .ok_or_else(|| mlua::Error::external("auth: secrets holder missing"))?;
+        .ok_or_else(|| mlua::Error::external("the secrets holder is not available in this Lua state — this is a bug in agentd, please report it"))?;
     let store =
         h.0.as_ref()
-            .ok_or_else(|| mlua::Error::external("auth: no secrets backend configured"))?;
+            .ok_or_else(|| mlua::Error::external("no secrets backend is configured, so secrets cannot be read or stored — configure one in the daemon config"))?;
     f(store)
 }
 
@@ -2505,24 +2532,26 @@ where
 {
     let h = lua
         .app_data_ref::<MemoryHolder>()
-        .ok_or_else(|| mlua::Error::external("memory: holder missing"))?;
+        .ok_or_else(|| mlua::Error::external("the memory backend holder is not available in this Lua state — this is a bug in agentd, please report it"))?;
     let store =
         h.0.as_ref()
-            .ok_or_else(|| mlua::Error::external("memory: no memory backend configured"))?;
+            .ok_or_else(|| mlua::Error::external("no memory backend is configured, so `ctx.memory` is unavailable — configure one in the daemon config"))?;
     f(store)
 }
 
 /// Parse exactly `(ns, key)` from a MultiValue.
 fn two_strings(lua: &Lua, args: MultiValue, what: &str) -> mlua::Result<(String, String)> {
     let mut it = args.into_iter();
-    let a: String = lua.unpack(
-        it.next()
-            .ok_or_else(|| mlua::Error::external(format!("{what}: ns required")))?,
-    )?;
-    let b: String = lua.unpack(
-        it.next()
-            .ok_or_else(|| mlua::Error::external(format!("{what}: key required")))?,
-    )?;
+    let a: String = lua.unpack(it.next().ok_or_else(|| {
+        mlua::Error::external(format!(
+            "`{what}` is missing the namespace — pass a namespace string as the first argument"
+        ))
+    })?)?;
+    let b: String = lua.unpack(it.next().ok_or_else(|| {
+        mlua::Error::external(format!(
+            "`{what}` is missing the key — pass a key string as the second argument"
+        ))
+    })?)?;
     Ok((a, b))
 }
 
@@ -2546,15 +2575,18 @@ fn mem_set_binding(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
     let mut it = args.into_iter();
     let ns: String = lua.unpack(
         it.next()
-            .ok_or_else(|| mlua::Error::external("memory:set: ns required"))?,
+            .ok_or_else(|| mlua::Error::external("`ctx.memory.set` is missing the namespace — pass a namespace string as the first argument"))?,
     )?;
-    let key: String = lua.unpack(
-        it.next()
-            .ok_or_else(|| mlua::Error::external("memory:set: key required"))?,
-    )?;
-    let v = it
-        .next()
-        .ok_or_else(|| mlua::Error::external("memory:set: value required"))?;
+    let key: String = lua.unpack(it.next().ok_or_else(|| {
+        mlua::Error::external(
+            "`ctx.memory.set` is missing the key — pass a key string as the second argument",
+        )
+    })?)?;
+    let v = it.next().ok_or_else(|| {
+        mlua::Error::external(
+            "`ctx.memory.set` is missing the value — pass the value to store as the third argument",
+        )
+    })?;
     check_permission_inline(lua, &Permission::new(format!("memory.write:{ns}")))?;
     let j: serde_json::Value = lua.from_value(v)?;
     let bytes = serde_json::to_vec(&j).map_err(mlua::Error::external)?;
@@ -2649,13 +2681,14 @@ fn auth_get_binding(lua: &Lua, key: String) -> mlua::Result<String> {
 
 fn auth_set_binding(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
     let mut it = args.into_iter();
-    let key: String = lua.unpack(
-        it.next()
-            .ok_or_else(|| mlua::Error::external("auth.set: key required"))?,
-    )?;
+    let key: String = lua.unpack(it.next().ok_or_else(|| {
+        mlua::Error::external(
+            "`ctx.auth.set` is missing the secret key — pass a key string as the first argument",
+        )
+    })?)?;
     let value: String = lua.unpack(
         it.next()
-            .ok_or_else(|| mlua::Error::external("auth.set: value required"))?,
+            .ok_or_else(|| mlua::Error::external("`ctx.auth.set` is missing the secret value — pass the value string as the second argument"))?,
     )?;
     check_permission_inline(lua, &Permission::new(format!("secret:{key}")))?;
     with_secrets(lua, |s| {
@@ -2715,7 +2748,7 @@ fn build_ai_table(lua: &Lua) -> mlua::Result<Table> {
 fn ai_providers_binding(lua: &Lua, _args: MultiValue) -> mlua::Result<Table> {
     let holder = lua
         .app_data_ref::<AiHolder>()
-        .ok_or_else(|| mlua::Error::external("ai: holder missing"))?;
+        .ok_or_else(|| mlua::Error::external("the AI provider holder is not available in this Lua state — this is a bug in agentd, please report it"))?;
     let t = lua.create_table()?;
     let mut names: Vec<&String> = holder.providers.keys().collect();
     names.sort();
@@ -2727,10 +2760,11 @@ fn ai_providers_binding(lua: &Lua, _args: MultiValue) -> mlua::Result<Table> {
 
 fn ai_ask_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
     let mut it = args.into_iter();
-    let prompt: String = lua.unpack(
-        it.next()
-            .ok_or_else(|| mlua::Error::external("ai.ask: prompt required"))?,
-    )?;
+    let prompt: String = lua.unpack(it.next().ok_or_else(|| {
+        mlua::Error::external(
+            "`ctx.ai.ask` is missing the prompt — pass a prompt string as the first argument",
+        )
+    })?)?;
     let opts = it.next();
     let req = build_completion_request(lua, prompt, opts)?;
     do_ai(lua, req)
@@ -2755,7 +2789,7 @@ fn build_completion_request(
     if let Some(Value::Table(t)) = opts {
         if t.get::<Option<String>>("provider")?.is_some() {
             return Err(mlua::Error::external(
-                "ai: `provider` opt is gone — use `model = \"<provider>/<model>\"`",
+                "the `provider` option has been removed — set `model = \"<provider>/<model>\"` instead",
             ));
         }
         if let Some(s) = t.get::<Option<String>>("system")? {
@@ -2782,7 +2816,9 @@ fn build_completion_request(
                     "user" => Role::User,
                     "assistant" => Role::Assistant,
                     other => {
-                        return Err(mlua::Error::external(format!("ai: unknown role `{other}`")));
+                        return Err(mlua::Error::external(format!(
+                            "`{other}` is not a valid message role — use `system`, `user`, or `assistant`"
+                        )));
                     }
                 };
                 let content: String = m.get("content")?;
@@ -2810,13 +2846,13 @@ fn build_completion_request(
     let resolved_provider = {
         let holder = lua
             .app_data_ref::<AiHolder>()
-            .ok_or_else(|| mlua::Error::external("ai: holder missing"))?;
+            .ok_or_else(|| mlua::Error::external("the AI provider holder is not available in this Lua state — this is a bug in agentd, please report it"))?;
         match provider_name {
             Some(n) => n,
             None => holder
                 .default
                 .clone()
-                .ok_or_else(|| mlua::Error::external("ai: no default provider configured"))?,
+                .ok_or_else(|| mlua::Error::external("no default AI provider is configured — name one explicitly with `model = \"<provider>/<model>\"` or set a default in config.toml"))?,
         }
     };
     req.model = model_id.filter(|s| !s.is_empty());
@@ -2830,14 +2866,14 @@ fn do_ai(lua: &Lua, (req, provider_name): (CompletionRequest, String)) -> mlua::
     let provider = {
         let holder = lua
             .app_data_ref::<AiHolder>()
-            .ok_or_else(|| mlua::Error::external("ai: holder missing"))?;
+            .ok_or_else(|| mlua::Error::external("the AI provider holder is not available in this Lua state — this is a bug in agentd, please report it"))?;
         match holder.providers.get(&provider_name).cloned() {
             Some(p) => p,
             None => {
                 let mut names: Vec<&str> = holder.providers.keys().map(String::as_str).collect();
                 names.sort_unstable();
                 return Err(mlua::Error::external(format!(
-                    "ai: provider `{provider_name}` not registered (available: {})",
+                    "AI provider `{provider_name}` is not configured — available providers are {}",
                     names.join(", ")
                 )));
             }
@@ -2977,14 +3013,16 @@ fn ws_connect_internal(lua: &Lua, url: String) -> mlua::Result<mlua::AnyUserData
 
 fn ws_send_internal(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
     let mut it = args.into_iter();
-    let ud: mlua::AnyUserData = lua.unpack(
-        it.next()
-            .ok_or_else(|| mlua::Error::external("ws:send: handle required"))?,
-    )?;
-    let msg: String = lua.unpack(
-        it.next()
-            .ok_or_else(|| mlua::Error::external("ws:send: message required"))?,
-    )?;
+    let ud: mlua::AnyUserData = lua.unpack(it.next().ok_or_else(|| {
+        mlua::Error::external(
+            "`ws.send` is missing the connection handle — pass the handle returned by `ws.connect`",
+        )
+    })?)?;
+    let msg: String = lua.unpack(it.next().ok_or_else(|| {
+        mlua::Error::external(
+            "`ws.send` is missing the message — pass the text to send as the second argument",
+        )
+    })?)?;
     let conn = ud.borrow::<WsHandle>()?.conn.clone();
     if scheduler::is_in_coroutine(lua) {
         return scheduler::build_marker(lua, scheduler::Op::WsSendText { conn, msg });
@@ -2998,12 +3036,13 @@ fn ws_send_binary_internal(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
     let mut it = args.into_iter();
     let ud: mlua::AnyUserData = lua.unpack(
         it.next()
-            .ok_or_else(|| mlua::Error::external("ws:send_binary: handle required"))?,
+            .ok_or_else(|| mlua::Error::external("`ws.send_binary` is missing the connection handle — pass the handle returned by `ws.connect`"))?,
     )?;
-    let bytes: mlua::String = lua.unpack(
-        it.next()
-            .ok_or_else(|| mlua::Error::external("ws:send_binary: bytes required"))?,
-    )?;
+    let bytes: mlua::String = lua.unpack(it.next().ok_or_else(|| {
+        mlua::Error::external(
+            "`ws.send_binary` is missing the bytes — pass the payload as the second argument",
+        )
+    })?)?;
     let bytes_vec: Vec<u8> = bytes.as_bytes().to_vec();
     let conn = ud.borrow::<WsHandle>()?.conn.clone();
     if scheduler::is_in_coroutine(lua) {
@@ -3022,10 +3061,11 @@ fn ws_send_binary_internal(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
 
 fn ws_recv_internal(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
     let mut it = args.into_iter();
-    let ud: mlua::AnyUserData = lua.unpack(
-        it.next()
-            .ok_or_else(|| mlua::Error::external("ws:recv: handle required"))?,
-    )?;
+    let ud: mlua::AnyUserData = lua.unpack(it.next().ok_or_else(|| {
+        mlua::Error::external(
+            "`ws.recv` is missing the connection handle — pass the handle returned by `ws.connect`",
+        )
+    })?)?;
     let timeout_ms: Option<u64> = match it.next() {
         None | Some(Value::Nil) => None,
         Some(v) => Some(lua.unpack(v)?),
@@ -3085,7 +3125,7 @@ fn ws_bytes_table_to_string(lua: &Lua, t: Table) -> mlua::Result<mlua::String> {
         let n = v?;
         if !(0..=255).contains(&n) {
             return Err(mlua::Error::external(format!(
-                "ws: binary byte out of range: {n}"
+                "a binary WebSocket frame contains the value {n}, which is not a byte — values must be between 0 and 255"
             )));
         }
         bytes.push(n as u8);
@@ -3103,7 +3143,11 @@ fn tools_resolve_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Function> 
     let mut iter = args.into_iter();
     let name: String = match iter.next() {
         Some(v) => lua.unpack(v)?,
-        None => return Err(mlua::Error::external("context.tools.call: name required")),
+        None => {
+            return Err(mlua::Error::external(
+                "`ctx.call` is missing the action name — pass an action name string as the first argument",
+            ));
+        }
     };
     // args are already validated as a serde value by the Lua wrapper before
     // it calls us; we only need the name + meta for the permission check.
@@ -3112,14 +3156,15 @@ fn tools_resolve_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Function> 
     let (handler, action_meta) = {
         let catalog = lua
             .app_data_ref::<SharedCatalog>()
-            .ok_or_else(|| mlua::Error::external("scripting catalog missing"))?;
+            .ok_or_else(|| mlua::Error::external("the scripting catalog is not available in this Lua state — this is a bug in agentd, please report it"))?;
         let cat = catalog
             .read()
             .map_err(|e| mlua::Error::external(e.to_string()))?;
-        let key = cat
-            .actions
-            .get(&name)
-            .ok_or_else(|| mlua::Error::external(format!("action `{name}` not registered")))?;
+        let key = cat.actions.get(&name).ok_or_else(|| {
+            mlua::Error::external(format!(
+                "action `{name}` is not registered — check the name against `ctx.tools.list()`"
+            ))
+        })?;
         let inner = cat.action_meta.get(&name).cloned().unwrap_or_default();
         let func: Function = lua
             .registry_value(key)
@@ -3130,10 +3175,10 @@ fn tools_resolve_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Function> 
     {
         let active = lua
             .app_data_ref::<ActiveContext>()
-            .ok_or_else(|| mlua::Error::external("active context missing"))?;
+            .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
         if action_meta.confirm {
             return Err(mlua::Error::external(format!(
-                "action `{name}` requires confirmation; cannot be invoked via context.tools.call"
+                "action `{name}` requires operator confirmation, so it cannot be invoked from a script — call it through the normal dispatch path instead"
             )));
         }
         for req in &action_meta.requires {
@@ -3142,7 +3187,7 @@ fn tools_resolve_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Function> 
                 return Err(mlua::Error::external(inline_denial(
                     &active,
                     &format!(
-                        "Lua tried to call action `{name}` but that action requires `{}`",
+                        "the script tried to call action `{name}`, which requires the `{}` grant",
                         p.as_str()
                     ),
                     &[p.as_str().to_string()],
@@ -3161,7 +3206,7 @@ fn tools_resolve_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Function> 
     {
         let mut active = lua
             .app_data_mut::<ActiveContext>()
-            .ok_or_else(|| mlua::Error::external("active context missing"))?;
+            .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
         active.call_chain.push(name);
         // Save the caller's cwd so the matching pop restores it, then apply the
         // callee's override if it declared one (else inherit — no change).
@@ -3204,7 +3249,7 @@ fn build_caller_table(lua: &Lua) -> mlua::Result<Table> {
         lua.create_function(|lua, (_t, key): (Table, String)| {
             let active = lua
                 .app_data_ref::<ActiveContext>()
-                .ok_or_else(|| mlua::Error::external("active context missing"))?;
+                .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
             let c = &active.caller;
             let v = match key.as_str() {
                 "interface" => c.interface.as_ref().map(|x| x.as_str().to_string()),
@@ -3224,7 +3269,9 @@ fn build_caller_table(lua: &Lua) -> mlua::Result<Table> {
     meta.set(
         "__newindex",
         lua.create_function(|_, _: MultiValue| -> mlua::Result<()> {
-            Err(mlua::Error::external("ctx.caller is read-only"))
+            Err(mlua::Error::external(
+                "`ctx.caller` is read-only — its fields describe the caller and cannot be assigned",
+            ))
         })?,
     )?;
     t.set_metatable(Some(meta))?;
@@ -3234,7 +3281,7 @@ fn build_caller_table(lua: &Lua) -> mlua::Result<Table> {
 fn tools_list_binding(lua: &Lua, _args: MultiValue) -> mlua::Result<Table> {
     let catalog = lua
         .app_data_ref::<SharedCatalog>()
-        .ok_or_else(|| mlua::Error::external("scripting catalog missing"))?;
+        .ok_or_else(|| mlua::Error::external("the scripting catalog is not available in this Lua state — this is a bug in agentd, please report it"))?;
     let cat = catalog
         .read()
         .map_err(|e| mlua::Error::external(e.to_string()))?;
@@ -3259,17 +3306,17 @@ fn validate_output_binding(lua: &Lua, value: Value) -> mlua::Result<(bool, Optio
     let action = {
         let active = lua
             .app_data_ref::<ActiveContext>()
-            .ok_or_else(|| mlua::Error::external("active context missing"))?;
+            .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
         active
             .call_chain
             .last()
             .cloned()
-            .ok_or_else(|| mlua::Error::external("validate_output: no enclosing action"))?
+            .ok_or_else(|| mlua::Error::external("`ctx.structured` with `validate = \"inherit\"` was used outside an action, so there is no output schema to inherit"))?
     };
     let schema = {
         let catalog = lua
             .app_data_ref::<SharedCatalog>()
-            .ok_or_else(|| mlua::Error::external("scripting catalog missing"))?;
+            .ok_or_else(|| mlua::Error::external("the scripting catalog is not available in this Lua state — this is a bug in agentd, please report it"))?;
         let cat = catalog
             .read()
             .map_err(|e| mlua::Error::external(e.to_string()))?;
@@ -3279,7 +3326,7 @@ fn validate_output_binding(lua: &Lua, value: Value) -> mlua::Result<(bool, Optio
     };
     let Some(schema) = schema else {
         return Err(mlua::Error::external(format!(
-            "validate_output: action `{action}` declares no output schema"
+            "action `{action}` declares no output schema, so there is nothing to validate against — add an `output` table to the action definition"
         )));
     };
     let json = lua_to_json_value(value)?;
@@ -3292,13 +3339,16 @@ fn validate_output_binding(lua: &Lua, value: Value) -> mlua::Result<(bool, Optio
 pub(crate) fn check_permission_inline(lua: &Lua, req: &Permission) -> mlua::Result<()> {
     let active = lua
         .app_data_ref::<ActiveContext>()
-        .ok_or_else(|| mlua::Error::external("active context missing"))?;
+        .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
     if active.effective_grants.contains(req) {
         Ok(())
     } else {
         Err(mlua::Error::external(inline_denial(
             &active,
-            &format!("Lua tried to use host permission `{}`", req.as_str()),
+            &format!(
+                "the script tried to use a capability that requires the `{}` grant",
+                req.as_str()
+            ),
             &[req.as_str().to_string()],
         )))
     }
@@ -3306,7 +3356,7 @@ pub(crate) fn check_permission_inline(lua: &Lua, req: &Permission) -> mlua::Resu
 
 fn inline_denial(active: &ActiveContext, what: &str, missing: &[String]) -> String {
     let location = if active.call_chain.is_empty() {
-        "unknown Lua execution".to_string()
+        "an unidentified Lua execution".to_string()
     } else {
         format!("call chain `{}`", active.call_chain.join(" -> "))
     };
@@ -3449,7 +3499,7 @@ impl Registry for LuaHost {
             && let Err(e) = validate_json(&args, schema)
         {
             return Err(RegistryError::Invocation(format!(
-                "{action}: input validation failed: {e}"
+                "the arguments passed to `{action}` do not match its input schema: {e}"
             )));
         }
 
@@ -3490,7 +3540,7 @@ impl Registry for LuaHost {
                 },
             )
             .await
-            .map_err(|e| RegistryError::Invocation(format!("join: {e}")))?
+            .map_err(|e| RegistryError::Invocation(format!("the Lua execution task ended unexpectedly ({e}) — this is a bug in agentd, please report it")))?
         };
         let (thread, grant_name, cwd) = setup?;
         // Expand relative grant specs against the effective cwd (additive), then
@@ -3519,7 +3569,7 @@ impl Registry for LuaHost {
             && let Err(e) = validate_json(&value, schema)
         {
             return Err(RegistryError::Invocation(format!(
-                "{action}: output validation failed: {e}"
+                "the result returned by `{action}` does not match its output schema: {e}"
             )));
         }
         Ok(ActionResult { value })
@@ -3571,7 +3621,7 @@ impl Registry for LuaHost {
                 let key = cat
                     .services
                     .get(&svc_name)
-                    .ok_or_else(|| RegistryError::NotFound(format!("service `{svc_name}`")))?;
+                    .ok_or_else(|| RegistryError::NotFound(format!("service `{svc_name}` is not registered — check the service name")))?;
                 let func: Function = lua_g
                     .registry_value(key)
                     .map_err(|e| RegistryError::Invocation(e.to_string()))?;
@@ -3580,7 +3630,7 @@ impl Registry for LuaHost {
                 Ok(thread)
             })
             .await
-            .map_err(|e| RegistryError::Invocation(format!("join: {e}")))??
+            .map_err(|e| RegistryError::Invocation(format!("the Lua execution task ended unexpectedly ({e}) — this is a bug in agentd, please report it")))??
         };
 
         let outcome = scheduler::drive(lua.clone(), thread, vec![], ctx_for_drive).await;
