@@ -3514,7 +3514,7 @@ impl Registry for LuaHost {
         // each resume and restores default on the way out.
         let outcome = scheduler::drive(lua.clone(), thread, vec![args], ctx_for_drive).await;
 
-        let value = outcome.map_err(|e| RegistryError::Invocation(e.to_string()))?;
+        let value = outcome.map_err(script_err)?;
         if let Some(schema) = &output_schema
             && let Err(e) = validate_json(&value, schema)
         {
@@ -3585,9 +3585,19 @@ impl Registry for LuaHost {
 
         let outcome = scheduler::drive(lua.clone(), thread, vec![], ctx_for_drive).await;
 
-        outcome
-            .map(|_| ())
-            .map_err(|e| RegistryError::Invocation(e.to_string()))
+        outcome.map(|_| ()).map_err(script_err)
+    }
+}
+
+/// Map a drive outcome into a structured registry error: Lua failures split
+/// into a clean message + cleaned traceback; anything else passes through.
+fn script_err(e: scheduler::DriveError) -> RegistryError {
+    match e {
+        scheduler::DriveError::Lua(le) => {
+            let (message, trace) = luaerr::split_lua_error(&le.to_string());
+            RegistryError::Script { message, trace }
+        }
+        other => RegistryError::Invocation(other.to_string()),
     }
 }
 

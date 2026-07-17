@@ -121,7 +121,8 @@ mod tests {
 
     #[test]
     fn plain_path_frame_and_named_function() {
-        let raw = "boom\nstack traceback:\n\tskills/review.lua:12: in function 'review'\n\t[C]: in ?";
+        let raw =
+            "boom\nstack traceback:\n\tskills/review.lua:12: in function 'review'\n\t[C]: in ?";
         let (_, trace) = split_lua_error(raw);
         assert_eq!(trace, vec!["skills/review.lua:12  in review"]);
     }
