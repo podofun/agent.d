@@ -96,7 +96,7 @@ impl Provider for ClaudeCliProvider {
                     .await
             }
             Some(McpEndpoint::Stdio { .. }) => Err(ProviderError::Config(
-                "ClaudeCliProvider: stdio MCP endpoint not supported (need http)".into(),
+                "the claude CLI provider only supports http MCP endpoints, not stdio".into(),
             )),
             None => self.complete_text_only(req).await,
         }
@@ -195,9 +195,16 @@ impl ClaudeCliProvider {
             .prefix("agentd-mcp-")
             .suffix(".json")
             .tempfile()
-            .map_err(|e| ProviderError::Config(format!("create mcp config: {e}")))?;
-        std::io::Write::write_all(&mut tmp, cfg.to_string().as_bytes())
-            .map_err(|e| ProviderError::Config(format!("write mcp config: {e}")))?;
+            .map_err(|e| {
+                ProviderError::Config(format!(
+                    "could not create the MCP config file for the claude CLI ({e})"
+                ))
+            })?;
+        std::io::Write::write_all(&mut tmp, cfg.to_string().as_bytes()).map_err(|e| {
+            ProviderError::Config(format!(
+                "could not write the MCP config file for the claude CLI ({e})"
+            ))
+        })?;
         let cfg_path = tmp.into_temp_path();
 
         let mut cmd = Command::new(&self.bin);

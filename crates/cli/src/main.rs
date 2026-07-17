@@ -143,7 +143,7 @@ enum PkgCmd {
 
 fn packages_root() -> Result<std::path::PathBuf> {
     Ok(dirs::data_dir()
-        .ok_or_else(|| anyhow!("no data dir"))?
+        .ok_or_else(|| anyhow!("could not locate a data directory (XDG) on this system"))?
         .join("agentd")
         .join("packages"))
 }
@@ -193,7 +193,7 @@ fn run_packages(cmd: PkgCmd) -> Result<()> {
         PkgCmd::Update { name } => {
             let entry = index
                 .get(&name)
-                .ok_or_else(|| anyhow!("{name} not installed"))?
+                .ok_or_else(|| anyhow!("no package named `{name}` is installed — run `agentctl pkg ls` to see what is"))?
                 .clone();
             let dir = root.join(&name);
             let commit = agentd_packages::update(&entry, &dir)?;
@@ -282,15 +282,19 @@ async fn cmd_health(base: &str, timeout: u64) -> Result<()> {
 // ---------- WS client ----------
 
 fn ws_url_of(base: &str) -> Result<String> {
-    let mut u = url::Url::parse(base).context("invalid --url")?;
+    let mut u = url::Url::parse(base).context("the --url value is not a valid URL")?;
     let scheme = match u.scheme() {
         "http" => "ws".to_string(),
         "https" => "wss".to_string(),
         "ws" | "wss" => u.scheme().to_string(),
-        other => return Err(anyhow!("unsupported scheme `{other}` in --url")),
+        other => {
+            return Err(anyhow!(
+                "--url must start with http, https, ws, or wss (got `{other}`)"
+            ));
+        }
     };
     u.set_scheme(&scheme)
-        .map_err(|_| anyhow!("could not rewrite scheme"))?;
+        .map_err(|_| anyhow!("could not build a WebSocket URL from --url"))?;
     u.set_path("/ws");
     Ok(u.to_string())
 }
@@ -345,15 +349,19 @@ fn resolve_ws_token() -> Option<String> {
 // ---------- control plane (grants) ----------
 
 fn control_url_of(base: &str) -> Result<String> {
-    let mut u = url::Url::parse(base).context("invalid --url")?;
+    let mut u = url::Url::parse(base).context("the --url value is not a valid URL")?;
     let scheme = match u.scheme() {
         "http" => "ws".to_string(),
         "https" => "wss".to_string(),
         "ws" | "wss" => u.scheme().to_string(),
-        other => return Err(anyhow!("unsupported scheme `{other}` in --url")),
+        other => {
+            return Err(anyhow!(
+                "--url must start with http, https, ws, or wss (got `{other}`)"
+            ));
+        }
     };
     u.set_scheme(&scheme)
-        .map_err(|_| anyhow!("could not rewrite scheme"))?;
+        .map_err(|_| anyhow!("could not build a WebSocket URL from --url"))?;
     u.set_path("/control");
     Ok(u.to_string())
 }
@@ -387,21 +395,21 @@ async fn cmd_grants_listen(base: &str, timeout: u64) -> Result<()> {
     let mut request = url
         .as_str()
         .into_client_request()
-        .with_context(|| format!("build request for {url}"))?;
+        .with_context(|| format!("could not build a request for `{url}`"))?;
     if let Some(token) = resolve_admin_token() {
         request.headers_mut().insert(
             "authorization",
             format!("Bearer {token}")
                 .parse()
-                .context("invalid admin token")?,
+                .context("the admin token contains characters that cannot go in a header")?,
         );
     }
     let connect = tokio_tungstenite::connect_async(request);
     let (mut ws, _) = tokio::time::timeout(Duration::from_millis(timeout), connect)
         .await
-        .with_context(|| format!("connect timeout to {url}"))?
+        .with_context(|| format!("timed out connecting to `{url}`"))?
         .with_context(|| {
-            format!("connect to {url} (is the daemon running with a control token?)")
+            format!("could not connect to `{url}` — is agentd running with a control token?")
         })?;
 
     // Register as an approver.
@@ -415,7 +423,7 @@ async fn cmd_grants_listen(base: &str, timeout: u64) -> Result<()> {
             Ok(Message::Binary(b)) => String::from_utf8_lossy(&b).into_owned(),
             Ok(Message::Close(_)) => break,
             Ok(_) => continue,
-            Err(e) => return Err(anyhow!("control socket error: {e}")),
+            Err(e) => return Err(anyhow!("the control connection failed ({e})")),
         };
         let v: Value = match serde_json::from_str(&text) {
             Ok(v) => v,
@@ -503,20 +511,20 @@ async fn ws_call(base: &str, timeout: u64, method: &str, params: Value) -> Resul
     let mut request = url
         .as_str()
         .into_client_request()
-        .with_context(|| format!("build request for {url}"))?;
+        .with_context(|| format!("could not build a request for `{url}`"))?;
     if let Some(token) = resolve_ws_token() {
         request.headers_mut().insert(
             "authorization",
             format!("Bearer {token}")
                 .parse()
-                .context("invalid auth token")?,
+                .context("the auth token contains characters that cannot go in a header")?,
         );
     }
     let connect = tokio_tungstenite::connect_async(request);
     let (mut ws, _) = tokio::time::timeout(Duration::from_millis(timeout), connect)
         .await
-        .with_context(|| format!("connect timeout to {url}"))?
-        .with_context(|| format!("connect to {url}"))?;
+        .with_context(|| format!("timed out connecting to `{url}`"))?
+        .with_context(|| format!("could not connect to `{url}` — is agentd running?"))?;
 
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let req = WsRequest { id, method, params };
@@ -526,8 +534,9 @@ async fn ws_call(base: &str, timeout: u64, method: &str, params: Value) -> Resul
     while let Some(msg) = ws.next().await {
         match msg? {
             Message::Text(t) => {
-                let resp: WsResponse =
-                    serde_json::from_str(&t).with_context(|| format!("decode response: {t}"))?;
+                let resp: WsResponse = serde_json::from_str(&t).with_context(|| {
+                    format!("the daemon sent a response that could not be decoded ({t})")
+                })?;
                 let _ = ws.send(Message::Close(None)).await;
                 return Ok(resp);
             }
@@ -821,7 +830,7 @@ async fn cmd_services(base: &str, timeout: u64, cmd: ServicesCmd) -> Result<()> 
 fn build_args(json: Option<&str>, kvs: &[String]) -> Result<Value> {
     if let Some(j) = json {
         if !kvs.is_empty() {
-            return Err(anyhow!("--json and -d are mutually exclusive"));
+            return Err(anyhow!("pass either --json or -d values, not both"));
         }
         return serde_json::from_str(j).context("parse --json");
     }
@@ -832,7 +841,7 @@ fn build_args(json: Option<&str>, kvs: &[String]) -> Result<Value> {
     for item in kvs {
         let (k, v) = item
             .split_once('=')
-            .ok_or_else(|| anyhow!("-d expects `key=value`, got `{item}`"))?;
+            .ok_or_else(|| anyhow!("-d expects `key=value` pairs (got `{item}`)"))?;
         let parsed: Value =
             serde_json::from_str(v).unwrap_or_else(|_| Value::String(v.to_string()));
         obj.insert(k.to_string(), parsed);
@@ -846,7 +855,10 @@ async fn cmd_trace(file: Option<std::path::PathBuf>, follow: bool, lines: usize)
         None => default_trace_path()?,
     };
     if !path.exists() {
-        return Err(anyhow!("trace file not found: {}", path.display()));
+        return Err(anyhow!(
+            "no trace file at `{}` — start agentd first or pass --file",
+            path.display()
+        ));
     }
     let body = tokio::fs::read_to_string(&path).await?;
     let all: Vec<&str> = body.lines().collect();

@@ -184,7 +184,10 @@ impl std::fmt::Display for DriveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DriveError::Lua(e) => write!(f, "{e}"),
-            DriveError::Join(e) => write!(f, "internal join error: {e}"),
+            DriveError::Join(e) => write!(
+                f,
+                "the Lua execution task ended unexpectedly ({e}) — this is a bug in agentd, please report it"
+            ),
         }
     }
 }

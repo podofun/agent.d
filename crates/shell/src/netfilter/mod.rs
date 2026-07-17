@@ -32,11 +32,13 @@ pub trait FilterHandle: Send + Sync {}
 /// Error from a backend operation.
 #[derive(Debug, thiserror::Error)]
 pub enum FilterError {
-    #[error("network filter backend unavailable: {0}")]
+    #[error("the network filter backend is unavailable ({0})")]
     Unsupported(String),
-    #[error("filter operation failed: {0}")]
+    #[error("the network filter operation failed ({0})")]
     Apply(String),
-    #[error("permitted set full (max_size reached)")]
+    #[error(
+        "the permitted-hosts set is full — remove entries or raise `max_size` to allow more hosts"
+    )]
     Full,
 }
 

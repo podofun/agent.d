@@ -5,9 +5,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum InstallError {
-    #[error("git {0} failed: {1}")]
+    #[error("the `git {0}` command failed ({1})")]
     Git(String, String),
-    #[error("io: {0}")]
+    #[error("I/O error ({0})")]
     Io(#[from] std::io::Error),
 }
 

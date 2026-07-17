@@ -261,7 +261,7 @@ async fn missing_subject_errors() {
         .unwrap();
     assert_eq!(res.value.get("ok").and_then(|v| v.as_bool()), Some(false));
     let err = res.value.get("err").and_then(|v| v.as_str()).unwrap();
-    assert!(err.contains("`subject` is required"), "got: {err}");
+    assert!(err.contains("missing its `subject` field"), "got: {err}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

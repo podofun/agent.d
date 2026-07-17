@@ -103,7 +103,7 @@ async fn missing_required_arg_rejected_before_handler() {
         .await
         .unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("input validation failed"), "{msg}");
+    assert!(msg.contains("do not match its input schema"), "{msg}");
     assert!(msg.contains("msg"), "{msg}");
 }
 
@@ -168,7 +168,7 @@ async fn bad_return_value_rejected_by_output_schema() {
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("output validation failed"),
+        err.to_string().contains("does not match its output schema"),
         "{err}"
     );
 }

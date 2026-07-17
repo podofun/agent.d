@@ -122,7 +122,7 @@ impl<'u, B: Backend> Session<'u, B> {
         if self.progress.child_pid.is_some() {
             return Err(SessionError {
                 kind: ErrKind::Proto,
-                msg: "spawn already called for this session".into(),
+                msg: "a process was already spawned for this broker session".into(),
             });
         }
         let pid = self
@@ -154,7 +154,8 @@ impl<'u, B: Backend> Session<'u, B> {
             Some(pid) => Ok(self.backend.wait_child(pid)),
             None => Err(SessionError {
                 kind: ErrKind::Proto,
-                msg: "wait before spawn".into(),
+                msg: "cannot wait for a process before one is spawned in this broker session"
+                    .into(),
             }),
         }
     }

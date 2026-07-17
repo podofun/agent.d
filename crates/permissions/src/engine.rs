@@ -35,7 +35,9 @@ pub enum DenyLayer {
 
 #[derive(Debug, Error)]
 pub enum EngineError {
-    #[error("unknown tool `{0}`")]
+    #[error(
+        "tool `{0}` is not registered — check the tool name in grants.toml against the loaded tools"
+    )]
     UnknownTool(String),
 }
 
@@ -65,7 +67,10 @@ impl Engine {
         if policy.denies_action(&action.name) {
             return Decision::Deny {
                 layer: DenyLayer::Policy,
-                reason: format!("policy denies action `{}`", action.name),
+                reason: format!(
+                    "action `{}` is on the policy deny list in grants.toml",
+                    action.name
+                ),
             };
         }
 
@@ -108,8 +113,13 @@ impl Engine {
                 return Decision::Deny {
                     layer: DenyLayer::Tool,
                     reason: format!(
-                        "tool `{tool_name}` missing permissions: {}",
-                        missing.join(", ")
+                        "tool `{tool_name}` has not been granted {} — add {} to its `granted` list in grants.toml",
+                        missing
+                            .iter()
+                            .map(|m| format!("`{m}`"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        if missing.len() == 1 { "it" } else { "them" },
                     ),
                 };
             }
@@ -124,7 +134,7 @@ impl Engine {
                     return Decision::Deny {
                         layer: DenyLayer::Runner,
                         reason: format!(
-                            "runner `{}` not allowed to call `{}`",
+                            "runner `{}` is not allowed to call `{}` — add the action to the runner's `allowed_actions` list in grants.toml",
                             runner_id.as_str(),
                             action.name
                         ),
@@ -142,7 +152,7 @@ impl Engine {
                     return Decision::Deny {
                         layer: DenyLayer::Service,
                         reason: format!(
-                            "service `{}` not allowed to call `{}`",
+                            "service `{}` is not allowed to call `{}` — add the action to the service's `allowed_actions` list in grants.toml",
                             svc_id.as_str(),
                             action.name
                         ),
@@ -151,7 +161,11 @@ impl Engine {
             } else {
                 return Decision::Deny {
                     layer: DenyLayer::Service,
-                    reason: format!("service `{}` not registered in grants", svc_id.as_str()),
+                    reason: format!(
+                        "service `{}` has no entry in grants.toml — add a `[service.{}]` section to register it",
+                        svc_id.as_str(),
+                        svc_id.as_str()
+                    ),
                 };
             }
         }
@@ -165,7 +179,7 @@ impl Engine {
             return Decision::Deny {
                 layer: DenyLayer::Interface,
                 reason: format!(
-                    "interface `{}` not allowed to call `{}`",
+                    "interface `{}` is not allowed to call `{}` — add the action to the interface's `allowed_actions` list in grants.toml",
                     iface_id.as_str(),
                     action.name
                 ),
@@ -179,7 +193,10 @@ impl Engine {
             if policy.denies_permission(req) {
                 return Decision::Deny {
                     layer: DenyLayer::Policy,
-                    reason: format!("policy denies permission `{}`", req.as_str()),
+                    reason: format!(
+                        "permission `{}` is on the policy deny list in grants.toml",
+                        req.as_str()
+                    ),
                 };
             }
         }
@@ -188,7 +205,10 @@ impl Engine {
         //    action records it in `policy.auto_confirm`, promoting it to Allow.
         if action.confirm && !policy.auto_confirms(&action.name) {
             return Decision::NeedsConfirmation {
-                reason: format!("action `{}` requires confirmation", action.name),
+                reason: format!(
+                    "action `{}` requires operator confirmation before it can run",
+                    action.name
+                ),
             };
         }
 

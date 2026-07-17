@@ -4,9 +4,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ManifestError {
-    #[error("read {0}: {1}")]
+    #[error("could not read the manifest `{0}` ({1})")]
     Read(String, std::io::Error),
-    #[error("parse {0}: {1}")]
+    #[error("could not parse the manifest `{0}` ({1})")]
     Parse(String, toml::de::Error),
 }
 
