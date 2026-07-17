@@ -27,8 +27,11 @@ ctx.structured(name: string, {
   system?:   string,
   model?:    string,
   retries?:  integer,
-  validate?: fun(value: any): boolean, string?,
+  validate?: fun(value: any): boolean, string? | "inherit",
 }) -> (decoded: table, response: RunResult)
+
+-- Check a value against the enclosing action's declared output schema
+ctx.validate_output(value: any) -> (ok: boolean, reason: string?)
 ```
 
 ## Methods
@@ -73,14 +76,52 @@ Like `ctx.run`, but instructs the runner to return a JSON object and decodes it.
 | `system` | `string` | System prompt override. |
 | `model` | `string` | Model override. |
 | `retries` | `integer` | Number of retry attempts on decode or validation failure. |
-| `validate` | `fun(value): boolean, string?` | Called with the decoded table; return `false, reason` to retry. |
+| `validate` | `fun(value): boolean, string?` or `"inherit"` | Called with the decoded table; return `false, reason` to retry. The string `"inherit"` uses the enclosing action's `output` schema as the contract instead. |
 
 **Returns:** `(decoded: table, response: RunResult)` — two values.
 
-`ctx.structured` validates a runner's reply at the point you call it, using a
-`validate` function you write. To validate an **action's own** arguments and
-return value instead — declaratively, and so AI runners see the expected shape —
-describe them with `input`/`output` schemas; see
+#### `validate = "inherit"`
+
+When the action you're writing already declares an `output` schema, you don't
+need to restate the same checks in a `validate` function. Pass
+`validate = "inherit"` and the model's reply is validated against that schema —
+same retry-with-reason loop, one single source of truth for the shape:
+
+```lua
+agentd.action({
+  name = "geo.capital",
+  input  = { country = { type = "string", required = true } },
+  output = {
+    capital = { type = "string", required = true },
+    population_millions = { type = "number", required = true },
+  },
+  handler = function(args, ctx)
+    local v = ctx.structured("geo_agent", {
+      prompt = "Country: " .. args.country ..
+        '. Reply as JSON: {"capital": ..., "population_millions": ...}',
+      validate = "inherit",
+    })
+    return v  -- already schema-shaped; passes the action's output gate
+  end,
+})
+```
+
+If the reply doesn't match, the model is reprompted with the exact rejection
+reason (e.g. `` /population_millions: expected number ``) until it conforms or
+`retries` is exhausted. Using `"inherit"` in an action that declares no
+`output` schema is an error — declare the schema first.
+
+### `ctx.validate_output(value)`
+
+Checks any value against the enclosing action's declared `output` schema.
+Returns `true`, or `false, reason` on mismatch. This is what
+`validate = "inherit"` uses under the hood; call it directly when you want to
+pre-check a value you assembled yourself before returning it.
+
+`ctx.structured` validates a runner's reply at the point you call it. To
+validate an **action's own** arguments and return value — declaratively, and so
+AI runners see the expected shape — describe them with `input`/`output`
+schemas; see
 [Describing arguments and results](/v0/writing/tools#describing-arguments-and-results).
 
 ## RunResult

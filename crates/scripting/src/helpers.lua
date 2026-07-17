@@ -284,6 +284,15 @@ do
     opts = opts or {}
     local retries = tonumber(opts.retries) or 2
     local validate = opts.validate
+    -- validate = "inherit": the contract is the enclosing action's declared
+    -- `output` schema. Same reprompt-on-reject loop, schema-backed. Raises
+    -- immediately if the action declares no output schema (caller bug, not
+    -- a model failure).
+    if validate == "inherit" then
+      validate = function(t)
+        return ctx.validate_output(t)
+      end
+    end
     local last_err
     local correction
 

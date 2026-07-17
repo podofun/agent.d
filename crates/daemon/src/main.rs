@@ -98,7 +98,7 @@ async fn run(cli: Cli) -> Result<()> {
     providers.insert("openai", openai_api);
     providers.insert("codex", codex);
     providers.insert("openai-cli", openai_cli);
-    providers.set_default("anthropic");
+    register_configured_providers(&mut providers, &cfg, keyring.clone());
     let providers = Arc::new(providers);
 
     // `agentd.import("name")` (bare) resolves installed packages here.
@@ -192,6 +192,49 @@ async fn run(cli: Cli) -> Result<()> {
     tracing::debug!(addr = %local_addr, "listening");
     serve(listener, router(state)).await?;
     Ok(())
+}
+
+/// Register user-configured `[providers.<name>]` entries on top of the
+/// built-ins and apply `runtime.default_provider`. Config validation
+/// (reserved names, auth choice) already happened in `Config::resolve`.
+fn register_configured_providers(
+    providers: &mut ProviderRegistry,
+    cfg: &Config,
+    keyring: Arc<dyn agentd_secrets::SecretStore>,
+) {
+    use config::ProviderKind;
+    for (name, spec) in &cfg.providers {
+        let p: Arc<dyn AIProvider> = match spec.kind {
+            ProviderKind::OpenAi => {
+                let mut prov = OpenAiApiProvider::new(keyring.clone())
+                    .with_name(name.clone())
+                    .with_endpoint(&spec.base_url);
+                prov = match (&spec.api_key_secret, spec.auth.as_deref()) {
+                    (Some(k), _) => prov.with_secret_key(k.clone()),
+                    (None, _) => prov.with_no_auth(),
+                };
+                if let Some(m) = &spec.default_model {
+                    prov = prov.with_default_model(m.clone());
+                }
+                Arc::new(prov)
+            }
+            ProviderKind::Anthropic => {
+                let mut prov = ClaudeApiProvider::new(keyring.clone())
+                    .with_name(name.clone())
+                    .with_endpoint(&spec.base_url);
+                prov = match (&spec.api_key_secret, spec.auth.as_deref()) {
+                    (Some(k), _) => prov.with_secret_key(k.clone()),
+                    (None, _) => prov.with_no_auth(),
+                };
+                if let Some(m) = &spec.default_model {
+                    prov = prov.with_default_model(m.clone());
+                }
+                Arc::new(prov)
+            }
+        };
+        providers.insert(name.clone(), p);
+    }
+    providers.set_default(&cfg.default_provider);
 }
 
 struct StartupSummary<'a> {
@@ -316,6 +359,63 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::time::Duration;
+
+    fn cfg_with(body: &str) -> Config {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("config.toml");
+        std::fs::write(&p, body).unwrap();
+        Config::resolve(Cli {
+            config: Some(p),
+            ..Cli::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn configured_openai_provider_lands_in_registry() {
+        let cfg = cfg_with(
+            r#"
+            [providers.openrouter]
+            kind = "openai"
+            base_url = "https://openrouter.ai/api/v1"
+            api_key_secret = "openrouter_api_key"
+
+            [providers.ollama]
+            kind = "openai"
+            base_url = "http://localhost:11434/v1"
+            auth = "none"
+        "#,
+        );
+        let keyring = Arc::new(agentd_secrets::MemoryStore::default());
+        let mut providers = ProviderRegistry::new();
+        register_configured_providers(&mut providers, &cfg, keyring);
+        assert!(providers.get("openrouter").is_some());
+        assert!(providers.get("ollama").is_some());
+        let (name, _, model) = providers
+            .resolve_for_model("openrouter/meta-llama/llama-3.3-70b")
+            .unwrap();
+        assert_eq!(name, "openrouter");
+        assert_eq!(model, "meta-llama/llama-3.3-70b");
+    }
+
+    #[test]
+    fn default_provider_from_config_is_applied() {
+        let cfg = cfg_with(
+            r#"
+            [runtime]
+            default_provider = "ollama"
+
+            [providers.ollama]
+            kind = "openai"
+            base_url = "http://localhost:11434/v1"
+            auth = "none"
+        "#,
+        );
+        let keyring = Arc::new(agentd_secrets::MemoryStore::default());
+        let mut providers = ProviderRegistry::new();
+        register_configured_providers(&mut providers, &cfg, keyring);
+        assert_eq!(providers.default_name(), Some("ollama"));
+    }
 
     #[test]
     fn startup_summary_is_compact_and_actionable() {

@@ -120,6 +120,7 @@ The specifier must match the prefix exactly — `ai:anthropic` does **not** gran
 | `ai:openai` | `openai/…` |
 | `ai:openai-cli` | `openai-cli/…` |
 | `ai:codex` | `codex/…` |
+| `ai:<name>` | `<name>/…` for any [`[providers.<name>]`](/v0/providers/custom) entry, e.g. `ai:ollama` |
 | `ai:*` | any registered provider |
 
 ```toml

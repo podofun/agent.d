@@ -271,3 +271,94 @@ async fn structured_raises_after_exhausting_retries() {
         v["err"]
     );
 }
+
+/// Mock for `validate = "inherit"`: first reply is missing the required `n`
+/// field, second conforms — structured must reprompt using the action's own
+/// output schema as the contract.
+struct SchemaFlakyRunner {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl RunnerDispatcher for SchemaFlakyRunner {
+    async fn run_runner_json(
+        &self,
+        _caller: Caller,
+        _name: &str,
+        _opts: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let text = if n == 0 {
+            r#"{"summary":"done"}"#.to_string()
+        } else {
+            r#"{"summary":"done","n":5}"#.to_string()
+        };
+        Ok(serde_json::json!({ "text": text, "model": "mock-1" }))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn structured_inherit_validates_against_action_output_schema() {
+    let dir = write_init(
+        r#"
+        agentd.tool{ name = "demo" }
+        agentd.action{
+          name = "demo.inherit",
+          output = {
+            summary = { type = "string", required = true },
+            n = { type = "integer", required = true },
+          },
+          handler = function(_, ctx)
+            local v = ctx.structured("scorer", {
+              prompt = "score it",
+              validate = "inherit",
+            })
+            return v
+          end,
+        }
+        "#,
+    );
+    let host = host_with(dir.path());
+    host.set_runner_dispatcher(Arc::new(SchemaFlakyRunner {
+        calls: AtomicUsize::new(0),
+    }));
+    host.load_file(&dir.path().join("init.lua")).unwrap();
+
+    let v = call(&host, "demo.inherit").await;
+    // First reply lacked `n` → reprompted → second conforms; the returned
+    // table then also passes the action's own output validation.
+    assert_eq!(v["summary"], serde_json::json!("done"));
+    assert_eq!(v["n"], serde_json::json!(5));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn structured_inherit_without_output_schema_is_an_error() {
+    let dir = write_init(
+        r#"
+        agentd.tool{ name = "demo" }
+        agentd.action{
+          name = "demo.inherit_missing",
+          handler = function(_, ctx)
+            local ok, err = pcall(ctx.structured, "scorer", {
+              prompt = "x",
+              validate = "inherit",
+            })
+            return { ok = ok, err = tostring(err) }
+          end,
+        }
+        "#,
+    );
+    let host = host_with(dir.path());
+    host.set_runner_dispatcher(Arc::new(SchemaFlakyRunner {
+        calls: AtomicUsize::new(0),
+    }));
+    host.load_file(&dir.path().join("init.lua")).unwrap();
+
+    let v = call(&host, "demo.inherit_missing").await;
+    assert_eq!(v["ok"], serde_json::json!(false));
+    assert!(
+        v["err"].as_str().unwrap().contains("no output schema"),
+        "got: {:?}",
+        v["err"]
+    );
+}
