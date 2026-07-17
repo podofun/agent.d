@@ -273,7 +273,7 @@ function string.split(s, sep) end
 ---@field system? string
 ---@field model? string
 ---@field retries? integer
----@field validate? fun(value: any): boolean, string?
+---@field validate? fun(value: any): boolean, string?|"inherit"
 
 ---@class Ctx
 ---@field log Ctx.Log
@@ -317,3 +317,9 @@ function Ctx.run(name, opts) end
 ---@param opts Ctx.StructuredOpts
 ---@return table decoded, Ctx.RunResult response
 function Ctx.structured(name, opts) end
+
+---Validate a value against the enclosing action's declared `output` schema.
+---Errors if there is no enclosing action or it declares no output schema.
+---@param value any
+---@return boolean ok, string? reason
+function Ctx.validate_output(value) end

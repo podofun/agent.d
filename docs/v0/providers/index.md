@@ -13,7 +13,7 @@ agentd.runner({
 })
 ```
 
-If you omit the provider prefix, agent.d defaults to `anthropic`:
+If you omit the provider prefix, agent.d uses the default provider (`anthropic` unless `runtime.default_provider` says otherwise):
 
 ```lua
 -- These two are equivalent:
@@ -23,7 +23,7 @@ ctx.ai.ask("Summarise this diff", { model = "anthropic/claude-opus-4-7" })
 
 ## Registered prefixes
 
-Five provider prefixes are registered at startup:
+Five built-in prefixes are registered at startup, plus one per `[providers.<name>]` entry in `config.toml` (see [Custom providers](/v0/providers/custom)):
 
 | Prefix | Backend |
 |---|---|
@@ -32,6 +32,7 @@ Five provider prefixes are registered at startup:
 | `openai` | OpenAI-compatible Messages API (key from the secret store) |
 | `codex` | `codex app-server` over JSON-RPC |
 | `openai-cli` | Local `codex` CLI text fallback |
+| *your own* | Any OpenAI- or Anthropic-compatible endpoint declared in `config.toml` — OpenRouter, Groq, Together, vLLM, Ollama, LM Studio, gateways |
 
 ## Tool-use loop cap
 
@@ -74,6 +75,7 @@ See [permission slugs](/v0/security/permission-slugs) and [grants](/v0/security/
 - [OpenAI](/v0/providers/openai) — `openai`
 - [CLI backends](/v0/providers/cli-backends) — `anthropic-cli` and `openai-cli`
 - [Codex](/v0/providers/codex) — `codex`
+- [Custom providers](/v0/providers/custom) — OpenAI/Anthropic-compatible endpoints and local servers via `config.toml`
 - [Credentials](/v0/providers/credentials) — storing API keys in the keyring
 - [MCP loopback](/v0/providers/mcp) — exposing tools to the `claude` CLI
 
