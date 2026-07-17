@@ -13,7 +13,7 @@
 | [`ctx.ws`](/v0/reference/ctx/websocket) | WebSocket connections | `net:<host>` |
 | [`ctx.mailer`](/v0/reference/ctx/mailer) | Send email over SMTP | `net:<host>` |
 | [`ctx.secret`](/v0/reference/ctx/secrets) | OS keyring get/set/delete | `secret:<key>` |
-| [`ctx.memory`](/v0/reference/ctx/memory) | Durable namespaced key/value (redb) | `memory.read:<ns>` / `memory.write:<ns>` |
+| [`ctx.memory`](/v0/reference/ctx/memory) | Durable namespaced key/value store | `memory.read:<ns>` / `memory.write:<ns>` |
 | [`ctx.state`](/v0/reference/ctx/memory) | Ephemeral in-process key/value | none |
 | [`ctx.ai`](/v0/reference/ctx/ai) | Model calls through registered providers | `ai:<provider>` |
 | [`ctx.call` / `ctx.run` / `ctx.structured`](/v0/reference/ctx/calls) | Cross-component action and runner invocation | depends on target |

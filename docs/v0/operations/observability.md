@@ -43,7 +43,7 @@ agentctl trace --file /var/log/agentd/trace.jsonl -f -n 100
 
 ## Log level
 
-The daemon emits structured tracing output to stderr. The log level is controlled by a [tracing](https://docs.rs/tracing-subscriber) filter string.
+The daemon emits structured tracing output to stderr. The log level is controlled by a filter string such as `warn`, `info`, or a per-target form like `warn,agentd=debug`.
 
 **Precedence:** `--log` flag > `AGENTD_LOG` env var > `log_level` in `config.toml` > `RUST_LOG` env var > built-in default (`warn`).
 

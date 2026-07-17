@@ -23,7 +23,7 @@ CLI flag  >  environment variable  >  config.toml  >  built-in default
 | `--grants <path>` | `-g` | `AGENTD_GRANTS` | `$XDG_CONFIG_HOME/agentd/grants.toml` | grants.toml path |
 | `--addr <addr>` | `-a` | `AGENTD_ADDR` | `127.0.0.1:7777` | HTTP + WebSocket bind address |
 | `--trace <path>` | — | `AGENTD_TRACE` | `$XDG_STATE_HOME/agentd/trace.jsonl` | JSONL trace sink |
-| `--log <filter>` | `-l` | `AGENTD_LOG` | `warn` | tracing-subscriber filter string |
+| `--log <filter>` | `-l` | `AGENTD_LOG` | `warn` | log filter string |
 | `--token <s>` | `-t` | `AGENTD_TOKEN` | auto-minted | `/ws` bearer token |
 | `--admin-token <s>` | — | `AGENTD_ADMIN_TOKEN` | auto-minted | `/control` bearer token |
 | `--no-auth` | — | `AGENTD_NO_AUTH` | `false` | Disable `/ws` and `/control` auth |
@@ -59,7 +59,7 @@ approval_timeout_ms = 120000
 |---|---|---|---|
 | `addr` | string | `"127.0.0.1:7777"` | Bind address for HTTP and WebSocket |
 | `trace_file` | string | `~/.local/state/agentd/trace.jsonl` | JSONL trace output path; `~/` is expanded |
-| `log_level` | string | `"warn"` | tracing-subscriber filter; also falls back to `RUST_LOG` |
+| `log_level` | string | `"warn"` | log filter string; also falls back to `RUST_LOG` |
 | `token` | string | — | Fixed `/ws` bearer token; omit to auto-mint |
 | `no_auth` | bool | `false` | Disable authentication on both `/ws` and `/control` |
 | `admin_token` | string | — | Fixed `/control` bearer token; omit to auto-mint |
@@ -141,7 +141,7 @@ When auth is enabled and no explicit token is configured, the daemon generates r
 - All skill `.md` files loaded via `agentd.skills.load()` or `agentd.skills.dir()`
 - `grants.toml`
 
-On any change it rebuilds the Lua runtime in place. In-flight requests drain on the old runtime (the executor is swapped via `ArcSwap` so ongoing requests keep their reference until they complete). After reload it also regenerates `.luals/` type stubs, identical to running `agentctl types`.
+On any change it rebuilds the Lua runtime in place. In-flight requests drain on the old runtime — ongoing requests finish against the code they started with, only new requests see the reloaded code. After reload it also regenerates `.luals/` type stubs, identical to running `agentctl types`.
 
 Durable memory (`memory.redb`) and any connected approval operator on `/control` survive reloads.
 

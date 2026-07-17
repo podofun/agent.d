@@ -26,7 +26,7 @@ Every call needs a matching grant in `grants.toml`. Reads need `fs.read:<path>`;
 | `ctx.fs.list_dir(path)`        | `fs.read:<path>`  | `table[]` | List a directory — see [list_dir](#list-dir).                 |
 | `ctx.fs.remove(path)`          | `fs.write:<path>` | —         | Delete a file.                                                |
 
-A missing file makes `read`, `stat`, and `list_dir` throw and error. It's advised that you guard with `exists` first if the file might not be there.
+A missing file makes `read`, `stat`, and `list_dir` throw an error. Guard with `exists` first if the file might not be there.
 
 ### stat
 

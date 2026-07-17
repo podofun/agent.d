@@ -71,7 +71,7 @@ Services have access to the full `ctx` API — shell, filesystem, HTTP, WebSocke
 
 ## Durable state across reloads
 
-Services are restarted on hot reload because the Lua runtime is rebuilt. To preserve state across reloads, write it to `ctx.memory` (durable, redb-backed). The data survives both restarts and reloads.
+Services are restarted on hot reload because the Lua runtime is rebuilt. To preserve state across reloads, write it to `ctx.memory` (durable, stored on disk). The data survives both restarts and reloads.
 
 Use `ctx.state` only for in-session bookkeeping that you don't need to survive a reload.
 

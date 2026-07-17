@@ -34,7 +34,7 @@ Each inbound call on `/ws` flows through the permission engine before any Lua co
 In development you can pass `--watch` (or set `AGENTD_WATCH=1`) to turn on hot reload. The daemon watches `init.lua`, every `import()`-ed file, loaded skill `.md` sources, and `grants.toml`. When any of those change:
 
 1. A new runtime is built and loaded in place.
-2. In-flight requests on the old runtime drain to completion (via an `ArcSwap` executor swap).
+2. In-flight requests on the old runtime drain to completion.
 3. The LuaLS type stubs in `.luals/` are regenerated.
 
 Durable memory (`ctx.memory`) and a connected approval operator on `/control` survive reloads — they are owned by the daemon process, not the runtime.

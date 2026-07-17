@@ -15,7 +15,7 @@ tool/package grants
   = Decision
 ```
 
-A call is allowed only when **every** layer that applies says yes. If any layer denies — or if a layer simply has no entry — the call is blocked. Writing `requires` in your Lua declares what an action needs; it never grants that need.
+A call is allowed only when **every** layer that applies says yes. If any layer denies — or has no entry — the call is blocked. Writing `requires` in your Lua declares what an action needs; it never grants that need.
 
 `grants.toml` is **the only source of grants**.
 

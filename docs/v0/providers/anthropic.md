@@ -11,7 +11,7 @@ echo "$ANTHROPIC_API_KEY" | agentctl secret set anthropic_api_key
 ```
 
 ::: info
-The exact secret key name the provider looks up is an internal implementation detail. Storing credentials in the OS keyring keeps them out of your Lua files and config. See [Credentials](/v0/providers/credentials) for the full pattern, including managing keys programmatically via `ctx.secret`.
+Storing credentials in the OS keyring keeps them out of your Lua files and config. See [Credentials](/v0/providers/credentials) for the full pattern, including managing keys programmatically via `ctx.secret`.
 :::
 
 ::: warning Never hardcode API keys

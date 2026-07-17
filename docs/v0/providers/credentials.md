@@ -4,11 +4,11 @@ agent.d providers that call external APIs read their keys from the **OS keyring*
 
 ## How credentials work
 
-The daemon uses the OS keyring (via the `agentd-secrets` crate backed by `KeyringStore`) as the single source of truth for provider API keys. When a provider like `anthropic` or `openai` makes a model call, it retrieves its key from the keyring at call time.
+The daemon uses the OS keyring as the single source of truth for provider API keys. When a provider like `anthropic` or `openai` makes a model call, it retrieves its key from the keyring at call time.
 
 ## Storing a key with `agentctl secret`
 
-The primary way to manage provider keys is the `agentctl secret` command. It writes to the same `agentd` keyring service the daemon reads, so a running daemon sees changes immediately — no restart, no setup action:
+The primary way to manage provider keys is the `agentctl secret` command. It writes to the keyring the daemon reads, so a running daemon sees changes immediately:
 
 ```bash
 agentctl secret set anthropic_api_key sk-ant-…
@@ -18,12 +18,6 @@ To keep the key out of your shell history, omit the value and pipe it on stdin:
 
 ```bash
 echo "$ANTHROPIC_API_KEY" | agentctl secret set anthropic_api_key
-```
-
-On success it prints:
-
-```
-stored `anthropic_api_key` — available to the daemon immediately
 ```
 
 To verify what is stored without exposing it, or to remove a key:
@@ -95,7 +89,7 @@ Grant `secret:<specific-key>` rather than `secret:*`. Grant `ai:<specific-provid
 
 ## Rotating a key
 
-To rotate a provider key, run `agentctl secret set` again with the new value — it overwrites the existing entry. No daemon restart is required; the provider reads the key on each call.
+To rotate a provider key, run `agentctl secret set` again with the new value — it overwrites the existing entry.
 
 ```bash
 echo "$NEW_KEY" | agentctl secret set anthropic_api_key

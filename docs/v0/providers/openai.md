@@ -11,7 +11,7 @@ echo "$OPENAI_API_KEY" | agentctl secret set openai_api_key
 ```
 
 ::: info
-The exact secret key name the provider looks up is an internal implementation detail. See [Credentials](/v0/providers/credentials) for the recommended pattern for storing and managing API keys.
+See [Credentials](/v0/providers/credentials) for the recommended pattern for storing and managing API keys.
 :::
 
 ::: warning Never hardcode API keys

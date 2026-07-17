@@ -4,7 +4,7 @@ Store a rolling history of interactions per user (or per channel, per session) u
 
 ## How it works
 
-`ctx.memory.create(namespace)` returns a handle to a durable key/value store backed by `redb`. You pick a namespace string that encodes the identity dimension you care about — by caller user, by session, by channel, or any combination:
+`ctx.memory.create(namespace)` returns a handle to a durable key/value store that survives daemon restarts. You pick a namespace string that encodes the identity dimension you care about — by caller user, by session, by channel, or any combination:
 
 ```lua
 -- Keyed by user

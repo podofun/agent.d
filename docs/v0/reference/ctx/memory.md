@@ -4,7 +4,7 @@ agent.d provides two key/value stores: **durable memory** (`ctx.memory`) that su
 
 ## Durable memory — `ctx.memory`
 
-`ctx.memory` is backed by an embedded [redb](https://github.com/cberner/redb) database stored at `$XDG_DATA_HOME/agentd/memory.redb`. Values are JSON-serialized automatically.
+`ctx.memory` is backed by an embedded database stored at `$XDG_DATA_HOME/agentd/memory.redb`. Values are JSON-serialized automatically.
 
 **Required permissions:** `memory.read:<ns-glob>` for reads; `memory.write:<ns-glob>` for writes and deletes.
 

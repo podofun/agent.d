@@ -4,7 +4,7 @@ agent.d gives you two storage mechanisms: durable `ctx.memory` that survives res
 
 ## Durable memory (`ctx.memory`)
 
-`ctx.memory` is backed by [redb](https://github.com/cberner/redb), an embedded key/value store on disk. Data written here is preserved across daemon restarts and hot reloads.
+`ctx.memory` is an embedded key/value store on disk. Data written here is preserved across daemon restarts and hot reloads.
 
 ```lua
 -- Required permissions: memory.read:<namespace> / memory.write:<namespace>
@@ -64,7 +64,7 @@ Use `ctx.state` for:
 | Survives restart | yes | no |
 | Survives hot reload | yes | no |
 | Permission required | `memory.read/write:<ns>` | none |
-| Storage | redb on disk | in-process |
+| Storage | on disk | in-process |
 | Use for | user data, history, configuration | temporary cache, in-session flags |
 
 ::: tip

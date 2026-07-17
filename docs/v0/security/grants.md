@@ -6,7 +6,7 @@
 
 The default path is `$XDG_CONFIG_HOME/agentd/grants.toml`. Override it with `--grants <path>` or `AGENTD_GRANTS` (the old `--grants-file` / `AGENTD_GRANTS_FILE` names still work as deprecated aliases). The file is reloaded automatically when you run with `--watch`.
 
-`init.lua` and `grants.toml` live in the same folder - that folder is serves as the **workspace root**. Supplying one option lets agent.d infer the other: pass just `--init path/to/init.lua` and it reads `grants.toml` beside it, or pass just `--grants path/to/grants.toml` and it loads `init.lua` beside it. You only need both flags if they live in different folders.
+`init.lua` and `grants.toml` live in the same folder - that folder serves as the **workspace root**. Supplying one option lets agent.d infer the other: pass just `--init path/to/init.lua` and it reads `grants.toml` beside it, or pass just `--grants path/to/grants.toml` and it loads `init.lua` beside it. You only need both flags if they live in different folders.
 
 ## The five-layer engine
 

@@ -201,7 +201,7 @@ Uses `AGENTD_ADMIN_TOKEN` / `$XDG_STATE_HOME/agentd/admin-token` for authenticat
 
 ### `agentctl secret set`
 
-Store a provider API key (or any secret) in the OS keyring, under the same `agentd` service the daemon reads. A running daemon sees the change immediately — providers read the keyring at call time, so no restart is needed.
+Store a provider API key (or any secret) in the OS keyring. A running daemon sees the change on its next provider call.
 
 ```bash
 agentctl secret set <name> [value]
@@ -211,12 +211,6 @@ The value is optional. When omitted, it is read from stdin — the recommended f
 
 ```bash
 echo "$ANTHROPIC_API_KEY" | agentctl secret set anthropic_api_key
-```
-
-On success:
-
-```
-stored `anthropic_api_key` — available to the daemon immediately
 ```
 
 ::: info Local operation

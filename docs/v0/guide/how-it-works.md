@@ -25,7 +25,7 @@ The startup banner prints the Local, WS, and Control URLs and the counts of load
 
 The daemon evaluates your Lua entry file (typically `init.lua`) once at startup. Every `agentd.tool`, `agentd.action`, `agentd.runner`, `agentd.skill`, and `agentd.service` call during that evaluation registers a component in the runtime. Once loaded, those components are available to every client that connects — no per-client boot cost, no duplicated state.
 
-In development mode (`--watch`), the daemon watches `init.lua`, every file pulled in via `import()`, loaded skill `.md` sources, and `grants.toml`. When any of them changes, the runtime rebuilds in place. In-flight requests drain on the old runtime via an executor swap; durable memory and a connected approval operator survive the reload.
+In development mode (`--watch`), the daemon watches `init.lua`, every file pulled in via `import()`, loaded skill `.md` sources, and `grants.toml`. When any of them changes, the runtime rebuilds in place. In-flight requests drain on the old runtime; durable memory and a connected approval operator survive the reload.
 
 ## The request lifecycle
 

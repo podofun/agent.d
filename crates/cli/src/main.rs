@@ -87,8 +87,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PkgCmd,
     },
-    /// Manage provider API keys in the OS keyring. Changes are visible to a
-    /// running daemon immediately — providers read the keyring at call time.
+    /// Manage provider API keys in the OS keyring.
     #[command(name = "secret", visible_alias = "secrets")]
     Secret {
         #[command(subcommand)]
@@ -191,7 +190,7 @@ fn run_secrets(cmd: SecretCmd) -> Result<()> {
                 ));
             }
             store.set(&name, &value)?;
-            println!("stored `{name}` — available to the daemon immediately");
+            println!("stored `{name}`");
         }
         SecretCmd::Unset { name } => {
             store.delete(&name)?;

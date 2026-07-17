@@ -29,7 +29,7 @@ Apply the same principle to all domains:
 
 ## Keep secrets in the keyring
 
-Never put tokens, API keys, or passwords in `grants.toml`, `init.lua`, or any source file. Store them with `agentctl call` (or a dedicated `set_token` action), then retrieve them at runtime with `ctx.secret.get`:
+Never put tokens, API keys, or passwords in `grants.toml`, `init.lua`, or any source file. Store them with `agentctl secret set` (or a dedicated `set_token` action), then retrieve them at runtime with `ctx.secret.get`:
 
 ```lua
 local token = ctx.secret.get("discord_token")
