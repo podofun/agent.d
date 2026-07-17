@@ -64,12 +64,22 @@ pub fn split_lua_error(raw: &str) -> (String, Vec<String>) {
         Some((h, t)) => (h, Some(t)),
         None => (raw, None),
     };
-    let message = head
+    let mut message = head
         .trim()
         .strip_prefix("runtime error: ")
         .unwrap_or_else(|| head.trim())
-        .trim()
-        .to_string();
+        .trim();
+    // Lua's `error("msg")` prepends the raising position
+    // (`[string "init.lua"]:2: msg`). The traceback already carries it —
+    // strip so the message reads clean.
+    if let Some(rest) = message.strip_prefix("[string \"")
+        && let Some((_, tail)) = rest.split_once("\"]:")
+        && let Some((line, msg)) = tail.split_once(": ")
+        && line.parse::<u32>().is_ok()
+    {
+        message = msg.trim();
+    }
+    let message = message.to_string();
     let trace = tail
         .map(|t| {
             t.lines()
@@ -117,6 +127,14 @@ mod tests {
         let (msg, trace) = split_lua_error(raw);
         assert_eq!(msg, "runner `gh_agent`: no provider resolved");
         assert_eq!(trace, vec!["init.lua:53"]);
+    }
+
+    #[test]
+    fn strips_lua_position_prefix_from_message() {
+        let raw = "runtime error: [string \"/tmp/x/init.lua\"]:2: something exploded\nstack traceback:\n\t[string \"/tmp/x/init.lua\"]:2: in function <[string \"/tmp/x/init.lua\"]:1>";
+        let (msg, trace) = split_lua_error(raw);
+        assert_eq!(msg, "something exploded");
+        assert_eq!(trace, vec!["/tmp/x/init.lua:2"]);
     }
 
     #[test]
