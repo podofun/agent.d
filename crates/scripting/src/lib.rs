@@ -1,4 +1,5 @@
 mod channels;
+mod luaerr;
 mod mailer;
 mod sandbox;
 mod scheduler;
