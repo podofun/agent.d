@@ -51,7 +51,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          cp target/release/daemon target/release/agentctl dist/
+          cp target/release/agentd target/release/agentctl dist/
           cp README.md LICENSE dist/
           tar -czf "${{ matrix.archive }}" -C dist .
 
@@ -60,9 +60,9 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/daemon.exe dist/
+          Copy-Item target/release/agentd.exe dist/
           Copy-Item target/release/agentctl.exe dist/
-          # Ships alongside daemon.exe; the daemon locates it in its own folder.
+          # Ships alongside agentd.exe; the daemon locates it in its own folder.
           Copy-Item target/release/agentd-netbroker.exe dist/
           Copy-Item README.md, LICENSE dist/
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.archive }}"

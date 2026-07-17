@@ -21,15 +21,15 @@ Run the daemon with the bundled example entry file and grants:
 ::: code-group
 
 ```bash [release]
-daemon \
+agentd \
   --init examples/init.lua \
-  --grants-file examples/grants.toml
+  --grants examples/grants.toml
 ```
 
 ```bash [cargo]
 cargo run -p daemon -- \
   --init examples/init.lua \
-  --grants-file examples/grants.toml
+  --grants examples/grants.toml
 ```
 
 :::

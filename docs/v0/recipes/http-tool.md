@@ -101,11 +101,11 @@ The `net:<host>` slug must match the hostname exactly (no scheme, no path). Wild
 ## How to run
 
 ```bash [release]
-daemon --init my-http-tool/init.lua --grants-file my-http-tool/grants.toml
+agentd --init my-http-tool/init.lua --grants my-http-tool/grants.toml
 ```
 
 ```bash [cargo]
-cargo run -p daemon -- --init my-http-tool/init.lua --grants-file my-http-tool/grants.toml
+cargo run -p daemon -- --init my-http-tool/init.lua --grants my-http-tool/grants.toml
 ```
 
 ## Invoke from the terminal

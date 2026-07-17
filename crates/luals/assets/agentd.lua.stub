@@ -1,7 +1,7 @@
 ---@meta
 -- Static type stubs for the fixed agentd Lua API (`agentd.*`, `ctx.*`, and the
 -- helper globals). Hand-maintained source; copied verbatim into a project's
--- `.luals/agentd.lua` by `agentctl types` and `daemon --watch`. The companion
+-- `.luals/agentd.lua` by `agentctl types` and `agentd --watch`. The companion
 -- `project.lua` supplies this project's own `agentd.ActionName`,
 -- `agentd.RunnerName`, and `agentd.SkillName` names.
 

@@ -12,7 +12,7 @@ Alphabetical definitions for every core term in agent.d.
 
 **ctx** — The per-invocation capability handle passed as the second argument to action handlers (first argument to services). It is the only way for Lua code to reach system resources. See [ctx reference](/v0/reference/ctx/).
 
-**Daemon** — The `daemon` binary: the Rust process that loads Lua components, enforces the permission engine, and serves the HTTP + WebSocket API. See [How it works](/v0/guide/how-it-works).
+**Daemon** — The `agentd` binary: the Rust process that loads Lua components, enforces the permission engine, and serves the HTTP + WebSocket API. See [How it works](/v0/guide/how-it-works).
 
 **Grant** — An explicit permission award in `grants.toml` that unlocks one or more permission slugs for a tool, runner, service, interface, or package. See [Permissions & grants](/v0/security/grants).
 

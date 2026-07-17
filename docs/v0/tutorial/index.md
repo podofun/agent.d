@@ -8,7 +8,7 @@ A self-contained project that registers a `git` tool with two actions (`git.diff
 
 ## Prerequisites
 
-- agent.d installed and `daemon` + `agentctl` on your `PATH` — see [Installation](/v0/guide/installation).
+- agent.d installed and `agentd` + `agentctl` on your `PATH` — see [Installation](/v0/guide/installation).
 - An Anthropic API key stored in the secret store (covered in [Step 5](/v0/tutorial/runner-and-skill)).
 - `git` available on `PATH`.
 

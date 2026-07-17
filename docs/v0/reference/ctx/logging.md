@@ -24,7 +24,7 @@ ctx.log.error(msg: string)
 
 **Required permission:** none.
 
-All output goes to the trace sink (`--trace-file`, default `$XDG_STATE_HOME/agentd/trace.jsonl`). Stream it live with `agentctl trace -f`.
+All output goes to the trace sink (`--trace`, default `$XDG_STATE_HOME/agentd/trace.jsonl`). Stream it live with `agentctl trace -f`.
 
 ## Parameters
 

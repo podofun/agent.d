@@ -157,11 +157,11 @@ The `memory.read/write` slugs use glob syntax on the namespace. `history/**` cov
 ## How to run
 
 ```bash [release]
-daemon --init init.lua --grants-file grants.toml
+agentd --init init.lua --grants grants.toml
 ```
 
 ```bash [cargo]
-cargo run -p daemon -- --init init.lua --grants-file grants.toml
+cargo run -p daemon -- --init init.lua --grants grants.toml
 ```
 
 ## Invoke from the terminal

@@ -6,7 +6,7 @@
 
 | Flag | Env | Default | Description |
 |---|---|---|---|
-| `--url <URL>` | `AGENTD_URL` | `http://127.0.0.1:7777` | Daemon base URL |
+| `--url <URL>` (`-u`) | `AGENTD_URL` | `http://127.0.0.1:7777` | Daemon base URL |
 | `--timeout <ms>` | — | `30000` | Connect timeout in milliseconds |
 
 **Token resolution.** For `/ws` commands, `agentctl` reads the bearer token from `AGENTD_TOKEN` first, then falls back to `$XDG_STATE_HOME/agentd/token` (the file the daemon writes at startup). If neither exists the daemon must be running with `--no-auth`. For `grants listen` the same logic applies to `AGENTD_ADMIN_TOKEN` / `$XDG_STATE_HOME/agentd/admin-token` on the `/control` plane.
@@ -16,6 +16,17 @@
 ---
 
 ## Commands
+
+**Noun aliases.** Command nouns are singular, with plural (and short) forms accepted as aliases:
+
+| Canonical | Aliases |
+|---|---|
+| `runner` | `runners` |
+| `skill` | `skills` |
+| `service` | `services`, `svc` |
+| `package` | `packages`, `pkg` |
+
+`agentctl pkg ls` and `agentctl runners ls` are equivalent to `agentctl package ls` and `agentctl runner ls`.
 
 ### `agentctl health`
 
@@ -44,14 +55,14 @@ Each name is printed one per line in `tool.action` form.
 Invoke an action and print the result.
 
 ```bash
-agentctl call <action> [--json '<json>'] [-d key=value]... [--result-only] [--compact]
+agentctl call <action> [-j '<json>'] [-d key=value]... [-r] [--compact]
 ```
 
 | Flag | Description |
 |---|---|
-| `--json '<json>'` | Pass arguments as a raw JSON string |
-| `-d key=value` | Pass a single argument; value is parsed as JSON, falls back to string |
-| `--result-only` | Print only the `result` field, not the full envelope |
+| `--json '<json>'` (`-j`) | Pass arguments as a raw JSON string |
+| `-d key=value` (`--data`) | Pass a single argument; value is parsed as JSON, falls back to string |
+| `--result-only` (`-r`) | Print only the `result` field, not the full envelope |
 | `--compact` | Print JSON on one line instead of pretty-printed |
 
 ::: warning Mutually exclusive
@@ -80,10 +91,10 @@ agentctl call git.diff -d path=src/
 agentctl call git.diff --json '{"path":"src/"}'
 
 # Only print the action's return value
-agentctl call git.status --result-only
+agentctl call git.status -r
 
 # Machine-readable one-liner
-agentctl call git.status --result-only --compact
+agentctl call git.status -r --compact
 ```
 
 ---
@@ -141,34 +152,34 @@ agentctl runner run backend_reviewer "Review the latest diff" --text-only
 
 ---
 
-### `agentctl skills ls`
+### `agentctl skill ls`
 
 List registered skills with their description.
 
 ```bash
-agentctl skills ls
+agentctl skill ls
 ```
 
 Output is tab-separated `name<TAB>description` lines.
 
 ---
 
-### `agentctl skills inspect <name>`
+### `agentctl skill inspect <name>`
 
 Print the full definition of a skill.
 
 ```bash
-agentctl skills inspect reviewer
+agentctl skill inspect reviewer
 ```
 
 ---
 
-### `agentctl services ls`
+### `agentctl service ls`
 
 List running services with their state and any last error.
 
 ```bash
-agentctl services ls
+agentctl service ls
 ```
 
 Output is tab-separated `name<TAB>state[<TAB>last_error]` lines.
@@ -187,26 +198,26 @@ Uses `AGENTD_ADMIN_TOKEN` / `$XDG_STATE_HOME/agentd/admin-token` for authenticat
 
 ---
 
-### `agentctl packages ls`
+### `agentctl package ls`
 
 List installed packages, their pinned commit, ref, and whether an update is available.
 
 ```bash
-agentctl packages ls
+agentctl package ls
 ```
 
 ::: info Local operation
-`packages` commands are local filesystem + git operations — they do not talk to a running daemon.
+`package` commands are local filesystem + git operations — they do not talk to a running daemon.
 :::
 
 ---
 
-### `agentctl packages install <git-url>`
+### `agentctl package install <git-url>`
 
 Clone a package from a git URL, read its `package.toml` manifest, and register it in the local package index.
 
 ```bash
-agentctl packages install <git-url> [--ref <ref>]
+agentctl package install <git-url> [--ref <ref>]
 ```
 
 | Flag | Description |
@@ -216,28 +227,29 @@ agentctl packages install <git-url> [--ref <ref>]
 After install, if the package declares permissions you are shown the slugs and told to add `[package.<name>] trusted = true` to `grants.toml` before they take effect.
 
 ```bash
-agentctl packages install https://github.com/example/acme-tools
-agentctl packages install https://github.com/example/acme-tools --ref v1.2.0
+agentctl package install https://github.com/example/acme-tools
+agentctl package install https://github.com/example/acme-tools --ref v1.2.0
 ```
 
 ---
 
-### `agentctl packages update <name>`
+### `agentctl package update <name>`
 
 Re-pull the package and update its pinned commit in the index.
 
 ```bash
-agentctl packages update acme-tools
+agentctl package update acme-tools
 ```
 
 ---
 
-### `agentctl packages remove <name>`
+### `agentctl package remove <name>`
 
-Delete the package directory and remove it from the index.
+Delete the package directory and remove it from the index. `rm` is an alias for `remove`.
 
 ```bash
-agentctl packages remove acme-tools
+agentctl package remove acme-tools
+agentctl pkg rm acme-tools
 ```
 
 ---

@@ -53,7 +53,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone)]
 pub struct AppState {
-    /// Hot-swappable executor. `daemon --watch` rebuilds the Lua runtime and
+    /// Hot-swappable executor. `agentd --watch` rebuilds the Lua runtime and
     /// `store()`s a fresh executor here; in-flight requests keep the `Arc` they
     /// `load()`ed and drain on the old runtime. Without `--watch` the pointer
     /// never changes.

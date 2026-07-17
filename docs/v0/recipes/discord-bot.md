@@ -329,12 +329,12 @@ Each message is handled in its own coroutine so the receive loop does not block 
 Seed your bot token once (requires the daemon to be running):
 
 ```bash [release]
-daemon --init examples/discord/init.lua --grants-file examples/discord/grants.toml
+agentd --init examples/discord/init.lua --grants examples/discord/grants.toml
 agentctl call discord.set_token -d token='<your-bot-token>' --result-only
 ```
 
 ```bash [cargo]
-cargo run -p daemon -- --init examples/discord/init.lua --grants-file examples/discord/grants.toml
+cargo run -p daemon -- --init examples/discord/init.lua --grants examples/discord/grants.toml
 agentctl call discord.set_token -d token='<your-bot-token>' --result-only
 ```
 
