@@ -22,7 +22,7 @@ webhooks, editors or small servers. Run the daemon once; connect clients to it.
 - **Fail closed by default.** Shell, filesystem, network, secrets and model calls all require an explicit grant.
 - **Approve on the fly.** A privileged operator can allow a missing grant once or persist it.
 - **Stay portable.** Frontends reuse the same agent definitions instead of carrying their own copies.
-- **Swap providers.** Anthropic, OpenAI, Codex and local CLI backends built in — plus any OpenAI/Anthropic-compatible endpoint (OpenRouter, Groq, vLLM, Ollama, ...) declared in `config.toml`. The Lua API is identical across all of them.
+- **Multi-provider support.** Anthropic, OpenAI, Claude CLI, Codex, and any other OpenAI-compatible API provider.
 
 ## A quick taste
 
