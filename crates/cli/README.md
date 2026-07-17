@@ -1,6 +1,6 @@
 # cli
 
-This crate builds the `agentctl` binary — the console client. It speaks WebSocket to the daemon.
+This crate builds the `agentctl` binary — the command-line client for a running `agentd`.
 
 Data-plane subcommands on `/ws`: `health`, `tools`, `call <action>`,
 `runner ls|inspect|run`, `skills ls|inspect`, `services ls`, `trace [-f|-n N]`
