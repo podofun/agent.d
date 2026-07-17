@@ -26,8 +26,11 @@ pub enum RegistryError {
     Denied { layer: String, reason: String },
     #[error("confirmation required: {0}")]
     NeedsConfirmation(String),
-    #[error("invocation failed: {0}")]
+    #[error("{0}")]
     Invocation(String),
+    /// Script (Lua) failure: clean human message + cleaned traceback frames.
+    #[error("{message}")]
+    Script { message: String, trace: Vec<String> },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

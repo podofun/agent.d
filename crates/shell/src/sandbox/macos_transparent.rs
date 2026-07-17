@@ -76,9 +76,9 @@ impl Broker {
         match self.call(req)? {
             Resp::Ok => Ok(()),
             Resp::Err { kind, msg } => Err(broker_error(kind, msg)),
-            other => Err(ShellError::Sandbox(format!(
-                "unexpected broker reply: {other:?}"
-            ))),
+            _ => Err(ShellError::Sandbox(
+                "unexpected broker reply during call".to_string(),
+            )),
         }
     }
 }
@@ -150,7 +150,11 @@ pub async fn run_contained(
     match broker.call(&Req::Lease { v: 1 })? {
         Resp::Leased { .. } => {}
         Resp::Err { kind, msg } => return Err(broker_error(kind, msg)),
-        other => return Err(ShellError::Sandbox(format!("lease reply: {other:?}"))),
+        _ => {
+            return Err(ShellError::Sandbox(
+                "unexpected broker reply during lease".to_string(),
+            ));
+        }
     }
     broker.expect_ok(&Req::Provision { tcp_port, dns_port })?;
     let read: Vec<String> = policy
@@ -187,7 +191,11 @@ pub async fn run_contained(
         let pid = match reply {
             Resp::Spawned { pid } => pid,
             Resp::Err { kind, msg } => return Err(broker_error(kind, msg)),
-            other => return Err(ShellError::Sandbox(format!("spawn reply: {other:?}"))),
+            _ => {
+                return Err(ShellError::Sandbox(
+                    "unexpected broker reply during spawn".to_string(),
+                ));
+            }
         };
         // Receive the child's stdio fds over SCM_RIGHTS on the same socket.
         let fds = recv_fds(&s, if want_stdin { 3 } else { 2 })
@@ -252,7 +260,11 @@ pub async fn run_contained(
     let exit_code = match broker.call(&Req::Wait)? {
         Resp::Exit { code } => code,
         Resp::Err { kind, msg } => return Err(broker_error(kind, msg)),
-        other => return Err(ShellError::Sandbox(format!("wait reply: {other:?}"))),
+        _ => {
+            return Err(ShellError::Sandbox(
+                "unexpected broker reply during wait".to_string(),
+            ));
+        }
     };
 
     // Dropping the broker connection triggers broker-side teardown (flush

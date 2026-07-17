@@ -59,7 +59,7 @@ pub enum RunnerError {
     NotFound(String),
     #[error("runner `{name}` references unknown skill `{skill}`")]
     UnknownSkill { name: String, skill: String },
-    #[error("runner `{name}`: no provider resolved for model `{model:?}`")]
+    #[error("runner `{name}` could not resolve a provider for model `{}`", model.as_deref().unwrap_or("(none configured)"))]
     NoProvider { name: String, model: Option<String> },
     #[error("provider `{provider}`: {source}")]
     Provider {
@@ -237,6 +237,22 @@ mod tests {
     use super::*;
     use agentd_ai::MockProvider;
     use agentd_skills::SkillDef;
+
+    #[test]
+    fn no_provider_message_has_no_debug_leak() {
+        let e = RunnerError::NoProvider {
+            name: "gh_agent".into(),
+            model: Some("github/openai/gpt-4o-mini".into()),
+        };
+        let s = e.to_string();
+        assert!(!s.contains("Some("), "{s}");
+        assert!(s.contains("`github/openai/gpt-4o-mini`"));
+        let e = RunnerError::NoProvider {
+            name: "x".into(),
+            model: None,
+        };
+        assert!(e.to_string().contains("(none configured)"));
+    }
 
     fn skill(name: &str, system: &str, actions: &[&str]) -> SkillDef {
         SkillDef {

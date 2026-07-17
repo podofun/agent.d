@@ -314,6 +314,10 @@ struct WsResponse {
     error: Option<String>,
     #[serde(default)]
     code: Option<String>,
+    #[serde(default)]
+    tip: Option<String>,
+    #[serde(default)]
+    trace: Option<Vec<String>>,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -601,9 +605,60 @@ fn print_result(resp: &WsResponse, compact: bool) -> Result<()> {
     } else {
         let code = resp.code.as_deref().unwrap_or("error");
         let msg = resp.error.as_deref().unwrap_or("(no message)");
-        eprintln!("[{code}] {msg}");
+        if compact {
+            // Machine-friendly one-liner keeps the full structured error.
+            let v = serde_json::json!({
+                "code": code, "error": msg, "tip": resp.tip, "trace": resp.trace,
+            });
+            eprintln!("{}", serde_json::to_string(&v)?);
+        } else {
+            use std::io::IsTerminal;
+            let dim = std::io::stderr().is_terminal();
+            let trace = resp.trace.as_deref().unwrap_or(&[]);
+            eprintln!(
+                "{}",
+                render_error(code, msg, resp.tip.as_deref(), trace, dim)
+            );
+        }
         std::process::exit(1);
     }
+}
+
+/// Human error rendering:
+///
+/// ```text
+/// Error: Could not resolve a provider for model `m`  (no_provider)
+/// Tip: You can configure new providers in your `config.toml`
+///
+/// Stack trace:
+///   helpers.lua:313  in structured
+///   init.lua:53
+/// ```
+///
+/// The code suffix goes ANSI-dim when `dim` (stderr is a tty). Tip and trace
+/// sections only appear when present.
+fn render_error(code: &str, msg: &str, tip: Option<&str>, trace: &[String], dim: bool) -> String {
+    let mut msg = msg.to_string();
+    if let Some(first) = msg.get(..1) {
+        let up = first.to_uppercase();
+        msg.replace_range(..1, &up);
+    }
+    let code_suffix = if dim {
+        format!("  \x1b[2m({code})\x1b[0m")
+    } else {
+        format!("  ({code})")
+    };
+    let mut out = format!("Error: {msg}{code_suffix}");
+    if let Some(tip) = tip {
+        out.push_str(&format!("\nTip: {tip}"));
+    }
+    if !trace.is_empty() {
+        out.push_str("\n\nStack trace:");
+        for frame in trace {
+            out.push_str(&format!("\n  {frame}"));
+        }
+    }
+    out
 }
 
 // ---------- commands ----------
@@ -880,5 +935,29 @@ mod tests {
     fn global_short_url_parses() {
         let c = parse(&["-u", "http://x:1", "health"]);
         assert_eq!(c.url, "http://x:1");
+    }
+
+    #[test]
+    fn render_error_full() {
+        let s = render_error(
+            "no_provider",
+            "could not resolve a provider for model `m`",
+            Some("You can configure new providers in your `config.toml`"),
+            &[
+                "helpers.lua:313  in structured".to_string(),
+                "init.lua:53".to_string(),
+            ],
+            false,
+        );
+        assert_eq!(
+            s,
+            "Error: Could not resolve a provider for model `m`  (no_provider)\nTip: You can configure new providers in your `config.toml`\n\nStack trace:\n  helpers.lua:313  in structured\n  init.lua:53"
+        );
+    }
+
+    #[test]
+    fn render_error_minimal() {
+        let s = render_error("denied", "denied at layer 3", None, &[], false);
+        assert_eq!(s, "Error: Denied at layer 3  (denied)");
     }
 }
