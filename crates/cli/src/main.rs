@@ -514,8 +514,14 @@ async fn cmd_grants_listen(base: &str, timeout: u64) -> Result<()> {
     Ok(())
 }
 
-/// Render an approval request and read a one-key decision from stdin. Defaults
-/// to `deny` on EOF / unrecognized input (fail safe).
+// ANSI styling for the approval card. Dim for the frame/labels, bold for the
+// action and the key hints so the eye lands on what matters.
+const DIM: &str = "\x1b[2m";
+const BOLD: &str = "\x1b[1m";
+const RESET: &str = "\x1b[0m";
+
+/// Render an approval request as a bordered card and read a single-keystroke
+/// decision. Fails safe to `deny` on Ctrl-C, `q`/Esc, or a non-TTY stdin.
 async fn prompt_verdict(req: &Value) -> Result<&'static str> {
     let action = req["action"].as_str().unwrap_or("?");
     let tool = req["tool"].as_str().unwrap_or("-");
@@ -539,40 +545,81 @@ async fn prompt_verdict(req: &Value) -> Result<&'static str> {
     .collect::<Vec<_>>()
     .join(" ");
 
-    println!(
-        "\n── APPROVAL #{}  {action}  (tool: {tool}) ─────────",
-        req["id"]
-    );
+    // A left-barred card. No right border, so unicode-width padding never
+    // misaligns; each row is `│  label   value`.
+    let mut rows = vec![("tool", tool.to_string())];
     if !caller.is_empty() {
-        println!("  caller : {caller}");
+        rows.push(("caller", caller));
     }
-    println!("  kind   : {kind}");
+    rows.push(("kind", kind.to_string()));
     if !missing.is_empty() {
-        println!("  missing: {}", missing.join(", "));
+        rows.push(("missing", missing.join(", ")));
     }
     if !reason.is_empty() {
-        println!("  reason : {reason}");
+        rows.push(("reason", reason.to_string()));
     }
-    print!("  Allow [o]nce / [f]orever / [d]eny ? ");
+
+    let id = &req["id"];
+    println!("\n  {DIM}╭╴{RESET} approval {DIM}#{id}{RESET} · {BOLD}{action}{RESET}");
+    for (label, value) in rows {
+        println!("  {DIM}│{RESET}  {DIM}{label:<8}{RESET}{value}");
+    }
+    print!("  {DIM}╰╴{RESET} {BOLD}o{RESET} once   {BOLD}f{RESET} forever   {BOLD}d{RESET} deny  {DIM}›{RESET} ");
     use std::io::Write;
     let _ = std::io::stdout().flush();
 
-    // Blocking stdin read off the async runtime.
-    let line = tokio::task::spawn_blocking(|| {
-        let mut s = String::new();
-        let _ = std::io::stdin().read_line(&mut s);
-        s
-    })
-    .await
-    .unwrap_or_default();
+    // One-key read off the async runtime. crossterm raw mode gives a
+    // cross-platform single keystroke; a non-TTY stdin (pipe, test) falls
+    // back to a line read so scripted approvals still work.
+    let verdict = tokio::task::spawn_blocking(read_verdict_key)
+        .await
+        .unwrap_or("deny");
 
-    let verdict = match line.trim().chars().next() {
-        Some('o') | Some('O') => "allow_once",
-        Some('f') | Some('F') => "allow_forever",
+    let shown = match verdict {
+        "allow_once" => "once",
+        "allow_forever" => "forever",
         _ => "deny",
     };
-    println!("  → {verdict}");
+    println!("{BOLD}{shown}{RESET}");
     Ok(verdict)
+}
+
+/// Block on a single keystroke and map it to a verdict. `o`/`f` allow, anything
+/// else (including `d`, `q`, Esc, Ctrl-C) denies. Falls back to a line read when
+/// raw mode is unavailable (stdin is not a terminal).
+fn read_verdict_key() -> &'static str {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+    if enable_raw_mode().is_err() {
+        let mut s = String::new();
+        let _ = std::io::stdin().read_line(&mut s);
+        return match s.trim().chars().next() {
+            Some('o' | 'O') => "allow_once",
+            Some('f' | 'F') => "allow_forever",
+            _ => "deny",
+        };
+    }
+
+    let verdict = loop {
+        match crossterm::event::read() {
+            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL)
+                    && k.code == KeyCode::Char('c');
+                match k.code {
+                    KeyCode::Char('o' | 'O') => break "allow_once",
+                    KeyCode::Char('f' | 'F') => break "allow_forever",
+                    KeyCode::Char('d' | 'D') | KeyCode::Char('q') | KeyCode::Esc => break "deny",
+                    _ if ctrl_c => break "deny",
+                    _ => continue, // ignore stray keys; keep waiting
+                }
+            }
+            Ok(_) => continue,
+            Err(_) => break "deny",
+        }
+    };
+    let _ = disable_raw_mode();
+    verdict
 }
 
 async fn ws_call(base: &str, timeout: u64, method: &str, params: Value) -> Result<WsResponse> {

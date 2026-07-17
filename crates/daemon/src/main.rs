@@ -105,8 +105,7 @@ async fn run(cli: Cli) -> Result<()> {
     let packages_root = dirs::data_dir()
         .map(|d| d.join("agentd").join("packages"))
         .ok_or_else(|| anyhow!("could not locate a data directory (XDG) for packages"))?;
-    // Durable `ctx.memory` store — one redb file under the XDG data dir, shared
-    // across hot reloads so memory survives.
+    // setup `ctx.memory` store
     let memory_path = dirs::data_dir()
         .map(|d| d.join("agentd").join("memory.redb"))
         .ok_or_else(|| {
@@ -275,7 +274,7 @@ impl StartupSummary<'_> {
         let port = self.bind_addr.port();
 
         format!(
-            "\n  {brand} v{}  ready in {} ms\n\n  Local:   {accent}http://{base}:{port}/{reset}\n  WS:      {accent}ws://{base}:{port}/ws{reset}\n  Control: {accent}ws://{base}:{port}/control{reset}\n  Loaded:  {}, {}, {}, {}\n  Init:    {}\n  Logs:    warnings/errors (AGENTD_LOG=debug for detail)\n",
+            "\n  {brand} v{}  ready in {} ms\n\n  Local:   {accent}http://{base}:{port}/{reset}\n  WS:      {accent}ws://{base}:{port}/ws{reset}\n  Control: {accent}ws://{base}:{port}/control{reset}\n  Loaded:  {}, {}, {}, {}\n  Init:    {}\n",
             env!("CARGO_PKG_VERSION"),
             self.elapsed.as_millis(),
             count_label(self.actions, "action"),
@@ -330,7 +329,7 @@ fn resolve_ws_token(cfg: &Config) -> Result<Option<String>> {
     Ok(Some(token))
 }
 
-/// Decide the effective `/control` admin token. `--no-auth` → `None`. Otherwise
+/// Decide the effective `/control` admin token. `--no-auth` -> `None`. Otherwise
 /// use the configured admin token, or mint one and persist it to the
 /// admin-token file (0600) so a local `agentctl grants listen` picks it up.
 fn resolve_admin_token(cfg: &Config) -> Result<Option<String>> {
@@ -450,7 +449,6 @@ mod tests {
         assert!(rendered.contains("Local:   http://127.0.0.1:7777/"));
         assert!(rendered.contains("WS:      ws://127.0.0.1:7777/ws"));
         assert!(rendered.contains("Loaded:  2 actions, 1 runner, 0 services, 3 skills"));
-        assert!(rendered.contains("Logs:    warnings/errors"));
         assert_eq!(rendered.lines().count(), 9);
     }
 
