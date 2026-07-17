@@ -1,4 +1,4 @@
-# daemon (`daemon` bin)
+# daemon (`agentd` bin)
 
 Runtime host + config. The binary; root of the dependency graph. No business logic
 beyond config.

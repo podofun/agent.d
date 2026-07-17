@@ -8,14 +8,14 @@ Point the daemon at your project's `init.lua` and `grants.toml`:
 
 ::: code-group
 ```bash [release]
-daemon \
+agentd \
   --init ~/projects/git-reviewer/init.lua \
-  --grants-file ~/projects/git-reviewer/grants.toml
+  --grants ~/projects/git-reviewer/grants.toml
 ```
 ```bash [cargo]
 cargo run -p daemon -- \
   --init ~/projects/git-reviewer/init.lua \
-  --grants-file ~/projects/git-reviewer/grants.toml
+  --grants ~/projects/git-reviewer/grants.toml
 ```
 :::
 

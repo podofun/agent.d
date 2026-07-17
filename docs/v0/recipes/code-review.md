@@ -137,11 +137,11 @@ See [Providers: credentials](/v0/providers/credentials) for how to define and wi
 ## How to run
 
 ```bash [release]
-daemon --init my-reviewer/init.lua --grants-file my-reviewer/grants.toml
+agentd --init my-reviewer/init.lua --grants my-reviewer/grants.toml
 ```
 
 ```bash [cargo]
-cargo run -p daemon -- --init my-reviewer/init.lua --grants-file my-reviewer/grants.toml
+cargo run -p daemon -- --init my-reviewer/init.lua --grants my-reviewer/grants.toml
 ```
 
 Confirm the daemon loaded correctly:

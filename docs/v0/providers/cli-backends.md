@@ -57,7 +57,7 @@ granted = ["ai:openai-cli"]
 ```
 
 ::: warning Requires local CLI on PATH
-Both backends require the respective CLI binary (`claude` or `codex`) to be installed and on `PATH` where the `daemon` process runs. If the binary is not found, the call will fail at runtime.
+Both backends require the respective CLI binary (`claude` or `codex`) to be installed and on `PATH` where the `agentd` process runs. If the binary is not found, the call will fail at runtime.
 :::
 
 ## See also

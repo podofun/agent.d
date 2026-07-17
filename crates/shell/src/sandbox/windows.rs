@@ -498,7 +498,7 @@ mod imp {
             if !crate::netbroker::available() {
                 unsafe { FreeSid(sid) };
                 return Err(sb(
-                    "network sandbox not installed: run `daemon --install-sandbox`",
+                    "network sandbox not installed: run `agentd --install-sandbox`",
                 ));
             }
             Some(provision_net(sid, policy)?)

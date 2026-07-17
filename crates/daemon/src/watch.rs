@@ -1,4 +1,4 @@
-//! Dev hot-reload watcher (`daemon --watch`).
+//! Dev hot-reload watcher (`agentd --watch`).
 //!
 //! Watches the *used* file set — `init.lua`, its `import()` targets, loaded
 //! skill sources, and `grants.toml` — and rebuilds the runtime in place on

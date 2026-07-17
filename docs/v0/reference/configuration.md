@@ -1,6 +1,6 @@
 # Configuration Reference
 
-This page covers every knob you can turn to configure the `daemon` binary: command-line flags, environment variables, and `config.toml` fields.
+This page covers every knob you can turn to configure the `agentd` binary: command-line flags, environment variables, and `config.toml` fields.
 
 ## Resolution precedence
 
@@ -16,20 +16,25 @@ CLI flag  >  environment variable  >  config.toml  >  built-in default
 
 ## Flag and environment variable reference
 
-| Flag | Env | Default | Description |
-|---|---|---|---|
-| `--config <path>` | `AGENTD_CONFIG` | `$XDG_CONFIG_HOME/agentd/config.toml` | Path to `config.toml` |
-| `--init <path>` | `AGENTD_INIT` | `$XDG_CONFIG_HOME/agentd/init.lua` | Lua entry point |
-| `--grants-file <path>` | `AGENTD_GRANTS_FILE` | `$XDG_CONFIG_HOME/agentd/grants.toml` | grants.toml path |
-| `--addr <addr>` | `AGENTD_ADDR` | `127.0.0.1:7777` | HTTP + WebSocket bind address |
-| `--trace-file <path>` | `AGENTD_TRACE_FILE` | `$XDG_STATE_HOME/agentd/trace.jsonl` | JSONL trace sink |
-| `--log <filter>` | `AGENTD_LOG` | `warn` | tracing-subscriber filter string |
-| `--token <s>` | `AGENTD_TOKEN` | auto-minted | `/ws` bearer token |
-| `--admin-token <s>` | `AGENTD_ADMIN_TOKEN` | auto-minted | `/control` bearer token |
-| `--no-auth` | `AGENTD_NO_AUTH` | `false` | Disable `/ws` and `/control` auth |
-| `--approval-timeout-ms <n>` | `AGENTD_APPROVAL_TIMEOUT_MS` | `120000` | Approval wait budget (ms) |
-| `--watch` | `AGENTD_WATCH` | `false` | Dev hot reload |
-| `--install-sandbox` | — | — | Windows only: one-time setup for sandboxed networking, then exit. See [Shell sandbox](/v0/security/sandbox#windows-one-time-network-setup) |
+| Flag | Short | Env | Default | Description |
+|---|---|---|---|---|
+| `--config <path>` | `-c` | `AGENTD_CONFIG` | `$XDG_CONFIG_HOME/agentd/config.toml` | Path to `config.toml` |
+| `--init <path>` | `-i` | `AGENTD_INIT` | `$XDG_CONFIG_HOME/agentd/init.lua` | Lua entry point |
+| `--grants <path>` | `-g` | `AGENTD_GRANTS` | `$XDG_CONFIG_HOME/agentd/grants.toml` | grants.toml path |
+| `--addr <addr>` | `-a` | `AGENTD_ADDR` | `127.0.0.1:7777` | HTTP + WebSocket bind address |
+| `--trace <path>` | — | `AGENTD_TRACE` | `$XDG_STATE_HOME/agentd/trace.jsonl` | JSONL trace sink |
+| `--log <filter>` | `-l` | `AGENTD_LOG` | `warn` | tracing-subscriber filter string |
+| `--token <s>` | `-t` | `AGENTD_TOKEN` | auto-minted | `/ws` bearer token |
+| `--admin-token <s>` | — | `AGENTD_ADMIN_TOKEN` | auto-minted | `/control` bearer token |
+| `--no-auth` | — | `AGENTD_NO_AUTH` | `false` | Disable `/ws` and `/control` auth |
+| `--approval-timeout <n>` | — | `AGENTD_APPROVAL_TIMEOUT_MS` | `120000` | Approval wait budget (ms) |
+| `--watch` | `-w` | `AGENTD_WATCH` | `false` | Dev hot reload |
+| `--install-sandbox` | — | — | — | Windows only: one-time setup for sandboxed networking, then exit. See [Shell sandbox](/v0/security/sandbox#windows-one-time-network-setup) |
+| `--uninstall-sandbox` | — | — | — | Reverse `--install-sandbox` (macOS/Windows), then exit |
+
+::: info Deprecated aliases
+The pre-rename long flags `--grants-file`, `--trace-file`, and `--approval-timeout-ms` still work as hidden aliases of `--grants`, `--trace`, and `--approval-timeout` for one release, after which they will be removed. Likewise the env vars `AGENTD_GRANTS_FILE` and `AGENTD_TRACE_FILE` remain deprecated aliases of `AGENTD_GRANTS` and `AGENTD_TRACE`.
+:::
 
 ---
 
@@ -141,7 +146,7 @@ On any change it rebuilds the Lua runtime in place. In-flight requests drain on 
 Durable memory (`memory.redb`) and any connected approval operator on `/control` survive reloads.
 
 ::: tip Dev workflow
-Run `daemon --watch` during development so you never need to restart after editing Lua files or skills.
+Run `agentd --watch` during development so you never need to restart after editing Lua files or skills.
 :::
 
 ---
