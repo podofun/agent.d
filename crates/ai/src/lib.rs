@@ -14,7 +14,7 @@ pub mod types;
 
 pub use providers::{
     ClaudeApiProvider, ClaudeCliProvider, CodexAppServerProvider, CodexCliProvider, MockProvider,
-    OpenAiApiProvider,
+    OpenAiApiProvider, normalize_anthropic_endpoint, normalize_openai_endpoint,
 };
 pub use registry::ProviderRegistry;
 pub use types::{
