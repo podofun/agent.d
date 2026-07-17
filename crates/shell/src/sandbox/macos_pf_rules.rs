@@ -65,7 +65,7 @@ pub fn build_anchor_rules(uid: u32, tcp_port: u16, dns_port: u16) -> String {
 /// `com.apple/*` anchors AND adds the `agentd/*` hooks so per-uid sub-anchors
 /// are evaluated. Section order is mandatory (scrub → nat → rdr → dummynet →
 /// filter); a partial `pfctl -f` reload silently drops whichever sections it
-/// omits (verified the hard way — Task 3 spike). rdr hook precedes the filter
+/// omits. rdr hook precedes the filter
 /// hook because translation runs first.
 pub const MAIN_CONF: &str = "\
 scrub-anchor \"com.apple/*\"\n\
@@ -81,7 +81,7 @@ load anchor \"com.apple\" from \"/etc/pf.anchors/com.apple\"\n";
 /// actually reroute the child's packets onto loopback. Without IP forwarding,
 /// pf accepts the rule but the packet is dropped instead of looped — the child
 /// then reaches the network unfiltered on the deny path / not at all on allow.
-/// VERIFIED in Task 3: forwarding=0 → no interception; forwarding=1 → works.
+/// VERIFIED: forwarding=0 → no interception; forwarding=1 → works.
 pub const REQUIRED_SYSCTLS: &[(&str, &str)] = &[
     ("net.inet.ip.forwarding", "1"),
     ("net.inet6.ip6.forwarding", "1"),

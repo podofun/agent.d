@@ -105,8 +105,7 @@ async fn run(cli: Cli) -> Result<()> {
     let packages_root = dirs::data_dir()
         .map(|d| d.join("agentd").join("packages"))
         .ok_or_else(|| anyhow!("could not locate a data directory (XDG) for packages"))?;
-    // Durable `ctx.memory` store — one redb file under the XDG data dir, shared
-    // across hot reloads so memory survives.
+    // setup `ctx.memory` store
     let memory_path = dirs::data_dir()
         .map(|d| d.join("agentd").join("memory.redb"))
         .ok_or_else(|| {
@@ -263,27 +262,52 @@ struct StartupSummary<'a> {
 }
 
 impl StartupSummary<'_> {
+    /// A Vite-style banner: a bold brand line, green `➜` arrows on the
+    /// actionable endpoints, then dim info rows. Colors collapse to empty
+    /// strings when `color` is off, so the plain layout stays aligned.
     fn render(&self) -> String {
-        let brand = if self.color {
-            "\x1b[1;35mAGENTD\x1b[0m"
-        } else {
-            "AGENTD"
-        };
-        let accent = if self.color { "\x1b[36m" } else { "" };
-        let reset = if self.color { "\x1b[0m" } else { "" };
+        use std::fmt::Write;
+
+        // Each ANSI code becomes "" when color is disabled; alignment is spaces,
+        // never color, so both modes line up.
+        let paint = |code: &'static str| if self.color { code } else { "" };
+        let brand = paint("\x1b[1;35m"); // bold magenta
+        let arrow = paint("\x1b[32m"); // green
+        let url = paint("\x1b[36m"); // cyan
+        let dim = paint("\x1b[2m");
+        let reset = paint("\x1b[0m");
+
         let base = url_host(self.bind_addr);
         let port = self.bind_addr.port();
-
-        format!(
-            "\n  {brand} v{}  ready in {} ms\n\n  Local:   {accent}http://{base}:{port}/{reset}\n  WS:      {accent}ws://{base}:{port}/ws{reset}\n  Control: {accent}ws://{base}:{port}/control{reset}\n  Loaded:  {}, {}, {}, {}\n  Init:    {}\n  Logs:    warnings/errors (AGENTD_LOG=debug for detail)\n",
-            env!("CARGO_PKG_VERSION"),
-            self.elapsed.as_millis(),
+        let endpoints = [
+            ("Local", format!("http://{base}:{port}/")),
+            ("WS", format!("ws://{base}:{port}/ws")),
+            ("Control", format!("ws://{base}:{port}/control")),
+        ];
+        let loaded = format!(
+            "{}, {}, {}, {}",
             count_label(self.actions, "action"),
             count_label(self.runners, "runner"),
             count_label(self.services, "service"),
             count_label(self.skills, "skill"),
-            self.init_file.display(),
-        )
+        );
+
+        let mut out = String::new();
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "  {brand}AGENTD{reset} {dim}v{}{reset}   {arrow}ready in {} ms{reset}",
+            env!("CARGO_PKG_VERSION"),
+            self.elapsed.as_millis(),
+        );
+        let _ = writeln!(out);
+        for (label, target) in endpoints {
+            let _ = writeln!(out, "  {arrow}➜{reset}  {dim}{label:<8}{reset}{url}{target}{reset}");
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(out, "  {dim}Loaded{reset}    {loaded}");
+        let _ = writeln!(out, "  {dim}Init{reset}      {}", self.init_file.display());
+        out
     }
 }
 
@@ -330,7 +354,7 @@ fn resolve_ws_token(cfg: &Config) -> Result<Option<String>> {
     Ok(Some(token))
 }
 
-/// Decide the effective `/control` admin token. `--no-auth` → `None`. Otherwise
+/// Decide the effective `/control` admin token. `--no-auth` -> `None`. Otherwise
 /// use the configured admin token, or mint one and persist it to the
 /// admin-token file (0600) so a local `agentctl grants listen` picks it up.
 fn resolve_admin_token(cfg: &Config) -> Result<Option<String>> {
@@ -447,10 +471,10 @@ mod tests {
 
         assert!(rendered.contains("AGENTD v"));
         assert!(rendered.contains("ready in 159 ms"));
-        assert!(rendered.contains("Local:   http://127.0.0.1:7777/"));
-        assert!(rendered.contains("WS:      ws://127.0.0.1:7777/ws"));
-        assert!(rendered.contains("Loaded:  2 actions, 1 runner, 0 services, 3 skills"));
-        assert!(rendered.contains("Logs:    warnings/errors"));
+        assert!(rendered.contains("➜  Local   http://127.0.0.1:7777/"));
+        assert!(rendered.contains("➜  WS      ws://127.0.0.1:7777/ws"));
+        assert!(rendered.contains("➜  Control ws://127.0.0.1:7777/control"));
+        assert!(rendered.contains("Loaded    2 actions, 1 runner, 0 services, 3 skills"));
         assert_eq!(rendered.lines().count(), 9);
     }
 

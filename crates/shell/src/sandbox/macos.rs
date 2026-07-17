@@ -64,10 +64,12 @@ fn sbpl_fs(policy: &SandboxPolicy) -> String {
         "(version 1)\n(deny default)\n(allow process-exec* process-fork)\n(allow sysctl-read)\n\
          (allow file-read-metadata)\n(allow file-read* (literal \"/\"))\n",
     );
+    let user_baseline = crate::policy::user_read_baseline();
     for r in READ_BASELINE
         .iter()
         .chain(MACOS_READ_EXTRA.iter())
         .map(|s| s.to_string())
+        .chain(user_baseline.iter().flat_map(|p| path_forms(p)))
         .chain(policy.read_paths.iter().flat_map(|p| path_forms(p)))
     {
         sbpl.push_str(&format!("(allow file-read* (subpath \"{r}\"))\n"));
