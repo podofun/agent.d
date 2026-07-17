@@ -1,6 +1,6 @@
 # agentctl CLI Reference
 
-`agentctl` is the console client for agent.d. It speaks WebSocket to the daemon for every command except `health`, which uses plain HTTP.
+`agentctl` is the command-line client for a running `agentd`: call actions, run runners, inspect skills and services, answer approval requests, and manage packages and secrets.
 
 ## Global flags
 
@@ -11,7 +11,7 @@
 
 **Token resolution.** For `/ws` commands, `agentctl` reads the bearer token from `AGENTD_TOKEN` first, then falls back to `$XDG_STATE_HOME/agentd/token` (the file the daemon writes at startup). If neither exists the daemon must be running with `--no-auth`. For `grants listen` the same logic applies to `AGENTD_ADMIN_TOKEN` / `$XDG_STATE_HOME/agentd/admin-token` on the `/control` plane.
 
-**Transport.** Every command except `health` opens a WebSocket connection to `/ws`, sends one JSON envelope, and exits when the response arrives. `health` uses `GET /health` (HTTP).
+**Transport.** Commands talk to the daemon over WebSocket (`/ws`) — one request per invocation.
 
 ---
 

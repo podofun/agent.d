@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::Message;
 #[command(
     name = "agentctl",
     version,
-    about = "Console client for agentd. Speaks WebSocket to the daemon."
+    about = "Command-line client for a running agentd: call actions, run runners, manage grants, packages, and secrets."
 )]
 struct Cli {
     /// Daemon base URL.
