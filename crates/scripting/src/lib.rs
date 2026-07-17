@@ -2816,16 +2816,26 @@ fn build_completion_request(
 }
 
 fn do_ai(lua: &Lua, (req, provider_name): (CompletionRequest, String)) -> mlua::Result<Value> {
-    check_permission_inline(lua, &Permission::new(format!("ai:{provider_name}")))?;
+    // Existence before permission: a typo'd provider should say "not
+    // registered", not tell the user to grant `ai:<typo>`. Provider names
+    // aren't secret (`ctx.ai.providers()` lists them ungated).
     let provider = {
         let holder = lua
             .app_data_ref::<AiHolder>()
             .ok_or_else(|| mlua::Error::external("ai: holder missing"))?;
-        holder.providers.get(&provider_name).cloned()
+        match holder.providers.get(&provider_name).cloned() {
+            Some(p) => p,
+            None => {
+                let mut names: Vec<&str> = holder.providers.keys().map(String::as_str).collect();
+                names.sort_unstable();
+                return Err(mlua::Error::external(format!(
+                    "ai: provider `{provider_name}` not registered (available: {})",
+                    names.join(", ")
+                )));
+            }
+        }
     };
-    let provider = provider.ok_or_else(|| {
-        mlua::Error::external(format!("ai: provider `{provider_name}` not registered"))
-    })?;
+    check_permission_inline(lua, &Permission::new(format!("ai:{provider_name}")))?;
     if scheduler::is_in_coroutine(lua) {
         return scheduler::build_marker(
             lua,

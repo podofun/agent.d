@@ -139,11 +139,20 @@ pub fn build_runtime(cfg: &Config, shared: &Shared) -> Result<BuiltRuntime> {
 /// grants to the tool that owns the action (by name), so a typo or a name that
 /// doesn't match any `agentd.tool{...}` is a common, hard-to-debug footgun.
 fn warn_orphan_tool_grants(reg: &dyn Registry, grants: &GrantsFile) {
+    let actions = reg.list();
     for name in grants.tool.keys() {
-        if reg.tool_info(name).is_none() {
+        // The engine binds `[tool.<name>]` grants to the registered tool OR
+        // to any action's `<name>.` namespace (engine falls back to
+        // `action.tool`), so a bare-action namespace is a live grant, not an
+        // orphan.
+        let covers_namespace = actions.iter().any(|a| {
+            a.strip_prefix(name.as_str())
+                .is_some_and(|r| r.starts_with('.'))
+        });
+        if reg.tool_info(name).is_none() && !covers_namespace {
             tracing::warn!(
                 tool = %name,
-                "grants.toml declares `[tool.{name}]` but no tool named `{name}` is registered in Lua; this grant has no effect"
+                "grants.toml declares `[tool.{name}]` but no tool or action namespace `{name}` is registered in Lua; this grant has no effect"
             );
         }
     }
