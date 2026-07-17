@@ -23,23 +23,45 @@ pub const READ_BASELINE: &[&str] = &[
 /// Per-user read-only config a sandboxed child needs beyond the system dirs.
 /// CLI tools read their global config on every invocation (`git`, `gh`, `npm`,
 /// …), so without these a sandboxed tool warns `Permission denied` on its own
-/// config even when the repo itself is granted. We expose the XDG config root
-/// (`~/.config`) plus the common home dotfiles that live outside it, read-only.
+/// config even when the repo itself is granted. We expose the platform config
+/// roots read-only:
+///
+/// - Unix: the XDG config root (`~/.config`) plus common home dotfiles
+///   (`~/.gitconfig`, `~/.npmrc`) that live outside it.
+/// - Windows: the Roaming/Local app-data roots (`%APPDATA%`, `%LOCALAPPDATA%`)
+///   plus `%USERPROFILE%\.gitconfig`.
 ///
 /// Deliberately NOT included: credential stores (`~/.git-credentials`,
-/// `~/.netrc`, `~/.ssh`, `~/.cargo/credentials.toml`). `~/.config` can itself
-/// hold app secrets — exposing it read-only is the accepted tradeoff for making
-/// ordinary tools work without a grant per tool. HOME-derived (so it can't be a
-/// `const`); nonexistent entries are skipped at apply time.
+/// `~/.netrc`, `~/.ssh`, `~/.cargo/credentials.toml`). The config roots can
+/// themselves hold app secrets — exposing them read-only is the accepted
+/// tradeoff for making ordinary tools work without a grant per tool.
+/// Environment-derived (so it can't be a `const`); nonexistent entries are
+/// skipped at apply time.
 pub fn user_read_baseline() -> Vec<PathBuf> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return Vec::new();
-    };
-    vec![
-        home.join(".config"),
-        home.join(".gitconfig"),
-        home.join(".npmrc"),
-    ]
+    #[cfg(windows)]
+    {
+        let mut out = Vec::new();
+        if let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+            out.push(profile.join(".gitconfig"));
+        }
+        for var in ["APPDATA", "LOCALAPPDATA"] {
+            if let Some(dir) = std::env::var_os(var).map(PathBuf::from) {
+                out.push(dir);
+            }
+        }
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return Vec::new();
+        };
+        vec![
+            home.join(".config"),
+            home.join(".gitconfig"),
+            home.join(".npmrc"),
+        ]
+    }
 }
 
 /// Always-writable scratch devices. Only real device nodes — `/dev/stdout` and
@@ -166,6 +188,7 @@ mod tests {
         assert!(!p.allow_net);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn user_read_baseline_covers_config_root_and_dotfiles() {
         // SAFETY: single-threaded test; we set HOME to a known value and read it
@@ -177,5 +200,21 @@ mod tests {
         assert!(paths.contains(&PathBuf::from("/home/tester/.npmrc")));
         // Credential stores must never be in the read baseline.
         assert!(!paths.contains(&PathBuf::from("/home/tester/.git-credentials")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn user_read_baseline_covers_windows_config_roots() {
+        // SAFETY: single-threaded test; set the profile env vars and read them
+        // back through the helper.
+        unsafe {
+            std::env::set_var("USERPROFILE", r"C:\Users\tester");
+            std::env::set_var("APPDATA", r"C:\Users\tester\AppData\Roaming");
+            std::env::set_var("LOCALAPPDATA", r"C:\Users\tester\AppData\Local");
+        }
+        let paths = user_read_baseline();
+        assert!(paths.contains(&PathBuf::from(r"C:\Users\tester\.gitconfig")));
+        assert!(paths.contains(&PathBuf::from(r"C:\Users\tester\AppData\Roaming")));
+        assert!(paths.contains(&PathBuf::from(r"C:\Users\tester\AppData\Local")));
     }
 }
