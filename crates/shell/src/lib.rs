@@ -57,17 +57,19 @@ pub struct ExecResult {
 
 #[derive(Debug, Error)]
 pub enum ShellError {
-    #[error("spawn `{bin}`: {source}")]
+    #[error("could not start `{bin}` ({source})")]
     Spawn {
         bin: String,
         #[source]
         source: std::io::Error,
     },
-    #[error("io: {0}")]
+    #[error("I/O error ({0})")]
     Io(#[from] std::io::Error),
-    #[error("native shell sandbox unavailable; shell denied")]
+    #[error(
+        "the native shell sandbox is unavailable, so shell commands are denied — run `agentd --install-sandbox` to set it up"
+    )]
     SandboxUnavailable,
-    #[error("sandbox setup failed: {0}")]
+    #[error("the shell sandbox could not be set up ({0})")]
     Sandbox(String),
 }
 

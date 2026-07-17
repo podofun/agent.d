@@ -37,11 +37,12 @@ pub fn write_project(
     skills: &[String],
 ) -> Result<()> {
     let luals = project_dir.join(LUALS_DIR);
-    std::fs::create_dir_all(&luals).with_context(|| format!("create {}", luals.display()))?;
+    std::fs::create_dir_all(&luals)
+        .with_context(|| format!("could not create the `{}` directory", luals.display()))?;
 
     let agentd_path = luals.join("agentd.lua");
     std::fs::write(&agentd_path, STATIC_STUB)
-        .with_context(|| format!("write {}", agentd_path.display()))?;
+        .with_context(|| format!("could not write `{}`", agentd_path.display()))?;
 
     let imports = scan_import_modules(project_dir);
     let project_path = luals.join("project.lua");
@@ -49,7 +50,7 @@ pub fn write_project(
         &project_path,
         render_catalog(actions, runners, skills, &imports),
     )
-    .with_context(|| format!("write {}", project_path.display()))?;
+    .with_context(|| format!("could not write `{}`", project_path.display()))?;
 
     let luarc_path = project_dir.join(".luarc.json");
     let merged = merge_luarc(read_json(&luarc_path)?);
@@ -57,7 +58,7 @@ pub fn write_project(
         &luarc_path,
         format!("{}\n", serde_json::to_string_pretty(&merged)?),
     )
-    .with_context(|| format!("write {}", luarc_path.display()))?;
+    .with_context(|| format!("could not write `{}`", luarc_path.display()))?;
 
     Ok(())
 }
@@ -205,11 +206,12 @@ fn alias(name: &str, names: &[String]) -> String {
 fn read_json(path: &Path) -> Result<Value> {
     match std::fs::read_to_string(path) {
         Ok(s) if s.trim().is_empty() => Ok(json!({})),
-        Ok(s) => {
-            serde_json::from_str(&s).with_context(|| format!("parse existing {}", path.display()))
-        }
+        Ok(s) => serde_json::from_str(&s)
+            .with_context(|| format!("`{}` exists but is not valid JSON", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
-        Err(e) => Err(anyhow::Error::new(e).context(format!("read {}", path.display()))),
+        Err(e) => {
+            Err(anyhow::Error::new(e).context(format!("could not read `{}`", path.display())))
+        }
     }
 }
 

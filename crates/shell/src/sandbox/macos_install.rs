@@ -49,19 +49,19 @@ fn daemon_uid() -> Result<u32, SandboxError> {
     std::env::var("SUDO_UID")
         .ok()
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| err("cannot determine invoking uid (SUDO_UID unset); run via sudo"))
+        .ok_or_else(|| err("could not determine the invoking user because `SUDO_UID` is unset — run the installer via `sudo`"))
 }
 
 fn run(bin: &str, args: &[&str]) -> Result<(), SandboxError> {
     let out = Command::new(bin)
         .args(args)
         .output()
-        .map_err(|e| err(format!("{bin}: {e}")))?;
+        .map_err(|e| err(format!("could not run `{bin}` ({e})")))?;
     if out.status.success() {
         Ok(())
     } else {
         Err(err(format!(
-            "{bin} {}: {}",
+            "`{bin} {}` failed ({})",
             args.join(" "),
             String::from_utf8_lossy(&out.stderr).trim()
         )))
@@ -152,28 +152,37 @@ pub fn install() -> Result<(), SandboxError> {
     let users = ensure_users(gid)?;
 
     // Config dir + broker.conf.
-    std::fs::create_dir_all(CONF_DIR).map_err(|e| err(format!("mkdir {CONF_DIR}: {e}")))?;
+    std::fs::create_dir_all(CONF_DIR)
+        .map_err(|e| err(format!("could not create the directory `{CONF_DIR}` ({e})")))?;
     let cfg = BrokerConfig {
         daemon_uid: duid,
         users: users.clone(),
     };
-    std::fs::write(CONF_PATH, cfg.render()).map_err(|e| err(format!("write {CONF_PATH}: {e}")))?;
+    std::fs::write(CONF_PATH, cfg.render())
+        .map_err(|e| err(format!("could not write `{CONF_PATH}` ({e})")))?;
 
     // Broker binary: copy from beside the running executable.
     let src = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("agentd-pf-broker")))
         .filter(|p| p.exists())
-        .ok_or_else(|| err("agentd-pf-broker not found beside the agentd binary"))?;
-    std::fs::create_dir_all(HELPER_DIR).map_err(|e| err(format!("mkdir {HELPER_DIR}: {e}")))?;
-    std::fs::copy(&src, HELPER_PATH).map_err(|e| err(format!("copy broker: {e}")))?;
+        .ok_or_else(|| {
+            err("the `agentd-pf-broker` helper was not found beside the `agentd` binary")
+        })?;
+    std::fs::create_dir_all(HELPER_DIR).map_err(|e| {
+        err(format!(
+            "could not create the directory `{HELPER_DIR}` ({e})"
+        ))
+    })?;
+    std::fs::copy(&src, HELPER_PATH)
+        .map_err(|e| err(format!("could not copy the broker helper into place ({e})")))?;
     run("/bin/chmod", &["755", HELPER_PATH])?;
     run("/usr/sbin/chown", &["root:wheel", HELPER_PATH])?;
 
     // pf: write our main conf and load it (preserves com.apple anchors + adds
     // agentd hooks), then enable pf.
     std::fs::write(PF_CONF_PATH, MAIN_CONF)
-        .map_err(|e| err(format!("write {PF_CONF_PATH}: {e}")))?;
+        .map_err(|e| err(format!("could not write `{PF_CONF_PATH}` ({e})")))?;
     run("/sbin/pfctl", &["-f", PF_CONF_PATH])?;
     let _ = Command::new("/sbin/pfctl").arg("-e").output(); // -e errors if already enabled
 
@@ -183,10 +192,12 @@ pub fn install() -> Result<(), SandboxError> {
         run("/usr/sbin/sysctl", &["-w", &format!("{k}={v}")])?;
         persisted.push_str(&format!("{k}={v}\n"));
     }
-    std::fs::write(SYSCTL_CONF, persisted).map_err(|e| err(format!("write {SYSCTL_CONF}: {e}")))?;
+    std::fs::write(SYSCTL_CONF, persisted)
+        .map_err(|e| err(format!("could not write `{SYSCTL_CONF}` ({e})")))?;
 
     // launchd job.
-    std::fs::write(PLIST_PATH, plist(duid)).map_err(|e| err(format!("write {PLIST_PATH}: {e}")))?;
+    std::fs::write(PLIST_PATH, plist(duid))
+        .map_err(|e| err(format!("could not write `{PLIST_PATH}` ({e})")))?;
     run("/usr/sbin/chown", &["root:wheel", PLIST_PATH])?;
     run("/bin/chmod", &["644", PLIST_PATH])?;
     // bootout first (ignore failure) so re-install reloads cleanly.

@@ -102,7 +102,9 @@ pub fn deny_ip_sockets() -> Result<(), SandboxError> {
     // load the fixed program. `&fprog` outlives the call. No allocation.
     unsafe {
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-            return Err(SandboxError::Apply("prctl(NO_NEW_PRIVS) failed".into()));
+            return Err(SandboxError::Apply(
+                "could not enable NO_NEW_PRIVS via prctl".into(),
+            ));
         }
         if libc::prctl(
             libc::PR_SET_SECCOMP,
@@ -112,7 +114,9 @@ pub fn deny_ip_sockets() -> Result<(), SandboxError> {
             0,
         ) != 0
         {
-            return Err(SandboxError::Apply("prctl(SET_SECCOMP) failed".into()));
+            return Err(SandboxError::Apply(
+                "could not install the seccomp filter via prctl".into(),
+            ));
         }
     }
     Ok(())

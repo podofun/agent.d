@@ -123,9 +123,18 @@ pub fn load_grants_file(path: &Path) -> Result<GrantsFile, String> {
     if !path.exists() {
         return Ok(GrantsFile::default());
     }
-    let body =
-        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    toml::from_str(&body).map_err(|e| format!("parse {}: {e}", path.display()))
+    let body = std::fs::read_to_string(path).map_err(|e| {
+        format!(
+            "could not read the grants file `{}` ({e}) — check that the file exists and is readable",
+            path.display()
+        )
+    })?;
+    toml::from_str(&body).map_err(|e| {
+        format!(
+            "the grants file `{}` is not valid TOML ({e}) — fix the syntax and try again",
+            path.display()
+        )
+    })
 }
 
 #[cfg(test)]

@@ -16,9 +16,9 @@ pub const DEFAULT_SERVICE: &str = "agentd";
 
 #[derive(Debug, Error)]
 pub enum SecretError {
-    #[error("secret `{0}` not found")]
+    #[error("no secret named `{0}` is stored in the keyring")]
     NotFound(String),
-    #[error("backend error: {0}")]
+    #[error("the keyring backend reported an error ({0})")]
     Backend(String),
 }
 

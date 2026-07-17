@@ -26,9 +26,10 @@ impl PackageIndex {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let body = std::fs::read_to_string(path).map_err(|e| format!("read index: {e}"))?;
-        let mut idx: PackageIndex =
-            toml::from_str(&body).map_err(|e| format!("parse index: {e}"))?;
+        let body = std::fs::read_to_string(path)
+            .map_err(|e| format!("could not read the package index ({e})"))?;
+        let mut idx: PackageIndex = toml::from_str(&body)
+            .map_err(|e| format!("could not parse the package index ({e})"))?;
         // `name` is skipped during (de)serialize; backfill from the map key.
         for (k, v) in idx.entries.iter_mut() {
             v.name = k.clone();
@@ -38,10 +39,12 @@ impl PackageIndex {
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("could not create the package index directory ({e})"))?;
         }
-        let body = toml::to_string_pretty(self).map_err(|e| format!("encode index: {e}"))?;
-        std::fs::write(path, body).map_err(|e| format!("write index: {e}"))
+        let body = toml::to_string_pretty(self)
+            .map_err(|e| format!("could not encode the package index ({e})"))?;
+        std::fs::write(path, body).map_err(|e| format!("could not write the package index ({e})"))
     }
 
     pub fn get(&self, name: &str) -> Option<&IndexEntry> {

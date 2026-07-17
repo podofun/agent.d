@@ -234,11 +234,14 @@ pub struct CompletionResponse {
 
 #[derive(Debug, Error)]
 pub enum ProviderError {
-    #[error("provider misconfigured: {0}")]
+    // Messages must be self-explanatory: they render under a
+    // `provider `<name>`: ` wrap, so no generic prefixes here (the final
+    // render stays at two colons or fewer).
+    #[error("{0}")]
     Config(String),
-    #[error("provider transport: {0}")]
+    #[error("transport error: {0}")]
     Transport(String),
-    #[error("provider returned error: {0}")]
+    #[error("upstream error: {0}")]
     Upstream(String),
     #[error("empty response")]
     EmptyResponse,

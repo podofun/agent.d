@@ -19,15 +19,15 @@ pub fn host_of(url: &str) -> Result<String, WsError> {
 
 #[derive(Debug, Error)]
 pub enum WsError {
-    #[error("invalid url `{0}`: {1}")]
+    #[error("the URL `{0}` is not valid ({1})")]
     InvalidUrl(String, String),
-    #[error("handshake: {0}")]
+    #[error("the WebSocket handshake failed ({0})")]
     Handshake(String),
-    #[error("io: {0}")]
+    #[error("I/O error on the WebSocket connection ({0})")]
     Io(String),
-    #[error("closed")]
+    #[error("the WebSocket connection is closed")]
     Closed,
-    #[error("timeout after {}ms", .0.as_millis())]
+    #[error("the WebSocket operation timed out after {}ms", .0.as_millis())]
     Timeout(Duration),
 }
 

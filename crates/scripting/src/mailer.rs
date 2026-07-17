@@ -26,11 +26,15 @@ impl mlua::UserData for MailerHandle {}
 fn mailer_create_internal(lua: &mlua::Lua, opts: mlua::Table) -> mlua::Result<mlua::AnyUserData> {
     let host: String = opts.get("host")?;
     if host.is_empty() {
-        return Err(mlua::Error::external("mailer.create: `host` is required"));
+        return Err(mlua::Error::external(
+            "the `mailer.create` table is missing its `host` field — name the SMTP server to connect to",
+        ));
     }
     let from: String = opts.get("from")?;
     if from.is_empty() {
-        return Err(mlua::Error::external("mailer.create: `from` is required"));
+        return Err(mlua::Error::external(
+            "the `mailer.create` table is missing its `from` field — set the sender address",
+        ));
     }
     let port: Option<u16> = opts.get("port")?;
     let user: Option<String> = opts.get("user")?;
@@ -41,7 +45,7 @@ fn mailer_create_internal(lua: &mlua::Lua, opts: mlua::Table) -> mlua::Result<ml
     // a config bug (the transport layer silently drops single-sided creds).
     if user.is_some() != pass.is_some() {
         return Err(mlua::Error::external(
-            "mailer.create: `user` and `pass` must be set together",
+            "`mailer.create` needs both `user` and `pass` for authentication — set both or neither",
         ));
     }
 
@@ -53,7 +57,7 @@ fn mailer_create_internal(lua: &mlua::Lua, opts: mlua::Table) -> mlua::Result<ml
             "plaintext" => Security::Plaintext,
             other => {
                 return Err(mlua::Error::external(format!(
-                    "mailer.create: unknown security `{other}` (expected starttls|tls|plaintext)"
+                    "`{other}` is not a valid mailer security mode — use `starttls`, `tls`, or `plaintext`"
                 )));
             }
         },
@@ -98,7 +102,7 @@ fn mailer_send_internal(
     let reply_to: Option<String> = mail_table.get("reply_to")?;
     let subject: String = mail_table
         .get::<Option<String>>("subject")?
-        .ok_or_else(|| mlua::Error::external("mailer:send: `subject` is required"))?;
+        .ok_or_else(|| mlua::Error::external("the `mailer.send` table is missing its `subject` field — every message needs a subject"))?;
     let text: Option<String> = mail_table.get("text")?;
     let html: Option<String> = mail_table.get("html")?;
 
@@ -165,7 +169,7 @@ pub fn build_mailer_table(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
               if type(r) == "userdata" then
                 r = coroutine.yield(r)
                 if type(r) == "table" and r.ok == false then
-                  error(r.error or "mailer error", 0)
+                  error(r.error or "sending the email failed", 0)
                 end
               end
               return r

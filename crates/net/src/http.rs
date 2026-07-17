@@ -55,15 +55,15 @@ pub struct Response {
 
 #[derive(Debug, Error)]
 pub enum HttpError {
-    #[error("invalid url `{0}`: {1}")]
+    #[error("the URL `{0}` is not valid ({1})")]
     InvalidUrl(String, String),
-    #[error("unsupported method `{0}`")]
+    #[error("the HTTP method `{0}` is not supported")]
     BadMethod(String),
-    #[error("request build: {0}")]
+    #[error("could not build the HTTP request ({0})")]
     Build(String),
-    #[error("transport: {0}")]
+    #[error("the HTTP request could not reach the server ({0})")]
     Transport(String),
-    #[error("decode body: {0}")]
+    #[error("could not decode the response body ({0})")]
     Decode(String),
 }
 

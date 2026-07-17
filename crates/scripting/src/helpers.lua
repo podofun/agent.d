@@ -40,7 +40,7 @@ do
       for w in s:gmatch("%S+") do out[#out + 1] = w end
       return out
     end
-    if sep == "" then error("string.split: separator must be non-empty", 2) end
+    if sep == "" then error("the separator passed to `string.split` is empty — pass a non-empty separator or nil to split on whitespace", 2) end
     local pos = 1
     while true do
       local i, j = s:find(sep, pos, true)
@@ -338,7 +338,7 @@ do
         " No prose, no markdown fences."
     end
 
-    error(runner .. ": structured output failed after " ..
-      tostring(retries + 1) .. " attempts: " .. tostring(last_err), 0)
+    error("runner `" .. runner .. "` did not produce valid structured output after " ..
+      tostring(retries + 1) .. " attempts (last problem: " .. tostring(last_err) .. ")", 0)
   end
 end

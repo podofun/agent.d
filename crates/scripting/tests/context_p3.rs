@@ -191,7 +191,7 @@ async fn auth_delete_removes_value() {
         .unwrap();
     assert_eq!(res.value.get("ok").and_then(|v| v.as_bool()), Some(false));
     let err = res.value.get("err").and_then(|v| v.as_str()).unwrap();
-    assert!(err.contains("not found"), "got: {err}");
+    assert!(err.contains("no secret named"), "got: {err}");
 }
 
 // ---------- ai ----------

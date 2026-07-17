@@ -13,9 +13,11 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum MemoryError {
-    #[error("memory backend: {0}")]
+    // Rendered under caller-supplied context ("could not open the memory
+    // database ..."), so no extra prefix here.
+    #[error("{0}")]
     Backend(String),
-    #[error("invalid key: {0}")]
+    #[error("invalid memory key — {0}")]
     InvalidKey(String),
 }
 

@@ -266,7 +266,7 @@ async fn structured_raises_after_exhausting_retries() {
         v["err"]
             .as_str()
             .unwrap()
-            .contains("structured output failed"),
+            .contains("did not produce valid structured output"),
         "got: {:?}",
         v["err"]
     );

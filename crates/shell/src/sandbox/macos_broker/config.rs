@@ -18,11 +18,11 @@ pub struct BrokerConfig {
 /// Parse error with line context.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ConfigError {
-    #[error("missing required key `{0}`")]
+    #[error("the broker config is missing the required key `{0}`")]
     Missing(&'static str),
-    #[error("bad value for `{key}`: {val}")]
+    #[error("the broker config has an invalid value `{val}` for key `{key}`")]
     BadValue { key: String, val: String },
-    #[error("no sandbox users configured")]
+    #[error("no sandbox users are configured — run `agentd --install-sandbox` to create them")]
     NoUsers,
 }
 

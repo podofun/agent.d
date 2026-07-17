@@ -57,9 +57,12 @@ impl std::fmt::Display for SandboxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SandboxError::Unsupported => {
-                write!(f, "native shell sandbox unavailable on this platform")
+                write!(
+                    f,
+                    "the native shell sandbox is not available on this platform"
+                )
             }
-            SandboxError::Apply(m) => write!(f, "sandbox apply failed: {m}"),
+            SandboxError::Apply(m) => write!(f, "could not apply the shell sandbox ({m})"),
         }
     }
 }

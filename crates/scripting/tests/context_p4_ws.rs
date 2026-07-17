@@ -168,7 +168,7 @@ async fn ws_recv_times_out() {
         .unwrap();
     assert_eq!(res.value.get("ok").and_then(|v| v.as_bool()), Some(false));
     let err = res.value.get("err").and_then(|v| v.as_str()).unwrap();
-    assert!(err.contains("timeout"), "got: {err}");
+    assert!(err.contains("timed out"), "got: {err}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

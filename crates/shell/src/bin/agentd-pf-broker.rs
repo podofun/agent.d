@@ -42,8 +42,9 @@ mod macos {
 
     pub fn run() {
         let text = std::fs::read_to_string(CONF_PATH)
-            .unwrap_or_else(|e| fatal(&format!("read {CONF_PATH}: {e}")));
-        let cfg = BrokerConfig::parse(&text).unwrap_or_else(|e| fatal(&format!("config: {e}")));
+            .unwrap_or_else(|e| fatal(&format!("could not read `{CONF_PATH}` ({e})")));
+        let cfg = BrokerConfig::parse(&text)
+            .unwrap_or_else(|e| fatal(&format!("the broker config is invalid ({e})")));
         let pool = std::sync::Arc::new(UidPool::new(cfg.users.clone()));
 
         // Startup recovery: a prior crash may have left anchors behind. Flush
@@ -56,8 +57,11 @@ mod macos {
         if let Some(dir) = std::path::Path::new(SOCKET_PATH).parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let listener = UnixListener::bind(SOCKET_PATH)
-            .unwrap_or_else(|e| fatal(&format!("bind {SOCKET_PATH}: {e}")));
+        let listener = UnixListener::bind(SOCKET_PATH).unwrap_or_else(|e| {
+            fatal(&format!(
+                "could not bind the broker socket `{SOCKET_PATH}` ({e})"
+            ))
+        });
         // Restrict the socket to the daemon uid at the filesystem layer (0600 +
         // chown), so only that uid can even connect; getpeereid then re-checks
         // per connection. Defense in depth, not either/or.
@@ -97,7 +101,14 @@ mod macos {
                     &mut w,
                     &Resp::Err {
                         kind: ErrKind::Denied,
-                        msg: format!("peer uid {other:?} != daemon uid {daemon_uid}"),
+                        msg: match other {
+                            Some(uid) => format!(
+                                "connection refused — peer uid {uid} does not match the daemon uid {daemon_uid}"
+                            ),
+                            None => format!(
+                                "connection refused — the peer uid could not be determined (daemon uid is {daemon_uid})"
+                            ),
+                        },
                     },
                 );
                 return;
@@ -112,7 +123,7 @@ mod macos {
                     &mut w,
                     &Resp::Err {
                         kind: ErrKind::PoolExhausted,
-                        msg: "all sandbox uids in use".into(),
+                        msg: "all sandbox uids are in use — retry shortly".into(),
                     },
                 );
                 return;
@@ -335,21 +346,21 @@ mod macos {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| format!("pfctl spawn: {e}"))?;
+            .map_err(|e| format!("could not start `pfctl` ({e})"))?;
         child
             .stdin
             .take()
             .unwrap()
             .write_all(rules.as_bytes())
-            .map_err(|e| format!("pfctl stdin: {e}"))?;
+            .map_err(|e| format!("could not write to the `pfctl` stdin ({e})"))?;
         let out = child
             .wait_with_output()
-            .map_err(|e| format!("pfctl wait: {e}"))?;
+            .map_err(|e| format!("could not wait for `pfctl` to finish ({e})"))?;
         if out.status.success() {
             Ok(())
         } else {
             Err(format!(
-                "pfctl: {}",
+                "the `pfctl` command failed ({})",
                 String::from_utf8_lossy(&out.stderr).trim()
             ))
         }
@@ -369,12 +380,12 @@ mod macos {
             .args(["+a", &ace, path])
             .stderr(std::process::Stdio::piped())
             .output()
-            .map_err(|e| format!("chmod spawn: {e}"))?;
+            .map_err(|e| format!("could not start `chmod` ({e})"))?;
         if st.status.success() {
             Ok(())
         } else {
             Err(format!(
-                "chmod +a {path}: {}",
+                "the command `chmod +a {path}` failed ({})",
                 String::from_utf8_lossy(&st.stderr).trim()
             ))
         }
@@ -413,12 +424,14 @@ mod macos {
         let mut cargs: Vec<CString> = vec![
             sandbox_exec.clone(),
             CString::new("-p").unwrap(),
-            CString::new(sbpl).map_err(|_| "sbpl has NUL")?,
+            CString::new(sbpl).map_err(|_| "the sandbox profile contains a NUL byte")?,
             CString::new("--").unwrap(),
-            CString::new(bin).map_err(|_| "bin has NUL")?,
+            CString::new(bin).map_err(|_| "the executable path contains a NUL byte")?,
         ];
         for a in args {
-            cargs.push(CString::new(a.as_str()).map_err(|_| "arg has NUL")?);
+            cargs.push(
+                CString::new(a.as_str()).map_err(|_| "a command argument contains a NUL byte")?,
+            );
         }
         let mut argv: Vec<*const libc::c_char> = cargs.iter().map(|c| c.as_ptr()).collect();
         argv.push(std::ptr::null());
@@ -501,7 +514,7 @@ mod macos {
         // hand it without taking ownership of the live connection socket.
         let borrowed = unsafe { BorrowedFd::borrow_raw(conn_fd) };
         sendmsg::<()>(borrowed.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
-            .map_err(|e| format!("sendmsg fds: {e}"))?;
+            .map_err(|e| format!("could not send the stdio file descriptors ({e})"))?;
         Ok(())
     }
 
@@ -511,7 +524,10 @@ mod macos {
         // fd anyway. Closed unconditionally before returning.
         let fd = unsafe { libc::open(b"/dev/pf\0".as_ptr() as *const _, libc::O_RDWR) };
         if fd < 0 {
-            return Err(format!("open /dev/pf: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "could not open `/dev/pf` ({})",
+                std::io::Error::last_os_error()
+            ));
         }
         let mut nl = PfiocNatlook::for_tcp(src, dst);
         // SAFETY: DIOCNATLOOK ioctl on /dev/pf. `nl` is a #[repr(C)] struct whose
@@ -522,10 +538,13 @@ mod macos {
         // SAFETY: close(2) on the fd we just opened and still own.
         unsafe { libc::close(fd) };
         if rc != 0 {
-            return Err(format!("DIOCNATLOOK: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "the pf NAT lookup ioctl failed ({})",
+                std::io::Error::last_os_error()
+            ));
         }
         nl.original_dst()
-            .ok_or_else(|| "natlook: no original dst".into())
+            .ok_or_else(|| "the pf NAT lookup returned no original destination".into())
     }
 
     fn peer_uid(stream: &UnixStream) -> Option<u32> {
