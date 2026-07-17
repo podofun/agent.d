@@ -1,377 +1,271 @@
 # agentctl CLI Reference
 
-`agentctl` is the command-line client for a running `agentd`: call actions, run runners, inspect skills and services, answer approval requests, and manage packages and secrets.
+`agentctl` is the command-line tool for managing and invoking a running agent.d instance. It lets you do everyday things — call an action, run a runner, approve a permission request, store an API key, install a package — directly from your terminal, without writing any code or talking to the server API yourself.
+
+If you have not set up a project yet, start with the [quick start guide](/v0/guide/quick-start). Everything on this page assumes a daemon is already running, except where noted.
 
 ## Global flags
 
+These flags work with every command:
+
 | Flag | Env | Default | Description |
 |---|---|---|---|
-| `--url <URL>` (`-u`) | `AGENTD_URL` | `http://127.0.0.1:7777` | Daemon base URL |
+| `-u`, `--url <URL>` | `AGENTD_URL` | `http://127.0.0.1:7777` | Address of the daemon to talk to |
 | `--timeout <ms>` | — | `30000` | Connect timeout in milliseconds |
 
-**Token resolution.** For `/ws` commands, `agentctl` reads the bearer token from `AGENTD_TOKEN` first, then falls back to `$XDG_STATE_HOME/agentd/token` (the file the daemon writes at startup). If neither exists the daemon must be running with `--no-auth`. For `grants listen` the same logic applies to `AGENTD_ADMIN_TOKEN` / `$XDG_STATE_HOME/agentd/admin-token` on the `/control` plane.
+You do not need to configure authentication. When the daemon starts, it writes its access token to a well-known file, and `agentctl` picks it up from there automatically. If you need to override it — for example, to reach a daemon on another machine — set the `AGENTD_TOKEN` environment variable.
 
-**Transport.** Commands talk to the daemon over WebSocket (`/ws`) — one request per invocation.
+Command nouns are singular, and the plural or short forms work as aliases: `runner`/`runners`, `skill`/`skills`, `service`/`services`/`svc`, `package`/`packages`/`pkg`, `secret`/`secrets`. Writing `agentctl pkg ls` is the same as writing `agentctl package ls` — use whichever comes naturally.
 
----
+## Working with actions
 
-## Commands
-
-**Noun aliases.** Command nouns are singular, with plural (and short) forms accepted as aliases:
-
-| Canonical | Aliases |
-|---|---|
-| `runner` | `runners` |
-| `skill` | `skills` |
-| `service` | `services`, `svc` |
-| `package` | `packages`, `pkg` |
-| `secret` | `secrets` |
-
-`agentctl pkg ls` and `agentctl runners ls` are equivalent to `agentctl package ls` and `agentctl runner ls`.
-
-### `agentctl health`
-
-Check daemon liveness via `GET /health`. Returns `ok` when the daemon is up.
-
-```bash
-agentctl health
-```
-
----
+Actions are the individual capabilities your project exposes — things like `git.status` or `http.fetch`. See [Tools and actions](/v0/concepts/tools-and-actions) for the concept.
 
 ### `agentctl tools`
 
-List all registered action names.
+Lists the names of every action registered in your project, one per line. This is the quickest way to see what your daemon can do.
 
 ```bash
 agentctl tools
 ```
 
-Each name is printed one per line in `tool.action` form.
-
----
-
 ### `agentctl call`
 
-Invoke an action and print the result.
+Invokes an action by name and prints its result. This is the command you will probably use most while building a project.
 
 ```bash
 agentctl call <action> [-j '<json>'] [-d key=value]... [-r] [--compact]
 ```
 
-| Flag | Description |
-|---|---|
-| `--json '<json>'` (`-j`) | Pass arguments as a raw JSON string |
-| `-d key=value` (`--data`) | Pass a single argument; value is parsed as JSON, falls back to string |
-| `--result-only` (`-r`) | Print only the `result` field, not the full envelope |
-| `--compact` | Print JSON on one line instead of pretty-printed |
-
-::: warning Mutually exclusive
-`--json` and `-d` cannot be used together.
-:::
-
-**Output shape** (without `--result-only`):
-
-```json
-{
-  "result": { ... },
-  "duration_ms": 42
-}
-```
-
-**Examples:**
+If the action takes arguments, pass them either one at a time with `-d key=value`, or all at once as a JSON string with `-j`. The two styles cannot be mixed in one call.
 
 ```bash
-# No arguments
-agentctl call git.status
+agentctl call git.status                        # no arguments
+agentctl call git.diff -d path=src/             # one key=value argument
+agentctl call git.diff -j '{"path":"src/"}'     # arguments as JSON
+```
 
-# Key=value arguments
-agentctl call git.diff -d path=src/
+By default the output includes the result and how long the call took:
 
-# JSON argument blob
-agentctl call git.diff --json '{"path":"src/"}'
+```json
+{ "result": { ... }, "duration_ms": 42 }
+```
 
-# Only print the action's return value
-agentctl call git.status -r
+Add `-r` (`--result-only`) to print just the action's return value, and `--compact` to put everything on one line — handy when piping into other tools:
 
-# Machine-readable one-liner
+```bash
 agentctl call git.status -r --compact
 ```
 
----
+## Working with runners
+
+Runners are your configured AI agents — a model plus a system prompt plus a set of skills. See [Runners](/v0/concepts/runners) for the concept.
 
 ### `agentctl runner ls`
 
-List registered runners with their configured model.
+Lists your runners and the model each one uses.
 
 ```bash
 agentctl runner ls
 ```
 
-Output is tab-separated `name<TAB>model` lines.
-
----
-
 ### `agentctl runner inspect <name>`
 
-Print the full composition of a runner (merged system prompt, resolved skills, allowed actions).
+Shows everything that makes up a runner: its merged system prompt, the skills it resolved, and the actions it is allowed to call. Useful when a runner is not behaving the way you expect and you want to see exactly what it was given.
 
 ```bash
 agentctl runner inspect backend_reviewer
 ```
 
----
-
 ### `agentctl runner run <name> "<prompt>"`
 
-Run a runner with a text prompt and print the result.
+Sends a prompt to a runner and prints the reply. This is the fastest way to try a runner out without wiring up an interface.
 
 ```bash
-agentctl runner run <name> "<prompt>" [--text-only]
+agentctl runner run backend_reviewer "Review the latest diff"
 ```
 
-| Flag | Description |
-|---|---|
-| `--text-only` | Print only the `text` field of the response |
-
-**Output shape** (without `--text-only`):
-
-```json
-{
-  "text": "...",
-  "provider": "anthropic",
-  "model": "claude-opus-4-7",
-  "stop_reason": "end_turn"
-}
-```
-
-**Example:**
+The full response includes the reply text along with which provider and model produced it. If you only want the text — for example, in a shell script — add `--text-only`:
 
 ```bash
 agentctl runner run backend_reviewer "Review the latest diff" --text-only
 ```
 
----
+## Working with skills and services
+
+Skills are reusable instruction sets that runners compose; services are long-running background tasks your project starts. See [Skills](/v0/concepts/skills) and [Services](/v0/concepts/services).
 
 ### `agentctl skill ls`
 
-List registered skills with their description.
+Lists your skills with their descriptions.
 
 ```bash
 agentctl skill ls
 ```
 
-Output is tab-separated `name<TAB>description` lines.
-
----
-
 ### `agentctl skill inspect <name>`
 
-Print the full definition of a skill.
+Shows a skill's full definition.
 
 ```bash
 agentctl skill inspect reviewer
 ```
 
----
-
 ### `agentctl service ls`
 
-List running services with their state and any last error.
+Lists your services and the state each one is in. If a service has crashed, its last error is shown next to it — this is the first place to look when a background task goes quiet.
 
 ```bash
 agentctl service ls
 ```
 
-Output is tab-separated `name<TAB>state[<TAB>last_error]` lines.
+## Approving permission requests
 
----
+When a runner or tool tries to do something it has not been granted — read a file outside its sandbox, call a new binary — the daemon can ask a human before deciding. This command makes your terminal that human.
 
 ### `agentctl grants listen`
 
-Connect to the `/control` plane and interactively answer permission-approval requests. Runs until the connection closes or Ctrl-C. On each request you are prompted to allow once (`o`), allow forever (`f`), or deny (`d`); anything else or EOF defaults to `deny`.
+Connects to the daemon and waits for permission requests. Each request shows you who is asking and what for, then prompts for a decision: press `o` to allow it once, `f` to allow it permanently (the grant is written to `grants.toml`), or `d` to deny. Anything else denies — the safe default. The command runs until you press Ctrl-C.
 
 ```bash
 agentctl grants listen
 ```
 
-Uses `AGENTD_ADMIN_TOKEN` / `$XDG_STATE_HOME/agentd/admin-token` for authentication.
+See [Grants](/v0/security/grants) for how permissions work.
 
----
+## Managing secrets
 
-### `agentctl secret set`
+Providers read their API keys from your operating system's keyring. These commands manage those keys. They work on the keyring directly, so they do not need the daemon to be running — and if it is running, it picks up changes on its next model call.
 
-Store a provider API key (or any secret) in the OS keyring. A running daemon sees the change on its next provider call.
+### `agentctl secret set <name> [value]`
+
+Stores an API key (or any other secret) under the given name.
 
 ```bash
-agentctl secret set <name> [value]
+agentctl secret set anthropic_api_key sk-ant-…
 ```
 
-The value is optional. When omitted, it is read from stdin — the recommended form, since it keeps keys out of shell history:
+You can leave the value off and pipe it in instead. This keeps the key out of your shell history, and is the form we recommend:
 
 ```bash
 echo "$ANTHROPIC_API_KEY" | agentctl secret set anthropic_api_key
 ```
 
-::: info Local operation
-`secret` commands write to the OS keyring directly — they do not talk to a running daemon, and no daemon needs to be up.
-:::
-
----
-
 ### `agentctl secret unset <name>`
 
-Remove a secret from the keyring. `rm` is an alias for `unset`.
+Removes a stored secret. `rm` works as an alias.
 
 ```bash
 agentctl secret unset anthropic_api_key
-agentctl secrets rm anthropic_api_key
 ```
-
----
 
 ### `agentctl secret peek <name>`
 
-Print a half-obfuscated preview of a stored secret — enough to confirm which key is stored, without exposing it:
+Shows a partially masked preview of a stored secret — enough to confirm which key is in there, without revealing it. Short values are masked entirely.
 
 ```bash
-agentctl secret peek my_key
-# sk-t************ef (24 chars)
+agentctl secret peek anthropic_api_key
+# sk-a************t- (32 chars)
 ```
 
-Short values are fully masked. The full value is never printed.
+See [Credentials](/v0/providers/credentials) for the full picture of how keys and grants fit together.
 
----
+## Managing packages
+
+Packages are shareable bundles of tools and skills, installed from git repositories. These commands manage your local package library and do not need the daemon to be running. See [Packages](/v0/packages/) for the concept.
 
 ### `agentctl package ls`
 
-List installed packages, their pinned commit, ref, and whether an update is available.
+Lists your installed packages, the commit each one is pinned to, and whether a newer version is available.
 
 ```bash
 agentctl package ls
 ```
 
-::: info Local operation
-`package` commands are local filesystem + git operations — they do not talk to a running daemon.
-:::
-
----
-
 ### `agentctl package install <git-url>`
 
-Clone a package from a git URL, read its `package.toml` manifest, and register it in the local package index.
-
-```bash
-agentctl package install <git-url> [--ref <ref>]
-```
-
-| Flag | Description |
-|---|---|
-| `--ref <ref>` | Git ref (branch, tag, or SHA) to pin |
-
-After install, if the package declares permissions you are shown the slugs and told to add `[package.<name>] trusted = true` to `grants.toml` before they take effect.
+Downloads a package from a git URL and registers it locally. Pass `--ref` to pin a specific branch, tag, or commit.
 
 ```bash
 agentctl package install https://github.com/example/acme-tools
 agentctl package install https://github.com/example/acme-tools --ref v1.2.0
 ```
 
----
+If the package asks for permissions, the install output lists them along with the exact `grants.toml` line you need to add before they take effect — nothing is granted automatically.
 
 ### `agentctl package update <name>`
 
-Re-pull the package and update its pinned commit in the index.
+Pulls the latest version of a package and updates its pin.
 
 ```bash
 agentctl package update acme-tools
 ```
 
----
-
 ### `agentctl package remove <name>`
 
-Delete the package directory and remove it from the index. `rm` is an alias for `remove`.
+Deletes a package and forgets about it. `rm` works as an alias.
 
 ```bash
 agentctl package remove acme-tools
-agentctl pkg rm acme-tools
 ```
 
----
+## Development helpers
+
+### `agentctl health`
+
+Checks that the daemon is up and reachable. Prints `ok` if it is.
+
+```bash
+agentctl health
+```
 
 ### `agentctl types [dir]`
 
-Fetch live action/runner/skill names from the daemon and write LuaLS type stubs into the project's `.luals/` directory.
+Generates editor type stubs for your project, so your editor can autocomplete action, runner, and skill names and check your Lua against the real API. It asks the running daemon for the live names and writes the stubs into your project's `.luals/` directory.
 
 ```bash
-agentctl types [dir]
+agentctl types                      # current project
+agentctl types ~/projects/my-agent  # a specific project
 ```
 
-- `dir` defaults to the current directory (the folder containing `init.lua`).
-- Writes `.luals/agentd.lua`, `.luals/project.lua`, and merges `.luarc.json`.
-- A daemon running with `agentd --watch` regenerates these stubs automatically on every reload; run this command manually when the daemon is not in watch mode.
-
-```bash
-# Current project
-agentctl types
-
-# Specific project directory
-agentctl types ~/projects/my-agent
-```
-
----
+The directory defaults to wherever you run the command — it should be the folder containing your `init.lua`. If your daemon runs with `agentd --watch`, the stubs regenerate automatically on every reload and you rarely need this command at all.
 
 ### `agentctl trace`
 
-Tail the JSONL trace file.
+Shows the daemon's trace log — a structured record of every action call, runner turn, and permission decision. Useful for understanding what actually happened during a run.
 
 ```bash
-agentctl trace [--file <path>] [-f] [-n <N>]
+agentctl trace              # the last 20 entries
+agentctl trace -f           # keep following as new entries arrive
+agentctl trace -f -n 50     # follow, starting with the last 50
 ```
 
-| Flag | Short | Default | Description |
-|---|---|---|---|
-| `--file <path>` | | `$XDG_STATE_HOME/agentd/trace.jsonl` | Trace file to read |
-| `--follow` | `-f` | off | Stream new lines as they are appended |
-| `--lines <N>` | `-n` | `20` | Number of tail lines to show |
+Pass `--file <path>` to read a trace file other than the default. See [Observability](/v0/operations/observability) for how tracing works.
 
-```bash
-# Last 20 lines
-agentctl trace
+## When something goes wrong
 
-# Follow with 50-line history
-agentctl trace -f -n 50
-
-# Alternate file
-agentctl trace --file /tmp/my-trace.jsonl -f
-```
-
----
-
-## Error output
-
-When a command fails, `agentctl` renders the daemon's error envelope for humans:
+When a command fails, `agentctl` explains what happened in plain language, and where possible tells you how to fix it:
 
 ```
-Error: Could not resolve a provider for model `github/openai/gpt-4o-mini`  (no_provider)
-Tip: You can configure new providers in your `config.toml`
+Error: Provider `github` is not configured — store the API key in the `github_models_token` secret to use it  (provider_misconfigured)
+Tip: Store the API key with `agentctl secret set <name> <value>`
+```
+
+If the failure came from inside your Lua code, a cleaned-up stack trace points at the line that raised it:
+
+```
+Error: Something exploded  (lua_error)
 
 Stack trace:
   helpers.lua:313  in structured
   init.lua:53
 ```
 
-- The trailing `(code)` suffix is dimmed on a TTY.
-- The `Tip:` line and the `Stack trace:` section only appear when the daemon supplies them — tips are attached per error code, and stack traces accompany failures raised from inside a Lua script.
-- With `call --compact`, errors are printed as one-line JSON instead: `{"code":...,"error":...,"tip":...,"trace":[...]}`.
-
-See the [error codes table](/v0/reference/protocol#error-codes) for the full code and tip catalog.
-
----
+The code in parentheses identifies the kind of error — the full list is in the [protocol reference](/v0/reference/protocol#error-codes). With `call --compact`, errors come back as one-line JSON instead, for scripts that want to parse them.
 
 ## See also
 
-- [WebSocket protocol](/v0/reference/protocol)
-- [Configuration reference](/v0/reference/configuration)
-- [Permissions & grants](/v0/security/grants)
-- [Observability](/v0/operations/observability)
+- [WebSocket protocol](/v0/reference/protocol) — for building your own client
+- [Configuration reference](/v0/reference/configuration) — daemon flags and `config.toml`
+- [Permissions & grants](/v0/security/grants) — how access control works
+- [Observability](/v0/operations/observability) — traces and logging
