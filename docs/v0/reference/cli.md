@@ -309,7 +309,7 @@ agentctl types [dir]
 
 - `dir` defaults to the current directory (the folder containing `init.lua`).
 - Writes `.luals/agentd.lua`, `.luals/project.lua`, and merges `.luarc.json`.
-- This is the same regeneration that `--watch` triggers automatically on reload.
+- A daemon running with `agentd --watch` regenerates these stubs automatically on every reload; run this command manually when the daemon is not in watch mode.
 
 ```bash
 # Current project

@@ -42,7 +42,7 @@ Once you have reviewed the declared permissions, add an entry to `grants.toml`:
 trusted = true
 ```
 
-Then restart the daemon (or trigger a hot reload with `--watch`) to load the package.
+Then restart the daemon to load the package (a daemon running with `agentd --watch` picks it up automatically).
 
 ## Updating a package
 
