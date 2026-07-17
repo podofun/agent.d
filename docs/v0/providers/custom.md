@@ -32,7 +32,7 @@ default_model = "qwen3:14b"
 - **`auth = "none"`** — send no auth header at all. For local servers like Ollama or vLLM without `--api-key`.
 - **`default_model`** — used when a call passes no model id.
 
-Provider names must not collide with the built-in prefixes (`anthropic`, `anthropic-cli`, `openai`, `codex`, `openai-cli`).
+Provider names must not collide with the reserved built-in prefixes (`anthropic`, `anthropic-cli`, `openai`, `codex`, `openai-cli`, `mock`).
 
 ## Storing the API key
 

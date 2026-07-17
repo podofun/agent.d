@@ -107,8 +107,8 @@ default_model = "qwen3:14b"
 | `auth` | `"none"` | one of these two | Send no auth header — for local servers without authentication |
 | `default_model` | string | no | Model used when a call passes no model id |
 
-Names must not collide with the built-in prefixes (`anthropic`,
-`anthropic-cli`, `openai`, `codex`, `openai-cli`). Exactly one of
+Names must not collide with the reserved built-in prefixes (`anthropic`,
+`anthropic-cli`, `openai`, `codex`, `openai-cli`, `mock`). Exactly one of
 `api_key_secret` or `auth = "none"` is required — pointing at a remote host
 without credentials must be an explicit choice. The daemon refuses to start on
 any invalid `[providers]` entry and names the offending provider in the error.
