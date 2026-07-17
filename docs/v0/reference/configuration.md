@@ -67,7 +67,8 @@ approval_timeout_ms = 120000
 init      = "~/.config/agentd/init.lua"
 max_turns = 16
 yolo      = false   # RESERVED — emits a warning and has no other effect
-# watch   = false
+# watch            = false
+# default_provider = "anthropic"
 ```
 
 | Field | Type | Default | Description |
@@ -76,6 +77,43 @@ yolo      = false   # RESERVED — emits a warning and has no other effect
 | `max_turns` | integer | `16` | Maximum tool-use loop iterations per runner call |
 | `yolo` | bool | `false` | **Reserved.** Currently emits a startup warning and is otherwise ignored |
 | `watch` | bool | `false` | Enable dev hot reload (same as `--watch` flag) |
+| `default_provider` | string | `anthropic` | Provider used when a model string has no `provider/` prefix. Any built-in or `[providers.<name>]` entry |
+
+### `[providers.<name>]` sections
+
+Each `[providers.<name>]` table registers an extra model provider under the
+prefix `<name>` — any OpenAI-compatible endpoint (OpenRouter, Groq, Together,
+vLLM, Ollama, LM Studio, GitHub Models, …) or Anthropic-compatible gateway:
+
+```toml
+[providers.openrouter]
+kind = "openai"
+base_url = "https://openrouter.ai/api/v1"
+api_key_secret = "openrouter_api_key"
+default_model = "meta-llama/llama-3.3-70b-instruct"
+
+[providers.ollama]
+kind = "openai"
+base_url = "http://localhost:11434/v1"
+auth = "none"
+default_model = "qwen3:14b"
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `kind` | `"openai"` \| `"anthropic"` | yes | Which API shape the endpoint speaks |
+| `base_url` | string | yes | Endpoint base; with or without the trailing API path, both work |
+| `api_key_secret` | string | one of these two | Secret-store key holding the API key (see [Credentials](/v0/providers/credentials)) |
+| `auth` | `"none"` | one of these two | Send no auth header — for local servers without authentication |
+| `default_model` | string | no | Model used when a call passes no model id |
+
+Names must not collide with the built-in prefixes (`anthropic`,
+`anthropic-cli`, `openai`, `codex`, `openai-cli`). Exactly one of
+`api_key_secret` or `auth = "none"` is required — pointing at a remote host
+without credentials must be an explicit choice. The daemon refuses to start on
+any invalid `[providers]` entry and names the offending provider in the error.
+
+See [Custom providers](/v0/providers/custom) for a usage-focused walkthrough.
 
 ---
 

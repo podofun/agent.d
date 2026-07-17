@@ -45,6 +45,7 @@ capabilities.
 | `ctx.run(name, prompt)` | action's own `requires` | [Calls](/v0/reference/ctx/calls) |
 | `ctx.structured(name, opts)` | action's own `requires` | [Calls](/v0/reference/ctx/calls) |
 | `ctx.tools()` | none | [Calls](/v0/reference/ctx/calls) |
+| `ctx.validate_output(value)` | none | [Calls](/v0/reference/ctx/calls) |
 | `ctx.caller` | none (read-only) | [Caller](/v0/reference/ctx/caller) |
 
 ### Logging
