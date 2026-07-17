@@ -45,13 +45,13 @@ granted = ["secret:discord_token"]
 
 ## Seeding secrets via agentctl
 
-Secrets are typically seeded at setup time using `agentctl call`:
+Secrets are typically seeded at setup time with [`agentctl secret set`](/v0/reference/cli#agentctl-secret-set), which writes to the same keyring:
 
 ```bash
-agentctl call discord.set_token -d token='xoxb-…' --result-only
+echo "$DISCORD_TOKEN" | agentctl secret set discord_token
 ```
 
-Where `discord.set_token` is an action that calls `ctx.secret.set("discord_token", args.token)`.
+No Lua action or grant is needed for this — reserve `ctx.secret.set` for secrets your tools and services manage at runtime.
 
 ## Examples
 

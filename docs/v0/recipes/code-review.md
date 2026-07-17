@@ -127,11 +127,11 @@ allowed_actions = ["git.diff", "git.status"]
 `[tool.git]` grants the `shell.exec:git` slug to every action under that tool. `[runner.backend_reviewer]` grants `ai:anthropic` so the runner can make model calls, and restricts which actions the runner may invoke at layer 3 of the permission engine.
 
 ::: tip Provider credentials
-The `anthropic` provider reads your API key from the secret store. Seed it once by calling a setup action that uses `ctx.secret.set` — for example, if you define a `setup.store_key` action:
+The `anthropic` provider reads your API key from the secret store. Seed it once with `agentctl secret set`:
 ```bash
-agentctl call setup.store_key -d name=anthropic_api_key -d value='sk-ant-…' --result-only
+echo "$ANTHROPIC_API_KEY" | agentctl secret set anthropic_api_key
 ```
-See [Providers: credentials](/v0/providers/credentials) for how to define and wire up a credential-seeding action.
+See [Providers: credentials](/v0/providers/credentials) for details.
 :::
 
 ## How to run
