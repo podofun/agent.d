@@ -106,13 +106,13 @@ pub enum ErrKind {
 /// Codec error.
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
-    #[error("io: {0}")]
+    #[error("I/O error ({0})")]
     Io(#[from] std::io::Error),
-    #[error("message exceeds {MAX_LINE} bytes")]
+    #[error("the broker message exceeds the {MAX_LINE}-byte limit")]
     TooLong,
-    #[error("peer closed")]
+    #[error("the broker peer closed the connection")]
     Eof,
-    #[error("bad message: {0}")]
+    #[error("could not decode the broker message ({0})")]
     Decode(#[from] serde_json::Error),
 }
 

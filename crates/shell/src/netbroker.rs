@@ -128,7 +128,7 @@ fn connect() -> Result<HANDLE, ShellError> {
             None,
         )
     }
-    .map_err(|e| sb(format!("network broker unavailable: {e}")))?;
+    .map_err(|e| sb(format!("the network broker is unavailable ({e})")))?;
     Ok(h)
 }
 
@@ -160,17 +160,22 @@ pub fn available() -> bool {
 pub fn provision(sid: Vec<u8>, ips: Vec<IpAddr>) -> Result<Provision, ShellError> {
     let pipe = connect()?;
     let req = serde_json::to_vec(&Request::Provision { sid, ips }).map_err(sb)?;
-    write_frame(pipe, &req).map_err(|e| sb(format!("broker write: {e}")))?;
-    let resp: Response =
-        serde_json::from_slice(&read_frame(pipe).map_err(|e| sb(format!("broker read: {e}")))?)
-            .map_err(sb)?;
+    write_frame(pipe, &req)
+        .map_err(|e| sb(format!("could not write to the network broker ({e})")))?;
+    let resp: Response = serde_json::from_slice(
+        &read_frame(pipe)
+            .map_err(|e| sb(format!("could not read from the network broker ({e})")))?,
+    )
+    .map_err(sb)?;
     match resp {
         Response::Ok => Ok(Provision { pipe }),
         Response::Err(e) => {
             unsafe {
                 let _ = CloseHandle(pipe);
             }
-            Err(sb(format!("broker refused provision: {e}")))
+            Err(sb(format!(
+                "the network broker refused to provision the sandbox ({e})"
+            )))
         }
     }
 }
@@ -194,7 +199,9 @@ pub fn serve_connection(pipe: HANDLE) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(r) => r,
             Err(e) => {
-                reply(Response::Err(format!("bad request: {e}")));
+                reply(Response::Err(format!(
+                    "the network broker received a malformed request ({e})"
+                )));
                 unsafe {
                     let _ = CloseHandle(pipe);
                 }
@@ -300,7 +307,7 @@ pub fn accept_loop(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Resul
             )
         };
         if pipe.is_invalid() {
-            return Err(sb("CreateNamedPipeW failed"));
+            return Err(sb("could not create the network broker named pipe"));
         }
         // Block until a client connects. ERROR_PIPE_CONNECTED means it connected
         // between create and connect — still a valid session.
