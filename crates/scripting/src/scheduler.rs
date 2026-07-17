@@ -183,8 +183,8 @@ pub enum DriveError {
 impl std::fmt::Display for DriveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DriveError::Lua(e) => write!(f, "lua: {e}"),
-            DriveError::Join(e) => write!(f, "join: {e}"),
+            DriveError::Lua(e) => write!(f, "{e}"),
+            DriveError::Join(e) => write!(f, "internal join error: {e}"),
         }
     }
 }

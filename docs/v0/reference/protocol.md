@@ -49,7 +49,21 @@ Every `/ws` exchange is a request/response pair of JSON objects.
   "id": 1,
   "ok": false,
   "code": "not_found",
-  "error": "action `git.oops` not registered"
+  "error": "action `git.oops` not registered",
+  "tip": "Run `agentctl tools` to list registered actions"
+}
+```
+
+A failure raised from inside a Lua script additionally carries a cleaned traceback:
+
+```json
+{
+  "id": 2,
+  "ok": false,
+  "code": "no_provider",
+  "error": "runner `juma` could not resolve a provider for model `github/openai/gpt-4o-mini`",
+  "tip": "You can configure new providers in your `config.toml`",
+  "trace": ["helpers.lua:313  in structured", "init.lua:53"]
 }
 ```
 
@@ -59,7 +73,9 @@ Every `/ws` exchange is a request/response pair of JSON objects.
 | `ok` | boolean | `true` on success, `false` on error |
 | `result` | any | Present when `ok: true` |
 | `code` | string | Machine-readable error class; present when `ok: false` |
-| `error` | string | Human-readable error message; present when `ok: false` |
+| `error` | string | Human-readable error message; present when `ok: false`. Always the innermost cause — no `invocation failed:` / `lua:` prefix chains |
+| `tip` | string | Optional actionable hint for the error code; present only when the code has one |
+| `trace` | array of strings | Optional cleaned Lua traceback frames (`file.lua:line  in fn`); present only for script failures |
 
 ---
 
@@ -258,19 +274,20 @@ List background services with their current state.
 
 ## Error codes
 
-| Code | Meaning |
-|---|---|
-| `invalid_envelope` | Request JSON could not be parsed |
-| `not_found` | Action, runner, or skill does not exist |
-| `unknown_method` | The `method` field is not a known method |
-| `bad_params` | Params failed to deserialize against the expected shape |
-| `denied` | The permission engine denied the call |
-| `needs_confirmation` | Action requires interactive approval; escalate via `/control` |
-| `invocation_failed` | The action handler returned an error |
-| `not_found` (runner) | Named runner does not exist |
-| `unknown_skill` | Runner references a skill that is not registered |
-| `no_provider` | No AI provider matched the runner's model prefix |
-| `provider_upstream` | AI provider returned an error |
+| Code | Meaning | Tip |
+|---|---|---|
+| `invalid_envelope` | Request JSON could not be parsed | — |
+| `not_found` | Action or skill does not exist | Run `agentctl tools` to list registered actions |
+| `unknown_method` | The `method` field is not a known method | — |
+| `bad_params` | Params failed to deserialize against the expected shape | Pass args with `-d key=value` or `--json '<json>'` |
+| `denied` | The permission engine denied the call | Adjust `grants.toml`, or approve live via `agentctl grants listen` |
+| `needs_confirmation` | Action requires interactive approval; escalate via `/control` | Adjust `grants.toml`, or approve live via `agentctl grants listen` |
+| `lua_error` | A Lua script raised an error; `trace` carries the cleaned traceback | — |
+| `invocation_failed` | The action failed outside the script itself (e.g. join errors, output validation) | — |
+| `runner_not_found` | Named runner does not exist | Run `agentctl runner ls` to list runners |
+| `unknown_skill` | Runner references a skill that is not registered | Run `agentctl skills ls` to list skills |
+| `no_provider` | The runner could not resolve a provider for its model | You can configure new providers in your `config.toml` |
+| `provider_upstream` | AI provider returned an error | — |
 
 ---
 

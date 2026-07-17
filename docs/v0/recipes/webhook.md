@@ -27,7 +27,7 @@ Every call over `/ws` uses this JSON envelope:
 { "id": 1, "ok": true, "result": { "result": { "queued": true }, "duration_ms": 4 } }
 
 // Server → client (error)
-{ "id": 1, "ok": false, "code": "not_found", "error": "action `x` not registered" }
+{ "id": 1, "ok": false, "code": "not_found", "error": "action `x` not registered", "tip": "Run `agentctl tools` to list registered actions" }
 ```
 
 The `session` and `user` fields are optional. When present, they override the default identity (`ws-<n>` session, no user) and flow into `ctx.caller` inside the handler.

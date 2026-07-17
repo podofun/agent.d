@@ -9,8 +9,9 @@
 //! { "id": 1, "method": "actions.call", "params": { "name": "git.diff", "args": {} } }
 //! // server -> client (success)
 //! { "id": 1, "ok": true, "result": { ... } }
-//! // server -> client (error)
-//! { "id": 1, "ok": false, "code": "not_found", "error": "action `x` not registered" }
+//! // server -> client (error; `tip` and `trace` are optional)
+//! { "id": 1, "ok": false, "code": "not_found", "error": "action `x` not registered",
+//!   "tip": "Run `agentctl tools` to list registered actions" }
 //! ```
 //!
 //! Methods implemented:
@@ -138,6 +139,12 @@ struct WsResponse {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<String>,
+    /// Actionable hint tied to `code` (e.g. where to configure providers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tip: Option<String>,
+    /// Cleaned script traceback frames, innermost first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace: Option<Vec<String>>,
 }
 
 /// Monotonic per-process counter backing the per-connection session id.
@@ -434,11 +441,29 @@ fn ok_ser<T: Serialize>(id: u64, value: &T) -> WsResponse {
     }
 }
 
+/// Actionable hint for an error code, shown to humans next to the message.
+fn tip_for(code: &str) -> Option<String> {
+    let tip = match code {
+        "no_provider" => "You can configure new providers in your `config.toml`",
+        "not_found" => "Run `agentctl tools` to list registered actions",
+        "runner_not_found" => "Run `agentctl runner ls` to list runners",
+        "denied" | "needs_confirmation" => {
+            "Grants live in `grants.toml`; run `agentctl grants listen` to approve interactively"
+        }
+        "unknown_skill" => "Run `agentctl skill ls` to list skills",
+        "bad_params" => "Pass args as `-d key=value` or `-j '<json>'`",
+        _ => return None,
+    };
+    Some(tip.to_string())
+}
+
 fn err(id: u64, code: impl Into<String>, msg: impl Into<String>) -> WsResponse {
+    let code = code.into();
     WsResponse {
         id,
         ok: false,
-        code: Some(code.into()),
+        tip: tip_for(&code),
+        code: Some(code),
         error: Some(msg.into()),
         ..Default::default()
     }
@@ -454,10 +479,17 @@ fn action_error(id: u64, e: RegistryError, dur: u128) -> WsResponse {
         RegistryError::Denied { .. } => "denied",
         RegistryError::NeedsConfirmation(_) => "needs_confirmation",
         RegistryError::Invocation(_) => "invocation_failed",
+        RegistryError::Script { .. } => "lua_error",
+    };
+    let trace = match &e {
+        RegistryError::Script { trace, .. } if !trace.is_empty() => Some(trace.clone()),
+        _ => None,
     };
     WsResponse {
         id,
         ok: false,
+        tip: tip_for(code),
+        trace,
         code: Some(code.into()),
         error: Some(e.to_string()),
         result: Some(json!({ "duration_ms": dur })),
@@ -466,7 +498,7 @@ fn action_error(id: u64, e: RegistryError, dur: u128) -> WsResponse {
 
 fn runner_error(id: u64, e: RunnerError) -> WsResponse {
     let code = match &e {
-        RunnerError::NotFound(_) => "not_found",
+        RunnerError::NotFound(_) => "runner_not_found",
         RunnerError::UnknownSkill { .. } => "unknown_skill",
         RunnerError::NoProvider { .. } => "no_provider",
         RunnerError::Provider { .. } => "provider_upstream",
@@ -477,5 +509,48 @@ fn runner_error(id: u64, e: RunnerError) -> WsResponse {
 impl IntoResponse for WsResponse {
     fn into_response(self) -> Response {
         axum::Json(self).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn script_error_serializes_tip_and_trace() {
+        let resp = action_error(
+            7,
+            RegistryError::Script {
+                message: "boom".into(),
+                trace: vec!["init.lua:53".into()],
+            },
+            12,
+        );
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["code"], "lua_error");
+        assert_eq!(v["error"], "boom");
+        assert_eq!(v["trace"][0], "init.lua:53");
+        assert!(v.get("tip").is_none(), "lua_error has no tip");
+    }
+
+    #[test]
+    fn empty_trace_and_absent_tip_are_omitted() {
+        let resp = action_error(
+            1,
+            RegistryError::Script {
+                message: "x".into(),
+                trace: vec![],
+            },
+            0,
+        );
+        let v = serde_json::to_value(&resp).unwrap();
+        assert!(v.get("trace").is_none());
+
+        let resp = err(2, "no_provider", "m");
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            v["tip"],
+            "You can configure new providers in your `config.toml`"
+        );
     }
 }

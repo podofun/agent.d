@@ -27,7 +27,7 @@ pub enum WsError {
     Io(String),
     #[error("closed")]
     Closed,
-    #[error("timeout after {0:?}")]
+    #[error("timeout after {}ms", .0.as_millis())]
     Timeout(Duration),
 }
 
