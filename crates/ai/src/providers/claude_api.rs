@@ -80,11 +80,12 @@ impl ClaudeApiProvider {
     fn api_key(&self) -> Result<Option<String>, ProviderError> {
         match &self.secret_key {
             None => Ok(None),
-            Some(k) => self
-                .secrets
-                .get(k)
-                .map(Some)
-                .map_err(|e| ProviderError::Config(format!("read `{k}`: {e}"))),
+            Some(k) => self.secrets.get(k).map(Some).map_err(|e| match e {
+                agentd_secrets::SecretError::NotFound(_) => ProviderError::Config(format!(
+                    "missing API key — store secret `{k}` in the keyring first"
+                )),
+                e => ProviderError::Config(format!("could not read secret `{k}`: {e}")),
+            }),
         }
     }
 }

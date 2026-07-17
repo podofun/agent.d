@@ -536,7 +536,9 @@ fn map_err(e: CodexError) -> ProviderError {
     match e {
         CodexError::Spawn(io) => ProviderError::Transport(format!("spawn codex app-server: {io}")),
         CodexError::Io(io) => ProviderError::Transport(format!("io: {io}")),
-        CodexError::Serde(s) => ProviderError::Config(format!("serde: {s}")),
+        CodexError::Serde(s) => {
+            ProviderError::Config(format!("invalid codex-app-server message: {s}"))
+        }
         CodexError::Transport(s) => ProviderError::Transport(s),
         CodexError::Rpc { code, message } => {
             ProviderError::Upstream(format!("codex rpc {code}: {message}"))
