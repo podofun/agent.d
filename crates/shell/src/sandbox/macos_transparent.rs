@@ -59,8 +59,9 @@ struct Broker {
 
 impl Broker {
     fn connect() -> Result<Self, ShellError> {
-        let stream = UnixStream::connect(SOCKET_PATH)
-            .map_err(|e| ShellError::Sandbox(format!("broker connect: {e}")))?;
+        let stream = UnixStream::connect(SOCKET_PATH).map_err(|e| {
+            ShellError::Sandbox(format!("could not connect to the sandbox broker ({e})"))
+        })?;
         Ok(Broker {
             stream: Mutex::new(stream),
         })
@@ -68,8 +69,14 @@ impl Broker {
 
     fn call(&self, req: &Req) -> Result<Resp, ShellError> {
         let mut s = self.stream.lock().unwrap();
-        write_msg(&mut *s, req).map_err(|e| ShellError::Sandbox(format!("broker send: {e}")))?;
-        read_msg::<_, Resp>(&mut *s).map_err(|e| ShellError::Sandbox(format!("broker recv: {e}")))
+        write_msg(&mut *s, req).map_err(|e| {
+            ShellError::Sandbox(format!(
+                "could not send a request to the sandbox broker ({e})"
+            ))
+        })?;
+        read_msg::<_, Resp>(&mut *s).map_err(|e| {
+            ShellError::Sandbox(format!("could not read the sandbox broker reply ({e})"))
+        })
     }
 
     fn expect_ok(&self, req: &Req) -> Result<(), ShellError> {
@@ -86,7 +93,7 @@ impl Broker {
 fn broker_error(kind: ErrKind, msg: String) -> ShellError {
     match kind {
         ErrKind::PoolExhausted => {
-            ShellError::Sandbox("all sandbox slots in use; retry shortly".into())
+            ShellError::Sandbox("all sandbox slots are in use — retry shortly".into())
         }
         _ => ShellError::Sandbox(format!("broker: {msg}")),
     }
@@ -141,8 +148,11 @@ pub async fn run_contained(
     let broker = Arc::new(Broker::connect()?);
 
     // Relay + DNS listeners (std sockets; converted to tokio below).
-    let tcp = bind_dual_tcp().map_err(|e| ShellError::Sandbox(format!("relay bind: {e}")))?;
-    let udp = bind_dual_udp().map_err(|e| ShellError::Sandbox(format!("dns bind: {e}")))?;
+    let tcp = bind_dual_tcp().map_err(|e| {
+        ShellError::Sandbox(format!("could not bind the network relay socket ({e})"))
+    })?;
+    let udp = bind_dual_udp()
+        .map_err(|e| ShellError::Sandbox(format!("could not bind the DNS relay socket ({e})")))?;
     let tcp_port = tcp.local_addr().map_err(io_sb)?.port();
     let dns_port = udp.local_addr().map_err(io_sb)?.port();
 
@@ -185,9 +195,16 @@ pub async fn run_contained(
                 want_stdin,
             },
         )
-        .map_err(|e| ShellError::Sandbox(format!("spawn send: {e}")))?;
-        let reply = read_msg::<_, Resp>(&mut *s)
-            .map_err(|e| ShellError::Sandbox(format!("spawn reply: {e}")))?;
+        .map_err(|e| {
+            ShellError::Sandbox(format!(
+                "could not send the spawn request to the sandbox broker ({e})"
+            ))
+        })?;
+        let reply = read_msg::<_, Resp>(&mut *s).map_err(|e| {
+            ShellError::Sandbox(format!(
+                "could not read the spawn reply from the sandbox broker ({e})"
+            ))
+        })?;
         let pid = match reply {
             Resp::Spawned { pid } => pid,
             Resp::Err { kind, msg } => return Err(broker_error(kind, msg)),
@@ -198,8 +215,11 @@ pub async fn run_contained(
             }
         };
         // Receive the child's stdio fds over SCM_RIGHTS on the same socket.
-        let fds = recv_fds(&s, if want_stdin { 3 } else { 2 })
-            .map_err(|e| ShellError::Sandbox(format!("recv stdio fds: {e}")))?;
+        let fds = recv_fds(&s, if want_stdin { 3 } else { 2 }).map_err(|e| {
+            ShellError::Sandbox(format!(
+                "could not receive the stdio handles from the sandbox broker ({e})"
+            ))
+        })?;
         drop(s);
         // Order matches the broker's send: [stdin_wr?, stdout_rd, stderr_rd].
         let mut it = fds.into_iter();

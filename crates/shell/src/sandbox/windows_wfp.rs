@@ -63,7 +63,9 @@ impl WfpFilter {
 }
 
 fn wfp_err(code: u32, what: &str) -> FilterError {
-    FilterError::Apply(format!("{what}: WFP error {code:#x}"))
+    FilterError::Apply(format!(
+        "the Windows Filtering Platform call `{what}` failed (error {code:#x})"
+    ))
 }
 
 /// The package-SID match condition. `sid_bytes` (the raw SID) must outlive the

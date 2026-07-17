@@ -104,17 +104,31 @@ async fn run(cli: Cli) -> Result<()> {
     // `agentd.import("name")` (bare) resolves installed packages here.
     let packages_root = dirs::data_dir()
         .map(|d| d.join("agentd").join("packages"))
-        .ok_or_else(|| anyhow!("no XDG data dir for packages"))?;
+        .ok_or_else(|| anyhow!("could not locate a data directory (XDG) for packages"))?;
     // Durable `ctx.memory` store — one redb file under the XDG data dir, shared
     // across hot reloads so memory survives.
     let memory_path = dirs::data_dir()
         .map(|d| d.join("agentd").join("memory.redb"))
-        .ok_or_else(|| anyhow!("no XDG data dir for memory"))?;
+        .ok_or_else(|| {
+            anyhow!("could not locate a data directory (XDG) for the memory database")
+        })?;
     if let Some(parent) = memory_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let memory = RedbStore::open(&memory_path)
-        .map_err(|e| anyhow!("open memory db {}: {e}", memory_path.display()))?;
+    let memory = RedbStore::open(&memory_path).map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("already open") || msg.contains("lock") {
+            anyhow!(
+                "another agentd instance is already using the memory database at `{}` — stop it first",
+                memory_path.display()
+            )
+        } else {
+            anyhow!(
+                "could not open the memory database at `{}` ({msg})",
+                memory_path.display()
+            )
+        }
+    })?;
 
     let trace = JsonlSink::open(&cfg.trace_file).await?;
     tracing::debug!(trace = %trace.path().display(), "trace open");

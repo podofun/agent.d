@@ -111,8 +111,7 @@ fn decision_to_error(
 ) -> RegistryError {
     match decision {
         Decision::NeedsConfirmation { reason } => RegistryError::NeedsConfirmation(format!(
-            "action `{}` requires confirmation\nreason: {reason}\ncaller: {}\nfix: run `agentctl grants listen` and approve the request, or add `{}` to `[policy].auto_confirm` in grants.toml",
-            action_meta.name,
+            "{reason} (caller {})\nfix: run `agentctl grants listen` and approve the request, or add `{}` to `[policy].auto_confirm` in grants.toml",
             caller_summary(caller),
             action_meta.name
         )),
@@ -120,7 +119,9 @@ fn decision_to_error(
             layer: deny_layer_label(layer).to_string(),
             reason: denial_reason(layer, reason, action_meta, tool_name, caller, engine),
         },
-        Decision::Allow => RegistryError::Invocation("unexpected Allow".into()),
+        Decision::Allow => RegistryError::Invocation(
+            "the permission check unexpectedly allowed this action while a denial was being reported — this is a bug in agentd, please report it".into(),
+        ),
     }
 }
 
@@ -158,7 +159,7 @@ fn denial_reason(
                 )
             };
             format!(
-                "action `{action}` requires {missing_text}, but tool `{tool}` is not granted it\nmissing: {missing_text}\ncaller: {caller_text}\nfix: {fix}"
+                "action `{action}` needs permissions that tool `{tool}` has not been granted\nmissing: {missing_text}\ncaller: {caller_text}\nfix: {fix}"
             )
         }
         DenyLayer::Runner => {
@@ -695,7 +696,7 @@ impl Executor {
                         extra: PermissionSet::empty(),
                     },
                     Err(e) => Escalation::Reject(RegistryError::Invocation(format!(
-                        "persist approval failed: {e}"
+                        "the approval was granted but could not be saved to grants.toml ({e}) — approve again or edit grants.toml by hand"
                     ))),
                 }
             }
@@ -711,36 +712,37 @@ impl Executor {
         action_name: &str,
         missing: &[String],
     ) -> Result<(), String> {
-        let path = self
-            .grants_path
-            .as_ref()
-            .ok_or_else(|| "no grants path".to_string())?;
-        let reload = self
-            .reload_grants
-            .as_ref()
-            .ok_or_else(|| "no reload closure".to_string())?;
+        let path = self.grants_path.as_ref().ok_or_else(|| {
+            "the daemon has no grants file path configured, so approvals cannot be saved"
+                .to_string()
+        })?;
+        let reload = self.reload_grants.as_ref().ok_or_else(|| {
+            "the daemon has no grants reload hook wired, so approvals cannot be saved".to_string()
+        })?;
 
         let _guard = self.forever_write_lock.lock().await;
 
         let text = std::fs::read_to_string(path).unwrap_or_default();
-        let mut doc = text
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|e| format!("parse grants.toml: {e}"))?;
+        let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| {
+            format!("grants.toml is not valid TOML ({e}) — fix the syntax and approve again")
+        })?;
 
         match kind {
             agentd_types::ApprovalKind::MissingGrant => {
                 let tool =
-                    tool_name.ok_or_else(|| "missing-grant verdict without tool".to_string())?;
+                    tool_name.ok_or_else(|| {
+                        "the approval did not name a tool, so there is nothing to grant the permissions to".to_string()
+                    })?;
                 let granted = doc
                     .as_table_mut()
                     .entry("tool")
                     .or_insert(toml_edit::table())
                     .as_table_mut()
-                    .ok_or("`tool` is not a table")?
+                    .ok_or("the `tool` key in grants.toml is not a table — remove or rename the conflicting `tool` entry")?
                     .entry(tool)
                     .or_insert(toml_edit::table())
                     .as_table_mut()
-                    .ok_or("tool entry is not a table")?
+                    .ok_or("this tool's entry in grants.toml is not a table — remove or rename the conflicting entry")?
                     .entry("granted")
                     .or_insert(toml_edit::value(toml_edit::Array::new()));
                 append_unique(ensure_string_array(granted), missing);
@@ -751,7 +753,7 @@ impl Executor {
                     .entry("policy")
                     .or_insert(toml_edit::table())
                     .as_table_mut()
-                    .ok_or("`policy` is not a table")?
+                    .ok_or("the `policy` key in grants.toml is not a table — remove or rename the conflicting `policy` entry")?
                     .entry("auto_confirm")
                     .or_insert(toml_edit::value(toml_edit::Array::new()));
                 append_unique(
@@ -761,7 +763,9 @@ impl Executor {
             }
         }
 
-        std::fs::write(path, doc.to_string()).map_err(|e| format!("write grants.toml: {e}"))?;
+        std::fs::write(path, doc.to_string()).map_err(|e| {
+            format!("could not write grants.toml ({e}) — check the file permissions")
+        })?;
         let fresh = reload()?;
         self.engine.store(Arc::new(fresh));
         Ok(())
@@ -873,7 +877,9 @@ impl Executor {
                 .await
                 .map_err(|e| RunnerError::Provider {
                     provider: provider_name.clone(),
-                    source: agentd_ai::ProviderError::Config(format!("bind MCP loopback: {e}")),
+                    source: agentd_ai::ProviderError::Config(format!(
+                        "could not start the local MCP bridge that lets the model call tools ({e})"
+                    )),
                 })?;
                 req.mcp_endpoint = Some(agentd_ai::McpEndpoint::Http {
                     url: loopback.url.clone(),
@@ -904,7 +910,7 @@ impl Executor {
                         return Err(RunnerError::Provider {
                             provider: provider_name.clone(),
                             source: agentd_ai::ProviderError::Upstream(format!(
-                                "tool-use loop exceeded {} turns",
+                                "the runner stopped after {} tool-use turns without producing a final answer — raise the turn limit or simplify the task",
                                 self.max_runner_turns
                             )),
                         });
@@ -943,9 +949,10 @@ impl Executor {
                             args: call.arguments.clone(),
                         };
                         let result_text = match self.run(tool_caller.clone(), action).await {
-                            Ok((res, _)) => serde_json::to_string(&res.value)
-                                .unwrap_or_else(|e| format!("<serialize error: {e}>")),
-                            Err((e, _)) => format!("<tool error: {e}>"),
+                            Ok((res, _)) => serde_json::to_string(&res.value).unwrap_or_else(|e| {
+                                format!("the tool result could not be serialized to JSON ({e})")
+                            }),
+                            Err((e, _)) => format!("tool call failed ({e})"),
                         };
                         req.messages
                             .push(agentd_ai::Message::tool_result(call_id, result_text));
@@ -1354,7 +1361,7 @@ impl Executor {
             return Err(RunnerError::Provider {
                 provider: provider_name,
                 source: agentd_ai::ProviderError::Config(
-                    "runners.run: need at least one of `prompt` or `messages`".into(),
+                    "`runners.run` needs something to send the model — pass a `prompt` string or a `messages` list".into(),
                 ),
             });
         }
@@ -1379,7 +1386,9 @@ impl Executor {
                 .await
                 .map_err(|e| RunnerError::Provider {
                     provider: provider_name.clone(),
-                    source: agentd_ai::ProviderError::Config(format!("bind MCP loopback: {e}")),
+                    source: agentd_ai::ProviderError::Config(format!(
+                        "could not start the local MCP bridge that lets the model call tools ({e})"
+                    )),
                 })?;
                 req.mcp_endpoint = Some(agentd_ai::McpEndpoint::Http {
                     url: loopback.url.clone(),
@@ -1409,7 +1418,7 @@ impl Executor {
                         return Err(RunnerError::Provider {
                             provider: provider_name,
                             source: agentd_ai::ProviderError::Upstream(format!(
-                                "tool-use loop exceeded {} turns",
+                                "the runner stopped after {} tool-use turns without producing a final answer — raise the turn limit or simplify the task",
                                 self.max_runner_turns
                             )),
                         });
@@ -1442,9 +1451,10 @@ impl Executor {
                             args: call.arguments.clone(),
                         };
                         let text = match self.run(tool_caller.clone(), action).await {
-                            Ok((res, _)) => serde_json::to_string(&res.value)
-                                .unwrap_or_else(|e| format!("<serialize: {e}>")),
-                            Err((e, _)) => format!("<tool error: {e}>"),
+                            Ok((res, _)) => serde_json::to_string(&res.value).unwrap_or_else(|e| {
+                                format!("the tool result could not be serialized to JSON ({e})")
+                            }),
+                            Err((e, _)) => format!("tool call failed ({e})"),
                         };
                         req.messages.push(agentd_ai::Message::tool_result(id, text));
                     }
@@ -1461,7 +1471,8 @@ fn parse_messages(v: serde_json::Value) -> Result<Vec<agentd_ai::Message>, Runne
             return Err(RunnerError::Provider {
                 provider: String::new(),
                 source: agentd_ai::ProviderError::Config(
-                    "runners.run: `messages` must be an array".into(),
+                    "the `messages` argument to `runners.run` must be an array of message tables"
+                        .into(),
                 ),
             });
         }
@@ -1471,7 +1482,7 @@ fn parse_messages(v: serde_json::Value) -> Result<Vec<agentd_ai::Message>, Runne
         let obj = item.as_object().ok_or_else(|| RunnerError::Provider {
             provider: String::new(),
             source: agentd_ai::ProviderError::Config(format!(
-                "runners.run: messages[{idx}] must be {{role, content}}"
+                "message {idx} in the `messages` list must be a table with `role` and `content` fields"
             )),
         })?;
         let role_s = obj

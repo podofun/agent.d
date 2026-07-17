@@ -305,8 +305,9 @@ pub async fn run_contained(
     host_grants: Vec<agentd_permissions::Permission>,
     literal_ips: Vec<IpAddr>,
 ) -> Result<ExecResult, ShellError> {
-    let sup_path = supervisor_path()
-        .ok_or_else(|| ShellError::Sandbox("netns supervisor binary not found".into()))?;
+    let sup_path = supervisor_path().ok_or_else(|| {
+        ShellError::Sandbox("the network-namespace supervisor binary was not found".into())
+    })?;
     let req = req.clone();
     let policy = policy.clone();
     let handle = tokio::runtime::Handle::current();
@@ -314,7 +315,7 @@ pub async fn run_contained(
         run_contained_blocking(&req, &policy, &sup_path, host_grants, literal_ips, handle)
     })
     .await
-    .map_err(|e| ShellError::Sandbox(format!("join: {e}")))?
+    .map_err(|e| ShellError::Sandbox(format!("a background sandbox task failed ({e})")))?
 }
 
 fn socketpair(ty: SockType) -> std::io::Result<(RawFd, RawFd)> {
@@ -385,7 +386,7 @@ fn run_contained_blocking(
     // shortcut.
     let child = unsafe { libc::fork() };
     if child < 0 {
-        return Err(sb("fork".into()));
+        return Err(sb("could not fork the sandbox child process".into()));
     }
     if child == 0 {
         // SAFETY: async-signal-safe-only region in the forked child.
@@ -413,7 +414,9 @@ fn run_contained_blocking(
     if read(s1.rd, &mut tmp) != Ok(1) {
         let _ = close(s1.rd);
         let _ = close(s2.wr);
-        return Err(sb("child failed to unshare".into()));
+        return Err(sb(
+            "the sandbox child process failed to unshare its namespaces".into(),
+        ));
     }
     let _ = write_file(&format!("/proc/{child}/uid_map"), &format!("0 {uid} 1\n"));
     let _ = write_file(&format!("/proc/{child}/setgroups"), "deny");

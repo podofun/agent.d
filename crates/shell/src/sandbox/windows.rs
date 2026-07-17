@@ -49,7 +49,9 @@ pub async fn run_contained(
     let policy = policy.clone();
     tokio::task::spawn_blocking(move || imp::run_blocking(&req, &policy))
         .await
-        .map_err(|e| crate::ShellError::Sandbox(format!("join: {e}")))?
+        .map_err(|e| {
+            crate::ShellError::Sandbox(format!("a background sandbox task failed ({e})"))
+        })?
 }
 
 /// One-time privileged sandbox setup; see [`imp::install`].
@@ -204,7 +206,7 @@ mod imp {
         let wname = to_wide(name);
         unsafe {
             DeriveAppContainerSidFromAppContainerName(PCWSTR(wname.as_ptr()))
-                .map_err(|e| sb(format!("derive AppContainer SID: {e}")))
+                .map_err(|e| sb(format!("could not derive the AppContainer SID ({e})")))
         }
     }
 
@@ -519,7 +521,7 @@ mod imp {
         // `lpApplicationName` so no PATH search happens at spawn.
         let bin_path = resolve_bin_path(&req.bin).ok_or_else(|| {
             ShellError::Sandbox(format!(
-                "executable not found: `{}` is not an absolute path and was not found on PATH",
+                "the executable `{}` was not found — it is not an absolute path and is not on `PATH`",
                 req.bin
             ))
         })?;
@@ -627,7 +629,7 @@ mod imp {
 
         let result = (|| -> Result<ExecResult, ShellError> {
             spawn.map_err(|e| {
-                ShellError::Sandbox(format!("CreateProcessW `{}`: {e}", bin_path.display()))
+                ShellError::Sandbox(format!("could not start `{}` ({e})", bin_path.display()))
             })?;
 
             // Feed stdin, if any, then close.

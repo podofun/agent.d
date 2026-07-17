@@ -225,11 +225,13 @@ impl Config {
         // 2. Parse (missing file = empty; malformed = hard error).
         let raw: RawConfig = match std::fs::read_to_string(&cfg_path) {
             Ok(s) => toml::from_str(&s)
-                .with_context(|| format!("malformed config.toml at {}", cfg_path.display()))?,
+                .with_context(|| format!("`{}` is not valid TOML", cfg_path.display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => RawConfig::default(),
             Err(e) => {
-                return Err(anyhow::Error::new(e)
-                    .context(format!("reading config.toml at {}", cfg_path.display())));
+                return Err(anyhow::Error::new(e).context(format!(
+                    "could not read config.toml at `{}`",
+                    cfg_path.display()
+                )));
             }
         };
         let daemon = raw.daemon.unwrap_or_default();
@@ -323,17 +325,19 @@ impl Config {
                 );
             }
             if spec.base_url.trim().is_empty() {
-                anyhow::bail!("provider `{name}`: base_url must not be empty");
+                anyhow::bail!(
+                    "provider `{name}` has an empty base_url — set it to the API endpoint URL"
+                );
             }
             match (&spec.api_key_secret, spec.auth.as_deref()) {
                 (Some(_), Some(_)) => anyhow::bail!(
-                    "provider `{name}`: api_key_secret and auth = \"none\" are mutually exclusive"
+                    "provider `{name}` sets both api_key_secret and auth = \"none\" — pick one"
                 ),
                 (None, None) => anyhow::bail!(
-                    "provider `{name}`: set api_key_secret = \"<secret name>\" or auth = \"none\""
+                    "provider `{name}` needs credentials — set api_key_secret = \"<secret name>\" or auth = \"none\""
                 ),
                 (None, Some(a)) if a != "none" => anyhow::bail!(
-                    "provider `{name}`: auth = \"{a}\" is invalid; the only value is \"none\""
+                    "provider `{name}` has auth = \"{a}\", which is not supported — the only value is \"none\""
                 ),
                 _ => {}
             }
@@ -348,7 +352,7 @@ impl Config {
             let configured: Vec<&str> = providers.iter().map(|(n, _)| n.as_str()).collect();
             names.extend(configured);
             anyhow::bail!(
-                "runtime.default_provider = \"{default_provider}\" names no known provider (available: {})",
+                "runtime.default_provider = \"{default_provider}\" does not match any provider — available providers are {}",
                 names.join(", ")
             );
         }
@@ -383,7 +387,7 @@ impl Config {
 pub fn default_token_file() -> Result<PathBuf> {
     let base = dirs::state_dir()
         .or_else(dirs::data_local_dir)
-        .context("no XDG state/data dir")?;
+        .context("could not locate a state directory (XDG) on this system")?;
     Ok(base.join("agentd").join("token"))
 }
 
@@ -392,7 +396,7 @@ pub fn default_token_file() -> Result<PathBuf> {
 pub fn default_admin_token_file() -> Result<PathBuf> {
     let base = dirs::state_dir()
         .or_else(dirs::data_local_dir)
-        .context("no XDG state/data dir")?;
+        .context("could not locate a state directory (XDG) on this system")?;
     Ok(base.join("agentd").join("admin-token"))
 }
 
@@ -421,21 +425,21 @@ fn sibling(base: &Path, name: &str) -> PathBuf {
 
 fn default_config_path() -> Result<PathBuf> {
     Ok(dirs::config_dir()
-        .context("no XDG config dir")?
+        .context("could not locate a config directory (XDG) on this system")?
         .join("agentd")
         .join("config.toml"))
 }
 
 fn default_init_file() -> Result<PathBuf> {
     Ok(dirs::config_dir()
-        .context("no XDG config dir")?
+        .context("could not locate a config directory (XDG) on this system")?
         .join("agentd")
         .join("init.lua"))
 }
 
 fn default_grants_file() -> Result<PathBuf> {
     Ok(dirs::config_dir()
-        .context("no XDG config dir")?
+        .context("could not locate a config directory (XDG) on this system")?
         .join("agentd")
         .join("grants.toml"))
 }
@@ -443,7 +447,7 @@ fn default_grants_file() -> Result<PathBuf> {
 fn default_trace_file() -> Result<PathBuf> {
     let base = dirs::state_dir()
         .or_else(dirs::data_local_dir)
-        .context("no XDG state/data dir")?;
+        .context("could not locate a state directory (XDG) on this system")?;
     Ok(base.join("agentd").join("trace.jsonl"))
 }
 

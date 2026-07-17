@@ -72,15 +72,15 @@ pub struct SendOutcome {
 
 #[derive(Debug, Error)]
 pub enum MailerError {
-    #[error("config: {0}")]
+    #[error("the mailer configuration is invalid ({0})")]
     Config(String),
-    #[error("address: {0}")]
+    #[error("the email address is invalid ({0})")]
     Address(String),
-    #[error("build: {0}")]
+    #[error("could not build the email message ({0})")]
     Build(String),
-    #[error("transport: {0}")]
+    #[error("could not connect to the mail server ({0})")]
     Transport(String),
-    #[error("send: {0}")]
+    #[error("the mail server refused to send the message ({0})")]
     Send(String),
 }
 
@@ -96,16 +96,16 @@ pub struct Mailer {
 
 fn parse_mailbox(s: &str) -> Result<Mailbox, MailerError> {
     s.parse::<Mailbox>()
-        .map_err(|e| MailerError::Address(format!("`{s}`: {e}")))
+        .map_err(|e| MailerError::Address(format!("`{s}` could not be parsed — {e}")))
 }
 
 impl Mailer {
     pub fn connect(cfg: MailerConfig) -> Result<Self, MailerError> {
         if cfg.host.is_empty() {
-            return Err(MailerError::Config("host is empty".into()));
+            return Err(MailerError::Config("`host` is empty".into()));
         }
         if cfg.from.is_empty() {
-            return Err(MailerError::Config("from is empty".into()));
+            return Err(MailerError::Config("`from` is empty".into()));
         }
         let from = parse_mailbox(&cfg.from)?;
 
@@ -222,10 +222,9 @@ impl Mailer {
             BodyInner::Multi(part) => MultiPart::mixed().multipart(part),
         };
         for att in &mail.attachments {
-            let ct = att
-                .content_type
-                .parse::<ContentType>()
-                .map_err(|e| MailerError::Build(format!("attachment content-type: {e}")))?;
+            let ct = att.content_type.parse::<ContentType>().map_err(|e| {
+                MailerError::Build(format!("the attachment content-type is invalid — {e}"))
+            })?;
             mixed = mixed.singlepart(
                 LettreAttachment::new(att.filename.clone()).body(att.bytes.clone(), ct),
             );

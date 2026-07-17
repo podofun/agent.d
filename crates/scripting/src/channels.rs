@@ -116,7 +116,7 @@ pub(crate) fn install_channel_global(lua: &Lua) -> mlua::Result<()> {
               if type(r) == "userdata" then
                 r = coroutine.yield(r)
                 if type(r) == "table" and r.ok == false then
-                  error(r.error or "channel error", 0)
+                  error(r.error or "the channel operation failed", 0)
                 end
               end
               return r
@@ -149,12 +149,12 @@ fn channel_open_internal(lua: &Lua, args: MultiValue) -> mlua::Result<AnyUserDat
             let name = s.to_str()?.to_string();
             let reg = lua
                 .app_data_ref::<ChannelRegistry>()
-                .ok_or_else(|| mlua::Error::external("channel registry missing"))?;
+                .ok_or_else(|| mlua::Error::external("the channel registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
             reg.open_or_create(&name)
         }
         Some(other) => {
             return Err(mlua::Error::external(format!(
-                "channel: name must be string or nil, got {}",
+                "the channel name must be a string (or omitted for an anonymous channel), but got a {} value",
                 other.type_name()
             )));
         }
@@ -164,25 +164,28 @@ fn channel_open_internal(lua: &Lua, args: MultiValue) -> mlua::Result<AnyUserDat
 
 fn channel_send_internal(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
     let mut it = args.into_iter();
-    let ud: AnyUserData = lua.unpack(
-        it.next()
-            .ok_or_else(|| mlua::Error::external("channel:send: state required"))?,
-    )?;
-    let msg = it
-        .next()
-        .ok_or_else(|| mlua::Error::external("channel:send: message required"))?;
+    let ud: AnyUserData = lua.unpack(it.next().ok_or_else(|| {
+        mlua::Error::external(
+            "`channel.send` is missing the channel handle — call it as a method on the channel",
+        )
+    })?)?;
+    let msg = it.next().ok_or_else(|| {
+        mlua::Error::external("`channel.send` is missing the message — pass the value to send")
+    })?;
     let payload: serde_json::Value = lua
         .from_value(msg)
-        .map_err(|e| mlua::Error::external(format!("channel:send: serialize: {e}")))?;
+        .map_err(|e| mlua::Error::external(format!("the message passed to `channel.send` cannot be serialized ({e}) — only JSON-compatible values are supported")))?;
     let handle = ud.borrow::<ChannelHandle>()?;
     if handle.0.closed() {
-        return Err(mlua::Error::external("channel:send: channel is closed"));
+        return Err(mlua::Error::external(
+            "this channel is closed, so nothing more can be sent on it",
+        ));
     }
-    handle
-        .0
-        .tx
-        .send(payload)
-        .map_err(|_| mlua::Error::external("channel:send: receiver dropped"))?;
+    handle.0.tx.send(payload).map_err(|_| {
+        mlua::Error::external(
+            "the receiving end of this channel is gone, so the message cannot be delivered",
+        )
+    })?;
     Ok(())
 }
 
@@ -197,14 +200,16 @@ fn channel_recv_internal(lua: &Lua, ud: AnyUserData) -> mlua::Result<Value> {
     // Top-level fallback: block on a fresh future.
     let rx = state.rx();
     let handle_rt = tokio::runtime::Handle::try_current()
-        .map_err(|e| mlua::Error::external(format!("channel:recv: no tokio runtime: {e}")))?;
+        .map_err(|e| mlua::Error::external(format!("`channel.recv` was called outside the daemon runtime ({e}) — this is a bug in agentd, please report it")))?;
     let received = handle_rt.block_on(async move {
         let mut guard = rx.lock().await;
         guard.recv().await
     });
     match received {
         Some(v) => Ok(lua.to_value(&v)?),
-        None => Err(mlua::Error::external("channel:recv: channel closed")),
+        None => Err(mlua::Error::external(
+            "this channel is closed and empty, so there is nothing left to receive",
+        )),
     }
 }
 
@@ -212,7 +217,7 @@ fn channel_try_recv_internal(lua: &Lua, ud: AnyUserData) -> mlua::Result<Value> 
     let state = ud.borrow::<ChannelHandle>()?.0.clone();
     let rx = state.rx();
     let handle_rt = tokio::runtime::Handle::try_current()
-        .map_err(|e| mlua::Error::external(format!("channel:try_recv: no tokio runtime: {e}")))?;
+        .map_err(|e| mlua::Error::external(format!("`channel.try_recv` was called outside the daemon runtime ({e}) — this is a bug in agentd, please report it")))?;
     let outcome = handle_rt.block_on(async move {
         let mut guard = rx.lock().await;
         guard.try_recv()
@@ -220,9 +225,9 @@ fn channel_try_recv_internal(lua: &Lua, ud: AnyUserData) -> mlua::Result<Value> 
     match outcome {
         Ok(v) => Ok(lua.to_value(&v)?),
         Err(mpsc::error::TryRecvError::Empty) => Ok(Value::Nil),
-        Err(mpsc::error::TryRecvError::Disconnected) => {
-            Err(mlua::Error::external("channel:try_recv: channel closed"))
-        }
+        Err(mpsc::error::TryRecvError::Disconnected) => Err(mlua::Error::external(
+            "this channel is closed and empty, so there is nothing left to receive",
+        )),
     }
 }
 

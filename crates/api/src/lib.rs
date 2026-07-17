@@ -444,13 +444,18 @@ fn ok_ser<T: Serialize>(id: u64, value: &T) -> WsResponse {
 /// Actionable hint for an error code, shown to humans next to the message.
 fn tip_for(code: &str) -> Option<String> {
     let tip = match code {
-        "no_provider" => "You can configure new providers in your `config.toml`",
+        "no_provider" => {
+            "You can configure new providers in your `config.toml` — https://docs.podo.fun/agentd/v0/reference/configuration"
+        }
         "not_found" => "Run `agentctl tools` to list registered actions",
         "runner_not_found" => "Run `agentctl runner ls` to list runners",
         "denied" | "needs_confirmation" => {
             "Grants live in `grants.toml`; run `agentctl grants listen` to approve interactively"
         }
         "unknown_skill" => "Run `agentctl skill ls` to list skills",
+        "provider_misconfigured" => {
+            "Store API keys in the keyring via `ctx.secret.set` — https://docs.podo.fun/agentd/v0/providers/credentials"
+        }
         "bad_params" => "Pass args as `-d key=value` or `-j '<json>'`",
         _ => return None,
     };
@@ -501,6 +506,10 @@ fn runner_error(id: u64, e: RunnerError) -> WsResponse {
         RunnerError::NotFound(_) => "runner_not_found",
         RunnerError::UnknownSkill { .. } => "unknown_skill",
         RunnerError::NoProvider { .. } => "no_provider",
+        RunnerError::Provider {
+            source: agentd_ai::ProviderError::Config(_),
+            ..
+        } => "provider_misconfigured",
         RunnerError::Provider { .. } => "provider_upstream",
     };
     err(id, code, e.to_string())
@@ -534,6 +543,28 @@ mod tests {
     }
 
     #[test]
+    fn misconfigured_provider_gets_own_code_and_tip() {
+        let resp = runner_error(
+            3,
+            RunnerError::Provider {
+                provider: "github".into(),
+                source: agentd_ai::ProviderError::Config(
+                    "provider `github` is not configured — store the API key in the \
+                     `github_models_token` secret to use it"
+                        .into(),
+                ),
+            },
+        );
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["code"], "provider_misconfigured");
+        let msg = v["error"].as_str().unwrap();
+        // Config messages pass through bare — one sentence, provider named once.
+        assert_eq!(msg.matches("`github`").count(), 1, "{msg}");
+        assert_eq!(msg.matches(':').count(), 0, "no colon chains, got: {msg}");
+        assert!(v["tip"].as_str().unwrap().contains("docs.podo.fun"));
+    }
+
+    #[test]
     fn empty_trace_and_absent_tip_are_omitted() {
         let resp = action_error(
             1,
@@ -548,9 +579,11 @@ mod tests {
 
         let resp = err(2, "no_provider", "m");
         let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(
-            v["tip"],
-            "You can configure new providers in your `config.toml`"
+        assert!(
+            v["tip"]
+                .as_str()
+                .unwrap()
+                .starts_with("You can configure new providers in your `config.toml`")
         );
     }
 }
