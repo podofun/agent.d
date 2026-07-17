@@ -14,7 +14,7 @@ This produces two binaries:
 
 | Binary | Path |
 |---|---|
-| `daemon` | `target/release/daemon` |
+| `agentd` | `target/release/agentd` |
 | `agentctl` | `target/release/agentctl` |
 
 Copy them to a directory on your `PATH` (e.g. `/usr/local/bin`).
@@ -27,7 +27,9 @@ The daemon resolves configuration in this order for each knob: **CLI flag > env 
 |---|---|---|
 | `--config <path>` | `AGENTD_CONFIG` | `$XDG_CONFIG_HOME/agentd/config.toml` |
 | `--init <path>` | `AGENTD_INIT` | `$XDG_CONFIG_HOME/agentd/init.lua` |
-| `--grants-file <path>` | `AGENTD_GRANTS_FILE` | `$XDG_CONFIG_HOME/agentd/grants.toml` |
+| `--grants <path>` | `AGENTD_GRANTS` | `$XDG_CONFIG_HOME/agentd/grants.toml` |
+
+The pre-rename `--grants-file` / `AGENTD_GRANTS_FILE` (and `--trace-file` / `AGENTD_TRACE_FILE`) remain deprecated aliases for one release.
 
 On most Linux systems `$XDG_CONFIG_HOME` resolves to `~/.config`. The defaults work when you place your files there; override with flags or env vars when deploying to non-standard locations.
 
@@ -42,7 +44,7 @@ The default bind address is `127.0.0.1:7777`. Keep it on localhost in production
 To change the address:
 
 ```bash
-daemon --addr 127.0.0.1:8080
+agentd --addr 127.0.0.1:8080
 # or
 export AGENTD_ADDR=127.0.0.1:8080
 ```
@@ -70,7 +72,7 @@ Both files are written with mode `0600`. `agentctl` reads these files automatica
 **Explicit tokens:** set the token via flag or env var to use a fixed value — useful when you inject secrets from a vault:
 
 ```bash
-daemon \
+agentd \
   --token  "$AGENTD_WS_TOKEN" \
   --admin-token "$AGENTD_CTRL_TOKEN"
 ```
@@ -97,9 +99,9 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/daemon \
+ExecStart=/usr/local/bin/agentd \
   --init /etc/agentd/init.lua \
-  --grants-file /etc/agentd/grants.toml \
+  --grants /etc/agentd/grants.toml \
   --config /etc/agentd/config.toml
 Environment=AGENTD_TOKEN=<your-ws-token>
 Environment=AGENTD_ADMIN_TOKEN=<your-ctrl-token>

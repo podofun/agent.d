@@ -36,7 +36,7 @@ agent.d turns those concerns into runtime configuration instead of application g
 
 Two binaries:
 
-- **`daemon`** — the runtime server. Loads your Lua components, enforces grants, and listens on `127.0.0.1:7777` by default.
+- **`agentd`** — the runtime server. Loads your Lua components, enforces grants, and listens on `127.0.0.1:7777` by default.
 - **`agentctl`** — the console client. Lets you call actions, inspect runners, follow traces, and manage packages from the terminal.
 
 You write components in Lua and configure permissions in TOML. The daemon does the rest.

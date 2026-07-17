@@ -93,11 +93,11 @@ import("tools/notify.lua")
 ## How to run
 
 ```bash [release]
-daemon --init init.lua --grants-file grants.toml
+agentd --init init.lua --grants grants.toml
 ```
 
 ```bash [cargo]
-cargo run -p daemon -- --init init.lua --grants-file grants.toml
+cargo run -p daemon -- --init init.lua --grants grants.toml
 ```
 
 ## Sending a trigger from a WebSocket client

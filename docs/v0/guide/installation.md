@@ -17,10 +17,10 @@ Pick the archive for your platform:
 | macOS (Apple Silicon) | `agentd-aarch64-macos.tar.gz` |
 | Windows (x86-64) | `agentd-x86_64-windows.zip` |
 
-Each archive contains the `daemon` and `agentctl` binaries (with `.exe`
+Each archive contains the `agentd` and `agentctl` binaries (with `.exe`
 extensions on Windows) plus the README and license. The Windows archive also
 includes `agentd-netbroker.exe`, a helper the daemon launches for sandboxed
-networking — keep it in the same folder as `daemon.exe`. A `SHA256SUMS.txt` is
+networking — keep it in the same folder as `agentd.exe`. A `SHA256SUMS.txt` is
 published alongside the archives so you can verify your download.
 
 ::: code-group
@@ -33,7 +33,7 @@ tar -xzf agentd-x86_64-linux.tar.gz
 sha256sum -c SHA256SUMS.txt --ignore-missing
 
 # Install onto your PATH
-install -m 0755 daemon agentctl ~/.local/bin/
+install -m 0755 agentd agentctl ~/.local/bin/
 ```
 
 ```powershell [Windows]
@@ -42,7 +42,7 @@ Expand-Archive agentd-x86_64-windows.zip -DestinationPath agentd
 
 # Move the binaries somewhere on your PATH, e.g. (keep all three together)
 New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\Programs\agentd" | Out-Null
-Move-Item agentd\daemon.exe, agentd\agentctl.exe, agentd\agentd-netbroker.exe "$env:LOCALAPPDATA\Programs\agentd"
+Move-Item agentd\agentd.exe, agentd\agentctl.exe, agentd\agentd-netbroker.exe "$env:LOCALAPPDATA\Programs\agentd"
 # Then add that folder to your PATH (System settings → Environment Variables)
 ```
 
@@ -52,7 +52,7 @@ Move-Item agentd\daemon.exe, agentd\agentctl.exe, agentd\agentd-netbroker.exe "$
 If your agents run network-enabled shell tools, run this once in an elevated terminal so the sandbox can confine their network:
 
 ```powershell
-daemon --install-sandbox
+agentd --install-sandbox
 ```
 
 The daemon itself then runs without Administrator. See [Shell sandbox](/v0/security/sandbox#windows-one-time-network-setup) for details.
@@ -85,7 +85,7 @@ The release build produces two binaries:
 
 | Binary | Path | Purpose |
 |---|---|---|
-| `daemon` | `target/release/daemon` | The runtime server |
+| `agentd` | `target/release/agentd` | The runtime server |
 | `agentctl` | `target/release/agentctl` | The console client |
 
 ## Put the binaries on your PATH
@@ -93,13 +93,13 @@ The release build produces two binaries:
 Copy or symlink both binaries to a directory on your PATH:
 
 ```bash
-cp target/release/daemon target/release/agentctl ~/.local/bin/
+cp target/release/agentd target/release/agentctl ~/.local/bin/
 ```
 
 Verify:
 
 ```bash
-daemon --help
+agentd --help
 agentctl --help
 ```
 
@@ -109,7 +109,7 @@ During active development you can run either binary directly through Cargo witho
 
 ```bash
 # Run the daemon
-cargo run -p daemon -- --init examples/init.lua --grants-file examples/grants.toml
+cargo run -p daemon -- --init examples/init.lua --grants examples/grants.toml
 
 # Run agentctl
 cargo run -p agentd-cli -- health
