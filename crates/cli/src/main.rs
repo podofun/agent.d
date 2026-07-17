@@ -24,7 +24,7 @@ use tokio_tungstenite::tungstenite::Message;
 )]
 struct Cli {
     /// Daemon base URL.
-    #[arg(long, env = "AGENTD_URL", default_value = "http://127.0.0.1:7777")]
+    #[arg(short = 'u', long, env = "AGENTD_URL", default_value = "http://127.0.0.1:7777")]
     url: String,
 
     /// Connect timeout (ms).
@@ -44,26 +44,29 @@ enum Cmd {
     /// Invoke an action.
     Call {
         action: String,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: Option<String>,
         #[arg(short = 'd', long = "data", value_name = "KEY=VAL")]
         data: Vec<String>,
-        #[arg(long)]
+        #[arg(short = 'r', long)]
         result_only: bool,
         #[arg(long)]
         compact: bool,
     },
     /// Runner operations.
+    #[command(visible_alias = "runners")]
     Runner {
         #[command(subcommand)]
         cmd: RunnerCmd,
     },
     /// Skill operations.
+    #[command(name = "skill", visible_alias = "skills")]
     Skills {
         #[command(subcommand)]
         cmd: SkillsCmd,
     },
     /// Service operations.
+    #[command(name = "service", visible_alias = "services", alias = "svc")]
     Services {
         #[command(subcommand)]
         cmd: ServicesCmd,
@@ -74,6 +77,7 @@ enum Cmd {
         cmd: GrantsCmd,
     },
     /// Manage installed packages (~/.local/share/agentd/packages).
+    #[command(name = "package", visible_alias = "packages", alias = "pkg")]
     Packages {
         #[command(subcommand)]
         cmd: PkgCmd,
@@ -128,6 +132,7 @@ enum PkgCmd {
     /// Re-pull and re-pin an installed package.
     Update { name: String },
     /// Remove an installed package.
+    #[command(alias = "rm")]
     Remove { name: String },
 }
 
@@ -821,4 +826,54 @@ fn default_trace_path() -> Result<std::path::PathBuf> {
         .or_else(dirs::data_local_dir)
         .ok_or_else(|| anyhow!("no XDG state/data dir"))?;
     Ok(base.join("agentd").join("trace.jsonl"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("agentctl").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn noun_aliases_parse() {
+        for cmd in [
+            "runner", "runners", "skill", "skills", "service", "services", "svc", "package",
+            "packages", "pkg",
+        ] {
+            parse(&[cmd, "ls"]);
+        }
+    }
+
+    #[test]
+    fn pkg_rm_alias_parses() {
+        let c = parse(&["pkg", "rm", "foo"]);
+        assert!(matches!(
+            c.cmd,
+            Cmd::Packages {
+                cmd: PkgCmd::Remove { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn call_short_flags_parse() {
+        let c = parse(&["call", "act", "-j", "{}", "-r"]);
+        match c.cmd {
+            Cmd::Call {
+                json, result_only, ..
+            } => {
+                assert_eq!(json.as_deref(), Some("{}"));
+                assert!(result_only);
+            }
+            _ => panic!("wrong cmd"),
+        }
+    }
+
+    #[test]
+    fn global_short_url_parses() {
+        let c = parse(&["-u", "http://x:1", "health"]);
+        assert_eq!(c.url, "http://x:1");
+    }
 }
