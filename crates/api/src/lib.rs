@@ -9,8 +9,9 @@
 //! { "id": 1, "method": "actions.call", "params": { "name": "git.diff", "args": {} } }
 //! // server -> client (success)
 //! { "id": 1, "ok": true, "result": { ... } }
-//! // server -> client (error)
-//! { "id": 1, "ok": false, "code": "not_found", "error": "action `x` not registered" }
+//! // server -> client (error; `tip` and `trace` are optional)
+//! { "id": 1, "ok": false, "code": "not_found", "error": "action `x` not registered",
+//!   "tip": "Run `agentctl tools` to list registered actions" }
 //! ```
 //!
 //! Methods implemented:

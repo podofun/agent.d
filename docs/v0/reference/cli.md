@@ -303,6 +303,27 @@ agentctl trace --file /tmp/my-trace.jsonl -f
 
 ---
 
+## Error output
+
+When a command fails, `agentctl` renders the daemon's error envelope for humans:
+
+```
+Error: Could not resolve a provider for model `github/openai/gpt-4o-mini`  (no_provider)
+Tip: You can configure new providers in your `config.toml`
+
+Stack trace:
+  helpers.lua:313  in structured
+  init.lua:53
+```
+
+- The trailing `(code)` suffix is dimmed on a TTY.
+- The `Tip:` line and the `Stack trace:` section only appear when the daemon supplies them — tips are attached per error code, and stack traces accompany failures raised from inside a Lua script.
+- With `call --compact`, errors are printed as one-line JSON instead: `{"code":...,"error":...,"tip":...,"trace":[...]}`.
+
+See the [error codes table](/v0/reference/protocol#error-codes) for the full code and tip catalog.
+
+---
+
 ## See also
 
 - [WebSocket protocol](/v0/reference/protocol)
