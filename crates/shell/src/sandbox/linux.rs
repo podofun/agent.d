@@ -65,6 +65,7 @@ pub fn apply(policy: &SandboxPolicy) -> Result<(), SandboxError> {
     let read_dirs = READ_BASELINE
         .iter()
         .map(PathBuf::from)
+        .chain(crate::policy::user_read_baseline())
         .chain(policy.read_paths.iter().cloned())
         .chain(policy.write_paths.iter().cloned());
     for path in read_dirs {
