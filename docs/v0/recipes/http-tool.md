@@ -79,7 +79,7 @@ ctx.http.client({
   headers  = { Authorization = "Bearer " .. ctx.secret.get("my_api_key") },
 })
 ```
-Store the key with `ctx.secret.set` and declare `secret:my_api_key` in `requires`. See [ctx.secret](/v0/reference/ctx/secrets).
+Store the key once with `agentctl secret set my_api_key` and declare `secret:my_api_key` in `requires`. See [ctx.secret](/v0/reference/ctx/secrets).
 :::
 
 ## Entry point

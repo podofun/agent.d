@@ -36,17 +36,10 @@ Provider names must not collide with the reserved built-in prefixes (`anthropic`
 
 ## Storing the API key
 
-Same pattern as the built-ins — once, via a setup action:
+Same pattern as the built-ins — once, with `agentctl secret set` under the name you declared in `api_key_secret`:
 
-```lua
-agentd.action("setup.openrouter_key", function(args, ctx)
-  ctx.secret.set("openrouter_api_key", args.key)
-  return "stored"
-end)
-```
-
-```
-agentctl call setup.openrouter_key -d key=sk-or-…
+```bash
+echo "$OPENROUTER_API_KEY" | agentctl secret set openrouter_api_key
 ```
 
 ## Using the provider

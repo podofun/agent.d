@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 agentd-luals.workspace = true
 agentd-packages.workspace = true
+agentd-secrets.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tempfile.workspace = true

@@ -87,6 +87,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PkgCmd,
     },
+    /// Manage provider API keys in the OS keyring. Changes are visible to a
+    /// running daemon immediately — providers read the keyring at call time.
+    #[command(name = "secret", visible_alias = "secrets")]
+    Secret {
+        #[command(subcommand)]
+        cmd: SecretCmd,
+    },
     /// Generate lua-language-server type stubs into a project's `.luals/`.
     Types {
         /// Project directory (the folder holding `init.lua`). Defaults to the
@@ -102,6 +109,18 @@ enum Cmd {
         #[arg(short = 'n', long, default_value_t = 20)]
         lines: usize,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum SecretCmd {
+    /// Store a secret. Omit `value` to read it from stdin (keeps the key out
+    /// of your shell history): `echo "$KEY" | agentctl secret set my_key`.
+    Set { name: String, value: Option<String> },
+    /// Remove a secret from the keyring.
+    #[command(alias = "rm")]
+    Unset { name: String },
+    /// Show a half-obfuscated preview of a secret (never the full value).
+    Peek { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -146,6 +165,56 @@ fn packages_root() -> Result<std::path::PathBuf> {
         .ok_or_else(|| anyhow!("could not locate a data directory (XDG) on this system"))?
         .join("agentd")
         .join("packages"))
+}
+
+/// Secret management talks straight to the OS keyring (same `agentd` service
+/// the daemon reads), so no daemon round-trip is needed and a running daemon
+/// picks up changes on its next provider call.
+fn run_secrets(cmd: SecretCmd) -> Result<()> {
+    use agentd_secrets::{KeyringStore, SecretStore};
+    let store = KeyringStore::default_service();
+    match cmd {
+        SecretCmd::Set { name, value } => {
+            let value = match value {
+                Some(v) => v,
+                None => {
+                    // Piped or typed on stdin; trailing newline stripped.
+                    let mut s = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)
+                        .context("could not read the secret value from stdin")?;
+                    s.trim_end_matches(['\r', '\n']).to_string()
+                }
+            };
+            if value.is_empty() {
+                return Err(anyhow!(
+                    "the secret value is empty — pass it as an argument or pipe it on stdin"
+                ));
+            }
+            store.set(&name, &value)?;
+            println!("stored `{name}` — available to the daemon immediately");
+        }
+        SecretCmd::Unset { name } => {
+            store.delete(&name)?;
+            println!("removed `{name}`");
+        }
+        SecretCmd::Peek { name } => {
+            let v = store.get(&name)?;
+            println!("{}", obfuscate(&v));
+        }
+    }
+    Ok(())
+}
+
+/// Half-obfuscated preview: enough to recognize a key, not enough to use
+/// it. Short values are fully masked.
+fn obfuscate(v: &str) -> String {
+    let n = v.chars().count();
+    if n < 8 {
+        return format!("{} ({n} chars)", "*".repeat(n));
+    }
+    let head: String = v.chars().take(4).collect();
+    let tail: String = v.chars().skip(n - 2).collect();
+    format!("{head}{}{tail} ({n} chars)", "*".repeat((n - 6).min(12)))
 }
 
 /// Package management is a local fs + git operation — no daemon round-trip.
@@ -259,6 +328,7 @@ async fn main() -> Result<()> {
             GrantsCmd::Listen => cmd_grants_listen(&cli.url, cli.timeout).await,
         },
         Cmd::Packages { cmd } => run_packages(cmd),
+        Cmd::Secret { cmd } => run_secrets(cmd),
         Cmd::Types { dir } => cmd_types(&cli.url, cli.timeout, dir).await,
         Cmd::Trace {
             file,
@@ -916,6 +986,54 @@ mod tests {
         ] {
             parse(&[cmd, "ls"]);
         }
+    }
+
+    #[test]
+    fn secret_commands_parse() {
+        assert!(matches!(
+            parse(&["secret", "set", "k", "v"]).cmd,
+            Cmd::Secret {
+                cmd: SecretCmd::Set { .. }
+            }
+        ));
+        // Value may come from stdin.
+        assert!(matches!(
+            parse(&["secret", "set", "k"]).cmd,
+            Cmd::Secret {
+                cmd: SecretCmd::Set { value: None, .. }
+            }
+        ));
+        assert!(matches!(
+            parse(&["secrets", "unset", "k"]).cmd,
+            Cmd::Secret {
+                cmd: SecretCmd::Unset { .. }
+            }
+        ));
+        assert!(matches!(
+            parse(&["secret", "rm", "k"]).cmd,
+            Cmd::Secret {
+                cmd: SecretCmd::Unset { .. }
+            }
+        ));
+        assert!(matches!(
+            parse(&["secret", "peek", "k"]).cmd,
+            Cmd::Secret {
+                cmd: SecretCmd::Peek { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn obfuscate_previews_without_revealing() {
+        // Long keys: 4-char head, 2-char tail, bounded mask, length shown.
+        let s = obfuscate("sk-ant-api03-abcdefghijklmnop");
+        assert!(s.starts_with("sk-a"), "{s}");
+        assert!(s.ends_with("op (29 chars)"), "{s}");
+        assert!(!s.contains("api03"), "middle must be masked: {s}");
+        // Short values: fully masked.
+        assert_eq!(obfuscate("abc"), "*** (3 chars)");
+        // Exactly at the boundary.
+        assert_eq!(obfuscate("12345678"), "1234**78 (8 chars)");
     }
 
     #[test]

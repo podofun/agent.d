@@ -454,7 +454,7 @@ fn tip_for(code: &str) -> Option<String> {
         }
         "unknown_skill" => "Run `agentctl skill ls` to list skills",
         "provider_misconfigured" => {
-            "Store API keys in the keyring via `ctx.secret.set` — https://docs.podo.fun/agentd/v0/providers/credentials"
+            "Store the API key with `agentctl secret set <name> <value>` — https://docs.podo.fun/agentd/v0/providers/credentials"
         }
         "bad_params" => "Pass args as `-d key=value` or `-j '<json>'`",
         _ => return None,
