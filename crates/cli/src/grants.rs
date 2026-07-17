@@ -80,6 +80,8 @@ pub(crate) async fn cmd_grants_listen(base: &str, timeout: u64) -> Result<()> {
 // action and the key hints so the eye lands on what matters.
 const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
+const GREEN: &str = "\x1b[32m";
+const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
 
 /// Render an approval request as a bordered card and read a single-keystroke
@@ -123,7 +125,7 @@ async fn prompt_verdict(req: &Value) -> Result<&'static str> {
 
     let id = &req["id"];
     println!("\n  {DIM}╭╴{RESET} approval {DIM}#{id}{RESET} · {BOLD}{action}{RESET}");
-    for (label, value) in rows {
+    for (label, value) in &rows {
         println!("  {DIM}│{RESET}  {DIM}{label:<8}{RESET}{value}");
     }
     print!("  {DIM}╰╴{RESET} {BOLD}o{RESET} once   {BOLD}f{RESET} forever   {BOLD}d{RESET} deny  {DIM}›{RESET} ");
@@ -137,13 +139,42 @@ async fn prompt_verdict(req: &Value) -> Result<&'static str> {
         .await
         .unwrap_or("deny");
 
-    let shown = match verdict {
-        "allow_once" => "once",
-        "allow_forever" => "forever",
-        _ => "deny",
-    };
-    println!("{BOLD}{shown}{RESET}");
+    // Collapse the whole card into one line summarizing the decision. On a TTY,
+    // rewind over the card (header + rows + prompt) and clear it first; when
+    // piped there's nothing to rewind, so just print the summary below.
+    // Rewind over the rows + prompt line to the header; the leading blank line
+    // stays as a separator above the summary.
+    let card_lines = rows.len() as u16 + 1;
+    collapse_card(card_lines);
+    println!("{}", decision_summary(verdict, action, tool));
     Ok(verdict)
+}
+
+/// One-line recap of a resolved approval, e.g.
+/// `✓ You approved git.status to use git · once`.
+fn decision_summary(verdict: &str, action: &str, tool: &str) -> String {
+    match verdict {
+        "allow_once" => {
+            format!("  {GREEN}✓{RESET} You approved {BOLD}{action}{RESET} to use {tool} {DIM}· once{RESET}")
+        }
+        "allow_forever" => {
+            format!("  {GREEN}✓{RESET} You approved {BOLD}{action}{RESET} to use {tool} {DIM}· always{RESET}")
+        }
+        _ => format!("  {RED}✗{RESET} You denied {BOLD}{action}{RESET} {DIM}({tool}){RESET}"),
+    }
+}
+
+/// Rewind `lines` rows up to the top of the printed card and clear everything
+/// below, so the caller can reprint a single summary line in its place. No-op
+/// when stdout is not a terminal (piped output has nothing to rewind).
+fn collapse_card(lines: u16) {
+    use std::io::{IsTerminal, stdout};
+    if !stdout().is_terminal() {
+        return;
+    }
+    use crossterm::cursor::MoveToPreviousLine;
+    use crossterm::terminal::{Clear, ClearType};
+    let _ = crossterm::execute!(stdout(), MoveToPreviousLine(lines), Clear(ClearType::FromCursorDown));
 }
 
 /// Block on a single keystroke and map it to a verdict. `o`/`f` allow, anything
