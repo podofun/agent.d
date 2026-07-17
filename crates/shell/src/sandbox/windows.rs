@@ -469,6 +469,17 @@ mod imp {
             }
         }
 
+        // Per-user config roots (%APPDATA%, %USERPROFILE%\.gitconfig, …) so
+        // sandboxed tools can read their own settings without a grant per tool.
+        // Read-only; see policy::user_read_baseline. Unlike the per-process
+        // Landlock/Seatbelt baselines, this stamps a persistent inherited ACE on
+        // the real directory — stamp_ace no-ops on paths that don't exist.
+        for p in crate::policy::user_read_baseline() {
+            if let Some(s) = p.to_str() {
+                stamp_ace(s, sid, GENERIC_READ);
+            }
+        }
+
         // Grant read+execute on the binary's own directory so a user-installed
         // program and the DLLs next to it can be loaded. System binaries under
         // System32 already grant ALL_APPLICATION_PACKAGES (which the lowbox token

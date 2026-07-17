@@ -13,6 +13,7 @@ agentd-packages.workspace = true
 agentd-secrets.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+crossterm = "0.29.0"
 tempfile.workspace = true
 dirs.workspace = true
 futures-util = { workspace = true, features = ["std", "sink"] }
