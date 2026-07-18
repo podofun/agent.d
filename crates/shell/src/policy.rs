@@ -40,16 +40,17 @@ pub const READ_BASELINE: &[&str] = &[
 pub fn user_read_baseline() -> Vec<PathBuf> {
     #[cfg(windows)]
     {
-        let mut out = Vec::new();
-        if let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
-            out.push(profile.join(".gitconfig"));
-        }
-        for var in ["APPDATA", "LOCALAPPDATA"] {
-            if let Some(dir) = std::env::var_os(var).map(PathBuf::from) {
-                out.push(dir);
-            }
-        }
-        out
+        // Empty by design. The Windows backend confines reads with an
+        // AppContainer lowbox token (default-deny: the child can only read
+        // objects whose ACL grants its package SID). Auto-granting a read
+        // baseline here would mean ACL-stamping the paths — and pointing that
+        // inheritable stamp at whole config roots (%APPDATA%, %LOCALAPPDATA%)
+        // both took minutes to propagate AND silently exposed everything under
+        // them (browser secrets, SSH keys) to sandboxed tools. So there is no
+        // implicit read grant on Windows: reads are limited to the cwd and the
+        // explicit `fs.read` grants, same meaning as Landlock/Seatbelt. A tool
+        // that needs `~/.gitconfig` gets an explicit `fs.read` for it.
+        Vec::new()
     }
     #[cfg(not(windows))]
     {
@@ -204,17 +205,9 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn user_read_baseline_covers_windows_config_roots() {
-        // SAFETY: single-threaded test; set the profile env vars and read them
-        // back through the helper.
-        unsafe {
-            std::env::set_var("USERPROFILE", r"C:\Users\tester");
-            std::env::set_var("APPDATA", r"C:\Users\tester\AppData\Roaming");
-            std::env::set_var("LOCALAPPDATA", r"C:\Users\tester\AppData\Local");
-        }
-        let paths = user_read_baseline();
-        assert!(paths.contains(&PathBuf::from(r"C:\Users\tester\.gitconfig")));
-        assert!(paths.contains(&PathBuf::from(r"C:\Users\tester\AppData\Roaming")));
-        assert!(paths.contains(&PathBuf::from(r"C:\Users\tester\AppData\Local")));
+    fn user_read_baseline_is_empty_on_windows() {
+        // Windows grants config reads through the sandbox token (user SID as a
+        // lowbox capability), not through an ACL-stamped path list.
+        assert!(user_read_baseline().is_empty());
     }
 }
