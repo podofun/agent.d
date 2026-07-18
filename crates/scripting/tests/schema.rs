@@ -144,11 +144,9 @@ async fn discord_example_loads_and_exposes_schemas() {
         serde_json::json!(["channel_id", "content"])
     );
 
-    let tok = host
-        .action_info("discord.set_token")
-        .and_then(|i| i.input_schema)
-        .expect("discord.set_token input schema");
-    assert_eq!(tok["required"], serde_json::json!(["token"]));
+    // Token setup moved to `agentctl secret set` (560fc4f); the example no
+    // longer registers a set_token action.
+    assert!(host.action_info("discord.set_token").is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
