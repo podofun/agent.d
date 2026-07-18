@@ -36,37 +36,74 @@ fn main() -> Result<()> {
     // launches the separate broker binary through UAC to register the SYSTEM
     // service that performs privileged network filtering.
     if cli.install_sandbox {
-        sandbox::install().map_err(|e| anyhow!("sandbox profile setup failed: {e}"))?;
+        // Windows: request elevation FIRST so the UAC prompt appears
+        // immediately, before the (unprivileged) profile setup in
+        // sandbox::install below.
         #[cfg(target_os = "windows")]
         {
-            let broker = std::env::current_exe()?
-                .parent()
-                .ok_or_else(|| anyhow!("cannot locate the daemon's directory"))?
-                .join("agentd-netbroker.exe");
-            if !broker.exists() {
-                return Err(anyhow!(
-                    "agentd-netbroker.exe not found next to agentd.exe (looked in {})",
-                    broker.display()
-                ));
-            }
-            if elevate::run_elevated(&broker, "--install")? {
-                println!("Network sandbox installed. The daemon runs without Administrator.");
-            } else {
-                return Err(anyhow!(
-                    "Administrator approval was declined; nothing was changed."
-                ));
+            let broker = broker_path()?;
+            match elevate::run_elevated(&broker, "--install")? {
+                elevate::ElevatedExit::Exit(0) => {}
+                elevate::ElevatedExit::Declined => {
+                    return Err(anyhow!(
+                        "Administrator approval was declined; nothing was changed."
+                    ));
+                }
+                elevate::ElevatedExit::Exit(code) => {
+                    return Err(anyhow!(
+                        "the network broker setup failed (agentd-netbroker --install exited with code {code}); check the Windows Event Log for service errors"
+                    ));
+                }
             }
         }
+        sandbox::install().map_err(|e| anyhow!("sandbox profile setup failed: {e}"))?;
+        #[cfg(target_os = "windows")]
+        println!("Network sandbox installed. The daemon runs without Administrator.");
         #[cfg(not(target_os = "windows"))]
         println!("Sandbox setup complete. The daemon runs unprivileged from here on.");
         return Ok(());
     }
     if cli.uninstall_sandbox {
         sandbox::uninstall().map_err(|e| anyhow!("sandbox teardown failed: {e}"))?;
+        // The broker SYSTEM service must be removed too, elevated. Leaving it
+        // registered points the sandbox at a possibly stale binary forever.
+        #[cfg(target_os = "windows")]
+        {
+            let broker = broker_path()?;
+            match elevate::run_elevated(&broker, "--uninstall")? {
+                elevate::ElevatedExit::Exit(0) => {}
+                elevate::ElevatedExit::Declined => {
+                    return Err(anyhow!(
+                        "Administrator approval was declined; the network broker service was not removed."
+                    ));
+                }
+                elevate::ElevatedExit::Exit(code) => {
+                    return Err(anyhow!(
+                        "the network broker removal failed (agentd-netbroker --uninstall exited with code {code})"
+                    ));
+                }
+            }
+        }
         println!("Sandbox setup removed.");
         return Ok(());
     }
     run(cli)
+}
+
+/// The broker binary that ships next to `agentd.exe`.
+#[cfg(target_os = "windows")]
+fn broker_path() -> Result<std::path::PathBuf> {
+    let broker = std::env::current_exe()?
+        .parent()
+        .ok_or_else(|| anyhow!("cannot locate the daemon's directory"))?
+        .join("agentd-netbroker.exe");
+    if !broker.exists() {
+        return Err(anyhow!(
+            "agentd-netbroker.exe not found next to agentd.exe (looked in {})",
+            broker.display()
+        ));
+    }
+    Ok(broker)
 }
 
 #[tokio::main]
@@ -302,7 +339,10 @@ impl StartupSummary<'_> {
         );
         let _ = writeln!(out);
         for (label, target) in endpoints {
-            let _ = writeln!(out, "  {arrow}➜{reset}  {dim}{label:<8}{reset}{url}{target}{reset}");
+            let _ = writeln!(
+                out,
+                "  {arrow}➜{reset}  {dim}{label:<8}{reset}{url}{target}{reset}"
+            );
         }
         let _ = writeln!(out);
         let _ = writeln!(out, "  {dim}Loaded{reset}    {loaded}");
