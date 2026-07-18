@@ -128,7 +128,9 @@ async fn prompt_verdict(req: &Value) -> Result<&'static str> {
     for (label, value) in &rows {
         println!("  {DIM}│{RESET}  {DIM}{label:<8}{RESET}{value}");
     }
-    print!("  {DIM}╰╴{RESET} {BOLD}o{RESET} once   {BOLD}f{RESET} forever   {BOLD}d{RESET} deny  {DIM}›{RESET} ");
+    print!(
+        "  {DIM}╰╴{RESET} {BOLD}o{RESET} once   {BOLD}f{RESET} forever   {BOLD}d{RESET} deny  {DIM}›{RESET} "
+    );
     use std::io::Write;
     let _ = std::io::stdout().flush();
 
@@ -155,10 +157,14 @@ async fn prompt_verdict(req: &Value) -> Result<&'static str> {
 fn decision_summary(verdict: &str, action: &str, tool: &str) -> String {
     match verdict {
         "allow_once" => {
-            format!("  {GREEN}✓{RESET} You approved {BOLD}{action}{RESET} to use {tool} {DIM}· once{RESET}")
+            format!(
+                "  {GREEN}✓{RESET} You approved {BOLD}{action}{RESET} to use {tool} {DIM}· once{RESET}"
+            )
         }
         "allow_forever" => {
-            format!("  {GREEN}✓{RESET} You approved {BOLD}{action}{RESET} to use {tool} {DIM}· always{RESET}")
+            format!(
+                "  {GREEN}✓{RESET} You approved {BOLD}{action}{RESET} to use {tool} {DIM}· always{RESET}"
+            )
         }
         _ => format!("  {RED}✗{RESET} You denied {BOLD}{action}{RESET} {DIM}({tool}){RESET}"),
     }
@@ -174,7 +180,11 @@ fn collapse_card(lines: u16) {
     }
     use crossterm::cursor::MoveToPreviousLine;
     use crossterm::terminal::{Clear, ClearType};
-    let _ = crossterm::execute!(stdout(), MoveToPreviousLine(lines), Clear(ClearType::FromCursorDown));
+    let _ = crossterm::execute!(
+        stdout(),
+        MoveToPreviousLine(lines),
+        Clear(ClearType::FromCursorDown)
+    );
 }
 
 /// Block on a single keystroke and map it to a verdict. `o`/`f` allow, anything

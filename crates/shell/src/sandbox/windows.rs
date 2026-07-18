@@ -469,16 +469,10 @@ mod imp {
             }
         }
 
-        // Per-user config roots (%APPDATA%, %USERPROFILE%\.gitconfig, …) so
-        // sandboxed tools can read their own settings without a grant per tool.
-        // Read-only; see policy::user_read_baseline. Unlike the per-process
-        // Landlock/Seatbelt baselines, this stamps a persistent inherited ACE on
-        // the real directory — stamp_ace no-ops on paths that don't exist.
-        for p in crate::policy::user_read_baseline() {
-            if let Some(s) = p.to_str() {
-                stamp_ace(s, sid, GENERIC_READ);
-            }
-        }
+        // No implicit read baseline on Windows: reads are confined to the cwd
+        // and explicit `fs.read` grants (stamped above). See
+        // policy::user_read_baseline for why auto-granting config roots was
+        // removed (slow, and a silent read-everything hole).
 
         // Grant read+execute on the binary's own directory so a user-installed
         // program and the DLLs next to it can be loaded. System binaries under
@@ -616,6 +610,17 @@ mod imp {
             .as_ref()
             .map(|b| b.as_ptr() as *const core::ffi::c_void);
 
+        // Honor the request's working directory. Without this the child inherits
+        // the daemon's cwd, which the lowbox token cannot read — tools that
+        // stat their cwd at startup (git: "Unable to read current working
+        // directory") then fail. The dir must be one the child can read, i.e. a
+        // granted path; callers pass a granted cwd.
+        let cwd_w = req.cwd.as_ref().map(|c| to_wide(&c.to_string_lossy()));
+        let cwd_ptr = cwd_w
+            .as_ref()
+            .map(|w| PCWSTR(w.as_ptr()))
+            .unwrap_or(PCWSTR::null());
+
         let spawn = unsafe {
             CreateProcessW(
                 PCWSTR(app_name_w.as_mut_ptr()),
@@ -625,7 +630,7 @@ mod imp {
                 true, // inherit handles (the stdio pipe ends)
                 EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
                 env_ptr,
-                PCWSTR::null(),
+                cwd_ptr,
                 &siex.StartupInfo,
                 &mut pi,
             )

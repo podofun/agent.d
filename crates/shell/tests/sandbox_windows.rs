@@ -7,6 +7,10 @@
 //!   ACL'd for the package so I/O works); `STATUS_DLL_INIT_FAILED`
 //!   (`0xC0000142` => `-1073741502`) before `main` would mean we broke startup;
 //! - writes land only inside the granted scratch dir, never outside;
+//! - reads are confined to `fs.read` grants — a granted file is readable, an
+//!   ungranted one is not (the guard against the removed implicit config
+//!   baseline silently exposing everything under `%APPDATA%`/`%LOCALAPPDATA%`);
+//! - common dev tools (git/node/yarn/npm/python) start and run confined;
 //! - with `allow_net = false` the child has no outbound network at all.
 
 use agentd_permissions::Permission;
@@ -455,6 +459,41 @@ async fn write_via_parent_traversal_is_denied() {
     assert!(!target.exists(), "file outside grant must not exist");
 }
 
+/// A file inside a read grant IS readable — the positive counterpart to
+/// `read_outside_grant_is_denied`. Absolute path, default cwd, so this isolates
+/// the read ACL grant from any working-directory concern.
+#[tokio::test]
+async fn read_inside_grant_succeeds() {
+    let _serial = SANDBOX_SERIAL.lock().await;
+    assert!(is_supported(), "windows sandbox must be supported");
+
+    let granted = tempfile::tempdir().unwrap();
+    let file = granted.path().join("cfg.txt");
+    std::fs::write(&file, "GRANTEDVALUE").unwrap();
+    let res = exec(req(
+        powershell(),
+        vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            format!("Get-Content -LiteralPath '{}'", file.display()),
+        ],
+        policy_reads(&[granted.path()], granted.path()),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        res.exit_code, 0,
+        "granted read failed; stderr: {}",
+        res.stderr
+    );
+    assert!(
+        res.stdout.contains("GRANTEDVALUE"),
+        "expected granted file content, got: {:?}",
+        res.stdout
+    );
+}
+
 /// A file outside every grant is unreadable by the AppContainer.
 #[tokio::test]
 async fn read_outside_grant_is_denied() {
@@ -483,6 +522,88 @@ async fn read_outside_grant_is_denied() {
         res.stdout
     );
     assert_ne!(res.exit_code, 0, "read outside grant must fail");
+}
+
+/// Resolve a bare tool name to an absolute path on PATH, skipping the Windows
+/// Store reparse stubs under WindowsApps. `None` if the tool is not installed.
+fn tool_on_path(name: &str) -> Option<String> {
+    let exe = format!("{name}.exe");
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|d| {
+        if d.to_string_lossy().contains("WindowsApps") {
+            return None;
+        }
+        let c = d.join(&exe);
+        c.is_file().then(|| c.to_string_lossy().into_owned())
+    })
+}
+
+/// A policy granting read on each of `reads` and write on `write`, no network.
+/// Mirrors how `fs.read:<dir>` + `fs.write:<dir>` grants land in the sandbox.
+fn policy_reads(reads: &[&std::path::Path], write: &std::path::Path) -> SandboxPolicy {
+    SandboxPolicy {
+        read_paths: reads.iter().map(|p| p.to_path_buf()).collect(),
+        write_paths: vec![write.to_path_buf()],
+        allow_net: false,
+        net_hosts: vec![],
+        unrestricted: false,
+    }
+}
+
+/// Real developer tools launch under the sandbox with no implicit config
+/// grant. This is the user-friendliness guard for dropping the auto config
+/// baseline: the common toolchain must still resolve on PATH, load its DLLs,
+/// and actually start.
+///
+/// Two levels of assertion, because tools differ in how much of the host they
+/// touch at startup:
+/// - Every found tool must *launch* — a real process exit, not a spawn/resolve
+///   failure (`ShellError`) or a DLL-init crash before `main`.
+/// - The tools that don't rely on POSIX emulation (node, python) must also run
+///   cleanly to a version string. Git for Windows is deliberately NOT required
+///   to exit 0 here: MSYS git opens `/dev/null` and canonicalizes its cwd at
+///   startup, which the default-deny sandbox denies unless those are granted —
+///   a documented caveat of the strict read model, not a regression. It still
+///   must launch (its own `fatal:` is proof the real git ran).
+#[tokio::test]
+async fn common_dev_tools_launch_under_sandbox() {
+    let _serial = SANDBOX_SERIAL.lock().await;
+    assert!(is_supported(), "windows sandbox must be supported");
+
+    let clean = ["node", "python"]; // no POSIX-emulation startup needs
+    let mut launched = 0;
+    for tool in ["git", "node", "yarn", "npm", "python"] {
+        let Some(abs) = tool_on_path(tool) else {
+            eprintln!("skip {tool}: not on PATH");
+            continue;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // exec() returning Ok means the sandbox resolved and spawned the real
+        // binary; a DLL-init crash would show the sentinel exit code.
+        let res = exec(req(abs, vec!["--version".into()], policy(dir.path())))
+            .await
+            .unwrap_or_else(|e| panic!("`{tool} --version` failed to launch: {e}"));
+        assert_ne!(
+            res.exit_code, STATUS_DLL_INIT_FAILED,
+            "`{tool}` died at DLL init under the sandbox"
+        );
+        launched += 1;
+
+        if clean.contains(&tool) {
+            assert_eq!(
+                res.exit_code, 0,
+                "`{tool} --version` should run cleanly (exit {:#x}); stderr: {}",
+                res.exit_code as u32, res.stderr
+            );
+            assert!(
+                !res.stdout.trim().is_empty(),
+                "`{tool} --version` produced no version output"
+            );
+        }
+    }
+    if launched == 0 {
+        eprintln!("no dev tools installed on this runner; nothing exercised");
+    }
 }
 
 /// A grandchild (the child spawns another process) stays confined: the

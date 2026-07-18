@@ -114,21 +114,59 @@ mod imp {
             account_name: None, // LocalSystem
             account_password: None,
         };
-        let access = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;
+        let access = ServiceAccess::CHANGE_CONFIG
+            | ServiceAccess::START
+            | ServiceAccess::STOP
+            | ServiceAccess::QUERY_STATUS;
         let service = match manager.create_service(&info, access) {
             Ok(s) => s,
-            // Already installed: just (re)start it.
-            Err(_) => manager.open_service(SERVICE_NAME, access)?,
+            // Already installed — possibly registered against a binary from a
+            // different (or since-removed) build directory. Repoint the
+            // registration at this binary and restart it so the running broker
+            // always matches the daemon that is installing.
+            Err(_) => {
+                let s = manager.open_service(SERVICE_NAME, access)?;
+                s.change_config(&info)?;
+                let _ = s.stop();
+                wait_stopped(&s);
+                s
+            }
         };
-        service.start::<OsString>(&[])?;
+        const ERROR_SERVICE_ALREADY_RUNNING: i32 = 1056;
+        match service.start::<OsString>(&[]) {
+            Ok(()) => {}
+            Err(windows_service::Error::Winapi(e))
+                if e.raw_os_error() == Some(ERROR_SERVICE_ALREADY_RUNNING) => {}
+            Err(e) => return Err(e.into()),
+        }
         println!("agent.d network broker installed and running.");
         Ok(())
+    }
+
+    /// Poll until the service reports Stopped (or ~10 s pass). A `start` issued
+    /// while the old process is still winding down fails spuriously.
+    fn wait_stopped(service: &windows_service::service::Service) {
+        for _ in 0..100 {
+            match service.query_status() {
+                Ok(st) if st.current_state != ServiceState::Stopped => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                _ => return,
+            }
+        }
     }
 
     fn uninstall() -> anyhow::Result<()> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
         let service =
-            manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::DELETE)?;
+            match manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::DELETE) {
+                Ok(s) => s,
+                // Not installed: uninstall is idempotent.
+                Err(_) => {
+                    println!("agent.d network broker is not installed; nothing to remove.");
+                    return Ok(());
+                }
+            };
         let _ = service.stop();
         service.delete()?;
         println!("agent.d network broker removed.");
