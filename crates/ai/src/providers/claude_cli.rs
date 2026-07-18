@@ -226,6 +226,17 @@ impl ClaudeCliProvider {
         for a in &self.extra_args {
             cmd.arg(a);
         }
+        // The CLI's MCP client aborts a tool call after ~60s by default, which
+        // spuriously "times out" a tool that is still busy (a large
+        // `npm install`, a build, a long shell step) even though it is making
+        // progress — and leaves the agentd-side action running. Give tool calls
+        // generous time; these only set a default, so an env value already in
+        // scope (operator override) wins.
+        for (k, default) in [("MCP_TOOL_TIMEOUT", "600000"), ("MCP_TIMEOUT", "600000")] {
+            if std::env::var_os(k).is_none() {
+                cmd.env(k, default);
+            }
+        }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

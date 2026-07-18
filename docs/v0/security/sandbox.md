@@ -22,9 +22,17 @@ This protection applies only to the shell invocation itself. If you pass user in
 
 ## Filesystem confinement
 
-A child process spawned by `ctx.shell` can only write to the paths you grant with `fs.write`. A write anywhere else fails, even with `shell.exec` granted — so a tool cannot modify files outside what its grants allow. Enforced on Linux, macOS, and Windows.
+A child process spawned by `ctx.shell` can only write to the paths you grant with `fs.write`, and read only its `fs.read` grants plus its `cwd`. Access anywhere else fails, even with `shell.exec` granted — so a tool cannot read or modify files outside what its grants allow. Enforced on Linux, macOS, and Windows.
 
 Keep grants narrow, and use the `cwd` option to scope where a tool's relative paths resolve.
+
+::: warning Windows performance and footprint
+Linux (Landlock) and macOS (Seatbelt) confine the filesystem at runtime and change nothing on disk. Windows has no equivalent lightweight primitive, so agent.d confines by temporarily adjusting the ACLs of the granted paths. Two things follow:
+
+- **Granting a large directory can be slow** the first time it's used (Windows applies the grant to every file in the subtree). Keep grants narrow; small grants are instant.
+- **The change is transient.** agent.d records its ACL entries and removes them on shutdown, on `agentd --uninstall-sandbox`, and on the next start after a crash.
+
+:::
 
 ## Network confinement
 

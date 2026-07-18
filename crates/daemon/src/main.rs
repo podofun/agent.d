@@ -64,6 +64,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if cli.uninstall_sandbox {
+        // Undo every filesystem ACE the daemon ever stamped, so the user's
+        // Remove the user-directory ACEs owned by the daemon; the broker
+        // revokes the system-owned grants below.
+        sandbox::revoke_all_stamps();
         sandbox::uninstall().map_err(|e| anyhow!("sandbox teardown failed: {e}"))?;
         // The broker SYSTEM service must be removed too, elevated. Leaving it
         // registered points the sandbox at a possibly stale binary forever.
@@ -122,6 +126,12 @@ async fn run(cli: Cli) -> Result<()> {
         );
     }
     tracing::debug!(?cfg, "starting agentd");
+
+    // Crash recovery: if a previous run was hard-killed before it could revoke
+    // its sandbox ACEs, the on-disk ledger still lists them. Undo them now so a
+    // crash never leaves a permanent footprint on the user's files. A no-op off
+    // Windows and when the ledger is empty (the normal, cleanly-shut-down case).
+    sandbox::revoke_all_stamps();
 
     let keyring = Arc::new(KeyringStore::default_service());
     let mut providers = ProviderRegistry::new();
@@ -240,7 +250,19 @@ async fn run(cli: Cli) -> Result<()> {
 
     println!("{}", startup.render());
     tracing::debug!(addr = %local_addr, "listening");
-    serve(listener, router(state)).await?;
+    // Serve until Ctrl+C. On a graceful shutdown, revoke every filesystem ACE
+    // the sandbox stamped this session so the user's files are left untouched.
+    // (A hard kill can't run this; startup crash-recovery — see `run` entry —
+    // heals any leftover on the next launch.)
+    let serve_result = tokio::select! {
+        r = serve(listener, router(state)) => r,
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("shutting down — reverting sandbox filesystem grants");
+            Ok(())
+        }
+    };
+    sandbox::revoke_all_stamps();
+    serve_result?;
     Ok(())
 }
 

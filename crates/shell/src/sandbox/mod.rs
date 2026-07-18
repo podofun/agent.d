@@ -35,6 +35,72 @@ pub mod macos_pf_rules;
 #[cfg(target_os = "windows")]
 pub use backend::run_contained as windows_run_contained;
 
+/// Grant the sandbox ancestor-directory metadata/traverse so path
+/// canonicalization works for arbitrary programs (Windows parity with the
+/// metadata allowances Linux/macOS give by default). Requires Administrator, so
+/// the elevated broker calls it at install; a no-op off Windows.
+pub fn grant_metadata_traversal() -> Result<(), SandboxError> {
+    #[cfg(target_os = "windows")]
+    {
+        backend::grant_metadata_traversal().map_err(|e| SandboxError::Apply(e.to_string()))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(())
+    }
+}
+
+/// Reverse [`grant_metadata_traversal`]; the broker calls it at uninstall.
+pub fn revoke_metadata_traversal() -> Result<(), SandboxError> {
+    #[cfg(target_os = "windows")]
+    {
+        backend::revoke_metadata_traversal().map_err(|e| SandboxError::Apply(e.to_string()))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(())
+    }
+}
+
+/// Grant the sandbox package SIDs create rights on the NPFS named-pipe root so
+/// appcontained children can create global named pipes — without this, Node/
+/// libuv toolchains that spawn children over stdio pipes (npm, create-*)
+/// deadlock. Requires Administrator, so the elevated broker calls it at install;
+/// a no-op off Windows.
+pub fn grant_pipe_namespace() -> Result<(), SandboxError> {
+    #[cfg(target_os = "windows")]
+    {
+        backend::grant_pipe_namespace().map_err(|e| SandboxError::Apply(e.to_string()))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(())
+    }
+}
+
+/// Reverse [`grant_pipe_namespace`]; the broker calls it at uninstall.
+pub fn revoke_pipe_namespace() -> Result<(), SandboxError> {
+    #[cfg(target_os = "windows")]
+    {
+        backend::revoke_pipe_namespace().map_err(|e| SandboxError::Apply(e.to_string()))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(())
+    }
+}
+
+/// Undo every filesystem ACE the daemon stamped for the sandbox, restoring the
+/// user's filesystem to its original state. Called on graceful shutdown, at
+/// startup (crash recovery), and on uninstall. A no-op off Windows (Landlock/
+/// Seatbelt mutate nothing).
+pub fn revoke_all_stamps() {
+    #[cfg(target_os = "windows")]
+    {
+        backend::revoke_all_stamps();
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub mod windows_wfp;
 
