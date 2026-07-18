@@ -18,9 +18,17 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Run `exe args` elevated and wait for it. `Ok(true)` = elevated run succeeded,
-/// `Ok(false)` = the user declined the UAC prompt, `Err` = unexpected failure.
-pub fn run_elevated(exe: &Path, args: &str) -> Result<bool> {
+/// Outcome of an elevated helper run.
+pub enum ElevatedExit {
+    /// The user declined the UAC prompt; the helper did not run.
+    Declined,
+    /// The helper ran to completion with this exit code.
+    Exit(u32),
+}
+
+/// Run `exe args` elevated and wait for it. `Err` = the elevation request
+/// itself failed unexpectedly.
+pub fn run_elevated(exe: &Path, args: &str) -> Result<ElevatedExit> {
     let exe_w = wide(&exe.to_string_lossy());
     let verb = wide("runas");
     let params = wide(args);
@@ -38,7 +46,7 @@ pub fn run_elevated(exe: &Path, args: &str) -> Result<bool> {
             // 1223 == ERROR_CANCELLED: the user clicked "No" on the UAC prompt.
             let code = GetLastError().0;
             if code == 1223 {
-                return Ok(false);
+                return Ok(ElevatedExit::Declined);
             }
             return Err(anyhow!("could not request elevation (error {code})"));
         }
@@ -49,6 +57,6 @@ pub fn run_elevated(exe: &Path, args: &str) -> Result<bool> {
         let mut code = 0u32;
         let _ = GetExitCodeProcess(info.hProcess, &mut code);
         let _ = CloseHandle(info.hProcess);
-        Ok(code == 0)
+        Ok(ElevatedExit::Exit(code))
     }
 }
