@@ -29,17 +29,6 @@ d.tool({
   requires = { "net:gateway.discord.gg", "net:discord.com", "secret:discord_token" },
 })
 
--- Store / retrieve the bot token in the OS keyring (never in source).
-d.action({
-  name = "discord.set_token",
-  requires = { "secret:discord_token" },
-  handler = function(args, ctx)
-    assert(type(args.token) == "string" and args.token ~= "", "token is required")
-    ctx.secret.set("discord_token", args.token)
-    return { ok = true }
-  end,
-})
-
 -- Reusable REST client with the bot token in the Authorization header.
 local function rest_client(ctx)
   return ctx.http.client({
@@ -338,7 +327,7 @@ echo '<your-bot-token>' | agentctl secret set discord_token
 cargo run -p daemon -- --init examples/discord/init.lua --grants examples/discord/grants.toml
 ```
 
-The token is stored in the OS keyring under the key `discord_token`. You only need to set it once; it persists across restarts. The `discord.set_token` action in the recipe does the same thing from Lua, if you prefer to seed the token through the daemon (`agentctl call discord.set_token -d token='…'`).
+The token is stored in the secret store under the key `discord_token`. You only need to set it once; it persists across restarts.
 
 ## Verify
 

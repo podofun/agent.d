@@ -20,22 +20,6 @@ d.tool({
 	requires = { "net:gateway.discord.gg", "net:discord.com", "secret:discord_token" },
 })
 
-d.action({
-	name = "discord.set_token",
-	requires = { "secret:discord_token" },
-	input = {
-		token = { type = "string", min_len = 1, required = true, desc = "Discord bot token" },
-	},
-	output = {
-		ok = { type = "boolean" },
-	},
-	handler = function(args, ctx)
-		-- the token is pre-validated by the input schema
-		ctx.secret.set("discord_token", args.token)
-		return { ok = true }
-	end,
-})
-
 -- Create a re-usable REST client
 local function rest_client(ctx)
 	return ctx.http.client({
