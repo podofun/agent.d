@@ -41,8 +41,12 @@ yolo = false
 # Custom providers: any OpenAI- or Anthropic-compatible endpoint becomes a
 # named prefix. `kind` picks the wire format ("openai" | "anthropic").
 # `base_url` is forgiving: with or without the /chat/completions suffix.
-# Auth is explicit: either `api_key_secret` (key name in the OS keyring) or
+# Auth is explicit: either `api_key_secret` (key name in the secret store) or
 # `auth = "none"` for local servers without authentication.
+#
+# `api_key_secret` names a key in the secret store, seeded once with
+# `agentctl secret set`, e.g.:
+#   echo "$OPENROUTER_API_KEY" | agentctl secret set openrouter_api_key
 
 # [providers.openrouter]
 # kind = "openai"

@@ -5,9 +5,8 @@
 --   discord_handler = pops events, calls the `discord_chat` runner,
 --                     posts the reply via Discord's REST API.
 --
--- The bot token lives in the secret store, never in source. Start the daemon,
--- then seed it once with:
---   agentctl call discord.set_token -d token='<your-bot-token>' --result-only
+-- Seed the bot token:
+--   echo '<your-bot-token>' | agentctl secret set discord_token
 -- The `secret:discord_token` grant is in this dir's grants.toml.
 
 local INTENTS = 37377 -- GUILDS + GUILD_MESSAGES + MESSAGE_CONTENT + DIRECT_MESSAGES
@@ -200,13 +199,13 @@ d.service("discord_handler", { restart = "always" }, function(ctx)
 
 		local reply = (out and out.text or ""):gsub("^%s+", ""):gsub("%s+$", "")
 		if reply == "" or reply == "<silent>" then
-			push(ctx, channel_id, { role = "assistant", name = "Fathi", id = "self", content = "<silent>" })
+			push(ctx, channel_id, { role = "assistant", name = "bot", id = "self", content = "<silent>" })
 			return
 		end
 		if #reply > 1900 then
 			reply = reply:sub(1, 1900) .. "…"
 		end
-		push(ctx, channel_id, { role = "assistant", name = "Fathi", id = "self", content = reply })
+		push(ctx, channel_id, { role = "assistant", name = "bot", id = "self", content = reply })
 
 		local ok2, sent = pcall(ctx.call, "discord.send", {
 			channel_id = channel_id,
