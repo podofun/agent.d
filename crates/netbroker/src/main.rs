@@ -139,6 +139,24 @@ mod imp {
                 if e.raw_os_error() == Some(ERROR_SERVICE_ALREADY_RUNNING) => {}
             Err(e) => return Err(e.into()),
         }
+
+        // Open ancestor-directory metadata/traverse for the sandbox. This needs
+        // Administrator (the roots are system-owned), which we hold here but the
+        // daemon never does — so it belongs in the elevated broker install.
+        // Without it, path canonicalization (realpath/getcwd) fails for most
+        // Windows programs under the sandbox. See agentd_shell::sandbox.
+        agentd_shell::sandbox::grant_metadata_traversal().map_err(|e| {
+            anyhow::anyhow!("could not open ancestor traversal for the sandbox: {e}")
+        })?;
+
+        // Let sandboxed children create global named pipes. Also elevated (the
+        // NPFS root is system-owned). Without it, any child that spawns its own
+        // children over stdio pipes — npm, node toolchains — deadlocks. See
+        // agentd_shell::sandbox::grant_pipe_namespace.
+        agentd_shell::sandbox::grant_pipe_namespace().map_err(|e| {
+            anyhow::anyhow!("could not open the pipe namespace for the sandbox: {e}")
+        })?;
+
         println!("agent.d network broker installed and running.");
         Ok(())
     }
@@ -169,6 +187,10 @@ mod imp {
             };
         let _ = service.stop();
         service.delete()?;
+        // Remove the ancestor metadata/traverse ACEs stamped at install.
+        let _ = agentd_shell::sandbox::revoke_metadata_traversal();
+        // Remove the NPFS pipe-root create ACEs stamped at install.
+        let _ = agentd_shell::sandbox::revoke_pipe_namespace();
         println!("agent.d network broker removed.");
         Ok(())
     }
