@@ -135,7 +135,7 @@ mod imp {
         SetSecurityDescriptorDacl,
     };
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW,
         GetLogicalDrives, OPEN_EXISTING, READ_CONTROL, ReadFile, WRITE_DAC, WriteFile,
     };
     use windows::Win32::System::Pipes::CreatePipe;
@@ -330,14 +330,19 @@ mod imp {
     const TRAVERSE_META: u32 = 0x1 | 0x20 | 0x80 | 0x0002_0000 | 0x0010_0000;
 
     /// The system-owned ancestor roots that block AppContainer canonicalization:
-    /// every fixed-drive root plus `%SystemDrive%\Users`.
+    /// every available fixed-drive root plus `%SystemDrive%\Users`.
     fn ancestor_roots() -> Vec<String> {
+        const DRIVE_FIXED: u32 = 3;
         let mut roots = Vec::new();
         let mask = unsafe { GetLogicalDrives() };
         for i in 0..26u32 {
             if mask & (1 << i) != 0 {
                 let letter = (b'A' + i as u8) as char;
-                roots.push(format!("{letter}:\\"));
+                let root = format!("{letter}:\\");
+                let wide = to_wide(&root);
+                if unsafe { GetDriveTypeW(PCWSTR(wide.as_ptr())) } == DRIVE_FIXED {
+                    roots.push(root);
+                }
             }
         }
         let sys = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
