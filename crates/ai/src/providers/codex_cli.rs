@@ -19,7 +19,6 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 use crate::types::{
     CompletionRequest, CompletionResponse, LoopMode, McpEndpoint, Provider, ProviderError,
@@ -90,7 +89,7 @@ impl CodexCliProvider {
         &self,
         req: CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
-        let mut cmd = Command::new(&self.bin);
+        let mut cmd = agentd_process::command(&self.bin);
         cmd.arg("exec")
             .arg("--json")
             .arg("--skip-git-repo-check")

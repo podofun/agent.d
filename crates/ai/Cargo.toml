@@ -7,6 +7,7 @@ edition.workspace = true
 agentd-codex.workspace = true
 agentd-net.workspace = true
 agentd-permissions.workspace = true
+agentd-process.workspace = true
 agentd-secrets.workspace = true
 agentd-types.workspace = true
 anyhow.workspace = true

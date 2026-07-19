@@ -34,7 +34,6 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 use crate::types::{
     CompletionRequest, CompletionResponse, LoopMode, McpEndpoint, Provider, ProviderError,
@@ -109,7 +108,7 @@ impl ClaudeCliProvider {
         &self,
         req: CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
-        let mut cmd = Command::new(&self.bin);
+        let mut cmd = agentd_process::command(&self.bin);
         cmd.arg("-p");
         if let Some(model) = &req.model {
             cmd.arg("--model").arg(model);
@@ -207,7 +206,7 @@ impl ClaudeCliProvider {
         })?;
         let cfg_path = tmp.into_temp_path();
 
-        let mut cmd = Command::new(&self.bin);
+        let mut cmd = agentd_process::command(&self.bin);
         cmd.arg("-p")
             .arg("--output-format")
             .arg("stream-json")
