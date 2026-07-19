@@ -1,89 +1,145 @@
 <div align="center">
 
-<img src="assets/agentd_logo.png" alt="agentd" width="160" height="160" />
+<img src="assets/agentd_logo.png" alt="agent.d" width="150" height="150" />
 
 # agent.d
 
-**A portable runtime for tool-using AI agents.**
+**A small runtime for building and operating tool-using AI agents.**
 
-[Documentation](https://docs.podo.fun/agentd/v0/guide/what-is-agentd) ·
-[Quick start](https://docs.podo.fun/agentd/v0/guide/quick-start) ·
-[Tutorial](https://docs.podo.fun/agentd/v0/tutorial/) ·
-[Reference](https://docs.podo.fun/agentd/v0/reference/ctx/)
+[Documentation](https://docs.podo.fun/agentd/v0/guide/what-is-agentd) · [Quick start](https://docs.podo.fun/agentd/v0/guide/quick-start) · [Recipes](https://docs.podo.fun/agentd/v0/recipes/) · [Releases](https://github.com/podofun/agent.d/releases)
 
 </div>
 
-agentd is a small runtime for building AI agents that need to call tools safely.
-You define what an agent can do once — its model, memory, external access and
-approval rules — and call it from any client: CLI tools, chat integrations,
-webhooks, editors or small servers. Run the daemon once; connect clients to it.
+agent.d runs AI agents as a local service. You define tools, agent behavior, and long-running services in Lua. You define permissions in TOML. The Rust runtime loads those definitions, connects them to model providers, and enforces access to the host.
 
-- **Define tools once.** Expose actions like `git.status` or `deploy.preview` and call them from any client.
-- **Fail closed by default.** Shell, filesystem, network, secrets and model calls all require an explicit grant.
-- **Approve on the fly.** A privileged operator can allow a missing grant once or persist it.
-- **Stay portable.** Frontends reuse the same agent definitions instead of carrying their own copies.
-- **Multi-provider support.** Anthropic, OpenAI, Claude CLI, Codex, and any other OpenAI-compatible API provider.
+The main idea is simple: tools should not belong to one chat UI or one model SDK. Define them once, give them explicit permissions, and call them from the CLI, a WebSocket client, an integration, or another agent.
 
-## A quick taste
+agent.d is useful when an agent needs to do real work on a machine and you need clear answers to questions such as:
 
-Define a tool in Lua:
+- Which programs may it run?
+- Which files may it read or change?
+- Which hosts may it contact?
+- Which tools may a specific agent or client call?
+- What happened during the last run?
+- Can a person approve one exceptional request without disabling the policy?
+
+## What the runtime provides
+
+- **Tools and actions.** Wrap local programs and APIs in reusable Lua functions that agents and clients can call.
+- **Runners.** Combine a model, system instructions, skills, and an allowed set of actions.
+- **Skills.** Keep reusable instructions in Markdown and load them into one or more runners.
+- **Services.** Run long-lived integrations and event loops in the same controlled runtime.
+- **Memory and state.** Store durable namespaced data or share short-lived state between components.
+- **Approvals.** Use a human-in-the-loop to allow a denied request once or persist a specific grant.
+- **Permissions and sandboxing.** Limit programs, files, network access, secrets, models, and component calls with default-deny grants and native OS confinement.
+- **Tracing.** Record action calls, runner activity, permission decisions, results, errors, and timings as JSONL.
+- **Provider routing.** Select Anthropic, OpenAI-compatible APIs, Claude CLI, or Codex backends per runner.
+- **Hot reload.** Reload Lua modules, skills, and grants during development with `agentd --watch`.
+
+## A practical example
+
+The following defines a small code-review agent. It can read the staged Git diff and send it to a model. It is not granted general shell access or filesystem access.
 
 ```lua
 -- init.lua
 agentd.tool({ name = "git", requires = { "shell.exec:git" } })
 
 agentd.action({
-  name = "git.status",
+  name = "git.diff",
   requires = { "shell.exec:git" },
   handler = function(args, ctx)
-    local res = ctx.shell("git", { "status", "--porcelain=v1" })
-    return { status = res.stdout, exit_code = res.exit_code }
+    local result = ctx.shell("git", {
+      "-C", args.cwd or ".", "diff", "--staged",
+    })
+    return { diff = result.stdout, exit_code = result.exit_code }
   end,
+})
+
+agentd.runner({
+  name = "review",
+  model = "anthropic/claude-opus-4-7",
+  system = "Review the staged diff. Find correctness and security issues. Cite files and be concise.",
+  actions = { "git.diff" },
 })
 ```
 
-Grant it the one capability it needs — nothing is granted implicitly:
+The declarations above describe what the components need. They do not grant access. Grants live separately:
 
 ```toml
 # grants.toml
 [tool.git]
 granted = ["shell.exec:git"]
+
+[runner.review]
+granted = ["ai:anthropic"]
+allowed_actions = ["git.diff"]
 ```
 
-Run it and call the action:
+Start the daemon and run the reviewer:
 
 ```bash
+echo "$ANTHROPIC_API_KEY" | agentctl secret set anthropic_api_key
 agentd --init init.lua --grants grants.toml
-agentctl call git.status
 ```
 
-That's the whole loop. Tools, runners (AI workers), skills, services, durable
-memory and the permission model are covered in the docs.
+```bash
+# Run from another terminal, inside a Git repository
+agentctl runner run review "Review what I am about to commit" --text-only
+```
+
+The runner can call `git.diff`, and that `git.diff` action can execute `git`.
 
 ## Install
 
-Download a pre-built binary for Linux, macOS or Windows from the
-[releases page](https://github.com/podofun/agent.d/releases), or build from source:
+Download a release for Linux, macOS, or Windows from [GitHub Releases](https://github.com/podofun/agent.d/releases), or build from source with Rust 1.85 or newer:
 
 ```bash
 git clone https://github.com/podofun/agent.d
 cd agent.d
-cargo build --release   # produces target/release/{agentd,agentctl}
+cargo build --release
 ```
 
-See [Installation](https://docs.podo.fun/agentd/v0/guide/installation) for details.
+This produces `target/release/agentd` and `target/release/agentctl`. Windows releases also include `agentd-netbroker.exe`; keep it beside `agentd.exe`. Follow the [installation guide](https://docs.podo.fun/agentd/v0/guide/installation) for PATH setup and the one-time Windows sandbox installation.
+
+## Quick start
+
+The bundled examples includes a small Git tool, sample skill files, and a basic code-review runner:
+
+```bash
+agentd --init examples/init.lua --grants examples/grants.toml
+```
+
+In another terminal:
+
+```bash
+agentctl health
+agentctl tools
+agentctl call git.status --result-only
+```
+
+Use `--watch` while editing a project:
+
+```bash
+agentd --watch --init examples/init.lua --grants examples/grants.toml
+```
+
+The [five-minute quick start](https://docs.podo.fun/agentd/v0/guide/quick-start) explains each command. The [tutorial](https://docs.podo.fun/agentd/v0/tutorial/) starts from scratch and covers the full workflow.
 
 ## Documentation
 
-Full documentation lives at **[docs.podo.fun/agentd](https://docs.podo.fun/agentd/v0/guide/quick-start)**:
+- [What is agent.d?](https://docs.podo.fun/agentd/v0/guide/what-is-agentd)
+- [How the runtime works](https://docs.podo.fun/agentd/v0/guide/how-it-works)
+- [Tools and actions](https://docs.podo.fun/agentd/v0/concepts/tools-and-actions)
+- [Runners](https://docs.podo.fun/agentd/v0/concepts/runners)
+- [Permissions](https://docs.podo.fun/agentd/v0/concepts/permissions)
+- [Providers](https://docs.podo.fun/agentd/v0/providers/)
+- [Recipes](https://docs.podo.fun/agentd/v0/recipes/)
+- [`ctx` API reference](https://docs.podo.fun/agentd/v0/reference/ctx/)
 
-- [Quick start](https://docs.podo.fun/agentd/v0/guide/quick-start) — running in five minutes
-- [Tutorial](https://docs.podo.fun/agentd/v0/tutorial/) — build your first agent step by step
-- [Core concepts](https://docs.podo.fun/agentd/v0/concepts/) — tools, runners, skills, services, permissions
-- [Capability reference](https://docs.podo.fun/agentd/v0/reference/ctx/) — the full `ctx` API
-- [Permissions & security](https://docs.podo.fun/agentd/v0/security/grants) — grants and the permission model
-- [Recipes](https://docs.podo.fun/agentd/v0/recipes/) — Discord bots, HTTP tools, and more
+## Project status
+
+agent.d is in its alpha stage and remains experimental. It is being developed as the runtime for Podofun's AI features, and its APIs and behavior may change as those features evolve. Bug reports, focused pull requests, and feedback from real workloads are welcome.
 
 ## License
 
-[MIT](./LICENSE).
+[MIT](./LICENSE)
