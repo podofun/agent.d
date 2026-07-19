@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -111,7 +111,7 @@ impl Client {
         env: &[(String, String)],
     ) -> Result<(Self, mpsc::UnboundedReceiver<Inbound>)> {
         let bin = bin.into();
-        let mut cmd = Command::new(&bin);
+        let mut cmd = agentd_process::command(&bin);
         cmd.arg("app-server")
             .arg("--listen")
             .arg("stdio://")

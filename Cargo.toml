@@ -9,6 +9,7 @@ members = [
     "crates/approvals",
     "crates/runners",
     "crates/packages",
+    "crates/process",
     "crates/services",
     "crates/shell",
     "crates/netbroker",
@@ -28,7 +29,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.8.0-alpha"
+version = "0.8.1-alpha"
 rust-version = "1.85"
 license = "MIT"
 authors = ["MrFoo"]
@@ -46,6 +47,7 @@ agentd-mcp         = { path = "crates/mcp" }
 agentd-memory      = { path = "crates/memory" }
 agentd-net         = { path = "crates/net" }
 agentd-packages    = { path = "crates/packages" }
+agentd-process     = { path = "crates/process" }
 agentd-permissions = { path = "crates/permissions" }
 agentd-runners     = { path = "crates/runners" }
 agentd-scripting   = { path = "crates/scripting" }
