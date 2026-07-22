@@ -50,12 +50,11 @@ export default defineConfig({
           collapsed: false,
           items: [
             { text: 'Overview', link: '/v0/tutorial/' },
-            { text: '1. Project layout', link: '/v0/tutorial/project-layout' },
-            { text: '2. Your first tool', link: '/v0/tutorial/first-tool' },
-            { text: '3. Granting permissions', link: '/v0/tutorial/permissions' },
-            { text: '4. A runner and a skill', link: '/v0/tutorial/runner-and-skill' },
-            { text: '5. Calling your agent', link: '/v0/tutorial/calling' },
-            { text: '6. The dev loop', link: '/v0/tutorial/dev-loop' }
+            { text: '1. Configuration directory', link: '/v0/tutorial/config-directory' },
+            { text: '2. Git action', link: '/v0/tutorial/first-tool' },
+            { text: '3. Permissions', link: '/v0/tutorial/permissions' },
+            { text: '4. Runner and skill', link: '/v0/tutorial/runner-and-skill' },
+            { text: '5. Run the agent', link: '/v0/tutorial/calling' }
           ]
         },
         {

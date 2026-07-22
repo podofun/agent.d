@@ -58,7 +58,7 @@ A `path` can be absolute or relative.
 - **Absolute** (`/home/me/data.txt`, `C:\data\x.txt`) is used as-is.
 - **Relative** (`notes/todo.md`) is joined onto the current **working directory**.
 
-By default the working directory is your **workspace root** — the folder `init.lua` lives in. So in a normal single-folder project, `ctx.fs.read("notes/todo.md")` reads `<workspace>/notes/todo.md` on every machine and no machine-specific absolute path needed for files that live with your project. You can use an absolute path when you deliberately reach outside the workspace (a system log, a shared data dir).
+By default, the working directory is the folder that contains `init.lua`. Thus, `ctx.fs.read("notes/todo.md")` reads `<configuration-directory>/notes/todo.md`. You can use an absolute path to read a file outside the configuration directory, such as a system log.
 
 ### Setting the working directory
 
