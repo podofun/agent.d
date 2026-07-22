@@ -1,6 +1,6 @@
 # Observability
 
-How to monitor a running agent.d daemon: the JSONL trace sink, log-level filters, the startup banner, and what to watch for in production.
+How to monitor a running agent.d daemon: the JSONL trace sink, log-level filters, and what to watch for in production.
 
 ## Trace log
 
@@ -70,23 +70,6 @@ Or in `config.toml`:
 [daemon]
 log_level = "info"
 ```
-
-## Startup banner
-
-When the daemon starts successfully it prints a banner to stdout listing what was loaded and where to connect:
-
-```
-  AGENTD v0.3.0-alpha  ready in 34 ms
-
-  Local:   http://127.0.0.1:7777/
-  WS:      ws://127.0.0.1:7777/ws
-  Control: ws://127.0.0.1:7777/control
-  Loaded:  14 actions, 9 runners, 0 services, 9 skills
-  Init:    /home/you/agents/init.lua
-  Logs:    warnings/errors (AGENTD_LOG=debug for detail)
-```
-
-The `Loaded` line reports how many actions, runners, services, and skills the runtime registered. If the counts are lower than expected, check `init.lua` and any `import()` files for registration errors — these are logged at `warn` or `error` level (raise verbosity with `AGENTD_LOG=debug`).
 
 ## What to watch for
 
