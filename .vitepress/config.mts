@@ -123,6 +123,7 @@ export default defineConfig({
             { text: 'OpenAI', link: '/v0/providers/openai' },
             { text: 'CLI backends', link: '/v0/providers/cli-backends' },
             { text: 'Codex app-server', link: '/v0/providers/codex' },
+            { text: 'Custom providers', link: '/v0/providers/custom' },
             { text: 'Credentials', link: '/v0/providers/credentials' }
           ]
         },
