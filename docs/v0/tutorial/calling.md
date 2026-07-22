@@ -40,14 +40,14 @@ The startup output must show one action, one runner, and one skill.
 The output is similar to this sample:
 
 ```text
-AGENTD v0.7.0-alpha  ready in 4 ms
+  AGENTD v0.8.3-alpha   ready in 3 ms
 
-Local:   http://127.0.0.1:7777/
-WS:      ws://127.0.0.1:7777/ws
-Control: ws://127.0.0.1:7777/control
-Loaded:  1 action, 1 runner, 0 services, 1 skill
-Init:    /home/user/.config/agentd/init.lua
-Logs:    warnings/errors (AGENTD_LOG=debug for detail)
+  ➜  Local   http://127.0.0.1:7777/
+  ➜  WS      ws://127.0.0.1:7777/ws
+  ➜  Control ws://127.0.0.1:7777/control
+
+  Loaded    1 action, 1 runner, 0 services, 1 skill
+  Init      /home/user/.config/agentd/init.lua
 ```
 
 Your output can show a different version, start time, and home directory.
@@ -94,7 +94,7 @@ The output is similar to this sample:
 
 ```json
 {
-  "duration_ms": 2,
+  "duration_ms": 3,
   "result": {
     "diff": "diff --git a/example.txt b/example.txt\nindex 08fe272..06fcdd7 100644\n--- a/example.txt\n+++ b/example.txt\n@@ -1 +1,2 @@\n first line\n+second line\n",
     "exit_code": 0
