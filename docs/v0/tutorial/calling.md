@@ -1,142 +1,168 @@
-# Step 5 — Calling the Agent
+# Step 5: Run the Agent
 
-With all the pieces in place you can start the daemon and exercise every component: health check, tool listing, raw action calls, and a full runner invocation.
+The configuration is complete. You can now start agent.d and review a staged diff.
 
-## Start the daemon
+## Prepare a repository
 
-Point the daemon at your project's `init.lua` and `grants.toml`:
+Use a Git repository that has staged changes. Run `git status` in that repository to confirm the changes.
+
+```bash
+git status --short
+```
+
+The first column shows the index status. For example, `M ` identifies a staged modification.
+
+The output is similar to this sample:
+
+```text
+M  example.txt
+```
+
+Your output contains the names of your changed files.
+
+## Start agent.d
+
+Start agent.d in one terminal:
 
 ::: code-group
-```bash [release]
-agentd \
-  --init ~/projects/git-reviewer/init.lua \
-  --grants ~/projects/git-reviewer/grants.toml
+```bash [installed binary]
+agentd
 ```
-```bash [cargo]
-cargo run -p daemon -- \
-  --init ~/projects/git-reviewer/init.lua \
-  --grants ~/projects/git-reviewer/grants.toml
+```bash [current source tree]
+cargo run -p daemon
 ```
 :::
 
-The startup banner confirms what was loaded, for example:
+By default, agent.d loads `init.lua` and `grants.toml` from `~/.config/agentd`.
 
+The startup output must show one action, one runner, and one skill.
+
+The output is similar to this sample:
+
+```text
+  AGENTD v0.8.3-alpha   ready in 3 ms
+
+  ➜  Local   http://127.0.0.1:7777/
+  ➜  WS      ws://127.0.0.1:7777/ws
+  ➜  Control ws://127.0.0.1:7777/control
+
+  Loaded    1 action, 1 runner, 0 services, 1 skill
+  Init      /home/user/.config/agentd/init.lua
 ```
-Local  http://127.0.0.1:7777
-WS     ws://127.0.0.1:7777/ws
-Control ws://127.0.0.1:7777/control
-actions=2  runners=1  services=0  skills=1
-```
 
-Leave this running and open a second terminal for `agentctl`.
+Your output can show a different version, start time, and home directory.
 
-## Check health
+Keep agent.d active. Open a second terminal for the next commands.
+
+## Verify the connection
+
+Run this command:
 
 ```bash
 agentctl health
 ```
 
-Returns `ok` when the daemon is reachable. This is the only endpoint that does not require authentication.
+The command returns `ok` when `agentctl` can connect to agent.d.
 
-## List registered tools
+```text
+ok
+```
+
+## Verify the action
+
+List the registered actions:
 
 ```bash
 agentctl tools
 ```
 
-You should see `git.diff` and `git.status` in the output.
+The output must contain `git.diff`.
 
-## Call an action directly
-
-`agentctl call` invokes a single action and prints the result:
-
-```bash
-agentctl call git.status
+```text
+git.diff
 ```
 
-Output includes the result and the duration:
+Call the action directly:
+
+```bash
+agentctl call git.diff
+```
+
+The result contains `exit_code` and `diff`. An exit code of `0` means that Git completed the command.
+
+The output is similar to this sample:
 
 ```json
 {
-  "result": { "status": " M tools/git.lua\n", "exit_code": 0 },
-  "duration_ms": 12
+  "duration_ms": 3,
+  "result": {
+    "diff": "diff --git a/example.txt b/example.txt\nindex 08fe272..06fcdd7 100644\n--- a/example.txt\n+++ b/example.txt\n@@ -1 +1,2 @@\n first line\n+second line\n",
+    "exit_code": 0
+  }
 }
 ```
 
-### Pass arguments
+The duration and diff contents depend on your repository.
 
-Use `-d key=value` pairs for simple values. Values are parsed as JSON first, falling back to a string:
+If `diff` is empty, make sure that the repository has staged changes.
 
-```bash
-agentctl call git.diff -d staged=true
-agentctl call git.diff -d cwd=/path/to/repo -d staged=true
-```
-
-For complex argument shapes, pass the whole object as `--json`:
+## Run the reviewer
 
 ```bash
-agentctl call git.diff --json '{"staged": true, "cwd": "/path/to/repo"}'
+agentctl runner run backend_reviewer "Review the staged diff."
 ```
 
-::: info Mutual exclusion
-`--json` and `-d` are mutually exclusive. Use one or the other.
-:::
+The runner sends the skill instructions to the model. The model can call `git.diff` to get the staged changes.
 
-### Trim the output
+agent.d verifies the runner permission before it calls the model. It also verifies the action permission before it runs Git.
 
-`--result-only` drops the `duration_ms` wrapper and prints only the `result` value:
+The final result contains the review text, provider, model, and stop reason.
 
-```bash
-agentctl call git.status --result-only
-```
-
-`--compact` prints the JSON without indentation:
-
-```bash
-agentctl call git.status --compact
-```
-
-## Run the runner
-
-`agentctl runner run` sends a natural-language prompt to the runner and streams back the model's response:
-
-```bash
-agentctl runner run backend_reviewer "review my staged diff"
-```
-
-The runner calls `git.diff` (with `staged = true` if it decides to) and `git.status`, reads the output, and returns a review. The result includes the model and stop reason:
+The output is similar to this sample:
 
 ```json
 {
-  "text": "…review text…",
-  "provider": "anthropic",
-  "model": "claude-opus-4-7",
-  "stop_reason": "end_turn"
+  "model": "sonnet",
+  "provider": "anthropic-cli",
+  "stop_reason": "end_turn",
+  "text": "The change adds one line to example.txt. I found no defects."
 }
 ```
 
-`--text-only` strips the envelope and prints only the `text` field — useful when piping to another command:
+The model writes a new review for each diff. Thus, the review text depends on your changes.
+
+To show only the review text, add `--text-only`:
 
 ```bash
-agentctl runner run backend_reviewer "review my staged diff" --text-only
+agentctl runner run backend_reviewer "Review the staged diff." --text-only
 ```
 
-## Inspect registered components
+The output contains only the model text:
 
-```bash
-agentctl runner ls
-agentctl runner inspect backend_reviewer
-agentctl skills ls
-agentctl skills inspect reviewer
+```text
+The change adds one line to example.txt. I found no defects.
 ```
 
-## Next step
+## If the runner call fails
 
-[Step 6 — The dev loop →](/v0/tutorial/dev-loop)
+Run `claude` in a terminal. Complete its authentication steps.
 
-## See also
+Then, run the reviewer command again.
 
-- [CLI reference](/v0/reference/cli)
-- [WebSocket protocol](/v0/reference/protocol)
-- [Concepts: interfaces and callers](/v0/concepts/interfaces-and-callers)
-- [Security: grants](/v0/security/grants)
+Make sure that the `claude` command is on the `PATH` used by agent.d.
+
+If you selected the Anthropic API, make sure that the key is in the agent.d secret store. Refer to [Provider credentials](/v0/providers/credentials).
+
+## What you made
+
+You made a Git action that reads a staged diff. The action does not contain an operation that changes repository files.
+
+The configuration directory can contain more agents, actions, skills, runners, and services. Load their files from the same `init.lua` file.
+
+## What to read next
+
+- [Write tools](/v0/writing/tools) explains actions and input schemas.
+- [Write runners](/v0/writing/runners) explains model configuration.
+- [Write skills](/v0/writing/skills) explains reusable model instructions.
+- [Permissions](/v0/security/grants) explains all grant layers.
+- [Development operations](/v0/operations/observability) explains traces and logs.

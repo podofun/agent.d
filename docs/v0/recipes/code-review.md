@@ -4,7 +4,7 @@ A minimal AI code-review agent: a `git` tool that shells out to the `git` binary
 
 This recipe is based directly on the bundled `examples/tools/git.lua`, `examples/runners/backend_reviewer.lua`, and `examples/skills/reviewer.md`.
 
-## Project layout
+## Configuration layout
 
 ```
 my-reviewer/

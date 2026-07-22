@@ -40,7 +40,7 @@ In development you can pass `--watch` (or set `AGENTD_WATCH=1`) to turn on hot r
 Durable memory (`ctx.memory`) and a connected approval operator on `/control` survive reloads — they are owned by the daemon process, not the runtime.
 
 ::: tip Development workflow
-See [Dev loop](/v0/tutorial/dev-loop) for a step-by-step guide to iterating with `--watch`.
+See [Observability](/v0/operations/observability) for development and runtime inspection commands.
 :::
 
 ## Observability
@@ -59,7 +59,6 @@ The default trace path is `$XDG_STATE_HOME/agentd/trace.jsonl`. See [Observabili
 
 ## See also
 
-- [Dev loop](/v0/tutorial/dev-loop)
-- [Deployment](/v0/operations/deployment)
 - [Observability](/v0/operations/observability)
+- [Deployment](/v0/operations/deployment)
 - [Configuration reference](/v0/reference/configuration)

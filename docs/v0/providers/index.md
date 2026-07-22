@@ -77,7 +77,6 @@ See [permission slugs](/v0/security/permission-slugs) and [grants](/v0/security/
 - [Codex](/v0/providers/codex) — `codex`
 - [Custom providers](/v0/providers/custom) — OpenAI/Anthropic-compatible endpoints and local servers via `config.toml`
 - [Credentials](/v0/providers/credentials) — storing API keys in the keyring
-- [MCP loopback](/v0/providers/mcp) — exposing tools to the `claude` CLI
 
 ## See also
 

@@ -1,116 +1,97 @@
-# Step 4 — Runner and Skill
+# Step 4: Add a Runner and a Skill
 
-A **skill** shapes what the model knows about its role; a **runner** wires a model, its skills, and an advisory action list into a named AI worker. This page adds both to the project.
+A skill gives task instructions to a model. A runner connects a model to the skill and action.
 
 ## Write the skill
 
-Create `skills/reviewer.md`. Skills are Markdown files with a YAML frontmatter block:
+Create `~/.config/agentd/skills/reviewer.md` with this content:
 
 ```markdown
 ---
 name: reviewer
-description: meticulous code reviewer
+description: Review a staged Git diff.
 actions:
   - git.diff
-  - git.status
 ---
-You are a meticulous code reviewer. Focus on correctness, clarity, and test
-coverage. Cite file paths and line numbers. Prefer concrete suggestions over
-hand-waving.
+Use `git.diff` to get the staged diff. Review only that diff. Find defects and missing tests. Give a specific correction for each defect.
 ```
 
-The frontmatter fields:
+The frontmatter gives the skill name, description, and applicable action. The text after the frontmatter gives instructions to the model.
 
-| Field | Required | Meaning |
-|-------|----------|---------|
-| `name` | yes | The skill's identifier; referenced by runners. |
-| `description` | no | Human-readable summary; shown by `agentctl skills ls`. |
-| `actions` | no | Advisory list of actions the skill expects to use. |
-
-Everything after the `---` closing fence is the system prompt fragment that gets composed into the runner's system prompt.
-
-## Load skills in `init.lua`
-
-You already added this line in [Step 1](/v0/tutorial/project-layout):
-
-```lua
-agentd.skills.dir("skills")
-```
-
-`agentd.skills.dir(path)` scans the directory relative to `init.lua` and loads every `*.md` file it finds. To load a single file instead, use `agentd.skills.load("skills/reviewer.md")`.
+The `agentd.skills.dir("skills")` line in `init.lua` loads this file.
 
 ## Write the runner
 
-Create `runners/backend_reviewer.lua`:
+Create `~/.config/agentd/runners/backend_reviewer.lua` with this content:
 
 ```lua
 agentd.runner({
     name = "backend_reviewer",
-    system = "Reply in plain text. No markdown headers.",
-    model = "anthropic/claude-opus-4-7",
+    model = "anthropic-cli/sonnet",
     skills = { "reviewer" },
-    actions = { "git.diff", "git.status" },
+    actions = { "git.diff" },
 })
 ```
 
-### Fields explained
+The `name` field identifies the runner. You will use this name with `agentctl runner run`.
 
-- **`name`** — the runner's identifier; used in `agentctl runner run <name>`.
-- **`model`** — the model selection string in `"<provider>/<model_id>"` format. The prefix before `/` routes to a registered provider. `anthropic` routes to the Anthropic Messages API.
-- **`system`** — an inline system prompt fragment added on top of composed skill prompts.
-- **`skills`** — skill names to compose into the system prompt.
-- **`actions`** — an advisory action allowlist. This is layer 3 of the permission engine; the grants file is still authoritative. An empty list means no constraint at this layer.
+The `model` field selects a provider and model. The string has the form `provider/model`.
 
-### Model selection string
+The `skills` field adds the review instructions to the system prompt. The `actions` field tells the model about `git.diff`.
 
-The general form is `"<provider>/<model_id>"`. Registered provider prefixes:
+The `actions` field is not a permission grant. The `allowed_actions` field in `grants.toml` is the permission limit.
 
-| Prefix | Backend |
-|--------|---------|
-| `anthropic` | Anthropic Messages API |
-| `anthropic-cli` | Local `claude` CLI |
-| `openai` | OpenAI-compatible API |
-| `codex` | `codex app-server` JSON-RPC |
-| `openai-cli` | Local `codex` CLI |
+## Select a provider
 
-## Grant the AI permission
+This tutorial uses `anthropic-cli`. It runs the `claude` command from the Claude Code terminal application.
 
-Running a runner calls the model, which requires an `ai:anthropic` grant. Add it to `grants.toml`:
+You can use `anthropic-cli` when Claude Code is installed and authenticated. You can also use it when you do not want an Anthropic API key in agent.d.
 
-```toml
-[tool.git]
-granted = ["shell.exec:git"]
+To use the Anthropic API, set the model to `anthropic/<model-id>`. Replace `<model-id>` with an available Anthropic model ID.
 
-[runner.backend_reviewer]
-allowed_actions = ["git.diff", "git.status"]
-granted = ["ai:anthropic"]
-```
+Then, change the runner grant to `ai:anthropic`.
 
-::: warning Provider credentials required
-The `ai:anthropic` grant tells the engine you allow the call, but the daemon also needs a real API key. Store your Anthropic key in the secret store before running the daemon. See [Provider credentials](/v0/providers/credentials) for the setup command.
+The `anthropic` prefix means the Anthropic API. This option requires an Anthropic API key in the agent.d secret store.
+
+agent.d also supplies `openai-cli` for text-only model calls. This prefix runs the `codex` command from the Codex terminal application.
+
+You can use `openai-cli` when Codex is installed and authenticated. You can also use it when you do not want an OpenAI API key in agent.d.
+
+Currently, `openai-cli` cannot call agent.d actions. Thus, do not use it for this action-using Git reviewer.
+
+For a text-only `ctx.ai` call, select `openai-cli/` and grant `ai:openai-cli`. Refer to [CLI providers](/v0/providers/cli-backends) for details.
+
+Neither CLI provider needs an API key in the agent.d secret store. Each provider uses the authentication of its terminal application.
+
+The terminal application also applies its own access and permission settings. The agent.d grants do not replace those settings.
+
+::: warning The terminal application must be available
+The `claude` or `codex` command must be on `PATH` for the `agentd` process. The provider call fails if its command is absent.
 :::
 
-## Your project so far
+## Configuration directory contents
 
-You now have all five files. Here is the complete state before you start the daemon:
+Your configuration directory now contains these files:
 
-```
-git-reviewer/
+```text
+agentd/
 ├── init.lua
 ├── grants.toml
-├── tools/git.lua
-├── skills/reviewer.md
-└── runners/backend_reviewer.lua
+├── tools/
+│   └── git.lua
+├── skills/
+│   └── reviewer.md
+└── runners/
+    └── backend_reviewer.lua
 ```
 
 ## Next step
 
-[Step 5 — Calling the agent →](/v0/tutorial/calling)
+[Step 5: Run the agent](/v0/tutorial/calling)
 
 ## See also
 
-- [Concepts: runners](/v0/concepts/runners)
-- [Concepts: skills](/v0/concepts/skills)
-- [Writing runners](/v0/writing/runners)
-- [Writing skills](/v0/writing/skills)
+- [Runner concepts](/v0/concepts/runners)
+- [Skill concepts](/v0/concepts/skills)
+- [CLI providers](/v0/providers/cli-backends)
 - [Provider credentials](/v0/providers/credentials)

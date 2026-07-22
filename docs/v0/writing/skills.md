@@ -6,7 +6,7 @@ Markdown file with YAML frontmatter, and an inline Lua call.
 
 ## Form 1 — Markdown file with YAML frontmatter
 
-Create a `.md` file anywhere under your project tree. The YAML frontmatter
+Create a `.md` file anywhere in your configuration directory. The YAML frontmatter
 declares metadata; the body is the instruction text.
 
 ```markdown

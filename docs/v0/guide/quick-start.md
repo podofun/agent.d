@@ -11,7 +11,7 @@ These steps use the bundled `examples/` files, which ship in the source
 repository. If you installed pre-built binaries, clone the repo to get the
 examples (`git clone https://github.com/podofun/agent.d`) and run the commands
 from there — or skip straight to the [Tutorial](/v0/tutorial/), which builds a
-project from scratch with no checkout required.
+configuration from scratch with no checkout required.
 :::
 
 ## Step 1 — Start the daemon
