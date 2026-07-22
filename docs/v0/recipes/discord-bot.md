@@ -7,7 +7,7 @@ The architecture uses two services:
 - **`discord_gateway`** — connects to Discord's WebSocket gateway, identifies, sends heartbeats via `timer.every`, and pushes `MESSAGE_CREATE` events onto a named `channel()`.
 - **`discord_handler`** — pops events from the channel, invokes the `discord_chat` runner with channel history, and posts replies via `ctx.call("discord.send")`.
 
-## Project layout
+## Configuration layout
 
 ```
 examples/discord/

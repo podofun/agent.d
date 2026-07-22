@@ -1,6 +1,6 @@
 # Recipes
 
-Self-contained mini-projects you can copy, paste, and run. Each recipe includes the full Lua, a `grants.toml`, run instructions, and a verification step.
+These self-contained configurations are ready to copy and run. Each recipe includes the Lua, a `grants.toml`, run instructions, and a verification step.
 
 | Recipe | What it shows |
 |---|---|

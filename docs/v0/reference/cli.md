@@ -311,7 +311,7 @@ agentctl pkg rm acme-tools
 
 ### `agentctl types [dir]`
 
-Fetch live action/runner/skill names from the daemon and write LuaLS type stubs into the project's `.luals/` directory.
+Fetch live action, runner, and skill names from the daemon. Then, write LuaLS type stubs into the configuration directory.
 
 ```bash
 agentctl types [dir]
@@ -322,11 +322,11 @@ agentctl types [dir]
 - This is the same regeneration that `--watch` triggers automatically on reload.
 
 ```bash
-# Current project
+# Current configuration directory
 agentctl types
 
-# Specific project directory
-agentctl types ~/projects/my-agent
+# Specified configuration directory
+agentctl types /path/to/agentd-config
 ```
 
 ---

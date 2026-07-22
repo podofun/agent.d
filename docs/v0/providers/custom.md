@@ -1,86 +1,135 @@
 # Custom providers
 
-Register any **OpenAI-compatible** endpoint (OpenRouter, Groq, Together, vLLM, Ollama, LM Studio, …) or **Anthropic-compatible** gateway as a named provider in `config.toml`. No code changes, no plugin — the daemon builds the provider at startup and it behaves exactly like the built-ins: same Lua API, same tool calling, same schemas, same `ctx.structured`.
+A custom provider connects agent.d to a model API that is not a built-in provider.
 
-## Declaring a provider
+The API must use one of these supported formats:
 
-Each `[providers.<name>]` table adds one prefix to the registry:
+| `kind` value | Required API format |
+|---|---|
+| `openai` | OpenAI Chat Completions |
+| `anthropic` | Anthropic Messages |
+
+agent.d does not install or start the model server. Before you make a model call, make sure that the API endpoint is available.
+
+## Add a local provider
+
+Add a provider table to `~/.config/agentd/config.toml`:
 
 ```toml
-# config.toml
-[providers.openrouter]
-kind = "openai"                       # wire format: "openai" | "anthropic"
-base_url = "https://openrouter.ai/api/v1"
-api_key_secret = "openrouter_api_key" # secret store key holding the API key
-default_model = "meta-llama/llama-3.3-70b-instruct"
-
-[providers.groq]
-kind = "openai"
-base_url = "https://api.groq.com/openai/v1"
-api_key_secret = "groq_api_key"
-
 [providers.ollama]
 kind = "openai"
-base_url = "http://localhost:11434/v1"
-auth = "none"                         # local server, no Authorization header
+base_url = "http://127.0.0.1:11434/v1"
+auth = "none"
 default_model = "qwen3:14b"
 ```
 
-- **`kind`** — `"openai"` for the Chat Completions wire format, `"anthropic"` for the Messages wire format (self-hosted gateways/proxies).
-- **`base_url`** — forgiving: `https://host/v1`, with or without a trailing slash, or the full `/chat/completions` (or `/v1/messages`) URL all work.
-- **`api_key_secret`** — name of the key in the OS keyring (see [Credentials](/v0/providers/credentials)). Exactly one of `api_key_secret` or `auth = "none"` is required; a remote endpoint without credentials must be opted into explicitly.
-- **`auth = "none"`** — send no auth header at all. For local servers like Ollama or vLLM without `--api-key`.
-- **`default_model`** — used when a call passes no model id.
+This example registers the provider name `ollama`. It assumes that an OpenAI-compatible server listens on port `11434`.
 
-Provider names must not collide with the reserved built-in prefixes (`anthropic`, `anthropic-cli`, `openai`, `codex`, `openai-cli`, `mock`).
+Replace the URL and model ID when your server uses different values.
 
-## Storing the API key
+The provider table has these fields:
 
-Same pattern as the built-ins — once, with `agentctl secret set` under the name you declared in `api_key_secret`:
+| Field | Use this field when | Function |
+|---|---|---|
+| `kind` | For every provider | Selects the supported API format. |
+| `base_url` | For every provider | Specifies the model API endpoint. |
+| `auth` | The endpoint has no authentication | Disables the authentication header when its value is `none`. |
+| `api_key_secret` | The endpoint uses an API key | Specifies the secret-store name that contains the API key. |
+| `default_model` | You want to specify a fallback model | Specifies the model when a call does not specify one. |
 
-```bash
-echo "$OPENROUTER_API_KEY" | agentctl secret set openrouter_api_key
-```
+Every provider must contain exactly one of these authentication fields: `auth` or `api_key_secret`. Use `auth = "none"` only when the endpoint does not require authentication.
 
-## Using the provider
+For an OpenAI-compatible API, `base_url` can contain the API base path or the full Chat Completions path.
 
-The new prefix works everywhere a built-in does. Model ids may contain slashes:
+For an Anthropic-compatible API, `base_url` can contain the API base path or the full Messages path.
+
+## Use the provider in a runner
+
+Add a runner to `init.lua` or to a Lua file that `init.lua` loads:
 
 ```lua
 agentd.runner({
-  name = "summariser",
-  model = "openrouter/meta-llama/llama-3.3-70b-instruct",
-  skills = { "summarise" },
+    name = "local_helper",
+    model = "ollama/qwen3:14b",
 })
 ```
 
-```lua
-local reply = ctx.ai.ask("Summarise this PR", { model = "ollama/qwen3:14b" })
+The text before the first `/` is the provider name. The remaining text is the model ID.
+
+A model ID can contain `/` characters after the first separator. agent.d keeps these characters in the model ID.
+
+Give the runner permission to call the provider:
+
+```toml
+[runner.local_helper]
+granted = ["ai:ollama"]
 ```
 
-Switching providers changes nothing else — tool calling, input/output schemas, and `ctx.structured` behave identically across all of them.
+The grant must contain the provider name. A grant for a different provider does not permit this call.
 
-## Default provider
+## Add an authenticated provider
 
-Point bare model ids (no `provider/` prefix) at your provider:
+Use `api_key_secret` when the endpoint requires an API key:
+
+```toml
+[providers.gateway]
+kind = "anthropic"
+base_url = "https://gateway.example.com/v1"
+api_key_secret = "gateway_api_key"
+default_model = "claude-compatible-model"
+```
+
+The `api_key_secret` value is a secret-store name. It is not the API key.
+
+Store the API key under that name. Refer to [Provider credentials](/v0/providers/credentials) for the applicable `agentctl` commands.
+
+The provider gets the key from the secret store when it makes a model call. You do not need to restart agent.d after a key change.
+
+## Select a default provider
+
+You can select a custom provider as the default provider:
 
 ```toml
 [runtime]
 default_provider = "ollama"
 ```
 
-## Required permission
+After this change, a model string without a provider prefix uses `ollama`.
 
-As with built-ins, callers need the matching grant:
+For example, `model = "qwen3:14b"` uses the `ollama` provider. The model string `openai/gpt-5.5` still selects `openai`.
 
-```toml
-# grants.toml
-[service.local_bot]
-granted = ["ai:ollama"]
-```
+## Provider-name restrictions
+
+A custom provider name cannot use a built-in provider name.
+
+These names are reserved:
+
+- `anthropic`
+- `anthropic-cli`
+- `openai`
+- `codex`
+- `openai-cli`
+- `mock`
+
+The daemon rejects an invalid provider configuration at startup. The error identifies the provider and the invalid field.
+
+The daemon also rejects these configurations:
+
+- `base_url` is empty.
+- Both authentication fields are present.
+- Both authentication fields are absent.
+- `auth` has a value other than `none`.
+- `runtime.default_provider` identifies an unknown provider.
+
+## Endpoint compatibility
+
+The endpoint must implement the selected API format. Some compatible endpoints do not implement every optional feature.
+
+Confirm that your endpoint supports the model, message, and tool features that your runner uses.
 
 ## See also
 
-- [Providers overview](/v0/providers/) — model selection, max_turns, all prefixes
-- [Credentials](/v0/providers/credentials) — storing and rotating API keys
-- [OpenAI](/v0/providers/openai) — the built-in `openai` prefix
+- [Providers overview](/v0/providers/)
+- [Provider credentials](/v0/providers/credentials)
+- [Configuration reference](/v0/reference/configuration)
+- [Permission slugs](/v0/security/permission-slugs)

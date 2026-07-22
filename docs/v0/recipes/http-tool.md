@@ -4,7 +4,7 @@ Call an external JSON API from an action using `ctx.http.client`, parse the resp
 
 This recipe uses a public weather API as the example target — replace the URL and fields with any JSON API you need.
 
-## Project layout
+## Configuration layout
 
 ```
 my-http-tool/

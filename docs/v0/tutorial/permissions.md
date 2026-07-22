@@ -1,93 +1,54 @@
-# Step 3 — Permissions
+# Step 3: Give Permissions
 
-Without a grants file every call to your new tool fails. This page explains agent.d's default-deny permission engine and shows you the minimal `grants.toml` that lets the git tool run.
-
-## Why default-deny?
-
-agent.d's permission engine evaluates five layers in intersection order:
-
-```
-tool/package grants
-  ∩ action.requires
-  ∩ runner.allowed_actions
-  ∩ interface.allowed_actions
-  ∩ policy
-  = Decision
-```
-
-A call is allowed only when **every** layer that applies says yes. If any layer denies — or if a layer simply has no entry — the call is blocked. Writing `requires` in your Lua declares what an action needs; it never grants that need.
-
-`grants.toml` is **the only source of grants**.
+agent.d denies access to a host capability when the necessary grant is absent. You must give each tool and runner its permissions.
 
 ## Write `grants.toml`
 
-Create `grants.toml` in your project root:
+Create `~/.config/agentd/grants.toml` with this content:
 
 ```toml
-# grants.toml
-
 [tool.git]
-granted = ["shell.exec:git"]
-```
+granted = [
+    "shell.exec:git",
+    "fs.read:/path/to/repository/**",
+]
 
-That one line is enough to let `agentctl call git.status` succeed. The slug `shell.exec:git` matches the `bin` argument you pass to `ctx.shell` — the bare binary name `"git"`.
-
-## Permission slug anatomy
-
-Slugs follow the form `domain` or `domain:specifier`. The domains relevant to this project:
-
-| Slug | What it allows |
-|------|---------------|
-| `shell.exec:git` | Run the `git` binary via `ctx.shell`. |
-| `ai:anthropic` | Make model calls through the Anthropic provider. |
-| `net:<host>` | HTTP or WebSocket to a specific host. |
-| `fs.read:<glob>` | Filesystem reads under a path glob. |
-| `fs.write:<glob>` | Filesystem writes under a path glob. |
-
-Wildcards are supported on the specifier: `net:*` allows all hosts, `fs.write:/tmp/**` allows all writes under `/tmp`.
-
-::: info Filesystem grants are resolved
-Path globs in `fs.read` and `fs.write` grants are resolved (symlinks, `..` expanded) before matching, so a tool cannot reach past them with aliases.
-:::
-
-## The other grant sections
-
-Your `grants.toml` can grow to cover every layer of the engine:
-
-```toml
-# Per-tool: what the tool itself is allowed to do.
-[tool.git]
-granted = ["shell.exec:git"]
-
-# Per-runner: which actions the runner may call.
-# Empty section = no constraint at this layer.
 [runner.backend_reviewer]
-allowed_actions = ["git.diff", "git.status"]
-
-# Per-interface: which actions a connected client may call.
-[interface.telegram]
-allowed_actions = ["git.status"]
-
-# Final policy denylist (hard block, never escalated to approval).
-[policy]
-deny_actions = []
-deny_permissions = []
-auto_confirm = []
+allowed_actions = ["git.diff"]
+granted = ["ai:anthropic-cli"]
 ```
 
-For now the minimal one-section file is all you need. You will add the runner section in the next step.
+Replace `/path/to/repository` with the same absolute path that you used in `tools/git.lua`.
 
-::: warning `requires` is not self-granting
-A component's `requires` list is a declaration of need, not a grant. Removing the `[tool.git]` block from `grants.toml` while keeping `requires = { "shell.exec:git" }` in Lua still denies every call.
-:::
+The `[tool.git]` section permits the `git` tool to run Git and read the selected repository.
+
+The `shell.exec:git` slug limits process execution to Git. The `fs.read` slug limits file access to the selected repository.
+
+The `[runner.backend_reviewer]` section gives two limits:
+
+- `allowed_actions` permits the runner to call only `git.diff`.
+- `granted` permits the runner to use the `anthropic-cli` provider.
+
+The provider grant does not give access to other actions. The action list does not give access to other providers.
+
+## Default-deny behavior
+
+The `requires` field in Lua declares a permission. The applicable section in `grants.toml` gives that permission.
+
+If you remove `[tool.git]`, the runtime denies the Git process. If you remove `fs.read`, Git cannot read the repository.
+
+If you remove the runner grant, the runtime denies the model call.
+
+If you remove `git.diff` from `allowed_actions`, the runner cannot call that action.
+
+This separation prevents a component from receiving a capability only because another component has it.
 
 ## Next step
 
-[Step 4 — Runner and skill →](/v0/tutorial/runner-and-skill)
+[Step 4: Add a runner and a skill](/v0/tutorial/runner-and-skill)
 
 ## See also
 
-- [Concepts: permissions](/v0/concepts/permissions)
-- [Security: grants](/v0/security/grants)
-- [Security: permission slugs](/v0/security/permission-slugs)
-- [Security: approvals](/v0/security/approvals)
+- [Permission concepts](/v0/concepts/permissions)
+- [Grant reference](/v0/security/grants)
+- [Permission slugs](/v0/security/permission-slugs)

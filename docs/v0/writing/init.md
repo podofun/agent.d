@@ -1,7 +1,7 @@
-# init.lua — Project Entry Point
+# init.lua — Configuration Entry File
 
 `init.lua` is the single file the daemon evaluates at startup. Everything else in
-your project — tools, runners, skills, services — is pulled in from here via
+your configuration — tools, runners, skills, services — is pulled in from here via
 `import()` or the skill loaders.
 
 ## How `import` works
@@ -17,14 +17,14 @@ forms are rejected with an error at load time:
 - Absolute paths (`/home/user/something.lua`)
 - Parent-directory traversal (`../shared/util.lua`)
 
-This keeps every project's dependency graph rooted in one place and prevents
+This keeps all configuration dependencies rooted in one place and prevents
 components from reaching outside their own tree.
 
 ::: tip
 `import` de-duplicates paths: calling `import` on the same canonicalized path a second time is a no-op — the file is not re-evaluated. You can safely import shared helpers from multiple files without worrying about double-registration.
 :::
 
-## Organizing a project
+## Organizing the configuration directory
 
 A flat single file is fine for small setups. For anything larger, a conventional
 layout keeps things navigable:
@@ -102,7 +102,7 @@ the daemon process when you want to pick up changes.
 
 ## See also
 
-- [Project layout](/v0/tutorial/project-layout)
+- [Configuration directory](/v0/tutorial/config-directory)
 - [Writing tools](/v0/writing/tools)
 - [Writing skills](/v0/writing/skills)
 - [Writing services](/v0/writing/services)

@@ -1,31 +1,47 @@
 # Build Your First Agent
 
-This tutorial walks you through creating a working git review agent from scratch. By the end you will have a running daemon that lets any client ask an AI to inspect staged changes in a repository.
+This tutorial shows you how to make a small Git review agent. The agent reads a staged diff and gives review comments.
 
-## What you will build
+You will put all agent.d files in one configuration directory. You do not need a separate directory for each agent.
 
-A self-contained project that registers a `git` tool with two actions (`git.diff`, `git.status`), a Markdown skill that shapes the reviewer's persona, and a runner that wires them together under `anthropic/claude-opus-4-7`. You will call it interactively with `agentctl` and watch hot reload in action.
+## What you will make
 
-## Prerequisites
+The configuration will contain these items:
 
-- agent.d installed and `agentd` + `agentctl` on your `PATH` — see [Installation](/v0/guide/installation).
-- An Anthropic API key stored in the secret store (covered in [Step 5](/v0/tutorial/runner-and-skill)).
-- `git` available on `PATH`.
+- One action runs `git diff --staged`.
+- One skill gives review instructions to the model.
+- One runner connects the model to the action and the skill.
+- One grants file gives only the necessary permissions.
 
-## The six steps
+## Before you start
 
-| Step | Page | What you do |
-|------|------|-------------|
-| 1 | [Project layout](/v0/tutorial/project-layout) | Create the project directory and write a minimal `init.lua`. |
-| 2 | [First tool](/v0/tutorial/first-tool) | Write `tools/git.lua` with two actions backed by `ctx.shell`. |
-| 3 | [Permissions](/v0/tutorial/permissions) | Write `grants.toml` and understand why the daemon is default-deny. |
-| 4 | [Runner & skill](/v0/tutorial/runner-and-skill) | Add a Markdown skill and a runner that uses the model. |
-| 5 | [Calling the agent](/v0/tutorial/calling) | Start the daemon and exercise every piece with `agentctl`. |
-| 6 | [Dev loop](/v0/tutorial/dev-loop) | Use `--watch`, `agentctl types`, and `agentctl trace` to iterate fast. |
+Install agent.d. Make sure that `agentd` and `agentctl` are on `PATH`. Refer to [Installation](/v0/guide/installation).
+
+Make sure that `git` is on `PATH`.
+
+You must also have one of these provider options:
+
+| Option | Requirement |
+|---|---|
+| `anthropic` | An Anthropic API key in the agent.d secret store. |
+| `anthropic-cli` | The Claude Code terminal application installed and authenticated. |
+
+This tutorial uses `anthropic-cli`. This option uses your Claude Code authentication and does not require an Anthropic API key in agent.d.
+
+## Tutorial steps
+
+| Step | Page | Task |
+|---|---|---|
+| 1 | [Configuration directory](/v0/tutorial/config-directory) | Make the configuration directory and write `init.lua`. |
+| 2 | [Git action](/v0/tutorial/first-tool) | Write an action that reads a staged Git diff. |
+| 3 | [Permissions](/v0/tutorial/permissions) | Give the minimum permissions. |
+| 4 | [Runner and skill](/v0/tutorial/runner-and-skill) | Add review instructions and a model runner. |
+| 5 | [Run the agent](/v0/tutorial/calling) | Start agent.d and review a staged diff. |
+
+Each step uses the same configuration directory.
 
 ## See also
 
 - [What is agent.d?](/v0/guide/what-is-agentd)
 - [How it works](/v0/guide/how-it-works)
-- [Quick start](/v0/guide/quick-start)
 - [Concepts overview](/v0/concepts/)

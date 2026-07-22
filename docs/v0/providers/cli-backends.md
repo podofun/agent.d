@@ -21,31 +21,44 @@ CLI backends are convenience paths. For production deployments, the direct API b
 
 ## anthropic-cli
 
-Uses the locally installed `claude` CLI. The agent.d MCP loopback server is used to feed tool calls back into the daemon during an agentic runner loop — see [MCP loopback](/v0/providers/mcp) for how that works.
+Uses the locally installed `claude` CLI. During a runner call, the CLI can call the agent.d actions that the runner permits.
 
 ```lua
 agentd.runner({
   name = "local_reviewer",
-  model = "anthropic-cli/claude-opus-4-7",
-  actions = { "git.diff", "git.status" },
+  model = "anthropic-cli/sonnet",
+  actions = { "git.diff" },
 })
 ```
 
 **Required permission:** `ai:anthropic-cli`
 
 ```toml
-[tool.review]
+[runner.local_reviewer]
+allowed_actions = ["git.diff"]
 granted = ["ai:anthropic-cli"]
 ```
 
 ## openai-cli
 
-Uses the locally installed `codex` CLI as a text-output fallback. This backend invokes `codex` and captures its text output; it does not drive a full agentic loop the same way `anthropic-cli` does.
+Uses the locally installed `codex` CLI as a text-output fallback. This backend invokes `codex` and captures its text output.
+
+Use `openai-cli` for text-only `ctx.ai` calls. It cannot call agent.d actions.
 
 ```lua
-agentd.runner({
-  name = "quick_assist",
-  model = "openai-cli/",
+agentd.tool({
+  name = "assist",
+  requires = { "ai:openai-cli" },
+})
+
+agentd.action({
+  name = "assist.ask",
+  requires = { "ai:openai-cli" },
+  handler = function(args, ctx)
+    return ctx.ai.ask(args.prompt, {
+      model = "openai-cli/",
+    })
+  end,
 })
 ```
 
@@ -63,6 +76,5 @@ Both backends require the respective CLI (`claude` or `codex`) to be installed a
 ## See also
 
 - [Providers overview](/v0/providers/) — all registered prefixes and model selection
-- [MCP loopback](/v0/providers/mcp) — how `anthropic-cli` feeds tool calls back into agent.d
 - [Credentials](/v0/providers/credentials) — keyring-based credentials for the direct API backends
 - [Anthropic provider](/v0/providers/anthropic) — direct Anthropic Messages API backend
