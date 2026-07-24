@@ -1,14 +1,13 @@
 # agentd-executor
 
-Execution / scheduler. The universal kernel — no Lua dep.
+`agentd-executor` runs actions and runners through the agentd policy boundary.
 
-`Executor` holds every registry (actions via `dyn Registry`, runners, services,
-skills, providers). Methods:
+For each action, the executor:
 
-- `run_action` — dispatch one action through the 5-layer permission engine.
-- `run_runner` — drives the tool-use loop. Owns it for `ExecutorOwned` providers (composes the tool catalog, dispatches each tool call back through `run`, re-prompts to a 16-turn cap); binds the MCP loopback for `ProviderOwned` providers.
-- `start_service` / `start_services` — supervises service lifecycle with restart policy.
+- Resolves action and tool metadata.
+- Evaluates required permissions, caller allowlists, and global policy.
+- Requests operator approval when the denial is eligible for escalation.
+- Invokes the registry with the effective grants and call context.
+- Records a redacted execution trace.
 
-Emits a `TraceEvent` for every dispatch. When wired to an `ApprovalBroker`, routes
-escalatable denials to interactive approval (`AllowOnce` overlay, `AllowForever`
-appends to `grants.toml` + hot-swaps a reloaded engine).
+It also composes runner skills, drives executor-owned model tool loops, and exposes dispatch bridges for MCP, Lua, and provider-owned loops.

@@ -1,9 +1,7 @@
 # agentd-fs
 
-Filesystem primitive.
+`agentd-fs` provides asynchronous filesystem primitives for the runtime.
 
-`read_to_string`, `read_bytes`, `write`, `append`, `exists`, `stat`, `list_dir`,
-`remove_file`, `remove_dir_all`.
+It can read text or bytes, write or append files, inspect paths, list directories, and remove files or directory trees. Directory entries and file metadata use typed return values.
 
-No permission checks here — the caller (scripting `ctx.fs`) gates by
-`fs.read:<abs-path>` / `fs.write:<abs-path>`.
+This crate performs filesystem operations. Callers must complete permission checks and path confinement before they call it.

@@ -1,10 +1,11 @@
 # agentd-api
 
-Interface — the WebSocket surface. An axum router, two planes + a health probe.
+`agentd-api` provides the daemon's HTTP health probe and WebSocket API.
 
-- `GET /health` → `ok` (always open).
-- `/ws` — **public data plane** (public bearer token). Methods: `tools.list`, `actions.call`, `runners.list|inspect|run`, `skills.list|inspect`, `services.list`.
-- `/control` — **control plane** (distinct admin token). `approvals.subscribe` / `approvals.resolve`, plus server-pushed `approval.request` frames. A public-token holder can never reach it.
+Routes:
 
-Envelope: `{ id, method, params? }` → `{ id, ok, result? | error?, code? }`. Each
-connection gets a `ws-<n>` session id. **No HTTP action routes.**
+- `GET /health` returns `ok` without authentication.
+- `/ws` is the data plane for tools, actions, runners, skills, and services.
+- `/control` is the operator plane for approval requests and decisions.
+
+The data and control planes can use different bearer tokens. WebSocket requests use `{ "id", "method", "params" }`. Responses include the same `id`, an `ok` flag, and either a result or an error.

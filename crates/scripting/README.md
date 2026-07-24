@@ -1,17 +1,7 @@
 # agentd-scripting
 
-Lua host. `LuaHost` is a `Registry` impl backed by mlua, owning the Lua state +
-catalog (actions, services).
+`agentd-scripting` hosts the sandboxed Lua 5.4 userland.
 
-Provides the sandboxed userland:
+`LuaHost` loads scripts and registers tools, actions, runners, skills, and services. Action contexts expose approved filesystem, shell, HTTP, WebSocket, mail, memory, secret, logging, nested-call, runner, and concurrency operations.
 
-- Registration: `import`, `agentd.tool`, `agentd.action`, `agentd.runner`, `agentd.skill`, `agentd.skills.load/dir`, `agentd.service`.
-- The per-invocation `ctx` capability handle (fs, http, ws, shell, secret, memory, ai, call, run, caller, log, state) — injected as the handler/service parameter, never a global. Every binding does an inline permission check.
-- Bare globals: `async`, `await`, `channel`, `sleep`, `timer`, `json`, `pcall`.
-- Cooperative scheduler — yieldable IO across Lua coroutines.
-
-Stdlib lockdown lives in the `sandbox` module (`lock_down(&Lua)`): strips
-`io`/`os`/`package`/`debug`/`require`/`load*`/metatable escapes; keeps
-`string`/`table`/`math`/`coroutine`/`utf8` + safe basics + `agentd`.
-
-Full surface: `docs/lua-reference.md`.
+The crate also provides coroutine scheduling, channels, imports, Lua error cleanup, and runtime API tables. Rust supplies host capabilities and effective grants; Lua defines user workflows.
