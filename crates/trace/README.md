@@ -1,9 +1,7 @@
 # agentd-trace
 
-Logs. Append-only execution trace.
+`agentd-trace` records append-only execution events.
 
-- `TraceEvent` — one recorded dispatch / lifecycle event.
-- `TraceSink` trait — pluggable sink.
-- `JsonlSink` — JSONL append to a file (no sqlite yet).
+`TraceEvent` stores the timestamp, action, duration, outcome, execution correlation ID, and event kind. Constructors redact every argument and result leaf before storage while preserving object keys and collection structure.
 
-The executor emits a `TraceEvent` for every dispatch, including service lifecycle.
+`TraceSink` defines the storage interface. `JsonlSink` appends one JSON object per line and flushes each event.

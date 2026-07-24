@@ -1,16 +1,7 @@
 # agentd-permissions
 
-Auth — enforcement. Default-deny.
+`agentd-permissions` defines permission values, grant files, caller identity, and policy evaluation.
 
-5-layer intersection engine:
+Permissions use scoped strings such as filesystem or network grants. The engine checks required permissions, runner, interface, and service allowlists, global deny rules, and confirmation settings. It returns an allow, deny, or confirmation decision and identifies the layer that caused a denial.
 
-```
-tool-pkg ∩ action-requires ∩ runner-allow ∩ interface-allow ∩ policy = Decision
-```
-
-- Loads `grants.toml` — the **only** source of grants. A tool manifest's `requires` is a wishlist, never self-granting.
-- Emits `Decision::Allow` / `NeedsConfirmation` / `Deny`.
-- `Decision::is_escalatable()` flags Tool-missing + confirm (eligible for interactive approval).
-- `[policy] auto_confirm` promotes a confirm action to Allow.
-
-Permission slug shape: `domain[:specifier]`, with wildcards on the specifier (`net:*`, `fs.read:/tmp/**`).
+This crate evaluates policy. It does not perform host operations or operator approval transport.

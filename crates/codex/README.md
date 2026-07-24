@@ -1,7 +1,7 @@
 # agentd-codex
 
-Codex transport. Long-lived `codex app-server` subprocess client.
+`agentd-codex` is an asynchronous client for `codex app-server`.
 
-Newline-delimited JSON-RPC over stdio, bidirectional — server-issued requests come back through the inbox. Hand-coded subset of the codex protocol covering just the methods agentd uses.
+It starts the app server as a child process, exchanges JSON-RPC messages over standard input and output, and separates responses, notifications, and server requests. The `protocol` module contains the typed request and response structures used to initialize threads and run turns.
 
-Consumed by `agentd-ai`'s `CodexAppServerProvider`.
+This crate implements the transport client. `agentd-ai` adapts it to the model-provider interface and applies agentd permission decisions.

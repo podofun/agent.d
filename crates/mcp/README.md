@@ -1,11 +1,13 @@
 # agentd-mcp
 
-MCP loopback. Lets `ProviderOwned` CLI providers (claude, codex) reach back into the
-executor without a circular crate dep.
+`agentd-mcp` exposes registered agentd actions as Model Context Protocol tools.
 
-`bind_loopback(dispatcher, caller, tools)` spawns a per-invocation HTTP JSON-RPC
-server on `127.0.0.1:0` exposing the given catalog as MCP tools. Every `tools/call`
-runs through the supplied `agentd_types::Dispatcher`, so the 5-layer permission engine
-fires — same path as a user-initiated `actions.call`.
+The loopback server:
 
-The executor binds it for the duration of a runner call and tears it down on return.
+- Binds to a local TCP address.
+- Requires a generated bearer token.
+- Implements MCP initialization, tool listing, and tool calls.
+- Routes calls through the shared `Dispatcher`.
+- Stops when its handle is shut down or dropped.
+
+The server is a loopback bridge for provider-owned model loops. It does not bypass executor permissions.

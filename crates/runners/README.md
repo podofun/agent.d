@@ -1,10 +1,7 @@
 # agentd-runners
 
-Runner — a named AI worker/identity.
+`agentd-runners` defines named model-runner configurations and executes them.
 
-- `RunnerDef { name, system, model, skills, allowed_actions }`. `model = "<provider>/<model_id>"`; the provider prefix resolves against the shared `ProviderRegistry`.
-- `RunnerRegistry`.
-- `compose()` — unions skill bodies + `system`, and skill `actions` + `allowed_actions`.
-- `run()` — single-shot: composes the prompt, dispatches `Provider::complete`, returns text.
+A `RunnerDef` selects a model, system instructions, skills, and allowed actions. `compose` resolves the referenced skills and produces the effective prompt and action list. `run` resolves the provider and returns a typed `RunnerOutcome`.
 
-The multi-turn tool-use loop lives in `agentd-executor`, not here.
+The registry stores runner definitions. The executor supplies tool dispatch and permission enforcement.
