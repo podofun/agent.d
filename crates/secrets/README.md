@@ -1,9 +1,7 @@
 # agentd-secrets
 
-Auth — credential store.
+`agentd-secrets` defines storage for credentials and other sensitive values.
 
-- `SecretStore` trait.
-- `MemoryStore` — in-process (tests).
-- `KeyringStore` — OS-native via `keyring-core` (libsecret on Linux, Keychain on macOS, Credential Manager on Windows).
+The `SecretStore` trait supports get, set, delete, and list operations. `MemoryStore` is for tests and temporary runtimes. `KeyringStore` uses the operating-system credential store and tracks names written through the current store instance.
 
-Values are zeroized on drop. Backs the Lua `ctx.secret.*` surface; scripting gates by `secret:<key>`.
+Secret values must not be written to configuration files, logs, or traces.

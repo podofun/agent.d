@@ -1,8 +1,7 @@
 # agentd-skills
 
-Skill — a reusable behavior mode (reviewer, debugger, support).
+`agentd-skills` parses and stores reusable runner behavior.
 
-- `SkillDef { name, description, system, actions }` — body is a system-prompt fragment; `actions` is an advisory allowlist.
-- `SkillRegistry` — loads `*.md` files with YAML-ish frontmatter from a skills dir.
+A skill contains a name, optional description, system-prompt text, and an advisory action list. `SkillRegistry` loads Markdown files recursively and also accepts definitions registered by Lua.
 
-Skills are authored as Markdown (frontmatter + body) or inline via `agentd.skill{...}`.
+Skill files use a small frontmatter format with `name`, `description`, and `actions` keys. The Markdown body becomes the system-prompt text. An action listed by a skill is not a permission grant.

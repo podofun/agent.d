@@ -1,11 +1,7 @@
 # agentd-services
 
-Service — a long-running named Lua task (Discord gateway loop, IMAP idle, cron poll).
+`agentd-services` stores definitions and lifecycle state for long-running handlers.
 
-Storage only — execution lives in `agentd-executor::start_service`.
+A `ServiceDef` contains the service name, restart policy, and backoff limits. The `ServiceRegistry` stores definitions and reports pending, running, stopped, or crashed state.
 
-- `ServiceDef { name, tool, source }`.
-- `ServiceRegistry`.
-- `ServiceState { Pending, Running, Stopped, Crashed }` + `ServiceStatus`.
-
-Registered in Lua via `agentd.service(name, fn)`.
+The handler implementation remains in the action registry, such as `LuaHost`. The executor supervises handlers and applies the configured restart policy and backoff.

@@ -1,16 +1,14 @@
-# agentd-cli (`agentctl`)
+# agentd-cli
 
-Console client. Speaks WebSocket to the daemon.
+`agentd-cli` builds the `agentctl` command-line client.
 
-Data-plane subcommands on `/ws`: `health`, `tools`, `call <action>`,
-`runner ls|inspect|run`, `skills ls|inspect`, `services ls`, `trace [-f|-n N]`
-(filesystem tail).
+The client can:
 
-Control-plane: `grants listen` connects `/control` with the admin token and
-interactively answers approval requests.
+- Check daemon health and list or call actions.
+- List, inspect, and run runners and skills.
+- List services and read execution traces.
+- Listen for approval requests on the control WebSocket.
+- Manage local secrets and packages.
+- Generate Lua type definitions.
 
-Package commands (`packages install|update|ls|remove`) run locally — fs + git, not
-over the socket.
-
-Base URL via `--url` or `AGENTD_URL`; scheme is swapped to `ws://` / `wss://`.
-Exit code 1 on non-2xx.
+Remote commands use the daemon WebSocket API. Local management commands read or update files on the host.

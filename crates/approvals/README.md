@@ -1,11 +1,12 @@
 # agentd-approvals
 
-Interactive permission approvals. Transport-agnostic.
+`agentd-approvals` coordinates permission decisions between the executor and operator clients.
 
-`Broker` holds a connected-approver registry + a pending-request registry, fans each
-request out to all approvers, and awaits the first verdict with a timeout.
+The `Broker`:
 
-- `request()` (the `ApprovalBroker` impl) — returns `Deny` if there's no approver or on timeout (**fail closed**).
-- `subscribe()` / `resolve()` — the control-transport side.
+- Assigns an ID to each approval request.
+- Sends requests to all subscribed approvers.
+- Resolves a request when an approver returns a verdict.
+- Denies a request when no approver is connected or the request times out.
 
-Knows nothing about WebSocket; `agentd-api`'s `/control` plane drives it.
+Transport code is outside this crate. `agentd-api` exposes the broker on the control WebSocket.

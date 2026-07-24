@@ -1,18 +1,12 @@
 # agentd-ai
 
-Model abstraction. One `Provider` trait, every vendor plugs in behind it.
+`agentd-ai` defines the common interface for model providers and stores configured providers by name.
 
-Unified `CompletionRequest` / `CompletionResponse`. A request can carry an optional
-`Arc<dyn Dispatcher>` + `Caller` so providers bridge tool calls + approvals back
-through the executor without going via HTTP MCP.
+It provides:
 
-`loop_mode()` splits providers into `ExecutorOwned` (executor drives the tool-use
-loop) and `ProviderOwned` (CLI/MCP providers own their own loop).
+- Request, response, message, tool-call, and provider error types.
+- The `Provider` trait and the `ProviderRegistry`.
+- Anthropic API, OpenAI-compatible API, Claude CLI, Codex CLI, Codex app-server, and mock providers.
+- Executor-owned and provider-owned tool loops through `LoopMode`.
 
-Providers:
-
-- `MockProvider` — tests.
-- `ClaudeCliProvider` — shells `claude -p`, MCP loopback with `--allowedTools "mcp__agentd__*"` (ProviderOwned).
-- `ClaudeApiProvider` — Anthropic Messages API (ExecutorOwned).
-- `CodexAppServerProvider` — drives `codex app-server` over JSON-RPC, MCP-only, bridges approvals to the permission engine.
-- `CodexCliProvider` — text-only fallback (`codex exec` has no allowlist flag).
+API providers return tool calls for the executor to run. CLI and app-server providers can own the loop and route tool calls or approval checks back through agentd.

@@ -1,12 +1,13 @@
 # agentd-types
 
-Shared vocabulary for the workspace. No logic, no I/O.
+`agentd-types` contains transport-neutral types and traits shared across runtime crates.
 
-Defines the core DTOs and traits every other crate speaks:
+It defines:
 
-- `ActionCall`, `ActionResult` — one dispatch in/out.
-- `Registry` trait + `RegistryError` — action lookup.
-- `Dispatcher` — invoke an action (and `check_grants` for permission-only checks).
-- Approval DTOs/trait — `ApprovalRequest`, `ApprovalKind`, `Verdict`, `ApprovalBroker`.
+- Action calls, results, registry metadata, and registry errors.
+- Call context and the `Registry` dispatch interface.
+- Executor bridges for actions and runners.
+- Approval requests, verdicts, and the approval-broker interface.
+- Service options shared with Lua registration.
 
-`types` is the leaf of the dependency graph; nothing here depends on the rest of agentd.
+The crate contains boundary contracts. Implementations remain in the executor, scripting, approvals, and services crates.

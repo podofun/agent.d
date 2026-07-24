@@ -1,15 +1,13 @@
-# daemon (`agentd` bin)
+# daemon
 
-Runtime host + config. The binary; root of the dependency graph. No business logic
-beyond config.
+`daemon` builds the `agentd` service.
 
-- `config` module — clap CLI + XDG resolution (`Cli`, `Config::resolve`). Precedence: CLI > env > `config.toml` > `RUST_LOG` (log only) > built-in default.
-- Wires config → scripting → executor → api.
-- Evaluates `init.lua` as the sole entry point (`runtime.init` / `--init` / `AGENTD_INIT`).
-- Defaults: secrets = `KeyringStore`, memory = `RedbStore`, providers = `{ anthropic: ClaudeApiProvider, anthropic-cli: ClaudeCliProvider }`.
-- Mints + `0600`-writes the public + admin tokens if unset; runs package grant desugaring before loading `grants.toml`.
-- Console logging defaults to warnings/errors plus one compact startup banner. Use `AGENTD_LOG=debug` for startup detail.
+At startup, it:
 
-```bash
-cargo run -p daemon -- --init ./examples/init.lua
-```
+- Loads command-line options and TOML configuration.
+- Loads grants, packages, Lua scripts, skills, runners, providers, secrets, and memory.
+- Builds the executor, approval broker, service registry, and WebSocket API.
+- Starts configured services and optional file watching.
+- Installs or removes platform sandbox support when requested.
+
+The daemon owns process lifecycle and composition. Policy and host operations remain in their dedicated crates.
