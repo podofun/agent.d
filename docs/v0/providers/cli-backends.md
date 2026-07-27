@@ -1,80 +1,103 @@
-# CLI backends
+# CLI Providers
 
-agent.d ships two local CLI backends that drive model calls through a locally installed CLI tool rather than a direct API call. Neither backend requires an API key in the secret store — they delegate authentication to the CLI tool itself.
+Each CLI provider starts a command from a local terminal application and uses the authentication data of that application.
+CLI providers do not use API keys from the agent.d keyring.
 
-| Prefix | CLI tool | Notes |
+| Provider | Command | Supported calls |
 |---|---|---|
-| `anthropic-cli` | `claude` (Claude CLI) | Drives the local `claude` binary |
-| `openai-cli` | `codex` (Codex CLI) | Text-output fallback via the local `codex` binary |
+| `anthropic-cli` | `claude` | `ctx.ai` calls and runner calls |
+| `openai-cli` | `codex exec` | Text-only `ctx.ai` calls |
 
-## When to use CLI backends
+## Prepare the terminal applications
 
-Use a CLI backend when:
+Install and authenticate Claude Code before you use `anthropic-cli`.
 
-- You have the `claude` or `codex` CLI installed and authenticated, but you have **not** stored an API key in the agent.d keyring.
-- You want to use credentials already managed by the upstream CLI (its own keyring / login session).
-- You are testing locally and want to avoid provisioning a separate API key for agent.d.
+Install and authenticate Codex before you use `openai-cli`.
 
-::: info
-CLI backends are convenience paths. For production deployments, the direct API backends (`anthropic`, `openai`) with keys stored in the keyring are more reliable and observable.
-:::
+Put the applicable command on the agent.d process `PATH` because the provider call fails when agent.d cannot find the command.
 
-## anthropic-cli
+On Windows, agent.d can use native programs and these launcher files:
 
-Uses the locally installed `claude` CLI. During a runner call, the CLI can call the agent.d actions that the runner permits.
+- `.ps1`
+- `.cmd`
+- `.bat`
+
+## Use `anthropic-cli` with `ctx.ai`
+
+A `ctx.ai` call starts `claude -p` and returns the text from the command.
+Because a direct `ctx.ai` call does not supply an action list, this call cannot use agent.d actions.
 
 ```lua
-agentd.runner({
-  name = "local_reviewer",
-  model = "anthropic-cli/sonnet",
-  actions = { "git.diff" },
+local reply = ctx.ai.ask("Summarize this text.", {
+    model = "anthropic-cli/sonnet",
 })
 ```
 
-**Required permission:** `ai:anthropic-cli`
+The call requires the `ai:anthropic-cli` permission:
+
+```toml
+[tool.summary]
+granted = ["ai:anthropic-cli"]
+```
+
+## Use `anthropic-cli` with a runner
+
+During a runner call, agent.d gives the action list to `claude`, which calls the actions through a private local connection to agent.d.
+
+```lua
+agentd.runner({
+    name = "local_reviewer",
+    model = "anthropic-cli/sonnet",
+    actions = { "git.diff" },
+})
+```
+
+Add each permitted action to the runner entry in `grants.toml`:
 
 ```toml
 [runner.local_reviewer]
 allowed_actions = ["git.diff"]
-granted = ["ai:anthropic-cli"]
 ```
 
-## openai-cli
+Each action also needs its tool permissions because the `actions` field in Lua does not give permission to call an action.
 
-Uses the locally installed `codex` CLI as a text-output fallback. This backend invokes `codex` and captures its text output.
+## Use `openai-cli` with `ctx.ai`
 
-Use `openai-cli` for text-only `ctx.ai` calls. It cannot call agent.d actions.
+For each `openai-cli` call, agent.d starts `codex exec` with the `read-only` sandbox and the `never` approval policy.
+This provider returns text only and cannot call agent.d actions.
 
 ```lua
 agentd.tool({
-  name = "assist",
-  requires = { "ai:openai-cli" },
+    name = "assist",
+    requires = { "ai:openai-cli" },
 })
 
 agentd.action({
-  name = "assist.ask",
-  requires = { "ai:openai-cli" },
-  handler = function(args, ctx)
-    return ctx.ai.ask(args.prompt, {
-      model = "openai-cli/",
-    })
-  end,
+    name = "assist.ask",
+    requires = { "ai:openai-cli" },
+    handler = function(args, ctx)
+        return ctx.ai.ask(args.prompt, {
+            model = "openai-cli/",
+        })
+    end,
 })
 ```
 
-**Required permission:** `ai:openai-cli`
+The call requires the `ai:openai-cli` permission:
 
 ```toml
 [tool.assist]
 granted = ["ai:openai-cli"]
 ```
 
-::: warning Requires local CLI on PATH
-Both backends require the respective CLI (`claude` or `codex`) to be installed and on `PATH` where the `agentd` process runs. On Windows, native executables and common launcher shims (`.ps1`, `.cmd`, and `.bat`) are resolved automatically. If the program is not found, the call will fail at runtime.
+::: warning Do not use `openai-cli` in a runner
+A runner gives its action list to the selected provider, but `openai-cli` cannot use this list and fails before Codex starts.
+Use the `codex` provider when a runner must call agent.d actions.
 :::
 
 ## See also
 
-- [Providers overview](/v0/providers/) — all registered prefixes and model selection
-- [Credentials](/v0/providers/credentials) — keyring-based credentials for the direct API backends
-- [Anthropic provider](/v0/providers/anthropic) — direct Anthropic Messages API backend
+- [Providers](/v0/providers/)
+- [Codex provider](/v0/providers/codex)
+- [Anthropic provider](/v0/providers/anthropic)
+- [Credentials](/v0/providers/credentials)
