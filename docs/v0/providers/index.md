@@ -1,86 +1,115 @@
 # Providers
 
-Providers are the backends agent.d uses to make model calls. This page explains how model selection works, which providers are registered, and what permissions are required.
+A provider sends a model request from agent.d to a model service or a local application.
 
-## Model selection
+This page explains provider names, model selection, turn limits, and permissions.
 
-Every model call in agent.d uses a string of the form `"<provider>/<model_id>"`. You pass this string in `agentd.runner({ model = … })` or in the `opts` to `ctx.ai.ask` / `ctx.ai.complete`.
+## Select a model
+
+Use a model string with this form:
+
+```text
+<provider>/<model-id>
+```
+
+The text before the first `/` is the provider name, and the text after the first `/` is the model ID.
+
+The following runner example selects the `anthropic` provider:
 
 ```lua
 agentd.runner({
-  name = "reviewer",
-  model = "anthropic/claude-opus-4-7",
+    name = "reviewer",
+    model = "anthropic/claude-opus-4-7",
 })
 ```
 
-If you omit the provider prefix, agent.d uses the default provider (`anthropic` unless `runtime.default_provider` says otherwise):
+If the string has no `/`, agent.d uses `anthropic` as the initial default provider.
 
-```lua
--- These two are equivalent:
-ctx.ai.ask("Summarise this diff", { model = "claude-opus-4-7" })
-ctx.ai.ask("Summarise this diff", { model = "anthropic/claude-opus-4-7" })
+Use `runtime.default_provider` in `config.toml` to select a different default:
+
+```toml
+[runtime]
+default_provider = "openai"
 ```
 
-## Registered prefixes
+These calls are equivalent when `anthropic` is the default provider:
 
-Five built-in prefixes are registered at startup, plus one per `[providers.<name>]` entry in `config.toml` (see [Custom providers](/v0/providers/custom)):
+```lua
+ctx.ai.ask("Summarize this diff.", {
+    model = "claude-opus-4-7",
+})
 
-| Prefix | Backend |
+ctx.ai.ask("Summarize this diff.", {
+    model = "anthropic/claude-opus-4-7",
+})
+```
+
+Always include the provider name when a model ID contains `/` because agent.d keeps all `/` characters after the first `/`.
+
+## Built-in providers
+
+At startup, agent.d registers five built-in providers and each custom provider from `config.toml`.
+
+| Provider | Purpose |
 |---|---|
-| `anthropic` | Anthropic Messages API (key from the secret store) |
-| `anthropic-cli` | Local `claude` CLI |
-| `openai` | OpenAI-compatible Messages API (key from the secret store) |
-| `codex` | `codex app-server` over JSON-RPC |
-| `openai-cli` | Local `codex` CLI text fallback |
-| *your own* | Any OpenAI- or Anthropic-compatible endpoint declared in `config.toml` — OpenRouter, Groq, Together, vLLM, Ollama, LM Studio, gateways |
+| `anthropic` | Calls the Anthropic Messages API. |
+| `anthropic-cli` | Starts the local `claude` command for each call. |
+| `openai` | Calls the OpenAI Chat Completions API. |
+| `codex` | Starts and controls one local `codex app-server` process. |
+| `openai-cli` | Starts `codex exec` for a text-only `ctx.ai` call. |
 
-## Tool-use loop cap
+Use `ctx.ai.providers()` to get a sorted list of registered provider names without a permission.
 
-When a runner drives an agentic loop (the model calls tools repeatedly), agent.d caps the number of turns at `runtime.max_turns`. The default is **16**. You can raise or lower it in `config.toml`:
+```lua
+agentd.action({
+    name = "debug.providers",
+    handler = function(_, ctx)
+        return ctx.ai.providers()
+    end,
+})
+```
+
+## Set the turn limit
+
+During a runner call, the `anthropic`, `openai`, and custom API providers can ask agent.d to call an action.
+After agent.d calls a permitted action, it sends the result to the provider in a new turn.
+
+The `runtime.max_turns` value limits this loop to 16 turns by default, and a value of `0` gives a one-turn limit.
 
 ```toml
 [runtime]
 max_turns = 32
 ```
 
-## Listing providers at runtime
+The `runtime.max_turns` value does not limit `anthropic-cli` or `codex` because the local applications control their own loops.
 
-Call `ctx.ai.providers()` from any action or service to see which prefixes are available on the running daemon:
+## Give permissions
 
-```lua
-agentd.action("debug.providers", function(args, ctx)
-  return ctx.ai.providers()
-end)
-```
-
-## Permissions
-
-Every model call requires the `ai:<provider>` grant for the provider being used. Grant it in `grants.toml` on the tool, runner, or service that makes the call:
+A `ctx.ai.ask` or `ctx.ai.complete` call requires the applicable `ai:<provider>` permission.
+Give the permission to the tool or service that makes the call.
 
 ```toml
-[tool.mytools]
+[tool.review]
 granted = ["ai:anthropic"]
 
-[service.my_bot]
+[service.triage_bot]
 granted = ["ai:openai"]
 ```
 
-Use `ai:*` to allow any provider (grant sparingly).
-
-See [permission slugs](/v0/security/permission-slugs) and [grants](/v0/security/grants) for details.
+The `ai:*` permission gives access to all registered providers, but use a provider-specific permission when possible.
 
 ## Provider pages
 
-- [Anthropic](/v0/providers/anthropic) — `anthropic` and `anthropic-cli`
-- [OpenAI](/v0/providers/openai) — `openai`
-- [CLI backends](/v0/providers/cli-backends) — `anthropic-cli` and `openai-cli`
-- [Codex](/v0/providers/codex) — `codex`
-- [Custom providers](/v0/providers/custom) — OpenAI/Anthropic-compatible endpoints and local servers via `config.toml`
-- [Credentials](/v0/providers/credentials) — storing API keys in the keyring
+- [Anthropic](/v0/providers/anthropic) explains the `anthropic` provider.
+- [OpenAI](/v0/providers/openai) explains the `openai` provider.
+- [CLI providers](/v0/providers/cli-backends) explains `anthropic-cli` and `openai-cli`.
+- [Codex](/v0/providers/codex) explains the `codex` provider.
+- [Custom providers](/v0/providers/custom) explains API endpoints in `config.toml`.
+- [Credentials](/v0/providers/credentials) explains keys in the OS keyring.
 
 ## See also
 
-- [ctx.ai](/v0/reference/ctx/ai) — `ctx.ai.ask`, `ctx.ai.complete`, `ctx.ai.providers`
-- [Runners](/v0/concepts/runners) — composing a model + skills + action allowlist
-- [Security grants](/v0/security/grants) — granting `ai:<provider>` to components
-- [Credentials](/v0/providers/credentials) — how provider keys are stored
+- [ctx.ai](/v0/reference/ctx/ai)
+- [Runners](/v0/concepts/runners)
+- [Security grants](/v0/security/grants)
+- [Permission slugs](/v0/security/permission-slugs)

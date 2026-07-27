@@ -1,38 +1,81 @@
-# Codex provider
+# Codex Provider
 
-The `codex` prefix connects agent.d to a running **`codex app-server`** process over JSON-RPC. It is distinct from the `openai-cli` text-fallback backend — `codex` speaks directly to the Codex app-server protocol rather than invoking a CLI and capturing its output.
+The `codex` provider starts and controls a local Codex app server that supports agent.d actions during a runner call.
 
-## Using the provider
+Unlike `codex`, the `openai-cli` provider starts `codex exec` for a text-only `ctx.ai` call.
+
+## Prepare Codex
+
+Install and authenticate Codex, and make sure that the `codex` command is on the `PATH` of the agent.d process.
+
+Do not start the app server separately because agent.d cannot attach to a server that it did not start.
+
+## Understand the app-server process
+
+The first provider call starts this command:
+
+```text
+codex app-server --listen stdio://
+```
+
+agent.d communicates with the app-server process through standard input and standard output, and it uses the same process for later calls.
+During normal cleanup, agent.d stops this app-server process.
+
+If the app server exits unexpectedly, the provider does not start another process, and you must restart agent.d.
+
+## Understand each call
+
+For each call, the provider starts a temporary Codex thread that Codex does not save to a rollout file.
+While a call is active, the provider waits before it starts another call.
+
+agent.d sets the Codex sandbox to `read-only`, the approval policy to `untrusted`, and the reasoning effort to `low`.
+
+agent.d disables the built-in Codex tools, so Codex can use only the runner actions through a private local connection to agent.d.
+
+agent.d returns a timeout error if the Codex turn does not complete in 180 seconds.
+
+## Use the provider with a runner
+
+Use `codex/<model-id>` to select a model, or use `codex/` to let Codex select its default model.
 
 ```lua
 agentd.runner({
-  name = "codex_agent",
-  model = "codex/",
-  actions = { "git.diff", "git.status" },
+    name = "codex_reviewer",
+    model = "codex/",
+    actions = { "git.diff", "git.status" },
 })
 ```
 
-```lua
-local reply = ctx.ai.ask("Explain this code", { model = "codex/" })
-```
-
-## Required permission
-
-Any component that calls this provider must hold the **`ai:codex`** grant:
+Add each permitted action to the runner entry in `grants.toml`:
 
 ```toml
-# grants.toml
-[tool.codex_tools]
+[runner.codex_reviewer]
+allowed_actions = ["git.diff", "git.status"]
+```
+
+Each action also needs its tool permissions because the `actions` field in Lua does not give permission to call an action.
+
+## Use the provider with `ctx.ai`
+
+A direct `ctx.ai` call gives Codex no agent.d actions, and the built-in Codex tools remain disabled.
+Use this form only when you need a text response.
+
+```lua
+local reply = ctx.ai.ask("Explain this code.", {
+    model = "codex/",
+})
+```
+
+The call requires the `ai:codex` permission:
+
+```toml
+[tool.codex_assist]
 granted = ["ai:codex"]
 ```
 
-::: info
-The `codex` backend requires `codex app-server` to be running and reachable. Consult the Codex CLI documentation for how to start the app-server.
-:::
-
 ## See also
 
-- [Providers overview](/v0/providers/) — model selection, max_turns, all registered prefixes
-- [CLI backends](/v0/providers/cli-backends) — `openai-cli` text-output fallback via `codex` CLI
-- [ctx.ai](/v0/reference/ctx/ai) — full API reference for model calls
-- [Security grants](/v0/security/grants) — granting `ai:codex` to components
+- [Providers](/v0/providers/)
+- [CLI providers](/v0/providers/cli-backends)
+- [ctx.ai](/v0/reference/ctx/ai)
+- [Security grants](/v0/security/grants)
