@@ -1,57 +1,78 @@
-# OpenAI provider
+# OpenAI Provider
 
-The `openai` prefix connects agent.d to an **OpenAI-compatible Messages API**. Use it for OpenAI models or any provider that speaks the same API surface.
+The `openai` provider sends requests to the OpenAI Chat Completions API.
+agent.d sends each request to `https://api.openai.com/v1/chat/completions`.
 
-## Credential setup
+## Store the API key
 
-The provider reads your API key from the OS keyring (secret store). Store it once with `agentctl secret set` — a running daemon picks it up immediately:
+The provider reads the API key from the `openai_api_key` secret when each model call starts.
+
+Use this command to store the key:
 
 ```bash
 echo "$OPENAI_API_KEY" | agentctl secret set openai_api_key
 ```
 
-::: info
-The exact secret key name the provider looks up is an internal implementation detail. See [Credentials](/v0/providers/credentials) for the recommended pattern for storing and managing API keys.
+The next model call uses the new key, so you do not have to restart agent.d.
+
+::: warning Protect the API key
+Do not put the API key in a Lua file or `config.toml`.
+Do not commit the API key to a repository.
+Use `agentctl secret` to put the key in the OS keyring.
 :::
 
-::: warning Never hardcode API keys
-Keep keys out of Lua files, `config.toml`, and version control. Use the keyring.
-:::
+## Use the provider
 
-## Using the provider
-
-Reference `openai/<model_id>` in a runner or inline call:
+To select this provider for a runner, use `openai/<model-id>`:
 
 ```lua
 agentd.runner({
-  name = "summariser",
-  model = "openai/gpt-5.5",
-  skills = { "summarise" },
+    name = "code_reviewer",
+    model = "openai/gpt-4.1",
+    skills = { "reviewer" },
+    actions = { "git.diff", "git.status" },
 })
 ```
+
+The provider lets a runner call actions, and agent.d checks each action call in the action loop.
+
+Use the same model string for a direct `ctx.ai` call, which does not give agent.d actions to the provider:
 
 ```lua
-local reply = ctx.ai.ask("Summarise this PR description", {
-  model = "openai/gpt-5.5",
+local reply = ctx.ai.ask("Summarize this change.", {
+    model = "openai/gpt-4.1",
 })
 ```
 
-## Required permission
+The agent.d default model for this provider is `gpt-4.1`.
+Use `openai/` when you want the provider to use this default.
 
-Any component that calls this provider must hold the **`ai:openai`** grant:
+If `openai` is the default provider, you can omit `openai/`.
+
+```lua
+ctx.ai.ask("Summarize this change.", {
+    model = "gpt-4.1",
+})
+```
+
+Use a [custom provider](/v0/providers/custom) for a different Chat Completions endpoint.
+
+## Give permission to a `ctx.ai` caller
+
+A `ctx.ai` call to this provider requires the `ai:openai` permission.
+Give this permission to the tool or service that makes the call.
 
 ```toml
-# grants.toml
 [tool.summary]
 granted = ["ai:openai"]
-
-[service.triage_bot]
-granted = ["ai:openai"]
 ```
+
+The caller does not need the `secret:openai_api_key` permission.
+agent.d reads the API key from the OS keyring and does not give the key to the Lua code.
 
 ## See also
 
-- [Providers overview](/v0/providers/) — model selection, max_turns, all prefixes
-- [CLI backends](/v0/providers/cli-backends) — `openai-cli` for key-free local use via `codex`
-- [Credentials](/v0/providers/credentials) — storing and rotating API keys
-- [ctx.ai](/v0/reference/ctx/ai) — full API reference for model calls
+- [Providers](/v0/providers/)
+- [Credentials](/v0/providers/credentials)
+- [CLI providers](/v0/providers/cli-backends)
+- [ctx.ai](/v0/reference/ctx/ai)

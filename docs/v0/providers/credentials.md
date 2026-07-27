@@ -1,110 +1,134 @@
-# Credentials
+# Provider Credentials
 
-agent.d providers that call external APIs read their keys from the **OS keyring** (secret store). This page explains how to store credentials and what grants are required to access them.
+API providers that require credentials read their keys from the OS keyring.
+An API provider with `auth = "none"` does not use a key.
+The CLI providers use the authentication data of their terminal applications.
 
-## How credentials work
+| Provider type | Credential source |
+|---|---|
+| `anthropic` | The `anthropic_api_key` secret |
+| `openai` | The `openai_api_key` secret |
+| Custom API provider | The secret in `api_key_secret`, or no credential with `auth = "none"` |
+| `anthropic-cli` | Claude Code authentication |
+| `codex` | Codex authentication |
+| `openai-cli` | Codex authentication |
 
-The daemon uses the OS keyring (via the `agentd-secrets` crate backed by `KeyringStore`) as the single source of truth for provider API keys. When a provider like `anthropic` or `openai` makes a model call, it retrieves its key from the keyring at call time.
+## Store a key
 
-## Storing a key with `agentctl secret`
-
-The primary way to manage provider keys is the `agentctl secret` command. It writes to the same `agentd` keyring service the daemon reads, so a running daemon sees changes immediately — no restart, no setup action:
-
-```bash
-agentctl secret set anthropic_api_key sk-ant-…
-```
-
-To keep the key out of your shell history, omit the value and pipe it on stdin:
+Use `agentctl secret set` to store a key, and send the value through standard input instead of the command line.
 
 ```bash
 echo "$ANTHROPIC_API_KEY" | agentctl secret set anthropic_api_key
 ```
 
-On success it prints:
+The command prints this message after it stores the key:
 
-```
+```text
 stored `anthropic_api_key` — available to the daemon immediately
 ```
 
-To verify what is stored without exposing it, or to remove a key:
+`agentctl` writes to the same keyring that agent.d uses, and agent.d does not have to be active when you run the command.
+
+Each API provider reads its key when a model call starts, so a key change does not require an agent.d restart.
+
+::: warning Do not put a key on the command line
+Your shell can save command-line values in its history.
+Do not put a key in a Lua file or `config.toml`.
+Do not commit a key to a repository.
+:::
+
+## Check a key
+
+Use `agentctl secret peek` to show a masked part of a key:
 
 ```bash
 agentctl secret peek anthropic_api_key
-# sk-a************nt- (32 chars)
+```
 
+`agentctl` shows the stored key in this masked form:
+
+```text
+sk-a************yz (24 chars)
+```
+
+The command does not print the complete key, and it fails if the key does not exist.
+
+## Remove a key
+
+Use `agentctl secret unset` to remove a key:
+
+```bash
 agentctl secret unset anthropic_api_key
 ```
 
-See the [CLI reference](/v0/reference/cli#agentctl-secret-set) for the full command surface.
+After `agentctl` removes the key, it prints this confirmation:
 
-::: warning Never hardcode keys
-Do not put API keys in `init.lua`, `config.toml`, environment variables checked into version control, or any file committed to a repository. The keyring is the only safe place for secrets in agent.d.
-:::
-
-## The `ctx.secret` API (programmatic)
-
-When a tool or service needs to read or write secrets at runtime — bot tokens, per-user credentials, keys received over an API — use `ctx.secret` from Lua. It gives you full CRUD over the same keyring. Every call requires the `secret:<key>` grant (or `secret:*` to allow all keys).
-
-```lua
-ctx.secret.set(key, value)          -- write a secret
-ctx.secret.get(key) -> string|nil   -- read a secret (nil if not found)
-ctx.secret.exists(key) -> boolean   -- check without reading
-ctx.secret.delete(key)              -- remove a secret
-ctx.secret.list() -> string[]       -- list all stored key names
+```text
+removed `anthropic_api_key`
 ```
 
-For example, an action that stores a token handed to it as an argument:
+## Replace a key
 
-```lua
-agentd.action("discord.set_token", function(args, ctx)
-  ctx.secret.set("discord_token", args.token)
-  return "stored"
-end)
-```
-
-For one-off provider key setup you do not need any of this — `agentctl secret set` does the same thing with no Lua and no grant wiring. See [ctx.secret](/v0/reference/ctx/secrets) for the full reference.
-
-## Required grants
-
-Two grant domains are relevant for credentials:
-
-| Grant | What it allows |
-|---|---|
-| `secret:<key>` | Read, write, or delete the named key in the keyring |
-| `secret:*` | Access any key (use sparingly) |
-| `ai:<provider>` | Make model calls through the named provider |
-
-`agentctl secret` operates directly on the keyring and needs no grants. Grants apply to Lua code — grant them in `grants.toml` only to the tools or services that genuinely need them:
-
-```toml
-# grants.toml
-
-[tool.discord]
-granted = ["secret:discord_token"]
-
-[tool.review]
-granted = ["ai:anthropic"]
-
-[service.discord_handler]
-granted = ["ai:openai", "secret:discord_token"]
-```
-
-::: info Principle of least privilege
-Grant `secret:<specific-key>` rather than `secret:*`. Grant `ai:<specific-provider>` rather than `ai:*`. Narrow grants limit blast radius if a component is compromised or misbehaves.
-:::
-
-## Rotating a key
-
-To rotate a provider key, run `agentctl secret set` again with the new value — it overwrites the existing entry. No daemon restart is required; the provider reads the key on each call.
+Use `agentctl secret set` with the new value to replace the previous value.
 
 ```bash
-echo "$NEW_KEY" | agentctl secret set anthropic_api_key
+echo "$NEW_ANTHROPIC_API_KEY" | agentctl secret set anthropic_api_key
 ```
+
+The next model call uses the new value.
+
+## Store a key for a custom provider
+
+The `api_key_secret` field contains the keyring name, not the API key.
+
+The following provider reads the `gateway_api_key` secret:
+
+```toml
+[providers.gateway]
+kind = "anthropic"
+base_url = "https://gateway.example.com/v1"
+api_key_secret = "gateway_api_key"
+```
+
+Store the key with the same name:
+
+```bash
+echo "$GATEWAY_API_KEY" | agentctl secret set gateway_api_key
+```
+
+## Use secrets from Lua
+
+Provider setup does not require Lua code, so use `ctx.secret` only when Lua code must manage a secret.
+
+| Call | Result |
+|---|---|
+| `ctx.secret.get(key)` | Returns the value. The call fails if the key does not exist. |
+| `ctx.secret.set(key, value)` | Stores or replaces the value. |
+| `ctx.secret.exists(key)` | Returns `true` if the key exists. |
+| `ctx.secret.delete(key)` | Removes the key. The call fails if the key does not exist. |
+| `ctx.secret.list()` | Returns secret names that this agent.d process stored through `ctx.secret.set`. |
+
+`ctx.secret.list()` returns only secret names that the current agent.d process stored through `ctx.secret.set`.
+The list does not include secret names that `agentctl` or an earlier agent.d process stored.
+
+## Give permissions to Lua code
+
+The key-specific calls require the `secret:<key>` permission, and the `ctx.secret.list()` call requires the `secret:*` permission.
+
+```toml
+[tool.discord]
+granted = ["secret:discord_token"]
+```
+
+The `agentctl secret` commands do not require an agent.d permission.
+
+An authenticated API provider reads its credential from the OS keyring without giving the credential to Lua code.
+A `ctx.ai` caller needs the applicable `ai:<provider>` permission.
+Give the caller a `secret:<key>` permission only if the Lua code must access the credential through `ctx.secret`.
 
 ## See also
 
-- [`agentctl secret`](/v0/reference/cli#agentctl-secret-set) — CLI reference for set/unset/peek
-- [ctx.secret](/v0/reference/ctx/secrets) — full `ctx.secret` API reference
-- [Security best practices](/v0/security/best-practices) — broader guidance on secrets handling
-- [Permission slugs](/v0/security/permission-slugs) — `secret:*` and `ai:*` slug domains
-- [Providers overview](/v0/providers/) — which providers use keyring-stored keys
+- [`agentctl secret`](/v0/reference/cli#agentctl-secret-set)
+- [ctx.secret](/v0/reference/ctx/secrets)
+- [Custom providers](/v0/providers/custom)
+- [Permission slugs](/v0/security/permission-slugs)

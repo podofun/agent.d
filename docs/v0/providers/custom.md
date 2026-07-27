@@ -1,17 +1,15 @@
-# Custom providers
+# Custom Providers
 
-A custom provider connects agent.d to a model API that is not a built-in provider.
+A custom provider sends model requests to an API endpoint that you select, using one of the two API formats that agent.d supports.
 
-The API must use one of these supported formats:
-
-| `kind` value | Required API format |
+| `kind` value | API format |
 |---|---|
 | `openai` | OpenAI Chat Completions |
 | `anthropic` | Anthropic Messages |
 
-agent.d does not install or start the model server. Before you make a model call, make sure that the API endpoint is available.
+agent.d does not install or start the API endpoint, so make sure that the endpoint is available before you make a model call.
 
-## Add a local provider
+## Add a provider without authentication
 
 Add a provider table to `~/.config/agentd/config.toml`:
 
@@ -23,51 +21,62 @@ auth = "none"
 default_model = "qwen3:14b"
 ```
 
-This example registers the provider name `ollama`. It assumes that an OpenAI-compatible server listens on port `11434`.
+This table registers `ollama` as the provider name and tells agent.d not to send an authentication header.
 
-Replace the URL and model ID when your server uses different values.
+Use `auth = "none"` only when the endpoint does not require authentication.
 
-The provider table has these fields:
+## Set the provider fields
 
-| Field | Use this field when | Function |
+Use these fields to configure each provider table:
+
+| Field | Requirement | Purpose |
 |---|---|---|
-| `kind` | For every provider | Selects the supported API format. |
-| `base_url` | For every provider | Specifies the model API endpoint. |
-| `auth` | The endpoint has no authentication | Disables the authentication header when its value is `none`. |
-| `api_key_secret` | The endpoint uses an API key | Specifies the secret-store name that contains the API key. |
-| `default_model` | You want to specify a fallback model | Specifies the model when a call does not specify one. |
+| `kind` | Required | Selects the API format. |
+| `base_url` | Required | Sets the API base URL or complete endpoint URL. |
+| `auth` | Use for an endpoint without authentication. | Turns off the authentication header when the value is `none`. |
+| `api_key_secret` | Use for an endpoint that requires an API key. | Identifies the keyring secret that contains the API key. |
+| `default_model` | Optional | Sets the model when a call does not supply one. |
 
-Every provider must contain exactly one of these authentication fields: `auth` or `api_key_secret`. Use `auth = "none"` only when the endpoint does not require authentication.
+Set exactly one of `auth` and `api_key_secret` because agent.d rejects a provider table that contains both fields or neither field.
 
-For an OpenAI-compatible API, `base_url` can contain the API base path or the full Chat Completions path.
+If you omit `default_model`, agent.d uses `gpt-4.1` for OpenAI format or `claude-opus-4-7` for Anthropic format.
 
-For an Anthropic-compatible API, `base_url` can contain the API base path or the full Messages path.
+## Set an OpenAI endpoint URL
 
-## Use the provider in a runner
+For `kind = "openai"`, agent.d uses the URL without a change when it ends with `/chat/completions`.
+For all other URLs, agent.d adds `/chat/completions`.
 
-Add a runner to `init.lua` or to a Lua file that `init.lua` loads:
+This example uses the following OpenAI base URL:
 
-```lua
-agentd.runner({
-    name = "local_helper",
-    model = "ollama/qwen3:14b",
-})
+```text
+http://127.0.0.1:11434/v1
 ```
 
-The text before the first `/` is the provider name. The remaining text is the model ID.
+agent.d sends the model request to this URL:
 
-A model ID can contain `/` characters after the first separator. agent.d keeps these characters in the model ID.
-
-Give the runner permission to call the provider:
-
-```toml
-[runner.local_helper]
-granted = ["ai:ollama"]
+```text
+http://127.0.0.1:11434/v1/chat/completions
 ```
 
-The grant must contain the provider name. A grant for a different provider does not permit this call.
+## Set an Anthropic endpoint URL
 
-## Add an authenticated provider
+For `kind = "anthropic"`, agent.d uses the URL without a change when it ends with `/v1/messages`.
+If the URL ends with `/v1`, agent.d adds `/messages`.
+For all other URLs, agent.d adds `/v1/messages`.
+
+This example uses the following Anthropic base URL:
+
+```text
+https://gateway.example.com/v1
+```
+
+agent.d sends the model request to this URL:
+
+```text
+https://gateway.example.com/v1/messages
+```
+
+## Add a provider with an API key
 
 Use `api_key_secret` when the endpoint requires an API key:
 
@@ -79,30 +88,73 @@ api_key_secret = "gateway_api_key"
 default_model = "claude-compatible-model"
 ```
 
-The `api_key_secret` value is a secret-store name. It is not the API key.
+The `api_key_secret` value is the keyring name, not the API key.
 
-Store the API key under that name. Refer to [Provider credentials](/v0/providers/credentials) for the applicable `agentctl` commands.
+Store the key with the same name:
 
-The provider gets the key from the secret store when it makes a model call. You do not need to restart agent.d after a key change.
+```bash
+echo "$GATEWAY_API_KEY" | agentctl secret set gateway_api_key
+```
 
-## Select a default provider
+The provider reads the secret when each model call starts, so a key change does not require an agent.d restart.
 
-You can select a custom provider as the default provider:
+## Use the provider with a runner
+
+To select a custom provider for a runner, use `<provider>/<model-id>`:
+
+```lua
+agentd.runner({
+    name = "local_helper",
+    model = "ollama/qwen3:14b",
+})
+```
+
+When the endpoint supports action calls, the provider can return them and agent.d checks each call in the action loop.
+
+## Use the provider with `ctx.ai`
+
+Use the custom provider name in the model string for a direct `ctx.ai` call.
+The following direct call does not give agent.d actions to the provider:
+
+```lua
+local reply = ctx.ai.ask("Summarize this text.", {
+    model = "ollama/qwen3:14b",
+})
+```
+
+Give the caller the permission for the custom provider name:
+
+```toml
+[tool.local_assist]
+granted = ["ai:ollama"]
+```
+
+A permission for a different provider does not permit this call.
+
+## Select the default provider
+
+Use `runtime.default_provider` to select a custom provider as the default:
 
 ```toml
 [runtime]
 default_provider = "ollama"
 ```
 
-After this change, a model string without a provider prefix uses `ollama`.
+After this change, a model string without `/` uses `ollama`.
 
-For example, `model = "qwen3:14b"` uses the `ollama` provider. The model string `openai/gpt-5.5` still selects `openai`.
+```lua
+ctx.ai.ask("Summarize this text.", {
+    model = "qwen3:14b",
+})
+```
 
-## Provider-name restrictions
+Always include the provider name when the model ID contains `/`.
 
-A custom provider name cannot use a built-in provider name.
+## Select a provider name
 
-These names are reserved:
+Use a nonempty provider name without `/` because a model string cannot select a provider name that contains `/`.
+
+A custom provider cannot use one of these reserved names:
 
 - `anthropic`
 - `anthropic-cli`
@@ -111,25 +163,31 @@ These names are reserved:
 - `openai-cli`
 - `mock`
 
-The daemon rejects an invalid provider configuration at startup. The error identifies the provider and the invalid field.
+The `mock` name is reserved for tests, and this provider is not available in a normal agent.d session.
+agent.d accepts `mock` as the default at startup, but it cannot complete a model call with this provider.
 
-The daemon also rejects these configurations:
+## Correct configuration errors
 
+agent.d rejects these provider configurations at startup:
+
+- The provider table does not contain `kind` or `base_url`.
+- The provider table contains an unknown field.
 - `base_url` is empty.
+- The provider name matches a reserved name.
 - Both authentication fields are present.
 - Both authentication fields are absent.
 - `auth` has a value other than `none`.
 - `runtime.default_provider` identifies an unknown provider.
 
-## Endpoint compatibility
+The startup error identifies the applicable provider or field.
 
-The endpoint must implement the selected API format. Some compatible endpoints do not implement every optional feature.
+## Check endpoint compatibility
 
-Confirm that your endpoint supports the model, message, and tool features that your runner uses.
+The endpoint must implement the selected API format and support each model, message type, and action feature that your call uses.
 
 ## See also
 
-- [Providers overview](/v0/providers/)
+- [Providers](/v0/providers/)
 - [Provider credentials](/v0/providers/credentials)
 - [Configuration reference](/v0/reference/configuration)
 - [Permission slugs](/v0/security/permission-slugs)
