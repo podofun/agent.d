@@ -120,6 +120,51 @@ any invalid `[providers]` entry and names the offending provider in the error.
 
 See [Custom providers](/v0/providers/custom) for a usage-focused walkthrough.
 
+### `[webhooks.<name>]` sections
+
+Each entry creates `POST /webhooks/<name>`. The route verifies the HMAC-SHA256 signature and calls one action.
+
+```toml
+[webhooks.events]
+action = "events.ingest"
+secret = "webhook_secret"
+signature_header = "x-webhook-signature-256"
+signature_prefix = "sha256="
+id_header = "x-webhook-id"
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `action` | string | yes | Action to call after verification |
+| `secret` | string | yes | Keyring name for the HMAC secret |
+| `signature_header` | string | yes | Header that contains the hexadecimal signature |
+| `signature_prefix` | string | no | Prefix before the signature; the default is empty |
+| `id_header` | string | no | Header to use for `ctx.caller.session` |
+
+Store the secret before starting the daemon:
+
+```bash
+echo "$WEBHOOK_SECRET" | agentctl secret set webhook_secret
+```
+
+Webhook names can contain letters, numbers, hyphens, and underscores.
+
+agent.d does not start if a route value is invalid. agent.d also checks the target action and the secret.
+
+The route calculates the HMAC-SHA256 value from the exact request body. The action receives `headers` and `payload`.
+
+Header names use lowercase characters. The action does not receive authentication headers or the signature header.
+
+The caller interface is `webhook.<name>`. The request ID is the caller session.
+
+If `id_header` is not set, agent.d creates a request ID. If `id_header` is set, the request must contain it.
+
+The permission engine checks the action. Signature verification is always required.
+
+Restart agent.d after you change a route or its secret.
+
+See [Receive a signed webhook](/v0/recipes/webhook) for the setup procedure.
+
 ---
 
 ## Auto-minted tokens

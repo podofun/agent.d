@@ -123,13 +123,14 @@ Use `EnvironmentFile=/etc/agentd/secrets.env` (mode `0600`, owned by the service
 
 The daemon speaks plain HTTP and WebSocket on localhost. It does **not** terminate TLS itself. Place a reverse proxy (nginx, Caddy, etc.) in front when you need `wss://` or `https://` from external clients.
 
-Proxy the three paths:
+Proxy only the paths the deployment uses:
 
 | Path | Protocol | Notes |
 |---|---|---|
 | `/health` | HTTP GET | Liveness probe, no auth |
 | `/ws` | WebSocket | Client data plane |
 | `/control` | WebSocket | Operator/approval plane |
+| `/webhooks/<name>` | HTTP POST | Configured signed webhook route |
 
 ::: warning
 Expose `/control` only to trusted networks or behind additional auth at the proxy layer. The control plane allows approving or denying privileged actions.
@@ -153,6 +154,10 @@ location /control {
 }
 
 location /health {
+    proxy_pass http://127.0.0.1:7777;
+}
+
+location /webhooks/ {
     proxy_pass http://127.0.0.1:7777;
 }
 ```
