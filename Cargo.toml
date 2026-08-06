@@ -68,11 +68,14 @@ clap               = { version = "4.6.1", features = ["derive", "env"] }
 dirs               = "6.0.0"
 futures-util       = { version = "0.3.32", default-features = false }
 getrandom          = "0.3"
+hex                = "0.4.3"
+hmac               = "0.12.1"
 mlua               = { version = "0.11.6", features = ["lua54", "vendored", "send"] }
 redb               = "4"
 reqwest            = { version = "0.13.3", default-features = false }
 serde              = { version = "1.0.228", features = ["derive"] }
 serde_json         = "1.0.149"
+sha2               = "0.10.9"
 thiserror          = "2.0.18"
 tokio              = { version = "1.52.3" }
 toml               = "0.9"

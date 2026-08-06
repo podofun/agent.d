@@ -81,6 +81,15 @@ pub fn build_runtime(cfg: &Config, shared: &Shared) -> Result<BuiltRuntime> {
     }
     host.load_file(&cfg.init_file)?;
 
+    for (name, webhook) in &cfg.webhooks {
+        if host.action_info(&webhook.action).is_none() {
+            bail!(
+                "webhook `{name}` targets action `{}`, but that action is not registered",
+                webhook.action
+            );
+        }
+    }
+
     let skills = host.skills();
     let runners = host.runners();
     let services = host.services();

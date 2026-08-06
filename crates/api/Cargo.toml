@@ -13,8 +13,11 @@ agentd-skills.workspace = true
 agentd-types.workspace = true
 arc-swap = "1.7"
 axum = { version = "0.8.9", features = ["ws"] }
+hex.workspace = true
+hmac.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 
@@ -25,5 +28,6 @@ arc-swap = "1.7"
 agentd-trace.workspace = true
 async-trait.workspace = true
 futures-util = { workspace = true, features = ["std", "sink"] }
+reqwest.workspace = true
 tempfile.workspace = true
 tokio-tungstenite = { workspace = true, features = ["connect"] }

@@ -3,6 +3,7 @@
 //! `LuaHost` with one registered action, and drives it from a tungstenite
 //! client — the same path agentctl takes.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use agentd_api::{AppState, router, serve};
@@ -67,6 +68,7 @@ async fn boot_with_auth(auth_token: Option<String>) -> (String, Option<String>) 
         broker: Arc::new(agentd_approvals::Broker::new(
             std::time::Duration::from_secs(30),
         )),
+        webhooks: Arc::new(HashMap::new()),
     };
     tokio::spawn(async move {
         let _ = serve(listener, router(state)).await;

@@ -26,6 +26,17 @@ no_auth = false
 # before failing closed (deny). Default 120000.
 approval_timeout_ms = 120000
 
+# This route receives `POST /webhooks/events`.
+# `secret` identifies an OS-keyring entry.
+# The header fields define the HMAC-SHA256 signature format.
+#
+# [webhooks.events]
+# action = "events.ingest"
+# secret = "webhook_secret"
+# signature_header = "x-webhook-signature-256"
+# signature_prefix = "sha256="
+# id_header = "x-webhook-id"
+
 [runtime]
 # Lua entry point. Absolute path or `~/...`.
 init = "~/.config/agentd/init.lua"
