@@ -96,6 +96,23 @@ pub struct RawConfig {
     /// the built-ins at daemon startup.
     #[serde(default)]
     pub providers: Option<std::collections::HashMap<String, RawProvider>>,
+    /// Signed webhook endpoints keyed by route name.
+    #[serde(default)]
+    pub webhooks: Option<std::collections::HashMap<String, RawWebhook>>,
+}
+
+/// One `[webhooks.<name>]` entry. Requests arrive at `/webhooks/<name>`, are
+/// verified with the named secret, and dispatch exactly one registered action.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawWebhook {
+    pub action: String,
+    pub secret: String,
+    pub signature_header: String,
+    #[serde(default)]
+    pub signature_prefix: String,
+    #[serde(default)]
+    pub id_header: Option<String>,
 }
 
 /// Wire format a config-driven provider speaks.
@@ -196,6 +213,8 @@ pub struct Config {
     pub providers: Vec<(String, RawProvider)>,
     /// Registry default provider name (built-in or configured).
     pub default_provider: String,
+    /// Signed webhook routes, sorted by name for deterministic setup.
+    pub webhooks: Vec<(String, RawWebhook)>,
 }
 
 /// Provider names claimed by built-ins registered in `main.rs`.
@@ -357,6 +376,37 @@ impl Config {
             );
         }
 
+        let mut webhooks: Vec<(String, RawWebhook)> =
+            raw.webhooks.unwrap_or_default().into_iter().collect();
+        webhooks.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, spec) in &webhooks {
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                anyhow::bail!(
+                    "webhook name `{name}` is invalid — use only letters, numbers, hyphens, and underscores"
+                );
+            }
+            if spec.action.trim().is_empty() {
+                anyhow::bail!("webhook `{name}` has an empty action");
+            }
+            if spec.secret.trim().is_empty() {
+                anyhow::bail!("webhook `{name}` has an empty secret name");
+            }
+            if spec.signature_header.trim().is_empty() {
+                anyhow::bail!("webhook `{name}` has an empty signature_header");
+            }
+            if spec
+                .id_header
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                anyhow::bail!("webhook `{name}` has an empty id_header");
+            }
+        }
+
         // Note on `yolo`: callers should emit the reserved-key warning
         // AFTER initializing the tracing subscriber. `Config::resolve` is
         // typically called before the subscriber exists; a warn here
@@ -378,6 +428,7 @@ impl Config {
             watch,
             providers,
             default_provider,
+            webhooks,
         })
     }
 }
@@ -502,6 +553,7 @@ mod tests {
             .map(|l| match l.strip_prefix("# ") {
                 Some(r)
                     if r.starts_with("[providers.")
+                        || r.starts_with("[webhooks.")
                         || (r.split_once(" = ").is_some_and(|(k, _)| {
                             !k.is_empty()
                                 && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -539,6 +591,64 @@ mod tests {
             Some("openrouter_api_key")
         );
         assert_eq!(provs["ollama"].auth.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn parses_webhooks_table() {
+        let src = r#"
+            [webhooks.events]
+            action = "events.ingest"
+            secret = "webhook_secret"
+            signature_header = "x-webhook-signature-256"
+            signature_prefix = "sha256="
+            id_header = "x-webhook-id"
+        "#;
+        let raw: RawConfig = toml::from_str(src).expect("parse");
+        let hook = &raw.webhooks.unwrap()["events"];
+        assert_eq!(hook.action, "events.ingest");
+        assert_eq!(hook.secret, "webhook_secret");
+        assert_eq!(hook.signature_header, "x-webhook-signature-256");
+        assert_eq!(hook.signature_prefix, "sha256=");
+        assert_eq!(hook.id_header.as_deref(), Some("x-webhook-id"));
+    }
+
+    #[test]
+    fn invalid_webhook_name_is_rejected() {
+        let err = resolve_with_providers(
+            r#"
+            [webhooks."events/invalid"]
+            action = "events.ingest"
+            secret = "webhook_secret"
+            signature_header = "x-webhook-signature-256"
+        "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("webhook name"));
+    }
+
+    #[test]
+    fn empty_webhook_fields_are_rejected() {
+        for (field, body) in [
+            (
+                "action",
+                "action = \"\"\nsecret = \"webhook_secret\"\nsignature_header = \"x-signature\"",
+            ),
+            (
+                "secret",
+                "action = \"events.ingest\"\nsecret = \"\"\nsignature_header = \"x-signature\"",
+            ),
+            (
+                "signature_header",
+                "action = \"events.ingest\"\nsecret = \"webhook_secret\"\nsignature_header = \"\"",
+            ),
+            (
+                "id_header",
+                "action = \"events.ingest\"\nsecret = \"webhook_secret\"\nsignature_header = \"x-signature\"\nid_header = \"\"",
+            ),
+        ] {
+            let err = resolve_with_providers(&format!("[webhooks.events]\n{body}")).unwrap_err();
+            assert!(format!("{err:#}").contains(field));
+        }
     }
 
     #[test]

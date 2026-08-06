@@ -7,7 +7,7 @@ These self-contained configurations are ready to copy and run. Each recipe inclu
 | [Code review runner](/v0/recipes/code-review) | `ctx.shell` + a Markdown skill + a runner; invoke with `agentctl runner run` |
 | [Discord bot](/v0/recipes/discord-bot) | Two services, WebSocket gateway with heartbeat, named channel, per-channel durable memory, REST client, secret-stored token |
 | [HTTP tool](/v0/recipes/http-tool) | `ctx.http.client` calling an external JSON API; `net:<host>` grant; invoke with `agentctl call` |
-| [Webhook trigger](/v0/recipes/webhook) | Trigger an action from an external system over the `/ws` data plane; read caller identity via `ctx.caller` |
+| [Receive a signed webhook](/v0/recipes/webhook) | Verify an HMAC-SHA256 signature and call an action |
 | [Per-user memory](/v0/recipes/per-user-memory) | Rolling-window durable history keyed by caller; `memory.read/write` grants |
 
 ## See also

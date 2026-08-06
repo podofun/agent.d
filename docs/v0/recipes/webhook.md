@@ -1,158 +1,131 @@
-# Recipe: Webhook trigger
+# Receive a signed webhook
 
-Trigger an action from an external system using the agent.d WebSocket data plane. Clients connect to `/ws`, send an `actions.call` message, and optionally pass `session` and `user` to carry caller identity — which the action handler can read back via `ctx.caller`.
+Use a webhook route to receive a JSON request. The route verifies the request signature before it calls an action.
 
-::: info Transport is WebSocket
-agent.d does not have a built-in HTTP webhook endpoint. The data plane is `/ws` (WebSocket). If your external system can only speak HTTP, put a thin adapter in front that upgrades the connection and forwards the JSON envelope. The protocol is documented at [/reference/protocol](/v0/reference/protocol).
-:::
+## Create the action
 
-## The protocol envelope
-
-Every call over `/ws` uses this JSON envelope:
-
-```json
-// Client → server
-{
-  "id": 1,
-  "method": "actions.call",
-  "params": {
-    "name": "notify.ingest",
-    "args": { "event": "push", "repo": "acme/api", "sha": "abc123" },
-    "session": "gh-webhook",
-    "user": "github-actions"
-  }
-}
-
-// Server → client (success)
-{ "id": 1, "ok": true, "result": { "result": { "queued": true }, "duration_ms": 4 } }
-
-// Server → client (error)
-{ "id": 1, "ok": false, "code": "not_found", "error": "action `x` not registered", "tip": "Run `agentctl tools` to list registered actions" }
-```
-
-The `session` and `user` fields are optional. When present, they override the default identity (`ws-<n>` session, no user) and flow into `ctx.caller` inside the handler.
-
-## Example action
-
-This action receives an inbound event and reads back the caller's identity:
+Create an action that accepts `headers` and `payload`.
 
 ```lua
--- tools/notify.lua
-agentd.tool({ name = "notify" })
-
+-- webhook.lua
 agentd.action({
-  name = "notify.ingest",
+  name = "events.receive",
+  strict = false,
+  input = {
+    headers = { type = "object", required = true },
+    payload = { type = "object", required = true },
+  },
   handler = function(args, ctx)
-    local caller = ctx.caller
-    ctx.log.info(("notify.ingest from session=%s user=%s"):format(
-      tostring(caller.session),
-      tostring(caller.user)
-    ))
-
-    -- args carries whatever the caller sent in "args"
-    ctx.log.info(("event=%s repo=%s"):format(
-      tostring(args.event),
-      tostring(args.repo)
-    ))
-
-    -- do work here: write to memory, call a runner, etc.
-    return { queued = true }
+    ctx.log.info("received webhook " .. tostring(ctx.caller.session))
+    return { received = true }
   end,
 })
 ```
 
-`ctx.caller` is a read-only table with these fields:
+Use `strict = false`. Webhook headers and payloads contain keys that the sender defines.
 
-| Field | Set when |
-|---|---|
-| `caller.session` | Always set for WebSocket connections (`ws-<n>`, or the `session` param if provided) |
-| `caller.user` | Set when the caller passes `user` in the envelope |
-| `caller.interface` | Set when the call arrives via a named interface |
-| `caller.runner` | Set when the call is made from inside a runner via `ctx.call` |
-| `caller.service` | Set when the call is made from a service via `ctx.call` |
-| `caller.execution` | Set for runner executions |
-
-## Entry point
+Import the file from `init.lua`.
 
 ```lua
--- init.lua
-import("tools/notify.lua")
+import("webhook.lua")
 ```
 
-## grants.toml
+## Store the secret
 
-`notify.ingest` does not require any capability grants in this minimal form. Add grants as needed when the handler calls out to memory, net, shell, etc.:
+Use the same secret in agent.d and in the sender. Store the secret in the OS keyring.
+
+```bash
+echo "$WEBHOOK_SECRET" | agentctl secret set webhook_secret
+```
+
+Do not put the secret in `config.toml`.
+
+## Configure the route
+
+Add the route to `config.toml`.
 
 ```toml
-# No grants required for the bare action above.
-# Add sections as you extend the handler, e.g.:
-# [tool.notify]
-# granted = ["memory.write:events/**"]
+[webhooks.events]
+action = "events.receive"
+secret = "webhook_secret"
+signature_header = "x-webhook-signature-256"
+signature_prefix = "sha256="
+id_header = "x-webhook-id"
 ```
 
-## How to run
+This configuration creates `POST /webhooks/events`.
 
-```bash [release]
-agentd --init init.lua --grants grants.toml
+The `secret` value is the keyring name. The `signature_header` value identifies the signature header.
+
+The `signature_prefix` field is optional. The default value is an empty string.
+
+The `id_header` field is optional. If you set this field, each request must contain the header.
+
+Restart agent.d after you change the route or its secret.
+
+## Grant the action
+
+Add the webhook interface to `grants.toml`.
+
+```toml
+[interface."webhook.events"]
+allowed_actions = ["events.receive"]
 ```
 
-```bash [cargo]
-cargo run -p daemon -- --init init.lua --grants grants.toml
-```
+## Configure the sender
 
-## Sending a trigger from a WebSocket client
+Configure the sender with these values:
 
-The daemon listens on `ws://127.0.0.1:7777/ws`. Auth is a bearer token sent in the `Authorization` header on the handshake (the auto-minted token is at `$XDG_STATE_HOME/agentd/token`).
+- URL: `https://agentd.example.com/webhooks/events`
+- Method: `POST`
+- Content type: `application/json`
+- Signature algorithm: HMAC-SHA256
+- Signature encoding: hexadecimal
+- Signature header: `x-webhook-signature-256`
+- Signature prefix: `sha256=`
+- Request ID header: `x-webhook-id`
 
-With `agentctl` (which handles auth automatically):
+Calculate the signature from the exact request body. Do not calculate it from a changed or formatted copy.
 
-```bash
-agentctl call notify.ingest \
-  -d event=push \
-  -d repo=acme/api \
-  -d sha=abc123 \
-  --result-only
-```
+## Read the action input
 
-From any WebSocket client that can set headers (e.g. `websocat`):
-
-```bash
-TOKEN=$(cat ~/.local/state/agentd/token)
-echo '{"id":1,"method":"actions.call","params":{"name":"notify.ingest","args":{"event":"push","repo":"acme/api","sha":"abc123"},"session":"gh-webhook","user":"github-actions"}}' \
-  | websocat -H "Authorization: Bearer $TOKEN" ws://127.0.0.1:7777/ws
-```
-
-::: tip No-auth mode for local development
-Pass `--no-auth` to the daemon (or set `no_auth = true` in `config.toml`) to skip bearer-token enforcement on `/ws`. Use only for local testing — never in production.
-:::
-
-## Reading caller identity in a handler
-
-The `ctx.caller` table lets you gate behavior on who is calling:
+The action receives this input:
 
 ```lua
-handler = function(args, ctx)
-  if ctx.caller.user ~= "github-actions" then
-    error("unexpected caller: " .. tostring(ctx.caller.user))
-  end
-  -- proceed
-end,
+{
+  headers = {
+    ["content-type"] = "application/json",
+    ["x-webhook-id"] = "request-123",
+  },
+  payload = { ... },
+}
 ```
 
-This is not a security boundary by itself — the `user` field is caller-supplied and only as trustworthy as your client. For hard security boundaries, use the permission engine's grant layers.
+Header names use lowercase characters. agent.d removes these headers from the action input:
 
-## Verify
+- The configured signature header
+- `Authorization`
+- `Cookie`
+- `Proxy-Authorization`
 
-```bash
-agentctl call notify.ingest -d event=test -d repo=my/repo
-agentctl trace -n 5
-```
+`ctx.caller.interface` is `webhook.events`. `ctx.caller.session` is the request ID.
 
-The trace log should show the `notify.ingest` invocation with the caller session.
+If you do not set `id_header`, agent.d creates the request ID.
+
+## Check the response
+
+| Condition | Response |
+|---|---|
+| The signature and action are valid | `202 Accepted` |
+| The route does not exist | `404 Not Found` |
+| The signature is missing or invalid | `401 Unauthorized` |
+| The request ID is missing | `400 Bad Request` |
+| The body is not valid JSON | `400 Bad Request` |
+| The action fails | `500 Internal Server Error` |
+
+agent.d writes action errors to the trace. The response does not contain the action error.
 
 ## See also
 
-- [WebSocket protocol reference](/v0/reference/protocol)
-- [ctx.caller reference](/v0/reference/ctx/caller)
-- [Concepts: interfaces and callers](/v0/concepts/interfaces-and-callers)
-- [Security: grants](/v0/security/grants)
+- [Webhook configuration](/v0/reference/configuration)
+- [Permissions and grants](/v0/security/grants)
