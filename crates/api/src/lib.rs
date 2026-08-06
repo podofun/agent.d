@@ -1,6 +1,6 @@
-//! Daemon control plane. The transport is WebSocket-only JSON envelopes (plus
-//! `/health` for liveness probes); every method goes through the single `/ws`
-//! endpoint rather than its own HTTP route.
+//! Daemon HTTP and WebSocket interface. The authenticated data and control
+//! planes use WebSocket JSON envelopes; configured webhooks use signed HTTP
+//! POST requests and dispatch into the same permission-aware executor.
 //!
 //! Envelope shape:
 //!
@@ -39,18 +39,77 @@ use agentd_runners::{RunnerError, compose};
 use agentd_types::{ActionCall, RegistryError};
 pub use axum::serve;
 use axum::{
-    Router,
+    Json, Router,
+    body::Bytes,
     extract::{
-        State, WebSocketUpgrade,
+        Path, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{any, get},
+    routing::{any, get, post},
 };
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::Sha256;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// One named HMAC-SHA256 webhook route. The secret is resolved from the OS
+/// keyring by the daemon; it never appears in config.toml or the action args.
+#[derive(Clone)]
+pub struct Webhook {
+    action: String,
+    secret: Arc<String>,
+    signature_header: axum::http::HeaderName,
+    signature_prefix: String,
+    id_header: Option<axum::http::HeaderName>,
+}
+
+impl Webhook {
+    pub fn new(
+        action: impl Into<String>,
+        secret: impl Into<String>,
+        signature_header: &str,
+        signature_prefix: impl Into<String>,
+        id_header: Option<&str>,
+    ) -> Result<Self, String> {
+        let action = action.into();
+        if action.trim().is_empty() {
+            return Err("webhook action is empty".into());
+        }
+        let secret = secret.into();
+        if secret.is_empty() {
+            return Err("webhook secret is empty".into());
+        }
+        let signature_header = signature_header
+            .parse()
+            .map_err(|_| format!("invalid signature header `{signature_header}`"))?;
+        let id_header: Option<axum::http::HeaderName> = id_header
+            .map(|name| {
+                name.parse()
+                    .map_err(|_| format!("invalid id header `{name}`"))
+            })
+            .transpose()?;
+        if id_header.as_ref().is_some_and(|header| {
+            header == signature_header
+                || header == axum::http::header::AUTHORIZATION
+                || header == axum::http::header::COOKIE
+                || header.as_str() == "proxy-authorization"
+        }) {
+            return Err("id header cannot contain authentication data".into());
+        }
+        Ok(Self {
+            action,
+            secret: Arc::new(secret),
+            signature_header,
+            signature_prefix: signature_prefix.into(),
+            id_header,
+        })
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -70,6 +129,8 @@ pub struct AppState {
     /// operator clients against it (`subscribe`) and relays their verdicts
     /// (`resolve`).
     pub broker: Arc<agentd_approvals::Broker>,
+    /// Named routes served at `/webhooks/<name>`.
+    pub webhooks: Arc<HashMap<String, Webhook>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -77,11 +138,127 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/ws", any(ws_upgrade))
         .route("/control", any(control_upgrade))
+        .route("/webhooks/{name}", post(webhook))
         .with_state(state)
 }
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn webhook(
+    Path(name): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(webhook) = state.webhooks.get(&name) else {
+        return webhook_error(StatusCode::NOT_FOUND, "webhook not found");
+    };
+
+    let signature = headers
+        .get(&webhook.signature_header)
+        .and_then(|value| value.to_str().ok());
+    if !valid_webhook_signature(webhook, signature, &body) {
+        return webhook_error(StatusCode::UNAUTHORIZED, "invalid signature");
+    }
+
+    let request_id = match &webhook.id_header {
+        Some(header) => match header_value(&headers, header) {
+            Some(value) => value,
+            None => return webhook_error(StatusCode::BAD_REQUEST, "missing webhook ID header"),
+        },
+        None => format!(
+            "webhook-{name}-{}",
+            WEBHOOK_REQ_SEQ.fetch_add(1, Ordering::Relaxed)
+        ),
+    };
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(_) => return webhook_error(StatusCode::BAD_REQUEST, "body must be valid JSON"),
+    };
+
+    let args = json!({
+        "headers": forwarded_headers(&headers, &webhook.signature_header),
+        "payload": payload,
+    });
+    let caller = webhook_caller(&name, &request_id);
+    let executor = state.executor.load();
+    let call = ActionCall {
+        action: webhook.action.clone(),
+        args,
+    };
+    match executor.run(caller, call).await {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "ok": true, "request_id": request_id })),
+        )
+            .into_response(),
+        Err((error, _)) => {
+            tracing::error!(
+                webhook = %name,
+                action = %webhook.action,
+                request_id = %request_id,
+                error = %error,
+                "webhook action failed"
+            );
+            webhook_error(StatusCode::INTERNAL_SERVER_ERROR, "webhook action failed")
+        }
+    }
+}
+
+fn header_value(headers: &HeaderMap, name: &axum::http::HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn forwarded_headers(
+    headers: &HeaderMap,
+    signature_header: &axum::http::HeaderName,
+) -> BTreeMap<String, String> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            *name != signature_header
+                && *name != axum::http::header::AUTHORIZATION
+                && *name != axum::http::header::COOKIE
+                && name.as_str() != "proxy-authorization"
+        })
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+fn valid_webhook_signature(webhook: &Webhook, signature: Option<&str>, body: &[u8]) -> bool {
+    let Some(encoded) = signature.and_then(|value| value.strip_prefix(&webhook.signature_prefix))
+    else {
+        return false;
+    };
+    let Ok(expected) = hex::decode(encoded) else {
+        return false;
+    };
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(webhook.secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(body);
+    mac.verify_slice(&expected).is_ok()
+}
+
+fn webhook_caller(name: &str, request_id: &str) -> Caller {
+    Caller::interface(format!("webhook.{name}"))
+        .with_session(request_id.to_string())
+        .with_execution(next_execution_id())
+}
+
+fn webhook_error(status: StatusCode, message: &'static str) -> Response {
+    (status, Json(json!({ "ok": false, "error": message }))).into_response()
 }
 
 async fn ws_upgrade(
@@ -154,6 +331,9 @@ static WS_CONN_SEQ: AtomicU64 = AtomicU64::new(1);
 /// request. The id rides on the `Caller` into every child runner run so the
 /// trace can group a request with all the dispatches it spawned.
 static EXEC_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Monotonic fallback request id for webhook routes without `id_header`.
+static WEBHOOK_REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
     // Every connection gets a stable session id (`ws-<n>`); callers can
@@ -289,14 +469,17 @@ async fn send(socket: &mut WebSocket, resp: &WsResponse) -> Result<(), axum::Err
 /// The handshake bearer token authenticates the *connection*; `user` is still
 /// caller-supplied identity within that trusted channel, not separately verified.
 fn ws_caller(conn_session: &str, session: Option<String>, user: Option<String>) -> Caller {
-    let exec_id = format!("exec-{}", EXEC_SEQ.fetch_add(1, Ordering::Relaxed));
     let mut c = Caller::interface("ws")
         .with_session(session.unwrap_or_else(|| conn_session.to_string()))
-        .with_execution(exec_id);
+        .with_execution(next_execution_id());
     if let Some(u) = user {
         c = c.with_user(u);
     }
     c
+}
+
+fn next_execution_id() -> String {
+    format!("exec-{}", EXEC_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
 async fn dispatch(state: AppState, req: WsRequest, conn_session: &str) -> WsResponse {
@@ -524,6 +707,27 @@ impl IntoResponse for WsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webhook_signature_matches_standard_hmac_sha256_vector() {
+        let webhook =
+            Webhook::new("events.ingest", "\x0b".repeat(20), "x-signature", "", None).unwrap();
+        assert!(valid_webhook_signature(
+            &webhook,
+            Some("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"),
+            b"Hi There"
+        ));
+    }
+
+    #[test]
+    fn webhook_rejects_invalid_header_configuration() {
+        assert!(Webhook::new("x", "secret", "not a header", "", None).is_err());
+        assert!(Webhook::new("x", "secret", "x-signature", "", Some("bad header")).is_err());
+        assert!(Webhook::new("x", "secret", "x-signature", "", Some("x-signature")).is_err());
+        assert!(Webhook::new("x", "secret", "x-signature", "", Some("authorization")).is_err());
+        assert!(Webhook::new("", "secret", "x-signature", "", None).is_err());
+        assert!(Webhook::new("x", "", "x-signature", "", None).is_err());
+    }
 
     #[test]
     fn script_error_serializes_tip_and_trace() {

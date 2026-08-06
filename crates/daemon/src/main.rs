@@ -2,14 +2,15 @@ use agentd_ai::{
     ClaudeApiProvider, ClaudeCliProvider, CodexAppServerProvider, CodexCliProvider,
     OpenAiApiProvider, Provider as AIProvider, ProviderRegistry,
 };
-use agentd_api::{AppState, router, serve};
+use agentd_api::{AppState, Webhook, router, serve};
 use agentd_memory::RedbStore;
-use agentd_secrets::KeyringStore;
+use agentd_secrets::{KeyringStore, SecretStore};
 use agentd_shell::sandbox;
 use agentd_trace::JsonlSink;
 use agentd_types::Registry;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -134,6 +135,7 @@ async fn run(cli: Cli) -> Result<()> {
     sandbox::revoke_all_stamps();
 
     let keyring = Arc::new(KeyringStore::default_service());
+    let webhooks = resolve_webhooks(&cfg, keyring.as_ref())?;
     let mut providers = ProviderRegistry::new();
     let anthropic_api: Arc<dyn AIProvider> = Arc::new(ClaudeApiProvider::new(keyring.clone()));
     let anthropic_cli: Arc<dyn AIProvider> = Arc::new(ClaudeCliProvider::new());
@@ -246,6 +248,7 @@ async fn run(cli: Cli) -> Result<()> {
         auth_token: auth_token.map(Arc::new),
         admin_token: admin_token.map(Arc::new),
         broker,
+        webhooks: Arc::new(webhooks),
     };
 
     println!("{}", startup.render());
@@ -264,6 +267,29 @@ async fn run(cli: Cli) -> Result<()> {
     sandbox::revoke_all_stamps();
     serve_result?;
     Ok(())
+}
+
+fn resolve_webhooks(cfg: &Config, secrets: &dyn SecretStore) -> Result<HashMap<String, Webhook>> {
+    cfg.webhooks
+        .iter()
+        .map(|(name, spec)| {
+            let secret = secrets.get(&spec.secret).with_context(|| {
+                format!(
+                    "webhook `{name}` could not read secret `{}` — store it with `agentctl secret set {}`",
+                    spec.secret, spec.secret
+                )
+            })?;
+            let webhook = Webhook::new(
+                spec.action.clone(),
+                secret,
+                &spec.signature_header,
+                spec.signature_prefix.clone(),
+                spec.id_header.as_deref(),
+            )
+            .map_err(|error| anyhow!("webhook `{name}`: {error}"))?;
+            Ok((name.clone(), webhook))
+        })
+        .collect()
 }
 
 /// Register user-configured `[providers.<name>]` entries on top of the

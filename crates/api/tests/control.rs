@@ -2,6 +2,7 @@
 //! subscribe → push → resolve round trip, and plane isolation (public token
 //! cannot reach `/control`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,6 +55,7 @@ async fn boot() -> Booted {
         auth_token: Some(Arc::new("public-tok".into())),
         admin_token: Some(Arc::new("admin-tok".into())),
         broker: broker.clone(),
+        webhooks: Arc::new(HashMap::new()),
     };
     tokio::spawn(async move {
         let _ = serve(listener, router(state)).await;
