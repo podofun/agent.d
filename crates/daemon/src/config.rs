@@ -74,6 +74,12 @@ pub struct Cli {
     #[arg(short = 'w', long, env = "AGENTD_WATCH")]
     pub watch: bool,
 
+    /// Secrets backend: `keyring` (OS keyring, the default), `env`
+    /// (`AGENTD_SECRET_<KEY>` variables), or `dir:<path>` (one file per
+    /// secret, e.g. `dir:/run/secrets`). Overrides `daemon.secrets`.
+    #[arg(long, env = "AGENTD_SECRETS")]
+    pub secrets: Option<String>,
+
     /// Run one-time network-sandbox setup (elevated on Windows/macOS), then exit.
     #[arg(long)]
     pub install_sandbox: bool,
@@ -161,6 +167,8 @@ pub struct RawDaemon {
     pub admin_token: Option<String>,
     #[serde(default)]
     pub approval_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub secrets: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -215,6 +223,40 @@ pub struct Config {
     pub default_provider: String,
     /// Signed webhook routes, sorted by name for deterministic setup.
     pub webhooks: Vec<(String, RawWebhook)>,
+    /// Where the daemon reads secrets from.
+    pub secrets: SecretsBackend,
+}
+
+/// Where the daemon reads secrets from. `keyring` needs an OS keyring
+/// service; `env` and `dir` are read-only and suit containers, where the
+/// platform injects secrets as environment variables or mounted files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretsBackend {
+    Keyring,
+    Env,
+    Dir(PathBuf),
+}
+
+impl SecretsBackend {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "keyring" => Ok(Self::Keyring),
+            "env" => Ok(Self::Env),
+            _ => {
+                if let Some(path) = raw.strip_prefix("dir:") {
+                    if path.trim().is_empty() {
+                        anyhow::bail!(
+                            "the secrets backend `dir:` needs a path — for example `dir:/run/secrets`"
+                        );
+                    }
+                    return Ok(Self::Dir(expand_tilde(path)));
+                }
+                anyhow::bail!(
+                    "`{raw}` is not a secrets backend — use `keyring`, `env`, or `dir:<path>`"
+                )
+            }
+        }
+    }
 }
 
 /// Provider names claimed by built-ins registered in `main.rs`.
@@ -331,6 +373,11 @@ impl Config {
             .or(daemon.approval_timeout_ms)
             .unwrap_or(120_000);
 
+        let secrets = match cli.secrets.or(daemon.secrets) {
+            Some(raw) => SecretsBackend::parse(&raw)?,
+            None => SecretsBackend::Keyring,
+        };
+
         // Validate user-defined providers; sorted for deterministic
         // registration order.
         let mut providers: Vec<(String, RawProvider)> =
@@ -429,6 +476,7 @@ impl Config {
             providers,
             default_provider,
             webhooks,
+            secrets,
         })
     }
 }
@@ -776,6 +824,92 @@ mod tests {
         let cfg = resolve_with_providers("").unwrap();
         assert_eq!(cfg.default_provider, "anthropic");
         assert!(cfg.providers.is_empty());
+    }
+
+    // ---------- secrets backend ----------
+
+    #[test]
+    fn secrets_backend_defaults_to_keyring() {
+        let cfg = resolve_with_providers("").unwrap();
+        assert_eq!(cfg.secrets, SecretsBackend::Keyring);
+    }
+
+    #[test]
+    fn secrets_backend_parses_from_config_toml() {
+        let cfg = resolve_with_providers(
+            r#"
+            [daemon]
+            secrets = "env"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.secrets, SecretsBackend::Env);
+    }
+
+    #[test]
+    fn secrets_backend_dir_carries_its_path() {
+        let cfg = resolve_with_providers(
+            r#"
+            [daemon]
+            secrets = "dir:/run/secrets"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.secrets,
+            SecretsBackend::Dir(PathBuf::from("/run/secrets"))
+        );
+    }
+
+    #[test]
+    fn secrets_backend_cli_overrides_config_toml() {
+        let td = tempdir().unwrap();
+        let cfg = write_config(
+            td.path(),
+            r#"
+            [daemon]
+            secrets = "keyring"
+        "#,
+        );
+        let resolved = Config::resolve(Cli {
+            config: Some(cfg),
+            secrets: Some("env".into()),
+            ..Cli::default()
+        })
+        .unwrap();
+        assert_eq!(resolved.secrets, SecretsBackend::Env);
+    }
+
+    #[test]
+    fn secrets_backend_unknown_value_is_rejected() {
+        let err = resolve_with_providers(
+            r#"
+            [daemon]
+            secrets = "vault"
+        "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("vault"), "must name the bad value: {msg}");
+        assert!(msg.contains("keyring"), "must list valid values: {msg}");
+    }
+
+    #[test]
+    fn secrets_backend_dir_without_path_is_rejected() {
+        let err = resolve_with_providers(
+            r#"
+            [daemon]
+            secrets = "dir:"
+        "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("dir:"));
+    }
+
+    #[test]
+    fn secrets_flag_parses() {
+        let c = parse(&["--secrets", "dir:/run/secrets"]);
+        assert_eq!(c.secrets.unwrap(), "dir:/run/secrets");
     }
 
     // ---------- expand_tilde ----------
