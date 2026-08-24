@@ -53,3 +53,32 @@ jobs:
 
       - name: Test shell crate (sandbox backend)
         run: cargo test -p agentd-shell
+
+  # Build the runtime image and boot it against the example userland so the
+  # Dockerfile can't silently rot. The container marks itself healthy only
+  # after /health answers 200.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: agentd:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Boot and wait for /health
+        run: |
+          docker run -d --name agentd -p 7777:7777 \
+            -v "$PWD/examples/docker:/etc/agentd:ro" agentd:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:7777/health; then exit 0; fi
+            sleep 1
+          done
+          echo "daemon never became healthy"; docker logs agentd; exit 1

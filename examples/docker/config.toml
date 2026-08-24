@@ -1,0 +1,19 @@
+# Minimal agentd config for the container image. Mounted at
+# /etc/agentd/config.toml (see docker-compose.yml at the repo root).
+#
+# The image sets AGENTD_ADDR=0.0.0.0:7777 and AGENTD_SECRETS=env, so this
+# file only needs what the environment can't express. Env vars override it.
+
+[daemon]
+log_level = "info"
+
+# Secrets come from the environment (AGENTD_SECRET_<NAME>) by default.
+# To read Docker/Kubernetes secret mounts instead, run with
+# AGENTD_SECRETS=dir:/run/secrets or uncomment:
+# secrets = "dir:/run/secrets"
+
+# [webhooks.events]
+# action = "events.ingest"
+# secret = "webhook_secret"
+# signature_header = "x-webhook-signature-256"
+# signature_prefix = "sha256="
