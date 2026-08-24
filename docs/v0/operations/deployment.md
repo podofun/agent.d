@@ -119,6 +119,28 @@ WantedBy=multi-user.target
 Use `EnvironmentFile=/etc/agentd/secrets.env` (mode `0600`, owned by the service user) to keep tokens out of the unit file and out of `systemctl show` output.
 :::
 
+## Running in a container
+
+The repository contains a `Dockerfile` and a `docker-compose.yml` at the root. To start the daemon in Docker:
+
+```bash
+docker compose up --build
+```
+
+This command builds the image, mounts the example userland from `examples/docker/`, and serves the daemon on port 7777. To deploy your own agent, replace the mounted directory with your own `config.toml`, `init.lua`, and `grants.toml`.
+
+The image makes three decisions:
+
+**It binds to all interfaces.** On a host, the daemon defaults to `127.0.0.1:7777`. Inside a container, that address is not reachable from outside. The image therefore sets `AGENTD_ADDR=0.0.0.0:7777`. The container boundary now does the job of localhost. Publish the port with care. Keep `/ws` and `/control` behind your proxy, as in the section below.
+
+**Secrets come from the environment, not the OS keyring.** Containers have no keyring service, so the image sets `AGENTD_SECRETS=env`. A variable named `AGENTD_SECRET_ANTHROPIC_API_KEY` becomes the secret `anthropic_api_key`. To keep values out of `docker inspect`, set `AGENTD_SECRETS=dir:/run/secrets` instead. The daemon then reads one file per secret. Docker secrets and Kubernetes secret volume mounts have this same shape. Both backends are read-only. `agentctl secret set` applies to the keyring on a host.
+
+**The shell sandbox does not operate.** The native sandbox needs kernel features, such as Landlock and nested namespaces, that default container seccomp profiles block. The daemon does not run shell commands unconfined. It fails closed, and sandboxed shell actions return an error inside the container. Treat the container itself as the confinement boundary. Use one container for each trust domain. Grant `shell.exec` with that boundary in mind, or not at all.
+
+State lives on one volume at `/var/lib/agentd`. This volume holds the memory database, the trace log, and the generated tokens. The memory database accepts one writer at a time. Give each container its own volume. A second daemon on the same volume will refuse to start.
+
+The image contains a health check. It probes `GET /health`, and Docker reports the container healthy after the daemon answers. In Kubernetes, point your liveness and readiness probes at the same path.
+
 ## Reverse proxy / TLS
 
 The daemon speaks plain HTTP and WebSocket on localhost. It does **not** terminate TLS itself. Place a reverse proxy (nginx, Caddy, etc.) in front when you need `wss://` or `https://` from external clients.

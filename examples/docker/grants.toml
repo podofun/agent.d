@@ -1,0 +1,2 @@
+# Grants for the container userland. Default-deny: the ping tool needs
+# nothing, so nothing is granted. Add [tool.<name>] entries as you add tools.

@@ -1,0 +1,29 @@
+# Local agentd container. `docker compose up --build` starts the daemon with
+# the example userland from examples/docker/.
+#
+# Secrets: the image defaults to the `env` backend, so any AGENTD_SECRET_<NAME>
+# variable becomes a secret named <name>. The commented block below shows the
+# file-based alternative (`dir:/run/secrets`), which keeps values out of
+# `docker inspect`.
+
+services:
+  agentd:
+    build: .
+    ports:
+      - "7777:7777"
+    volumes:
+      - agentd-data:/var/lib/agentd
+      - ./examples/docker:/etc/agentd:ro
+    environment:
+      AGENTD_LOG: info
+      # AGENTD_SECRET_ANTHROPIC_API_KEY: sk-ant-...
+      # AGENTD_SECRETS: dir:/run/secrets
+    # secrets:
+    #   - webhook_secret
+
+# secrets:
+#   webhook_secret:
+#     file: ./webhook_secret.txt
+
+volumes:
+  agentd-data:

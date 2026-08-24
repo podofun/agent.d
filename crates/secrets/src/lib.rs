@@ -5,6 +5,10 @@
 //! - `KeyringStore` — OS-native keyring (libsecret / Keychain / Cred Manager)
 //!   via `keyring-core` + platform store crate. Installs the platform default
 //!   store on first use, idempotently.
+//! - `EnvStore`     — read-only, `AGENTD_SECRET_<KEY>` environment variables.
+//!   For containers where the platform injects secrets into the environment.
+//! - `DirStore`     — read-only, one file per secret under a directory. Matches
+//!   Docker secrets (`/run/secrets`) and Kubernetes secret volume mounts.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
@@ -16,9 +20,9 @@ pub const DEFAULT_SERVICE: &str = "agentd";
 
 #[derive(Debug, Error)]
 pub enum SecretError {
-    #[error("no secret named `{0}` is stored in the keyring")]
+    #[error("no secret named `{0}` is stored")]
     NotFound(String),
-    #[error("the keyring backend reported an error ({0})")]
+    #[error("the secrets backend reported an error ({0})")]
     Backend(String),
 }
 
@@ -210,6 +214,148 @@ impl SecretStore for KeyringStore {
             .lock()
             .map_err(|e| SecretError::Backend(e.to_string()))?;
         Ok(idx.iter().cloned().collect())
+    }
+}
+
+// ---------- EnvStore ----------
+
+pub const ENV_PREFIX: &str = "AGENTD_SECRET_";
+
+/// Read-only store backed by `AGENTD_SECRET_<KEY>` environment variables.
+/// The key is uppercased and dashes become underscores: the secret
+/// `github-webhook` reads `AGENTD_SECRET_GITHUB_WEBHOOK`.
+#[derive(Default)]
+pub struct EnvStore;
+
+impl EnvStore {
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn var_name(key: &str) -> String {
+        let mapped: String = key
+            .chars()
+            .map(|c| {
+                if c == '-' {
+                    '_'
+                } else {
+                    c.to_ascii_uppercase()
+                }
+            })
+            .collect();
+        format!("{ENV_PREFIX}{mapped}")
+    }
+}
+
+impl SecretStore for EnvStore {
+    fn get(&self, key: &str) -> Result<String> {
+        std::env::var(Self::var_name(key)).map_err(|_| SecretError::NotFound(key.to_string()))
+    }
+    fn set(&self, _key: &str, _value: &str) -> Result<()> {
+        Err(SecretError::Backend(
+            "the env secret store is read-only — secrets are provided by the environment".into(),
+        ))
+    }
+    fn delete(&self, _key: &str) -> Result<()> {
+        Err(SecretError::Backend(
+            "the env secret store is read-only — secrets are provided by the environment".into(),
+        ))
+    }
+    fn list(&self) -> Result<Vec<String>> {
+        let mut keys: Vec<String> = std::env::vars()
+            .filter_map(|(name, _)| {
+                name.strip_prefix(ENV_PREFIX)
+                    .map(|k| k.to_ascii_lowercase())
+            })
+            .collect();
+        keys.sort();
+        Ok(keys)
+    }
+}
+
+// ---------- DirStore ----------
+
+/// Read-only store with one file per secret under a directory, the shape of
+/// Docker secrets (`/run/secrets`) and Kubernetes secret volume mounts.
+/// A single trailing newline is trimmed from each value.
+pub struct DirStore {
+    root: std::path::PathBuf,
+}
+
+impl DirStore {
+    pub fn new(root: impl Into<std::path::PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    fn path_for(&self, key: &str) -> Result<std::path::PathBuf> {
+        let valid = !key.is_empty()
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+            && !key.starts_with('.');
+        if !valid {
+            return Err(SecretError::Backend(format!(
+                "the secret name `{key}` is not a plain file name"
+            )));
+        }
+        Ok(self.root.join(key))
+    }
+}
+
+impl SecretStore for DirStore {
+    fn get(&self, key: &str) -> Result<String> {
+        let path = self.path_for(key)?;
+        match std::fs::read_to_string(&path) {
+            Ok(mut v) => {
+                if v.ends_with('\n') {
+                    v.pop();
+                    if v.ends_with('\r') {
+                        v.pop();
+                    }
+                }
+                Ok(v)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(SecretError::NotFound(key.to_string()))
+            }
+            Err(e) => Err(SecretError::Backend(format!(
+                "could not read the secret file {} ({e})",
+                path.display()
+            ))),
+        }
+    }
+    fn set(&self, _key: &str, _value: &str) -> Result<()> {
+        Err(SecretError::Backend(
+            "the dir secret store is read-only — secrets are mounted files".into(),
+        ))
+    }
+    fn delete(&self, _key: &str) -> Result<()> {
+        Err(SecretError::Backend(
+            "the dir secret store is read-only — secrets are mounted files".into(),
+        ))
+    }
+    fn list(&self) -> Result<Vec<String>> {
+        let entries = std::fs::read_dir(&self.root).map_err(|e| {
+            SecretError::Backend(format!(
+                "could not list the secrets directory {} ({e})",
+                self.root.display()
+            ))
+        })?;
+        let mut keys = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| SecretError::Backend(e.to_string()))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // metadata() follows symlinks: Kubernetes mounts each key as a
+            // symlink into a `..data` directory.
+            let is_file = std::fs::metadata(entry.path())
+                .map(|m| m.is_file())
+                .unwrap_or(false);
+            if is_file && !name.starts_with('.') {
+                keys.push(name);
+            }
+        }
+        keys.sort();
+        Ok(keys)
     }
 }
 

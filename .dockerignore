@@ -1,0 +1,12 @@
+target/
+docs/
+.vitepress/
+node_modules/
+dist/
+.git/
+.github/
+*.md
+package.json
+bun.lock
+vercel.json
+.luarc.json

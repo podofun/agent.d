@@ -25,6 +25,11 @@ no_auth = false
 # How long (ms) an escalated permission request waits for an operator verdict
 # before failing closed (deny). Default 120000.
 approval_timeout_ms = 120000
+# Where the daemon reads secrets from. "keyring" (the default) uses the OS
+# keyring. In containers, use "env" (AGENTD_SECRET_<NAME> variables) or
+# "dir:/run/secrets" (one file per secret, the shape of Docker/Kubernetes
+# secret mounts) — both are read-only; the platform provides the values.
+# secrets = "keyring"
 
 # This route receives `POST /webhooks/events`.
 # `secret` identifies an OS-keyring entry.
