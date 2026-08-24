@@ -134,7 +134,7 @@ async fn run(cli: Cli) -> Result<()> {
     // Windows and when the ledger is empty (the normal, cleanly-shut-down case).
     sandbox::revoke_all_stamps();
 
-    let keyring = Arc::new(KeyringStore::default_service());
+    let keyring = build_secret_store(&cfg.secrets);
     let webhooks = resolve_webhooks(&cfg, keyring.as_ref())?;
     let mut providers = ProviderRegistry::new();
     let anthropic_api: Arc<dyn AIProvider> = Arc::new(ClaudeApiProvider::new(keyring.clone()));
@@ -190,7 +190,7 @@ async fn run(cli: Cli) -> Result<()> {
     // Dependencies that must outlive any single runtime build.
     let shared = Shared {
         providers,
-        keyring,
+        secrets: keyring,
         memory: Arc::new(memory),
         trace: Arc::new(trace),
         broker: broker.clone(),
@@ -269,14 +269,51 @@ async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// Build the secret store the whole daemon reads from, per `daemon.secrets`
+/// (`AGENTD_SECRETS`). Keyring is the default; env and dir are read-only
+/// backends for containers, where the platform injects secrets.
+fn build_secret_store(backend: &config::SecretsBackend) -> Arc<dyn SecretStore> {
+    match backend {
+        config::SecretsBackend::Keyring => Arc::new(KeyringStore::default_service()),
+        config::SecretsBackend::Env => Arc::new(agentd_secrets::EnvStore::new()),
+        config::SecretsBackend::Dir(path) => Arc::new(agentd_secrets::DirStore::new(path)),
+    }
+}
+
+/// How to provision a missing secret, phrased for the active backend.
+fn secret_hint(backend: &config::SecretsBackend, key: &str) -> String {
+    match backend {
+        config::SecretsBackend::Keyring => {
+            format!("store it with `agentctl secret set {key}`")
+        }
+        config::SecretsBackend::Env => {
+            let var = key
+                .chars()
+                .map(|c| {
+                    if c == '-' {
+                        '_'
+                    } else {
+                        c.to_ascii_uppercase()
+                    }
+                })
+                .collect::<String>();
+            format!("set the AGENTD_SECRET_{var} environment variable")
+        }
+        config::SecretsBackend::Dir(path) => {
+            format!("add the file {}", path.join(key).display())
+        }
+    }
+}
+
 fn resolve_webhooks(cfg: &Config, secrets: &dyn SecretStore) -> Result<HashMap<String, Webhook>> {
     cfg.webhooks
         .iter()
         .map(|(name, spec)| {
             let secret = secrets.get(&spec.secret).with_context(|| {
                 format!(
-                    "webhook `{name}` could not read secret `{}` — store it with `agentctl secret set {}`",
-                    spec.secret, spec.secret
+                    "webhook `{name}` could not read secret `{}` — {}",
+                    spec.secret,
+                    secret_hint(&cfg.secrets, &spec.secret)
                 )
             })?;
             let webhook = Webhook::new(
@@ -541,6 +578,54 @@ mod tests {
         let mut providers = ProviderRegistry::new();
         register_configured_providers(&mut providers, &cfg, keyring);
         assert_eq!(providers.default_name(), Some("ollama"));
+    }
+
+    #[test]
+    fn build_secret_store_dir_backend_reads_mounted_files() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(td.path().join("webhook_secret"), "s3cret\n").unwrap();
+        let store = build_secret_store(&config::SecretsBackend::Dir(td.path().to_path_buf()));
+        assert_eq!(store.get("webhook_secret").unwrap(), "s3cret");
+    }
+
+    #[test]
+    fn build_secret_store_env_backend_reads_environment() {
+        unsafe { std::env::set_var("AGENTD_SECRET_DAEMON_WIRING_TEST", "v") };
+        let store = build_secret_store(&config::SecretsBackend::Env);
+        assert_eq!(store.get("daemon_wiring_test").unwrap(), "v");
+        unsafe { std::env::remove_var("AGENTD_SECRET_DAEMON_WIRING_TEST") };
+    }
+
+    #[test]
+    fn secret_hint_matches_backend() {
+        use config::SecretsBackend;
+        let hint = secret_hint(&SecretsBackend::Keyring, "api_key");
+        assert!(hint.contains("agentctl secret set api_key"), "{hint}");
+        let hint = secret_hint(&SecretsBackend::Env, "api_key");
+        assert!(hint.contains("AGENTD_SECRET_API_KEY"), "{hint}");
+        let hint = secret_hint(&SecretsBackend::Dir("/run/secrets".into()), "api_key");
+        assert!(hint.contains("/run/secrets/api_key"), "{hint}");
+    }
+
+    #[test]
+    fn webhook_secret_error_carries_backend_hint() {
+        let cfg = cfg_with(
+            r#"
+            [daemon]
+            secrets = "env"
+
+            [webhooks.events]
+            action = "events.ingest"
+            secret = "missing_hook_secret"
+            signature_header = "x-signature"
+        "#,
+        );
+        let store = build_secret_store(&cfg.secrets);
+        let Err(err) = resolve_webhooks(&cfg, store.as_ref()) else {
+            panic!("missing secret must fail webhook resolution");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("AGENTD_SECRET_MISSING_HOOK_SECRET"), "{msg}");
     }
 
     #[test]

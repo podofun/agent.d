@@ -3,7 +3,7 @@
 //! service tasks, and the set of files the runtime actually loaded.
 //!
 //! The daemon calls it once at startup and again on every `--watch` hot reload.
-//! The pieces that must survive a reload (providers, keyring, durable memory,
+//! The pieces that must survive a reload (providers, secrets, durable memory,
 //! the trace sink, the approval broker, the async runtime handle) live in
 //! [`Shared`] and are built once in `main::run`; everything else is rebuilt
 //! fresh so a reload leaves no stale registrations behind.
@@ -16,7 +16,7 @@ use agentd_executor::{Executor, ExecutorHandle};
 use agentd_memory::RedbStore;
 use agentd_permissions::{Engine, Grants, GrantsFile, load_grants_file};
 use agentd_scripting::LuaHost;
-use agentd_secrets::KeyringStore;
+use agentd_secrets::SecretStore;
 use agentd_trace::JsonlSink;
 use agentd_types::Registry;
 use anyhow::{Result, anyhow, bail};
@@ -28,7 +28,7 @@ use crate::config::Config;
 /// at daemon startup; cloned into each [`build_runtime`] call.
 pub struct Shared {
     pub providers: Arc<ProviderRegistry>,
-    pub keyring: Arc<KeyringStore>,
+    pub secrets: Arc<dyn SecretStore>,
     pub memory: Arc<RedbStore>,
     pub trace: Arc<JsonlSink>,
     pub broker: Arc<agentd_approvals::Broker>,
@@ -62,7 +62,7 @@ pub fn build_runtime(cfg: &Config, shared: &Shared) -> Result<BuiltRuntime> {
     host.set_workspace_root(&cfg.workspace_root);
     host.set_packages_root(&shared.packages_root);
     host.start_async_runtime(shared.async_handle.clone());
-    host.set_secrets(shared.keyring.clone());
+    host.set_secrets(shared.secrets.clone());
     host.set_memory(shared.memory.clone());
     for name in shared.providers.names() {
         if let Some(p) = shared.providers.get(&name) {

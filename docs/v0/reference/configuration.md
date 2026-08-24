@@ -28,6 +28,7 @@ CLI flag  >  environment variable  >  config.toml  >  built-in default
 | `--admin-token <s>` | — | `AGENTD_ADMIN_TOKEN` | auto-minted | `/control` bearer token |
 | `--no-auth` | — | `AGENTD_NO_AUTH` | `false` | Disable `/ws` and `/control` auth |
 | `--approval-timeout <n>` | — | `AGENTD_APPROVAL_TIMEOUT_MS` | `120000` | Approval wait budget (ms) |
+| `--secrets <backend>` | — | `AGENTD_SECRETS` | `keyring` | Secrets backend: `keyring`, `env`, or `dir:<path>` |
 | `--watch` | `-w` | `AGENTD_WATCH` | `false` | Dev hot reload |
 | `--install-sandbox` | — | — | — | Windows only: one-time setup for sandboxed networking, then exit. See [Shell sandbox](/v0/security/sandbox#windows-one-time-network-setup) |
 | `--uninstall-sandbox` | — | — | — | Reverse `--install-sandbox` (macOS/Windows), then exit |
@@ -53,6 +54,7 @@ log_level           = "warn"
 no_auth             = false
 # admin_token       = "..."          # set explicitly or leave unset to auto-mint
 approval_timeout_ms = 120000
+# secrets           = "keyring"      # or "env", or "dir:/run/secrets"
 ```
 
 | Field | Type | Default | Description |
@@ -64,6 +66,7 @@ approval_timeout_ms = 120000
 | `no_auth` | bool | `false` | Disable authentication on both `/ws` and `/control` |
 | `admin_token` | string | — | Fixed `/control` bearer token; omit to auto-mint |
 | `approval_timeout_ms` | integer | `120000` | How long (ms) to wait for an operator verdict before failing closed |
+| `secrets` | string | `"keyring"` | Secrets backend: `keyring` (OS keyring), `env` (`AGENTD_SECRET_<NAME>` variables), or `dir:<path>` (one file per secret, for example Docker or Kubernetes secret mounts). `env` and `dir` are read-only |
 
 ### `[runtime]` section
 
