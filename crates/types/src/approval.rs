@@ -20,6 +20,9 @@ pub enum ApprovalKind {
     MissingGrant,
     /// The action is flagged `confirm = true`.
     Confirm,
+    /// A runner tried an action absent from its `allowed_actions` allowlist.
+    /// `AllowForever` appends the action to the runner's list.
+    RunnerAction,
 }
 
 /// An operator's decision on an [`ApprovalRequest`].
@@ -58,6 +61,34 @@ pub trait ApprovalBroker: Send + Sync {
     /// Ask a connected approver to decide `req`. Returns [`Verdict::Deny`] if no
     /// approver is connected or the request times out (fail closed).
     async fn request(&self, req: ApprovalRequest) -> Verdict;
+}
+
+/// A capability check that failed *inside* a running handler — `ctx.fs`,
+/// `ctx.http`, `ctx.secret`, … derived a permission slug the executing
+/// tool/service has not been granted. Unlike the dispatch-time check, the
+/// scheduler surfaces these mid-execution, so they carry the grant subject
+/// and the call chain instead of a resolved action/tool pair.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlineApprovalRequest {
+    /// `"tool"` or `"service"` — which grants.toml table owns the execution.
+    pub grant_kind: Option<String>,
+    /// The `[tool.<name>]` / `[service.<name>]` grants entry to extend.
+    pub grant_name: Option<String>,
+    /// Action/service call chain, outermost first (e.g. `["git.status"]`).
+    pub call_chain: Vec<String>,
+    /// The single permission slug the handler needs (e.g. `fs.read:/tmp/x`).
+    pub permission: String,
+    pub caller: Caller,
+}
+
+/// Escalation point for [`InlineApprovalRequest`]s. Implemented by the
+/// executor, which owns the broker, the trace sink, and the grants.toml
+/// persistence used by an `AllowForever` verdict.
+#[async_trait]
+pub trait InlineApprovals: Send + Sync {
+    /// Escalate an inline capability denial. Returns [`Verdict::Deny`] when no
+    /// broker/approver is available or the operator rejects (fail closed).
+    async fn request_inline(&self, req: InlineApprovalRequest) -> Verdict;
 }
 
 #[cfg(test)]
