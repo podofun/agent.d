@@ -6,11 +6,13 @@ When a call lacks a required grant or hits an action marked `confirm = true`, ag
 
 An approval request is raised when:
 
-1. **A required permission is missing** from `grants.toml` for the calling context (tool, runner, interface, or service layer).
-2. **An action is marked `confirm = true`** in its registration — every invocation requires explicit operator approval, regardless of grants.
+1. **A required permission is missing** from the tool's `granted` list in `grants.toml` when an action is dispatched.
+2. **A runner calls an action outside its `allowed_actions` list.** The runner allowlist is default-deny, so an absent entry is not a decision you already made — agent.d asks you instead of silently failing the agent.
+3. **An action is marked `confirm = true`** in its registration — every invocation requires explicit operator approval, regardless of grants.
+4. **A handler uses a capability mid-run that its tool was never granted** — for example `ctx.fs.read` on a path outside every `fs.read` grant, or `ctx.secret.get` for an ungranted key. The handler pauses on the capability call, the approval request goes out, and an approving verdict resumes the handler right where it stopped.
 
 ::: warning
-Policy denials (`[policy].deny_actions` and `[policy].deny_permissions`) and allowlist denials are **hard denials** — they are never escalated to approval. The call fails immediately. Only missing grants and `confirm = true` actions reach the approval queue.
+Policy denials (`[policy].deny_actions` and `[policy].deny_permissions`) and the interface/service allowlists are **hard denials** — they are explicit operator intent and are never escalated. The call fails immediately.
 :::
 
 ## The approval loop with `agentctl grants listen`
@@ -26,8 +28,16 @@ The command subscribes as an approver and blocks, printing each request as it ar
 | Verdict | Effect |
 |---|---|
 | `allow_once` | Permits this single call; the next identical request escalates again. |
-| `allow_forever` | Permits this call and appends the action to `[policy].auto_confirm` in `grants.toml`. Future calls are pre-approved without escalation. |
+| `allow_forever` | Permits this call and persists the decision to `grants.toml`, so future calls pass without escalation. What gets written depends on the request kind — see the table below. |
 | `deny` | Rejects the call; the caller receives an error. |
+
+What `allow_forever` writes:
+
+| Request kind | grants.toml change |
+|---|---|
+| `missing_grant` | Appends the permission slugs to the owning `[tool.<name>]` (or `[service.<name>]`) `granted` list. |
+| `runner_action` | Appends the action to the runner's `allowed_actions` list. |
+| `confirm` | Appends the action name to `[policy].auto_confirm`. |
 
 ## Request fields
 
@@ -38,7 +48,7 @@ Each approval request contains:
 | `id` | Unique request identifier used when resolving. |
 | `action` | Fully-qualified action name (e.g. `git.status`). |
 | `tool` | The tool that owns the action. |
-| `kind` | Why the request was raised (`missing_grant` or `confirm`). |
+| `kind` | Why the request was raised (`missing_grant`, `runner_action`, or `confirm`). |
 | `reason` | Human-readable explanation of what permission is needed. |
 | `missing[]` | The specific permission slugs that are absent. |
 | `caller.runner` | Runner name, if the call came from a runner. |

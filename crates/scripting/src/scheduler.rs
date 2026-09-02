@@ -92,6 +92,16 @@ pub(crate) enum Op {
         mailer: Arc<Mailer>,
         mail: Mail,
     },
+    /// An inline permission denial escalating to the approval broker. Handled
+    /// directly in [`drive`] (not [`perform`]) because an approving verdict
+    /// must insert the permission into the coroutine's `ActiveContext`
+    /// effective grants before the retry resume.
+    Approval {
+        hook: Arc<dyn agentd_types::InlineApprovals>,
+        request: agentd_types::InlineApprovalRequest,
+        /// The human-readable denial to raise if the verdict is `Deny`.
+        denied_msg: String,
+    },
 }
 
 /// Userdata wrapper Lua passes back through `coroutine.yield`. The scheduler
@@ -107,7 +117,13 @@ impl OpMarker {
     }
 }
 
-impl mlua::UserData for OpMarker {}
+impl mlua::UserData for OpMarker {
+    fn add_fields<F: mlua::UserDataFields<Self>>(fields: &mut F) {
+        // Lets the Lua-side wrapper distinguish an op marker from a binding's
+        // legitimate userdata return (e.g. a ws connection handle).
+        fields.add_field("__agentd_op", true);
+    }
+}
 
 /// Shared state for an `async(fn)` handle. The driver future writes either
 /// `Ok(result)` or `Err(message)` then notifies waiters.
@@ -258,6 +274,27 @@ pub async fn drive(
         ctx = evolved;
         match step {
             StepOutcome::Done(v) => return Ok(v),
+            StepOutcome::Yielded(Op::Approval {
+                hook,
+                request,
+                denied_msg,
+            }) => {
+                // Inline permission escalation. On an approving verdict the
+                // permission joins THIS execution's effective grants so the
+                // wrapper's retry passes; `AllowForever` has additionally
+                // persisted it to grants.toml inside the hook.
+                let permission = request.permission.clone();
+                match hook.request_inline(request).await {
+                    agentd_types::Verdict::AllowOnce | agentd_types::Verdict::AllowForever => {
+                        ctx.effective_grants
+                            .insert(agentd_permissions::Permission::new(permission));
+                        next = vec![serde_json::json!({ "ok": true, "approved": true })];
+                    }
+                    agentd_types::Verdict::Deny => {
+                        next = vec![serde_json::json!({ "ok": false, "error": denied_msg })];
+                    }
+                }
+            }
             StepOutcome::Yielded(op) => {
                 // Perform the IO outside the Lua mutex — this is the whole
                 // point of the scheduler. Multiple coroutines can be in this
@@ -347,6 +384,9 @@ async fn perform(op: Op) -> Result<serde_json::Value, String> {
             .await
             .map(send_outcome_to_json)
             .map_err(|e| e.to_string()),
+        // Handled in `drive` (it must mutate the ActiveContext). Reaching it
+        // here would be a scheduler bug — fail closed with the denial.
+        Op::Approval { denied_msg, .. } => Err(denied_msg),
     }
 }
 

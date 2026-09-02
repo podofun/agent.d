@@ -217,16 +217,18 @@ impl Engine {
 }
 
 impl Decision {
-    /// True if a connected approver may override this decision at runtime. Only
-    /// a missing grant (Tool layer) and confirm gating are escalatable; policy
-    /// denylist and runner/interface/service allowlists are explicit operator
-    /// intent and stay hard-deny.
+    /// True if a connected approver may override this decision at runtime.
+    /// Escalatable: a missing grant (Tool layer), a runner calling an action
+    /// outside its allowlist (Runner layer — absence from a default-deny list
+    /// is not explicit operator intent, so a human gets to decide), and
+    /// confirm gating. The policy denylist and interface/service allowlists
+    /// are explicit operator intent and stay hard-deny.
     pub fn is_escalatable(&self) -> bool {
         matches!(
             self,
             Decision::NeedsConfirmation { .. }
                 | Decision::Deny {
-                    layer: DenyLayer::Tool,
+                    layer: DenyLayer::Tool | DenyLayer::Runner,
                     ..
                 }
         )
@@ -530,8 +532,22 @@ mod tests {
             .is_escalatable()
         );
         assert!(
-            !Decision::Deny {
+            Decision::Deny {
                 layer: DenyLayer::Runner,
+                reason: "x".into()
+            }
+            .is_escalatable()
+        );
+        assert!(
+            !Decision::Deny {
+                layer: DenyLayer::Interface,
+                reason: "x".into()
+            }
+            .is_escalatable()
+        );
+        assert!(
+            !Decision::Deny {
+                layer: DenyLayer::Service,
                 reason: "x".into()
             }
             .is_escalatable()

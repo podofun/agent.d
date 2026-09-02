@@ -311,3 +311,164 @@ async fn allow_forever_writes_and_reloads() {
     let res2 = exec.run(Caller::interface("http"), act()).await;
     assert!(res2.is_ok(), "static pass after forever-grant: {res2:?}");
 }
+
+// ---------- runner-allowlist escalation ----------
+
+fn engine_with_runner(file_tool_perms: &[&str]) -> Engine {
+    let mut file = GrantsFile::default();
+    file.tool.insert(
+        "tool".into(),
+        ToolGrants {
+            granted: PermissionSet::from_iter(file_tool_perms.iter().copied()),
+        },
+    );
+    file.runner
+        .insert("reviewer".into(), RunnerGrants::default());
+    Engine::new(Grants::from_file(file))
+}
+
+#[tokio::test]
+async fn runner_allowlist_deny_escalates_and_allow_once_proceeds() {
+    let mut exec = base_executor(&["cap:foo"], false, engine_with_runner(&["cap:foo"]));
+    let broker = MockBroker::new(Verdict::AllowOnce);
+    exec.set_broker(broker.clone());
+    let res = exec
+        .run(Caller::default().with_runner("reviewer"), act())
+        .await;
+    assert!(res.is_ok(), "allow-once should proceed: {res:?}");
+    let seen = broker.seen.lock().unwrap();
+    let req = seen.as_ref().expect("broker must have been consulted");
+    assert_eq!(req.kind, agentd_types::ApprovalKind::RunnerAction);
+    assert_eq!(req.action, "tool.act");
+    assert!(req.missing.is_empty(), "runner escalation carries no perms");
+}
+
+#[tokio::test]
+async fn runner_allowlist_deny_verdict_still_rejects() {
+    let mut exec = base_executor(&["cap:foo"], false, engine_with_runner(&["cap:foo"]));
+    exec.set_broker(MockBroker::new(Verdict::Deny));
+    let err = exec
+        .run(Caller::default().with_runner("reviewer"), act())
+        .await
+        .unwrap_err()
+        .0;
+    let msg = err.to_string();
+    assert!(msg.contains("runner `reviewer`"), "got {msg}");
+}
+
+#[tokio::test]
+async fn runner_allowlist_allow_forever_persists_allowed_actions() {
+    use std::io::Write;
+    let mut tf = tempfile::NamedTempFile::new().unwrap();
+    write!(
+        tf,
+        "[tool.tool]\ngranted = [\"cap:foo\"]\n\n[runner.reviewer]\nallowed_actions = []\n"
+    )
+    .unwrap();
+    let path = tf.path().to_path_buf();
+
+    let mut exec = base_executor(&["cap:foo"], false, engine_with_runner(&["cap:foo"]));
+    exec.set_broker(MockBroker::new(Verdict::AllowForever));
+    exec.set_grants_path(path.clone());
+    let reload_path = path.clone();
+    exec.set_reload_grants(Arc::new(move || {
+        let text = std::fs::read_to_string(&reload_path).map_err(|e| e.to_string())?;
+        let file: GrantsFile = toml::from_str(&text).map_err(|e| e.to_string())?;
+        Ok(Engine::new(Grants::from_file(file)))
+    }));
+
+    let res = exec
+        .run(Caller::default().with_runner("reviewer"), act())
+        .await;
+    assert!(res.is_ok(), "allow-forever first call: {res:?}");
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains("allowed_actions") && on_disk.contains("tool.act"),
+        "grants.toml missing the runner allowlist entry: {on_disk}"
+    );
+
+    // Engine hot-swapped: second call passes statically (an AllowForever
+    // broker re-consult would double-append; unchanged file proves it didn't).
+    let before = std::fs::read_to_string(&path).unwrap();
+    let res2 = exec
+        .run(Caller::default().with_runner("reviewer"), act())
+        .await;
+    assert!(res2.is_ok(), "static pass after forever-grant: {res2:?}");
+    assert_eq!(before, std::fs::read_to_string(&path).unwrap());
+}
+
+// ---------- inline (mid-handler) escalation ----------
+
+use agentd_types::{InlineApprovalRequest, InlineApprovals};
+
+fn inline_req(perm: &str) -> InlineApprovalRequest {
+    InlineApprovalRequest {
+        grant_kind: Some("tool".into()),
+        grant_name: Some("tool".into()),
+        call_chain: vec!["tool.act".into()],
+        permission: perm.into(),
+        caller: Caller::interface("http"),
+    }
+}
+
+#[tokio::test]
+async fn inline_without_broker_denies() {
+    let exec = Arc::new(base_executor(&[], false, engine_with_tool_grant(&[])));
+    let v = exec.request_inline(inline_req("fs.read:/tmp/x")).await;
+    assert_eq!(v, Verdict::Deny);
+}
+
+#[tokio::test]
+async fn inline_allow_once_returns_verdict_and_reaches_broker() {
+    let mut exec = base_executor(&[], false, engine_with_tool_grant(&[]));
+    let broker = MockBroker::new(Verdict::AllowOnce);
+    exec.set_broker(broker.clone());
+    let exec = Arc::new(exec);
+    let v = exec.request_inline(inline_req("fs.read:/tmp/x")).await;
+    assert_eq!(v, Verdict::AllowOnce);
+    let seen = broker.seen.lock().unwrap();
+    let req = seen.as_ref().unwrap();
+    assert_eq!(req.kind, agentd_types::ApprovalKind::MissingGrant);
+    assert_eq!(req.missing, vec!["fs.read:/tmp/x".to_string()]);
+    assert_eq!(req.tool.as_deref(), Some("tool"));
+}
+
+#[tokio::test]
+async fn inline_allow_forever_persists_tool_grant() {
+    use std::io::Write;
+    let mut tf = tempfile::NamedTempFile::new().unwrap();
+    write!(tf, "[tool.tool]\ngranted = []\n").unwrap();
+    let path = tf.path().to_path_buf();
+
+    let mut exec = base_executor(&[], false, engine_with_tool_grant(&[]));
+    exec.set_broker(MockBroker::new(Verdict::AllowForever));
+    exec.set_grants_path(path.clone());
+    let reload_path = path.clone();
+    exec.set_reload_grants(Arc::new(move || {
+        let text = std::fs::read_to_string(&reload_path).map_err(|e| e.to_string())?;
+        let file: GrantsFile = toml::from_str(&text).map_err(|e| e.to_string())?;
+        Ok(Engine::new(Grants::from_file(file)))
+    }));
+    let exec = Arc::new(exec);
+
+    let v = exec
+        .request_inline(inline_req("secret:discord_token"))
+        .await;
+    assert_eq!(v, Verdict::AllowForever);
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains("secret:discord_token"),
+        "grants.toml not updated: {on_disk}"
+    );
+}
+
+#[tokio::test]
+async fn inline_allow_forever_without_persistence_degrades_to_allow_once() {
+    let mut exec = base_executor(&[], false, engine_with_tool_grant(&[]));
+    exec.set_broker(MockBroker::new(Verdict::AllowForever));
+    // No grants_path / reload wired.
+    let exec = Arc::new(exec);
+    let v = exec.request_inline(inline_req("net:api.github.com")).await;
+    assert_eq!(v, Verdict::AllowOnce);
+}

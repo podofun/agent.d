@@ -502,7 +502,7 @@ impl Executor {
                     }
                 }
             } else {
-                // Not escalatable (policy / runner / interface / service) or no
+                // Not escalatable (policy / interface / service) or no
                 // broker wired: reject with a diagnostic that names the
                 // denied component and the grants.toml fix.
                 let err = decision_to_error(
@@ -607,6 +607,10 @@ impl Executor {
         // the engine would require.
         let (kind, missing): (agentd_types::ApprovalKind, Vec<String>) = match &decision {
             Decision::NeedsConfirmation { .. } => (agentd_types::ApprovalKind::Confirm, Vec::new()),
+            Decision::Deny {
+                layer: DenyLayer::Runner,
+                ..
+            } => (agentd_types::ApprovalKind::RunnerAction, Vec::new()),
             Decision::Deny { .. } => {
                 let pkg_granted = tool_name
                     .and_then(|t| {
@@ -689,7 +693,13 @@ impl Executor {
                     };
                 }
                 match self
-                    .apply_forever(kind, tool_name, &action_meta.name, &missing)
+                    .apply_forever(
+                        kind,
+                        tool_name,
+                        caller.runner.as_ref().map(|r| r.as_str()),
+                        &action_meta.name,
+                        &missing,
+                    )
                     .await
                 {
                     Ok(()) => Escalation::Proceed {
@@ -709,6 +719,7 @@ impl Executor {
         &self,
         kind: agentd_types::ApprovalKind,
         tool_name: Option<&str>,
+        runner_name: Option<&str>,
         action_name: &str,
         missing: &[String],
     ) -> Result<(), String> {
@@ -761,7 +772,84 @@ impl Executor {
                     std::slice::from_ref(&action_name.to_string()),
                 );
             }
+            agentd_types::ApprovalKind::RunnerAction => {
+                let runner = runner_name.ok_or_else(|| {
+                    "the approval did not name a runner, so there is no `allowed_actions` list to extend".to_string()
+                })?;
+                let allowed = doc
+                    .as_table_mut()
+                    .entry("runner")
+                    .or_insert(toml_edit::table())
+                    .as_table_mut()
+                    .ok_or("the `runner` key in grants.toml is not a table — remove or rename the conflicting `runner` entry")?
+                    .entry(runner)
+                    .or_insert(toml_edit::table())
+                    .as_table_mut()
+                    .ok_or("this runner's entry in grants.toml is not a table — remove or rename the conflicting entry")?
+                    .entry("allowed_actions")
+                    .or_insert(toml_edit::value(toml_edit::Array::new()));
+                append_unique(
+                    ensure_string_array(allowed),
+                    std::slice::from_ref(&action_name.to_string()),
+                );
+            }
         }
+
+        std::fs::write(path, doc.to_string()).map_err(|e| {
+            format!("could not write grants.toml ({e}) — check the file permissions")
+        })?;
+        let fresh = reload()?;
+        self.engine.store(Arc::new(fresh));
+        Ok(())
+    }
+
+    /// Persist an inline `AllowForever` verdict: append `perm` to the
+    /// `granted` list of the `[tool.<name>]` / `[service.<name>]` entry that
+    /// owns the executing handler, then hot-reload the engine.
+    async fn persist_inline_grant(
+        &self,
+        grant_kind: Option<&str>,
+        grant_name: Option<&str>,
+        perm: &str,
+    ) -> Result<(), String> {
+        let (kind, name) = match (grant_kind, grant_name) {
+            (Some(k @ ("tool" | "service")), Some(n)) => (k, n),
+            _ => {
+                return Err(
+                    "the execution has no tool or service grants entry to extend".to_string(),
+                );
+            }
+        };
+        let path = self.grants_path.as_ref().ok_or_else(|| {
+            "the daemon has no grants file path configured, so approvals cannot be saved"
+                .to_string()
+        })?;
+        let reload = self.reload_grants.as_ref().ok_or_else(|| {
+            "the daemon has no grants reload hook wired, so approvals cannot be saved".to_string()
+        })?;
+
+        let _guard = self.forever_write_lock.lock().await;
+
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| {
+            format!("grants.toml is not valid TOML ({e}) — fix the syntax and approve again")
+        })?;
+        let granted = doc
+            .as_table_mut()
+            .entry(kind)
+            .or_insert(toml_edit::table())
+            .as_table_mut()
+            .ok_or_else(|| format!("the `{kind}` key in grants.toml is not a table — remove or rename the conflicting entry"))?
+            .entry(name)
+            .or_insert(toml_edit::table())
+            .as_table_mut()
+            .ok_or_else(|| format!("the `[{kind}.{name}]` entry in grants.toml is not a table — remove or rename the conflicting entry"))?
+            .entry("granted")
+            .or_insert(toml_edit::value(toml_edit::Array::new()));
+        append_unique(
+            ensure_string_array(granted),
+            std::slice::from_ref(&perm.to_string()),
+        );
 
         std::fs::write(path, doc.to_string()).map_err(|e| {
             format!("could not write grants.toml ({e}) — check the file permissions")
@@ -1180,6 +1268,75 @@ pub struct ExecutorHandle(pub Arc<Executor>);
 impl ExecutorHandle {
     pub fn new(executor: Arc<Executor>) -> Arc<Self> {
         Arc::new(Self(executor))
+    }
+}
+
+/// Bridge for inline (mid-handler) permission escalations from the scripting
+/// scheduler. Reuses the same broker, trace kind, and grants persistence the
+/// dispatch-time escalation path uses, so the operator experience is one flow.
+#[async_trait]
+impl agentd_types::InlineApprovals for Executor {
+    async fn request_inline(
+        &self,
+        req: agentd_types::InlineApprovalRequest,
+    ) -> agentd_types::Verdict {
+        use std::sync::atomic::Ordering;
+
+        let Some(broker) = self.broker.as_ref() else {
+            return agentd_types::Verdict::Deny;
+        };
+        let id = self.approval_seq.fetch_add(1, Ordering::Relaxed);
+        let action = req
+            .call_chain
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "<lua>".to_string());
+        let subject = match (req.grant_kind.as_deref(), req.grant_name.as_deref()) {
+            (Some(k), Some(n)) => format!("{k} `{n}`"),
+            _ => "the executing script".to_string(),
+        };
+        let approval = agentd_types::ApprovalRequest {
+            id,
+            kind: agentd_types::ApprovalKind::MissingGrant,
+            action: action.clone(),
+            tool: req.grant_name.clone(),
+            requires: vec![req.permission.clone()],
+            missing: vec![req.permission.clone()],
+            reason: format!(
+                "the handler asked for `{}` mid-run, which {subject} has not been granted",
+                req.permission
+            ),
+            caller: req.caller.clone(),
+        };
+        let verdict = broker.request(approval).await;
+        self.trace
+            .record(
+                TraceEvent::ok(
+                    &action,
+                    serde_json::json!({ "request_id": id, "permission": req.permission }),
+                    0,
+                    serde_json::json!({ "approval": format!("{verdict:?}") }),
+                )
+                .with_execution(req.caller.execution_str())
+                .with_kind("approval"),
+            )
+            .await;
+        if verdict == agentd_types::Verdict::AllowForever
+            && let Err(e) = self
+                .persist_inline_grant(
+                    req.grant_kind.as_deref(),
+                    req.grant_name.as_deref(),
+                    &req.permission,
+                )
+                .await
+        {
+            tracing::warn!(
+                permission = %req.permission,
+                "allow-forever could not be saved ({e}); degrading to allow-once"
+            );
+            return agentd_types::Verdict::AllowOnce;
+        }
+        verdict
     }
 }
 

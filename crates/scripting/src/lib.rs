@@ -404,6 +404,25 @@ impl LuaHost {
         lua.set_app_data(RunnerDispatcherHolder(Some(dispatcher)));
     }
 
+    /// Wire the inline-approval escalation hook. With it set, a `ctx.*`
+    /// capability call that fails its permission check inside a coroutine
+    /// yields an approval request to the hook (the executor bridges it to the
+    /// broker) instead of failing immediately. Without it, inline denials
+    /// keep the fail-fast behavior.
+    pub fn set_inline_approvals(&self, hook: Arc<dyn agentd_types::InlineApprovals>) {
+        let lua = self.lua.lock().unwrap();
+        lua.set_app_data(InlineApprovalsHandle(hook));
+    }
+
+    /// Drop the inline-approval hook. Counterpart of
+    /// [`LuaHost::clear_runner_dispatcher`]: the hook parks an `Arc<Executor>`
+    /// in the Lua app-data, which would otherwise keep the old runtime alive
+    /// across a hot reload.
+    pub fn clear_inline_approvals(&self) {
+        let lua = self.lua.lock().unwrap();
+        lua.remove_app_data::<InlineApprovalsHandle>();
+    }
+
     /// Snapshot of every file the runtime has loaded: init.lua plus every
     /// `import("rel/path.lua")` target, keyed by canonicalized absolute path.
     /// The daemon's `--watch` loop derives its watch set from this.
@@ -464,24 +483,62 @@ impl LuaHost {
 /// closure that calls the C fn and, if the return is a marker, invokes
 /// `coroutine.yield` from the Lua frame — sidestepping the
 /// "attempt to yield across a C-call boundary" restriction in Lua 5.4.
+///
+/// The wrapper also carries the inline-approval retry loop: a permission
+/// denial raised by `check_permission_inline` with an escalation mark is
+/// turned into an `Op::Approval` yield (via the `__agentd_escalate` binding),
+/// and an approving verdict re-invokes the original call — the scheduler has
+/// inserted the permission into the execution's effective grants by then. A
+/// denied or non-escalatable error re-raises unchanged.
 fn yieldable_wrap(lua: &Lua, internal: Function) -> mlua::Result<Function> {
     let chunk_src = r#"
-        local internal = ...
+        local internal, escalate = ...
         return function(...)
-          local v = internal(...)
-          if type(v) == "userdata" then
-            local r = coroutine.yield(v)
-            if type(r) == "table" and r.ok == false then
-              error(r.error or "scheduler error", 0)
+          local args = table.pack(...)
+          while true do
+            local rets = table.pack(pcall(internal, table.unpack(args, 1, args.n)))
+            if rets[1] then
+              local v = rets[2]
+              if type(v) == "userdata" and v.__agentd_op then
+                local r = coroutine.yield(v)
+                if type(r) == "table" and r.ok == false then
+                  error(r.error or "scheduler error", 0)
+                end
+                return r
+              end
+              return table.unpack(rets, 2, rets.n)
             end
-            return r
+            local err = rets[2]
+            local marker = escalate(err)
+            if marker == nil then error(err, 0) end
+            local r = coroutine.yield(marker)
+            if type(r) == "table" and r.ok == false then
+              error(r.error or "permission denied", 0)
+            end
+            -- Approved: loop and retry the original call under the new grant.
           end
-          return v
         end
     "#;
+    let escalate = lua.create_function(escalate_binding)?;
     lua.load(chunk_src)
         .set_name("yieldable_wrap")
-        .call::<Function>(internal)
+        .call::<Function>((internal, escalate))
+}
+
+/// Wrap every function-valued entry of `t` with [`yieldable_wrap`] so inline
+/// permission denials inside those bindings can escalate to an approver.
+fn wrap_table_fns(lua: &Lua, t: &Table) -> mlua::Result<()> {
+    let mut wrapped = Vec::new();
+    for pair in t.pairs::<Value, Value>() {
+        let (k, v) = pair?;
+        if let Value::Function(f) = v {
+            wrapped.push((k, yieldable_wrap(lua, f)?));
+        }
+    }
+    for (k, f) in wrapped {
+        t.set(k, f)?;
+    }
+    Ok(())
 }
 
 fn install_agentd_globals(lua: &Lua, _catalog: &SharedCatalog) -> Result<()> {
@@ -592,12 +649,23 @@ fn build_and_store_ctx(lua: &Lua) -> mlua::Result<()> {
     // `ctx.shell(bin, args?, opts?)` — single op, so the table is the callable.
     let shell_internal = lua.create_function(shell_exec_binding)?;
     ctx.set("shell", yieldable_wrap(lua, shell_internal)?)?;
-    ctx.set("fs", build_fs_table(lua)?)?;
+    // Permission-checked capability tables get the escalating wrapper on every
+    // function so an inline denial can prompt an approver instead of failing.
+    // (`http` and `ai` wrap their own entries at build time.)
+    let fs = build_fs_table(lua)?;
+    wrap_table_fns(lua, &fs)?;
+    ctx.set("fs", fs)?;
     ctx.set("http", build_http_table(lua)?)?;
-    ctx.set("secret", build_secret_table(lua)?)?;
+    let secret = build_secret_table(lua)?;
+    wrap_table_fns(lua, &secret)?;
+    ctx.set("secret", secret)?;
     ctx.set("ai", build_ai_table(lua)?)?;
-    ctx.set("ws", build_ws_table(lua)?)?;
-    ctx.set("mailer", mailer::build_mailer_table(lua)?)?;
+    let ws = build_ws_table(lua)?;
+    wrap_table_fns(lua, &ws)?;
+    ctx.set("ws", ws)?;
+    let mailer_t = mailer::build_mailer_table(lua)?;
+    wrap_table_fns(lua, &mailer_t)?;
+    ctx.set("mailer", mailer_t)?;
     ctx.set("state", build_state_table(lua)?)?;
     ctx.set("memory", build_memory_table(lua)?)?;
     ctx.set("caller", build_caller_table(lua)?)?;
@@ -2633,12 +2701,15 @@ fn mem_clear_binding(lua: &Lua, ns: String) -> mlua::Result<()> {
 
 fn build_memory_table(lua: &Lua) -> mlua::Result<Table> {
     let t = lua.create_table()?;
-    let get = lua.create_function(mem_get_binding)?;
-    let set = lua.create_function(mem_set_binding)?;
-    let del = lua.create_function(mem_delete_binding)?;
-    let exists = lua.create_function(mem_exists_binding)?;
-    let keys = lua.create_function(mem_keys_binding)?;
-    let clear = lua.create_function(mem_clear_binding)?;
+    // Each internal is escalation-wrapped so `memory.read:<ns>` /
+    // `memory.write:<ns>` denials inside the per-namespace closures can
+    // prompt an approver like every other ctx capability.
+    let get = yieldable_wrap(lua, lua.create_function(mem_get_binding)?)?;
+    let set = yieldable_wrap(lua, lua.create_function(mem_set_binding)?)?;
+    let del = yieldable_wrap(lua, lua.create_function(mem_delete_binding)?)?;
+    let exists = yieldable_wrap(lua, lua.create_function(mem_exists_binding)?)?;
+    let keys = yieldable_wrap(lua, lua.create_function(mem_keys_binding)?)?;
+    let clear = yieldable_wrap(lua, lua.create_function(mem_clear_binding)?)?;
     let ctor: Function = lua
         .load(
             r#"
@@ -3336,22 +3407,91 @@ fn validate_output_binding(lua: &Lua, value: Value) -> mlua::Result<(bool, Optio
     }
 }
 
+/// Separator marking an escalatable inline denial. The error string a binding
+/// raises is `<mark><perm><mark><human denial message>`; the Lua-side wrapper
+/// hands it to [`escalate_binding`], which rebuilds the pieces. `\u{1}` cannot
+/// appear in a permission slug or in our own denial prose, so the split is
+/// unambiguous.
+const ESCALATE_MARK: &str = "\u{1}agentd:escalate\u{1}";
+
+/// Escalation hook stored in Lua app-data (wired by the daemon via
+/// [`LuaHost::set_inline_approvals`]). Present ⇒ inline permission denials
+/// inside coroutine executions escalate to the approval broker instead of
+/// failing immediately.
+#[derive(Clone)]
+pub(crate) struct InlineApprovalsHandle(pub(crate) Arc<dyn agentd_types::InlineApprovals>);
+
 pub(crate) fn check_permission_inline(lua: &Lua, req: &Permission) -> mlua::Result<()> {
     let active = lua
         .app_data_ref::<ActiveContext>()
         .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
     if active.effective_grants.contains(req) {
-        Ok(())
-    } else {
-        Err(mlua::Error::external(inline_denial(
-            &active,
-            &format!(
-                "the script tried to use a capability that requires the `{}` grant",
-                req.as_str()
-            ),
-            &[req.as_str().to_string()],
-        )))
+        return Ok(());
     }
+    let denial = inline_denial(
+        &active,
+        &format!(
+            "the script tried to use a capability that requires the `{}` grant",
+            req.as_str()
+        ),
+        &[req.as_str().to_string()],
+    );
+    drop(active);
+    // Escalatable only when an approval hook is wired AND we are inside a
+    // scheduler coroutine (the wrapper needs to yield the approval op). The
+    // top-level block_on path — init.lua load time — stays a hard deny.
+    if lua.app_data_ref::<InlineApprovalsHandle>().is_some() && scheduler::is_in_coroutine(lua) {
+        return Err(mlua::Error::external(format!(
+            "{ESCALATE_MARK}{}{ESCALATE_MARK}{denial}",
+            req.as_str()
+        )));
+    }
+    Err(mlua::Error::external(denial))
+}
+
+/// `__agentd_escalate(err)` — inspect a pcall-captured error. If it carries
+/// the escalation mark, build an [`scheduler::Op::Approval`] and return its
+/// marker for the wrapper to yield; otherwise return `nil` so the wrapper
+/// re-raises the error unchanged.
+fn escalate_binding(lua: &Lua, err: Value) -> mlua::Result<Value> {
+    let text = match &err {
+        Value::Error(e) => e.to_string(),
+        Value::String(s) => s.to_str()?.to_string(),
+        _ => return Ok(Value::Nil),
+    };
+    let Some(start) = text.find(ESCALATE_MARK) else {
+        return Ok(Value::Nil);
+    };
+    let rest = &text[start + ESCALATE_MARK.len()..];
+    let Some((perm, denial)) = rest.split_once(ESCALATE_MARK) else {
+        return Ok(Value::Nil);
+    };
+    let Some(hook) = lua
+        .app_data_ref::<InlineApprovalsHandle>()
+        .map(|h| h.0.clone())
+    else {
+        return Ok(Value::Nil);
+    };
+    let request = {
+        let active = lua
+            .app_data_ref::<ActiveContext>()
+            .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
+        agentd_types::InlineApprovalRequest {
+            grant_kind: active.grant_kind.clone(),
+            grant_name: active.grant_name.clone(),
+            call_chain: active.call_chain.clone(),
+            permission: perm.to_string(),
+            caller: active.caller.clone(),
+        }
+    };
+    scheduler::build_marker(
+        lua,
+        scheduler::Op::Approval {
+            hook,
+            request,
+            denied_msg: denial.to_string(),
+        },
+    )
 }
 
 fn inline_denial(active: &ActiveContext, what: &str, missing: &[String]) -> String {
