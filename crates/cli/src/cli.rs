@@ -121,6 +121,10 @@ pub(crate) enum RunnerCmd {
         prompt: String,
         #[arg(long)]
         text_only: bool,
+        /// Print the response as it is generated (token deltas), then exit
+        /// with the complete result.
+        #[arg(long)]
+        stream: bool,
     },
 }
 

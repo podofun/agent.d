@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
-use agentd_net::http::{Request as HttpRequest, send as http_send};
+use agentd_net::http::{Request as HttpRequest, send as http_send, send_streaming};
 use agentd_secrets::SecretStore;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use super::sse::SseBuffer;
 use crate::types::{
     CompletionRequest, CompletionResponse, LoopMode, Message, Provider, ProviderError, Role,
-    ToolCall,
+    StreamEvent, StreamSink, ToolCall,
 };
 
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -141,6 +142,184 @@ impl Provider for ClaudeApiProvider {
         })?;
 
         Ok(translate_response(parsed, req.model))
+    }
+
+    async fn complete_streaming(
+        &self,
+        req: CompletionRequest,
+        sink: StreamSink,
+    ) -> Result<CompletionResponse, ProviderError> {
+        let api_key = self.api_key()?;
+
+        let mut body = build_request_body(&req, self.default_model());
+        body["stream"] = serde_json::Value::Bool(true);
+
+        let mut http_req = HttpRequest {
+            method: "POST".into(),
+            url: self.endpoint().to_string(),
+            json: Some(body),
+            // Streamed turns outlive the 30s default while staying bounded.
+            timeout_ms: Some(600_000),
+            ..Default::default()
+        };
+        if let Some(key) = api_key {
+            http_req.headers.insert("x-api-key".into(), key);
+        }
+        http_req
+            .headers
+            .insert("anthropic-version".into(), ANTHROPIC_VERSION.into());
+
+        let mut acc = StreamAccumulator::default();
+        let mut sse = SseBuffer::new();
+        let resp = send_streaming(http_req, |chunk| {
+            sse.push(chunk, |data| acc.feed(data, &sink));
+        })
+        .await
+        .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        if !(200..300).contains(&resp.status) {
+            return Err(ProviderError::Upstream(format!(
+                "anthropic {}: {}",
+                resp.status, resp.body
+            )));
+        }
+        acc.finish(req.model)
+    }
+}
+
+/// Rebuilds the complete response from Anthropic's SSE event stream while
+/// relaying text deltas and tool-call announcements into the sink.
+#[derive(Default)]
+struct StreamAccumulator {
+    model: Option<String>,
+    stop_reason: Option<String>,
+    /// Content blocks by stream index, in arrival order semantics.
+    blocks: std::collections::BTreeMap<u64, StreamBlock>,
+    error: Option<String>,
+}
+
+enum StreamBlock {
+    Text(String),
+    ToolUse {
+        id: String,
+        name: String,
+        input_json: String,
+    },
+}
+
+impl StreamAccumulator {
+    fn feed(&mut self, data: &str, sink: &StreamSink) {
+        let Ok(ev) = serde_json::from_str::<serde_json::Value>(data) else {
+            return;
+        };
+        match ev["type"].as_str().unwrap_or("") {
+            "message_start" => {
+                if let Some(m) = ev["message"]["model"].as_str() {
+                    self.model = Some(m.to_string());
+                }
+            }
+            "content_block_start" => {
+                let idx = ev["index"].as_u64().unwrap_or(0);
+                let block = &ev["content_block"];
+                match block["type"].as_str().unwrap_or("") {
+                    "tool_use" => {
+                        let name = block["name"].as_str().unwrap_or("").to_string();
+                        let _ = sink.send(StreamEvent::ToolCall { name: name.clone() });
+                        self.blocks.insert(
+                            idx,
+                            StreamBlock::ToolUse {
+                                id: block["id"].as_str().unwrap_or("").to_string(),
+                                name,
+                                input_json: String::new(),
+                            },
+                        );
+                    }
+                    _ => {
+                        self.blocks.insert(idx, StreamBlock::Text(String::new()));
+                    }
+                }
+            }
+            "content_block_delta" => {
+                let idx = ev["index"].as_u64().unwrap_or(0);
+                let delta = &ev["delta"];
+                match delta["type"].as_str().unwrap_or("") {
+                    "text_delta" => {
+                        if let Some(t) = delta["text"].as_str() {
+                            let _ = sink.send(StreamEvent::TextDelta {
+                                text: t.to_string(),
+                            });
+                            if let Some(StreamBlock::Text(s)) = self.blocks.get_mut(&idx) {
+                                s.push_str(t);
+                            }
+                        }
+                    }
+                    "input_json_delta" => {
+                        if let (Some(p), Some(StreamBlock::ToolUse { input_json, .. })) =
+                            (delta["partial_json"].as_str(), self.blocks.get_mut(&idx))
+                        {
+                            input_json.push_str(p);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "message_delta" => {
+                if let Some(s) = ev["delta"]["stop_reason"].as_str() {
+                    self.stop_reason = Some(s.to_string());
+                }
+            }
+            "message_stop" => {
+                let _ = sink.send(StreamEvent::TurnEnd);
+            }
+            "error" => {
+                self.error = Some(ev["error"]["message"].as_str().unwrap_or(data).to_string());
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(self, requested_model: Option<String>) -> Result<CompletionResponse, ProviderError> {
+        if let Some(e) = self.error {
+            return Err(ProviderError::Upstream(format!("anthropic stream: {e}")));
+        }
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        for (_, block) in self.blocks {
+            match block {
+                StreamBlock::Text(t) => {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&t);
+                }
+                StreamBlock::ToolUse {
+                    id,
+                    name,
+                    input_json,
+                } => {
+                    let arguments = if input_json.trim().is_empty() {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::from_str(&input_json).map_err(|e| {
+                            ProviderError::Upstream(format!(
+                                "anthropic stream: tool input for `{name}` is not valid JSON ({e})"
+                            ))
+                        })?
+                    };
+                    tool_calls.push(ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    });
+                }
+            }
+        }
+        Ok(CompletionResponse {
+            text,
+            model: self.model.or(requested_model),
+            stop_reason: self.stop_reason,
+            tool_calls,
+        })
     }
 }
 
@@ -400,6 +579,54 @@ mod tests {
         let secrets = Arc::new(MemoryStore::default());
         let p = ClaudeApiProvider::new(secrets);
         assert!(matches!(p.api_key(), Err(ProviderError::Config(_))));
+    }
+
+    #[test]
+    fn stream_accumulator_rebuilds_full_response_and_emits_deltas() {
+        use crate::types::StreamEvent;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = StreamAccumulator::default();
+        for ev in [
+            r#"{"type":"message_start","message":{"model":"claude-x"}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"c1","name":"notes.lookup"}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"q\":"}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"x\"}"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ] {
+            acc.feed(ev, &tx);
+        }
+        let resp = acc.finish(None).unwrap();
+        assert_eq!(resp.text, "Hello");
+        assert_eq!(resp.model.as_deref(), Some("claude-x"));
+        assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].name, "notes.lookup");
+        assert_eq!(resp.tool_calls[0].arguments, serde_json::json!({"q":"x"}));
+
+        let mut deltas = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            deltas.push(ev);
+        }
+        assert!(matches!(&deltas[0], StreamEvent::TextDelta { text } if text == "Hel"));
+        assert!(matches!(&deltas[1], StreamEvent::TextDelta { text } if text == "lo"));
+        assert!(
+            matches!(&deltas[2], StreamEvent::ToolCall { name } if name == "notes.lookup"),
+            "got {deltas:?}"
+        );
+        assert!(matches!(deltas.last(), Some(StreamEvent::TurnEnd)));
+    }
+
+    #[test]
+    fn stream_accumulator_surfaces_error_events() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = StreamAccumulator::default();
+        acc.feed(r#"{"type":"error","error":{"message":"overloaded"}}"#, &tx);
+        let err = acc.finish(None).unwrap_err();
+        assert!(err.to_string().contains("overloaded"), "got {err}");
     }
 
     #[test]

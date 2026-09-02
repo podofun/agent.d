@@ -127,12 +127,13 @@ agentctl runner inspect backend_reviewer
 Run a runner with a text prompt and print the result.
 
 ```bash
-agentctl runner run <name> "<prompt>" [--text-only]
+agentctl runner run <name> "<prompt>" [--text-only] [--stream]
 ```
 
 | Flag | Description |
 |---|---|
 | `--text-only` | Print only the `text` field of the response |
+| `--stream` | Print the response as it is generated; tool calls show as dim `[tool: name]` markers on stderr |
 
 **Output shape** (without `--text-only`):
 

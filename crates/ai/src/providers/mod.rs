@@ -4,6 +4,7 @@ mod codex_app_server;
 mod codex_cli;
 mod mock;
 mod openai_api;
+mod sse;
 
 pub use claude_api::{ClaudeApiProvider, normalize_anthropic_endpoint};
 pub use claude_cli::ClaudeCliProvider;
