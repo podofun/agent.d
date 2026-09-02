@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
-use agentd_net::http::{Request as HttpRequest, send as http_send};
+use agentd_net::http::{Request as HttpRequest, send as http_send, send_streaming};
 use agentd_secrets::SecretStore;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use super::sse::SseBuffer;
 use crate::types::{
     CompletionRequest, CompletionResponse, LoopMode, Message, Provider, ProviderError, Role,
-    ToolCall,
+    StreamEvent, StreamSink, ToolCall,
 };
 
 const OPENAI_URL: &str = "https://api.openai.com/v1/chat/completions";
@@ -140,6 +141,139 @@ impl Provider for OpenAiApiProvider {
         })?;
 
         translate_response(parsed, req.model)
+    }
+
+    async fn complete_streaming(
+        &self,
+        req: CompletionRequest,
+        sink: StreamSink,
+    ) -> Result<CompletionResponse, ProviderError> {
+        let api_key = self.api_key()?;
+
+        let mut body = build_request_body(&req, self.default_model());
+        body["stream"] = serde_json::Value::Bool(true);
+
+        let mut http_req = HttpRequest {
+            method: "POST".into(),
+            url: self.endpoint().to_string(),
+            json: Some(body),
+            // Streamed turns outlive the 30s default while staying bounded.
+            timeout_ms: Some(600_000),
+            ..Default::default()
+        };
+        if let Some(key) = api_key {
+            http_req
+                .headers
+                .insert("authorization".into(), format!("Bearer {key}"));
+        }
+
+        let mut acc = ChunkAccumulator::default();
+        let mut sse = SseBuffer::new();
+        let resp = send_streaming(http_req, |chunk| {
+            sse.push(chunk, |data| acc.feed(data, &sink));
+        })
+        .await
+        .map_err(|e| ProviderError::Transport(e.to_string()))?;
+
+        if !(200..300).contains(&resp.status) {
+            return Err(ProviderError::Upstream(format!(
+                "openai {}: {}",
+                resp.status, resp.body
+            )));
+        }
+        acc.finish(req.model)
+    }
+}
+
+/// Rebuilds the complete response from OpenAI's chunked SSE stream while
+/// relaying text deltas and tool-call announcements into the sink.
+#[derive(Default)]
+struct ChunkAccumulator {
+    model: Option<String>,
+    finish_reason: Option<String>,
+    text: String,
+    /// Tool calls by chunk index; arguments accumulate as string fragments.
+    tool_calls: std::collections::BTreeMap<u64, (String, String, String)>,
+    saw_chunk: bool,
+}
+
+impl ChunkAccumulator {
+    fn feed(&mut self, data: &str, sink: &StreamSink) {
+        if data.trim() == "[DONE]" {
+            let _ = sink.send(StreamEvent::TurnEnd);
+            return;
+        }
+        let Ok(ev) = serde_json::from_str::<serde_json::Value>(data) else {
+            return;
+        };
+        self.saw_chunk = true;
+        if let Some(m) = ev["model"].as_str() {
+            self.model = Some(m.to_string());
+        }
+        let Some(choice) = ev["choices"].get(0) else {
+            return;
+        };
+        if let Some(f) = choice["finish_reason"].as_str() {
+            self.finish_reason = Some(f.to_string());
+        }
+        let delta = &choice["delta"];
+        if let Some(t) = delta["content"].as_str()
+            && !t.is_empty()
+        {
+            let _ = sink.send(StreamEvent::TextDelta {
+                text: t.to_string(),
+            });
+            self.text.push_str(t);
+        }
+        if let Some(calls) = delta["tool_calls"].as_array() {
+            for c in calls {
+                let idx = c["index"].as_u64().unwrap_or(0);
+                let entry = self
+                    .tool_calls
+                    .entry(idx)
+                    .or_insert_with(|| (String::new(), String::new(), String::new()));
+                if let Some(id) = c["id"].as_str() {
+                    entry.0.push_str(id);
+                }
+                if let Some(n) = c["function"]["name"].as_str() {
+                    entry.1.push_str(n);
+                    let _ = sink.send(StreamEvent::ToolCall {
+                        name: entry.1.clone(),
+                    });
+                }
+                if let Some(a) = c["function"]["arguments"].as_str() {
+                    entry.2.push_str(a);
+                }
+            }
+        }
+    }
+
+    fn finish(self, requested_model: Option<String>) -> Result<CompletionResponse, ProviderError> {
+        if !self.saw_chunk {
+            return Err(ProviderError::EmptyResponse);
+        }
+        let tool_calls = self
+            .tool_calls
+            .into_values()
+            .map(|(id, name, args)| {
+                let arguments = if args.trim().is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::from_str(&args).unwrap_or(serde_json::Value::String(args))
+                };
+                ToolCall {
+                    id,
+                    name,
+                    arguments,
+                }
+            })
+            .collect();
+        Ok(CompletionResponse {
+            text: self.text,
+            model: self.model.or(requested_model),
+            stop_reason: self.finish_reason.map(normalize_stop_reason),
+            tool_calls,
+        })
     }
 }
 
@@ -484,6 +618,49 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "choices": [] })).unwrap();
         assert!(matches!(
             translate_response(parsed, None),
+            Err(ProviderError::EmptyResponse)
+        ));
+    }
+
+    #[test]
+    fn chunk_accumulator_rebuilds_full_response_and_emits_deltas() {
+        use crate::types::StreamEvent;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = ChunkAccumulator::default();
+        for ev in [
+            r#"{"model":"gpt-x","choices":[{"delta":{"content":"Hel"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"lo"}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"notes.lookup"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":\"x\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ] {
+            acc.feed(ev, &tx);
+        }
+        let resp = acc.finish(None).unwrap();
+        assert_eq!(resp.text, "Hello");
+        assert_eq!(resp.model.as_deref(), Some("gpt-x"));
+        // Canonical vocabulary, same normalization as the aggregate path.
+        assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].id, "c1");
+        assert_eq!(resp.tool_calls[0].arguments, serde_json::json!({"q":"x"}));
+
+        let mut deltas = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            deltas.push(ev);
+        }
+        assert!(matches!(&deltas[0], StreamEvent::TextDelta { text } if text == "Hel"));
+        assert!(matches!(&deltas[1], StreamEvent::TextDelta { text } if text == "lo"));
+        assert!(matches!(&deltas[2], StreamEvent::ToolCall { name } if name == "notes.lookup"));
+        assert!(matches!(deltas.last(), Some(StreamEvent::TurnEnd)));
+    }
+
+    #[test]
+    fn chunk_accumulator_with_no_chunks_is_empty_response() {
+        let acc = ChunkAccumulator::default();
+        assert!(matches!(
+            acc.finish(None),
             Err(ProviderError::EmptyResponse)
         ));
     }

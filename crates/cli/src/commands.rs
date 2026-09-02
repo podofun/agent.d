@@ -102,7 +102,53 @@ pub(crate) async fn cmd_runner(base: &str, timeout: u64, cmd: RunnerCmd) -> Resu
             name,
             prompt,
             text_only,
+            stream,
         } => {
+            if stream {
+                use std::io::Write;
+                let mut streamed_any = false;
+                let resp = crate::ws::ws_call_streaming(
+                    base,
+                    timeout,
+                    "runners.run",
+                    serde_json::json!({ "name": name, "prompt": prompt, "stream": true }),
+                    |delta| match delta.get("type").and_then(|t| t.as_str()) {
+                        Some("text_delta") => {
+                            if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
+                                streamed_any = true;
+                                print!("{t}");
+                                let _ = std::io::stdout().flush();
+                            }
+                        }
+                        Some("tool_call") => {
+                            if let Some(n) = delta.get("name").and_then(|v| v.as_str()) {
+                                eprintln!("\x1b[2m[tool: {n}]\x1b[0m");
+                            }
+                        }
+                        _ => {}
+                    },
+                )
+                .await?;
+                if streamed_any {
+                    println!();
+                }
+                if resp.ok {
+                    // Deltas already rendered the text; without any (a
+                    // provider with no incremental output), fall back to the
+                    // complete response so the reply is never lost.
+                    if !streamed_any
+                        && let Some(t) = resp
+                            .result
+                            .as_ref()
+                            .and_then(|r| r.get("text"))
+                            .and_then(|v| v.as_str())
+                    {
+                        println!("{t}");
+                    }
+                    return Ok(());
+                }
+                return print_result(&resp, false);
+            }
             let resp = ws_call(
                 base,
                 timeout,

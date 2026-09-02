@@ -887,174 +887,31 @@ impl Executor {
         runner_name: &str,
         prompt: String,
     ) -> Result<RunnerOutcome, RunnerError> {
-        let def = self
-            .runners
-            .get(runner_name)
-            .ok_or_else(|| RunnerError::NotFound(runner_name.to_string()))?;
-        let composition = agentd_runners::compose(&def, &self.skills)?;
+        self.run_runner_extended(caller, runner_name, Some(prompt), None, None, None, None)
+            .await
+    }
 
-        let (provider_name, provider, model_id) = match composition.model.as_deref() {
-            Some(m) => {
-                self.providers
-                    .resolve_for_model(m)
-                    .ok_or_else(|| RunnerError::NoProvider {
-                        name: def.name.clone(),
-                        model: composition.model.clone(),
-                    })?
-            }
-            None => {
-                let (n, p) =
-                    self.providers
-                        .resolve(None)
-                        .ok_or_else(|| RunnerError::NoProvider {
-                            name: def.name.clone(),
-                            model: None,
-                        })?;
-                (n, p, String::new())
-            }
-        };
-
-        // Caller seen by every dispatched tool inherits the runner identity
-        // so the permission engine's layer-3 check (`runner.allowed_actions`)
-        // gates which actions this runner may invoke.
-        let tool_caller = {
-            let mut c = caller.clone();
-            c.runner = Some(runner_name.into());
-            c
-        };
-
-        // Build the tool catalog the model sees this turn. Source = runner's
-        // composed `allowed_actions`; the registry supplies the action's
-        // metadata for description + requires.
-        let tools = self.build_tool_catalog(&composition.allowed_actions);
-
-        let mut req = agentd_ai::CompletionRequest::default();
-        if !composition.system.is_empty() {
-            req.system = Some(composition.system.clone());
-        }
-        if !model_id.is_empty() {
-            req.model = Some(model_id);
-        }
-        req.messages = vec![agentd_ai::Message::user(prompt)];
-        req.tools = tools;
-
-        let last_stop_reason;
-        let final_text;
-
-        let req_model_echo = req.model.clone();
-        match provider.loop_mode() {
-            agentd_ai::LoopMode::ProviderOwned => {
-                // Spin a per-invocation MCP loopback. The provider (a CLI
-                // wrapper) drives its own agent loop and reaches back into
-                // this executor for every tool call via the loopback URL.
-                // The handle drops at end-of-scope, killing the listener so
-                // we don't leak ports across runner runs.
-                let dispatcher: Arc<dyn Dispatcher> = self.clone();
-                // A provider that bakes the token into a long-lived subprocess
-                // (codex) dictates a stable token; header-based providers
-                // (claude) get a fresh random one per invocation.
-                let token = provider
-                    .preferred_mcp_token()
-                    .unwrap_or_else(agentd_mcp::gen_token);
-                let loopback = agentd_mcp::bind_loopback(
-                    dispatcher,
-                    tool_caller.clone(),
-                    req.tools.clone(),
-                    token,
-                )
-                .await
-                .map_err(|e| RunnerError::Provider {
-                    provider: provider_name.clone(),
-                    source: agentd_ai::ProviderError::Config(format!(
-                        "could not start the local MCP bridge that lets the model call tools ({e})"
-                    )),
-                })?;
-                req.mcp_endpoint = Some(agentd_ai::McpEndpoint::Http {
-                    url: loopback.url.clone(),
-                    token: loopback.token.clone(),
-                });
-                // Also wire the in-process dispatcher path. ProviderOwned
-                // providers that can't use the HTTP loopback (codex
-                // app-server speaks JSON-RPC over stdio, not MCP) read
-                // these to bridge tool calls + approval requests through
-                // the agentd permission engine.
-                req.dispatcher = Some(self.clone());
-                req.caller = Some(tool_caller.clone());
-                let resp = provider
-                    .complete(req)
-                    .await
-                    .map_err(|e| RunnerError::Provider {
-                        provider: provider_name.clone(),
-                        source: e,
-                    })?;
-                drop(loopback);
-                final_text = resp.text;
-                last_stop_reason = resp.stop_reason;
-            }
-            agentd_ai::LoopMode::ExecutorOwned => {
-                let mut turns: u32 = 0;
-                loop {
-                    if turns >= self.max_runner_turns {
-                        return Err(RunnerError::Provider {
-                            provider: provider_name.clone(),
-                            source: agentd_ai::ProviderError::Upstream(format!(
-                                "the runner stopped after {} tool-use turns without producing a final answer — raise the turn limit or simplify the task",
-                                self.max_runner_turns
-                            )),
-                        });
-                    }
-                    turns += 1;
-
-                    let resp = provider.complete(req.clone()).await.map_err(|e| {
-                        RunnerError::Provider {
-                            provider: provider_name.clone(),
-                            source: e,
-                        }
-                    })?;
-
-                    if resp.tool_calls.is_empty() {
-                        final_text = resp.text;
-                        last_stop_reason = resp.stop_reason;
-                        break;
-                    }
-
-                    // Record the assistant turn that asked for tools, then
-                    // dispatch each call. Errors become tool_result strings
-                    // rather than runner-level failures so the model can
-                    // recover (the standard agent convention).
-                    let assistant_text = resp.text.clone();
-                    req.messages.push(agentd_ai::Message {
-                        role: agentd_ai::Role::Assistant,
-                        content: assistant_text,
-                        tool_calls: resp.tool_calls.clone(),
-                        tool_call_id: None,
-                    });
-
-                    for call in resp.tool_calls {
-                        let call_id = call.id.clone();
-                        let action = agentd_types::ActionCall {
-                            action: call.name.clone(),
-                            args: call.arguments.clone(),
-                        };
-                        let result_text = match self.run(tool_caller.clone(), action).await {
-                            Ok((res, _)) => serde_json::to_string(&res.value).unwrap_or_else(|e| {
-                                format!("the tool result could not be serialized to JSON ({e})")
-                            }),
-                            Err((e, _)) => format!("tool call failed ({e})"),
-                        };
-                        req.messages
-                            .push(agentd_ai::Message::tool_result(call_id, result_text));
-                    }
-                }
-            }
-        }
-
-        Ok(RunnerOutcome {
-            text: final_text,
-            provider: provider_name,
-            model: req_model_echo,
-            stop_reason: last_stop_reason,
-        })
+    /// Like [`Executor::run_runner`], additionally pushing
+    /// [`agentd_ai::StreamEvent`]s into `sink` as the provider produces
+    /// output. The complete [`RunnerOutcome`] is still returned — streaming
+    /// is a live view, never a replacement for the full response.
+    pub async fn run_runner_streaming(
+        self: &Arc<Self>,
+        caller: Caller,
+        runner_name: &str,
+        prompt: String,
+        sink: agentd_ai::StreamSink,
+    ) -> Result<RunnerOutcome, RunnerError> {
+        self.run_runner_extended(
+            caller,
+            runner_name,
+            Some(prompt),
+            None,
+            None,
+            None,
+            Some(sink),
+        )
+        .await
     }
 
     /// Translate runner.allowed_actions into `ToolDef`s the provider sees.
@@ -1383,6 +1240,7 @@ impl RunnerDispatcher for ExecutorHandle {
                 messages,
                 system_override,
                 model_override,
+                None,
             )
             .await;
         let dur = started.elapsed().as_millis();
@@ -1442,6 +1300,9 @@ impl Executor {
     /// `agentd.runners.run` accepts. Equivalent to `run_runner` for the
     /// simple-prompt case; extends it with explicit `messages` and per-call
     /// `system` / `model` overrides.
+    // The extended surface is a set of orthogonal optional inputs; bundling
+    // them into an options struct would just move the noise to every caller.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_runner_extended(
         self: &Arc<Self>,
         caller: Caller,
@@ -1450,6 +1311,7 @@ impl Executor {
         messages: Option<serde_json::Value>,
         system_override: Option<String>,
         model_override: Option<String>,
+        sink: Option<agentd_ai::StreamSink>,
     ) -> Result<RunnerOutcome, RunnerError> {
         let def = self
             .runners
@@ -1553,13 +1415,14 @@ impl Executor {
                 });
                 req.dispatcher = Some(self.clone());
                 req.caller = Some(tool_caller.clone());
-                let resp = provider
-                    .complete(req)
-                    .await
-                    .map_err(|e| RunnerError::Provider {
-                        provider: provider_name.clone(),
-                        source: e,
-                    })?;
+                let resp = match &sink {
+                    Some(s) => provider.complete_streaming(req, s.clone()).await,
+                    None => provider.complete(req).await,
+                }
+                .map_err(|e| RunnerError::Provider {
+                    provider: provider_name.clone(),
+                    source: e,
+                })?;
                 drop(loopback);
                 Ok(RunnerOutcome {
                     text: resp.text,
@@ -1581,11 +1444,13 @@ impl Executor {
                         });
                     }
                     turns += 1;
-                    let resp = provider.complete(req.clone()).await.map_err(|e| {
-                        RunnerError::Provider {
-                            provider: provider_name.clone(),
-                            source: e,
-                        }
+                    let resp = match &sink {
+                        Some(s) => provider.complete_streaming(req.clone(), s.clone()).await,
+                        None => provider.complete(req.clone()).await,
+                    }
+                    .map_err(|e| RunnerError::Provider {
+                        provider: provider_name.clone(),
+                        source: e,
                     })?;
                     if resp.tool_calls.is_empty() {
                         return Ok(RunnerOutcome {

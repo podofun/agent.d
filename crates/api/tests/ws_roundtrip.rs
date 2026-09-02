@@ -177,3 +177,119 @@ async fn unknown_method_and_missing_action_error_cleanly() {
     assert_eq!(missing["ok"], false);
     assert_eq!(missing["code"], "not_found");
 }
+
+/// Boot with a mock-backed runner and no auth; returns the `ws://` URL.
+async fn boot_with_runner() -> String {
+    let host = LuaHost::new().expect("lua host");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("runner.lua"),
+        r#"
+        agentd.runner({ name = "helper", model = "mock/test" })
+        "#,
+    )
+    .unwrap();
+    host.load_dir(dir.path()).expect("load runner");
+    std::mem::forget(dir);
+
+    let skills = host.skills();
+    let runners = host.runners();
+    let services = host.services();
+    let registry: Arc<dyn Registry> = Arc::new(host);
+    let mut providers = agentd_ai::ProviderRegistry::new();
+    providers.insert(
+        "mock",
+        Arc::new(agentd_ai::MockProvider::new().with_reply("streamed hello")),
+    );
+    providers.set_default("mock");
+    let executor = Arc::new(Executor::new(
+        registry,
+        Arc::new(NullSink),
+        Arc::new(Engine::new(Grants::from_file(GrantsFile::default()))),
+        runners,
+        services,
+        skills,
+        Arc::new(providers),
+    ));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = AppState {
+        executor: Arc::new(arc_swap::ArcSwap::from(executor)),
+        auth_token: None,
+        admin_token: None,
+        broker: Arc::new(agentd_approvals::Broker::new(
+            std::time::Duration::from_secs(30),
+        )),
+        webhooks: Arc::new(HashMap::new()),
+    };
+    tokio::spawn(async move {
+        let _ = serve(listener, router(state)).await;
+    });
+    format!("ws://{addr}/ws")
+}
+
+#[tokio::test]
+async fn streaming_run_pushes_deltas_then_complete_response() {
+    let url = boot_with_runner().await;
+    let (mut sock, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    sock.send(Message::Text(
+        serde_json::json!({
+            "id": 9,
+            "method": "runners.run",
+            "params": { "name": "helper", "prompt": "hi", "stream": true }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut deltas: Vec<serde_json::Value> = Vec::new();
+    let final_resp = loop {
+        match sock.next().await.unwrap().unwrap() {
+            Message::Text(t) => {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v.get("event").and_then(|e| e.as_str()) == Some("runner.delta") {
+                    assert_eq!(v["id"], 9, "delta frames carry the request id");
+                    deltas.push(v["delta"].clone());
+                    continue;
+                }
+                break v;
+            }
+            Message::Ping(_) | Message::Pong(_) => continue,
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    };
+
+    // Every delta frame arrived before the final response; text deltas
+    // reassemble the full reply the complete envelope also carries.
+    let streamed: String = deltas
+        .iter()
+        .filter(|d| d["type"] == "text_delta")
+        .filter_map(|d| d["text"].as_str())
+        .collect();
+    assert_eq!(streamed, "streamed hello");
+    assert!(deltas.iter().any(|d| d["type"] == "turn_end"));
+    assert_eq!(final_resp["id"], 9);
+    assert_eq!(final_resp["ok"], true);
+    assert_eq!(final_resp["result"]["text"], "streamed hello");
+}
+
+#[tokio::test]
+async fn non_streaming_run_gets_single_complete_response() {
+    let url = boot_with_runner().await;
+    let (mut sock, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let resp = call(
+        &mut sock,
+        serde_json::json!({
+            "id": 10,
+            "method": "runners.run",
+            "params": { "name": "helper", "prompt": "hi" }
+        }),
+    )
+    .await;
+    assert_eq!(resp["ok"], true);
+    assert_eq!(resp["result"]["text"], "streamed hello");
+}

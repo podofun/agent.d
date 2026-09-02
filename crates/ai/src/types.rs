@@ -232,6 +232,30 @@ pub struct CompletionResponse {
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// One incremental event from a streaming completion. Streaming is additive:
+/// the provider still returns the complete [`CompletionResponse`] at the end,
+/// so consumers that ignore events lose nothing and consumers that render
+/// them get live output. Events are best-effort — a dropped receiver never
+/// fails the completion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamEvent {
+    /// A chunk of assistant text, in order.
+    TextDelta { text: String },
+    /// The assistant asked for a tool. Emitted when the call is known
+    /// (name complete); results flow through the normal tool loop.
+    ToolCall { name: String },
+    /// One provider turn finished. The executor-owned loop may start another
+    /// turn after dispatching tools; the final turn is followed by the
+    /// complete response instead.
+    TurnEnd,
+}
+
+/// Sender half providers push [`StreamEvent`]s into. Unbounded on purpose:
+/// producers are network-paced and events are small; a slow consumer must
+/// never stall the completion that the caller still expects in full.
+pub type StreamSink = tokio::sync::mpsc::UnboundedSender<StreamEvent>;
+
 #[derive(Debug, Error)]
 pub enum ProviderError {
     // Messages must be self-explanatory: they render under a
@@ -269,4 +293,17 @@ pub trait Provider: Send + Sync {
     }
 
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError>;
+
+    /// Like [`Provider::complete`], additionally pushing [`StreamEvent`]s into
+    /// `sink` as output arrives. The complete response is still returned —
+    /// streaming augments the aggregate contract, it never replaces it. The
+    /// default implementation performs a plain completion and emits nothing,
+    /// so providers without incremental output remain correct.
+    async fn complete_streaming(
+        &self,
+        req: CompletionRequest,
+        _sink: StreamSink,
+    ) -> Result<CompletionResponse, ProviderError> {
+        self.complete(req).await
+    }
 }

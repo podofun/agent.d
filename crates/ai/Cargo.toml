@@ -17,7 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-multi-thread", "fs"] }
+tokio = { workspace = true, features = ["process", "io-util", "macros", "rt-multi-thread", "fs", "sync"] }
 tracing.workspace = true
 
 [dev-dependencies]

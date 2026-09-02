@@ -225,6 +225,7 @@ Run a runner with a prompt and return its text output.
 | `prompt` | string | yes | User prompt |
 | `session` | string | no | Override session id |
 | `user` | string | no | Caller-supplied user id |
+| `stream` | bool | no | Push `runner.delta` event frames while the run is in flight |
 
 **Result:** `{ "text": "...", "provider": "...", "model": "...", "stop_reason"?: "..." }`
 
@@ -233,6 +234,18 @@ Run a runner with a prompt and return its text output.
 // →
 { "id": 6, "ok": true, "result": { "text": "LGTM.", "provider": "anthropic", "model": "claude-opus-4-7", "stop_reason": "end_turn" } }
 ```
+
+**Streaming.** With `stream: true` the server pushes event frames on the same connection while the run is in flight, then sends the ordinary complete response envelope as the final frame. You always receive the full result, even if you ignore every delta — streaming is a live view, not a replacement.
+
+```json
+{ "event": "runner.delta", "id": 6, "delta": { "type": "text_delta", "text": "LG" } }
+{ "event": "runner.delta", "id": 6, "delta": { "type": "text_delta", "text": "TM." } }
+{ "event": "runner.delta", "id": 6, "delta": { "type": "tool_call", "name": "git.diff" } }
+{ "event": "runner.delta", "id": 6, "delta": { "type": "turn_end" } }
+{ "id": 6, "ok": true, "result": { "text": "LGTM.", "provider": "anthropic", "model": "claude-opus-4-7", "stop_reason": "end_turn" } }
+```
+
+Delta types: `text_delta` (a chunk of assistant text, in order), `tool_call` (the model asked for a tool), `turn_end` (one provider turn finished). Event frames carry the request `id`, so a client multiplexing requests can route them. Providers without incremental output send no deltas; the final envelope arrives either way.
 
 ---
 
