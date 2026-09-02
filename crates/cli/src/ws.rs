@@ -138,3 +138,64 @@ pub(crate) async fn ws_call(
     }
     Err(anyhow!("ws closed before response"))
 }
+
+/// Like [`ws_call`], but relays `runner.delta` event frames to `on_delta` as
+/// they arrive and returns the final complete response envelope. Only the
+/// connect handshake is bounded by `timeout` — a streaming run legitimately
+/// outlives any fixed request budget.
+pub(crate) async fn ws_call_streaming(
+    base: &str,
+    timeout: u64,
+    method: &str,
+    params: Value,
+    mut on_delta: impl FnMut(&Value),
+) -> Result<WsResponse> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let url = ws_url_of(base)?;
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .with_context(|| format!("could not build a request for `{url}`"))?;
+    if let Some(token) = resolve_ws_token() {
+        request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {token}")
+                .parse()
+                .context("the auth token contains characters that cannot go in a header")?,
+        );
+    }
+    let connect = tokio_tungstenite::connect_async(request);
+    let (mut ws, _) = tokio::time::timeout(Duration::from_millis(timeout), connect)
+        .await
+        .with_context(|| format!("timed out connecting to `{url}`"))?
+        .with_context(|| format!("could not connect to `{url}` — is agentd running?"))?;
+
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let req = WsRequest { id, method, params };
+    let body = serde_json::to_string(&req)?;
+    ws.send(Message::Text(body.into())).await?;
+
+    while let Some(msg) = ws.next().await {
+        let text = match msg? {
+            Message::Text(t) => t.to_string(),
+            Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
+            Message::Close(_) => break,
+            _ => continue,
+        };
+        // Event frames carry `event`; the final envelope does not.
+        if let Ok(v) = serde_json::from_str::<Value>(&text)
+            && v.get("event").and_then(|e| e.as_str()) == Some("runner.delta")
+        {
+            if let Some(d) = v.get("delta") {
+                on_delta(d);
+            }
+            continue;
+        }
+        let resp: WsResponse = serde_json::from_str(&text).with_context(|| {
+            format!("the daemon sent a response that could not be decoded ({text})")
+        })?;
+        let _ = ws.send(Message::Close(None)).await;
+        return Ok(resp);
+    }
+    Err(anyhow!("ws closed before response"))
+}

@@ -2,7 +2,10 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::types::{CompletionRequest, CompletionResponse, Provider, ProviderError, ToolCall};
+use crate::types::{
+    CompletionRequest, CompletionResponse, Provider, ProviderError, StreamEvent, StreamSink,
+    ToolCall,
+};
 
 /// Deterministic provider for tests. Two modes:
 ///
@@ -94,5 +97,40 @@ impl Provider for MockProvider {
             stop_reason: Some("end_turn".into()),
             tool_calls: Vec::new(),
         })
+    }
+
+    /// Streams the canned response: the text split into two deltas (so tests
+    /// observe real incremental order), a `ToolCall` per scripted call, and a
+    /// `TurnEnd` — then returns the same complete response `complete` would.
+    async fn complete_streaming(
+        &self,
+        req: CompletionRequest,
+        sink: StreamSink,
+    ) -> Result<CompletionResponse, ProviderError> {
+        let resp = self.complete(req).await?;
+        if !resp.text.is_empty() {
+            let mid = resp.text.len() / 2;
+            // Split on a char boundary; fall back to one delta if the midpoint
+            // lands inside a multi-byte character.
+            if resp.text.is_char_boundary(mid) && mid > 0 {
+                let _ = sink.send(StreamEvent::TextDelta {
+                    text: resp.text[..mid].to_string(),
+                });
+                let _ = sink.send(StreamEvent::TextDelta {
+                    text: resp.text[mid..].to_string(),
+                });
+            } else {
+                let _ = sink.send(StreamEvent::TextDelta {
+                    text: resp.text.clone(),
+                });
+            }
+        }
+        for tc in &resp.tool_calls {
+            let _ = sink.send(StreamEvent::ToolCall {
+                name: tc.name.clone(),
+            });
+        }
+        let _ = sink.send(StreamEvent::TurnEnd);
+        Ok(resp)
     }
 }

@@ -37,6 +37,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::types::{
     CompletionRequest, CompletionResponse, LoopMode, McpEndpoint, Provider, ProviderError,
+    StreamEvent, StreamSink,
 };
 
 pub struct ClaudeCliProvider {
@@ -91,12 +92,32 @@ impl Provider for ClaudeCliProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
         match &req.mcp_endpoint {
             Some(McpEndpoint::Http { url, token }) => {
-                self.complete_with_mcp(req.clone(), url.clone(), token.clone())
+                self.complete_with_mcp(req.clone(), url.clone(), token.clone(), None)
                     .await
             }
             Some(McpEndpoint::Stdio { .. }) => Err(ProviderError::Config(
                 "the claude CLI provider only supports http MCP endpoints, not stdio".into(),
             )),
+            None => self.complete_text_only(req).await,
+        }
+    }
+
+    async fn complete_streaming(
+        &self,
+        req: CompletionRequest,
+        sink: StreamSink,
+    ) -> Result<CompletionResponse, ProviderError> {
+        match &req.mcp_endpoint {
+            Some(McpEndpoint::Http { url, token }) => {
+                self.complete_with_mcp(req.clone(), url.clone(), token.clone(), Some(sink))
+                    .await
+            }
+            Some(McpEndpoint::Stdio { .. }) => Err(ProviderError::Config(
+                "the claude CLI provider only supports http MCP endpoints, not stdio".into(),
+            )),
+            // The plain-text path buffers the whole reply anyway; the
+            // aggregate fallback is already correct, so avoid the heavier
+            // stream-json invocation for tool-less completions.
             None => self.complete_text_only(req).await,
         }
     }
@@ -173,6 +194,7 @@ impl ClaudeCliProvider {
         req: CompletionRequest,
         mcp_url: String,
         mcp_token: String,
+        sink: Option<StreamSink>,
     ) -> Result<CompletionResponse, ProviderError> {
         // Build the MCP config file. claude CLI expects:
         //   { "mcpServers": { "<name>": { "type": "http", "url", "headers" } } }
@@ -256,20 +278,49 @@ impl ClaudeCliProvider {
                 .map_err(|e| ProviderError::Transport(format!("close stdin: {e}")))?;
         }
 
-        let output = child
-            .wait_with_output()
+        // Read stdout line-by-line so a sink (when present) gets deltas as the
+        // CLI emits them; every line is also kept, and the final text is still
+        // extracted from the complete transcript — streaming never replaces
+        // the aggregate contract. Stderr drains concurrently to avoid a pipe
+        // deadlock on chatty diagnostics.
+        let stdout_pipe = child.stdout.take().ok_or_else(|| {
+            ProviderError::Transport("could not capture the claude CLI's stdout".into())
+        })?;
+        let stderr_pipe = child.stderr.take();
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut p) = stderr_pipe {
+                use tokio::io::AsyncReadExt;
+                let _ = p.read_to_end(&mut buf).await;
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+
+        let mut stdout = String::new();
+        {
+            use tokio::io::AsyncBufReadExt;
+            let mut lines = tokio::io::BufReader::new(stdout_pipe).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(sink) = &sink {
+                    relay_stream_line(&line, sink);
+                }
+                stdout.push_str(&line);
+                stdout.push('\n');
+            }
+        }
+
+        let status = child
+            .wait()
             .await
             .map_err(|e| ProviderError::Transport(format!("wait: {e}")))?;
         // `cfg_path` (the TempPath) is dropped at function end, deleting the file.
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if !status.success() {
+            let stderr = stderr_task.await.unwrap_or_default();
             return Err(ProviderError::Upstream(format!(
-                "claude exited {}: {}",
-                output.status, stderr
+                "claude exited {status}: {stderr}"
             )));
         }
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let text = extract_final_text(&stdout).ok_or(ProviderError::EmptyResponse)?;
         Ok(CompletionResponse {
             text,
@@ -277,6 +328,46 @@ impl ClaudeCliProvider {
             stop_reason: Some("end_turn".into()),
             tool_calls: Vec::new(),
         })
+    }
+}
+
+/// Translate one `stream-json` line into [`StreamEvent`]s. With
+/// `--include-partial-messages` the CLI relays Anthropic's SSE events under
+/// `type: "stream_event"`; text deltas and tool-call starts map directly.
+/// Unknown lines are skipped — the aggregate result never depends on this.
+fn relay_stream_line(line: &str, sink: &StreamSink) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return;
+    };
+    if v["type"].as_str().unwrap_or("") == "stream_event" {
+        let ev = &v["event"];
+        match ev["type"].as_str().unwrap_or("") {
+            "content_block_delta" => {
+                if let Some(t) = ev["delta"]["text"].as_str()
+                    && !t.is_empty()
+                {
+                    let _ = sink.send(StreamEvent::TextDelta {
+                        text: t.to_string(),
+                    });
+                }
+            }
+            "content_block_start" => {
+                if ev["content_block"]["type"] == "tool_use"
+                    && let Some(name) = ev["content_block"]["name"].as_str()
+                {
+                    // The loopback registers tools as `mcp__agentd__<name>`;
+                    // report the agentd-side name.
+                    let name = name.strip_prefix("mcp__agentd__").unwrap_or(name);
+                    let _ = sink.send(StreamEvent::ToolCall {
+                        name: name.to_string(),
+                    });
+                }
+            }
+            "message_stop" => {
+                let _ = sink.send(StreamEvent::TurnEnd);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -434,5 +525,28 @@ mod tests {
     fn loop_mode_is_provider_owned() {
         let p = ClaudeCliProvider::new();
         assert_eq!(p.loop_mode(), LoopMode::ProviderOwned);
+    }
+
+    #[test]
+    fn relay_stream_line_maps_partial_events() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for line in [
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp__agentd__note.save"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_stop"}}"#,
+            r#"{"type":"system","subtype":"init"}"#,
+            "not json at all",
+        ] {
+            relay_stream_line(line, &tx);
+        }
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        assert_eq!(out.len(), 3, "got {out:?}");
+        assert!(matches!(&out[0], StreamEvent::TextDelta { text } if text == "hi"));
+        // The MCP prefix is stripped so callers see the agentd action name.
+        assert!(matches!(&out[1], StreamEvent::ToolCall { name } if name == "note.save"));
+        assert!(matches!(out[2], StreamEvent::TurnEnd));
     }
 }

@@ -77,7 +77,45 @@ pub fn host_of(url: &str) -> Result<String, HttpError> {
         .ok_or_else(|| HttpError::InvalidUrl(url.to_string(), "no host".into()))
 }
 
-pub async fn send(req: Request) -> Result<Response, HttpError> {
+/// Like [`send`], but hands each body chunk to `on_chunk` as it arrives —
+/// the primitive under SSE-style provider streaming. `on_chunk` fires only
+/// for 2xx responses (an error body carries no events worth relaying); the
+/// full body is accumulated and returned either way, so callers keep the
+/// complete response and the existing status/error handling.
+pub async fn send_streaming(
+    req: Request,
+    mut on_chunk: impl FnMut(&[u8]) + Send,
+) -> Result<Response, HttpError> {
+    let mut resp = begin(req).await?;
+    let status = resp.status().as_u16();
+    let stream_chunks = (200..300).contains(&status);
+    let mut headers = BTreeMap::new();
+    for (k, v) in resp.headers() {
+        if let Ok(s) = v.to_str() {
+            headers.insert(k.as_str().to_string(), s.to_string());
+        }
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| HttpError::Transport(e.to_string()))?
+    {
+        if stream_chunks {
+            on_chunk(&chunk);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8(body).map_err(|e| HttpError::Decode(e.to_string()))?;
+    Ok(Response {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// Build and dispatch the request, returning the live `reqwest::Response`.
+async fn begin(req: Request) -> Result<reqwest::Response, HttpError> {
     let method = req.method.to_uppercase();
     let method = match method.as_str() {
         "GET" => reqwest::Method::GET,
@@ -106,10 +144,13 @@ pub async fn send(req: Request) -> Result<Response, HttpError> {
         _ => rb,
     };
 
-    let resp = rb
-        .send()
+    rb.send()
         .await
-        .map_err(|e| HttpError::Transport(e.to_string()))?;
+        .map_err(|e| HttpError::Transport(e.to_string()))
+}
+
+pub async fn send(req: Request) -> Result<Response, HttpError> {
+    let resp = begin(req).await?;
     let status = resp.status().as_u16();
     let mut headers = BTreeMap::new();
     for (k, v) in resp.headers() {

@@ -251,3 +251,57 @@ async fn provider_owned_loop_skips_executor_dispatch() {
     assert_eq!(*provider.calls.lock().unwrap(), 1);
     assert!(registry_calls.lock().unwrap().is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_run_emits_deltas_and_returns_complete_outcome() {
+    // Two-turn script: a tool call, then the final text. The streaming run
+    // must surface deltas from BOTH turns and still return the complete
+    // outcome — streaming augments the aggregate contract, never replaces it.
+    let mock = MockProvider::new().with_script(vec![
+        MockProvider::tool_call("call_1", "notes.lookup", serde_json::json!({ "q": "42" })),
+        MockProvider::text_only("notes say: the answer is 42"),
+    ]);
+    let (exec, calls) = build_executor(Arc::new(mock));
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let outcome = exec
+        .run_runner_streaming(
+            Caller::interface("ws").with_runner("researcher"),
+            "researcher",
+            "what is the answer?".into(),
+            tx,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.text, "notes say: the answer is 42");
+    assert_eq!(calls.lock().unwrap().len(), 1);
+
+    let mut deltas = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        deltas.push(ev);
+    }
+    // Turn 1: a ToolCall event (empty text → no text deltas). Turn 2: the
+    // final text as deltas. TurnEnd after each provider turn.
+    assert!(
+        deltas.iter().any(
+            |e| matches!(e, agentd_ai::StreamEvent::ToolCall { name } if name == "notes.lookup")
+        ),
+        "missing tool-call event: {deltas:?}"
+    );
+    let streamed_text: String = deltas
+        .iter()
+        .filter_map(|e| match e {
+            agentd_ai::StreamEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streamed_text, "notes say: the answer is 42");
+    assert_eq!(
+        deltas
+            .iter()
+            .filter(|e| matches!(e, agentd_ai::StreamEvent::TurnEnd))
+            .count(),
+        2
+    );
+}

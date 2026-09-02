@@ -368,11 +368,82 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 continue;
             }
         };
-        let resp = dispatch(state.clone(), req, &session).await;
+        // A streaming runner run pushes `runner.delta` event frames onto the
+        // socket while the run is in flight, then the ordinary final response;
+        // it needs the socket, so it cannot go through `dispatch`.
+        let resp = match streaming_run_params(&req) {
+            Some(p) => handle_streaming_run(&state, req.id, p, &session, &mut socket).await,
+            None => dispatch(state.clone(), req, &session).await,
+        };
         if send(&mut socket, &resp).await.is_err() {
             break;
         }
     }
+}
+
+/// Returns the parsed params when `req` is a `runners.run` with
+/// `stream: true`; `None` sends the request down the ordinary dispatch path.
+fn streaming_run_params(req: &WsRequest) -> Option<RunParams> {
+    if req.method != "runners.run" {
+        return None;
+    }
+    let p: RunParams = serde_json::from_value(req.params.clone()).ok()?;
+    p.stream.then_some(p)
+}
+
+/// Run a runner while relaying its stream events as `runner.delta` frames:
+///
+/// ```json
+/// { "event": "runner.delta", "id": <request id>, "delta": { "type": "text_delta", "text": "…" } }
+/// ```
+///
+/// The final frame is the same complete response envelope a non-streaming
+/// `runners.run` returns, so callers always end on the full result even if
+/// they ignored (or missed) every delta.
+async fn handle_streaming_run(
+    state: &AppState,
+    id: u64,
+    p: RunParams,
+    conn_session: &str,
+    socket: &mut WebSocket,
+) -> WsResponse {
+    let executor = state.executor.load();
+    let caller = ws_caller(conn_session, p.session, p.user).with_runner(p.name.clone());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<agentd_ai::StreamEvent>();
+    let run = executor.run_runner_streaming(caller, &p.name, p.prompt, tx);
+    tokio::pin!(run);
+    loop {
+        tokio::select! {
+            ev = rx.recv() => {
+                if let Some(ev) = ev
+                    && send_delta(socket, id, &ev).await.is_err()
+                {
+                    // The socket is gone; let the run finish so side effects
+                    // and the trace complete, then the outer loop closes.
+                    break run.await.map_or_else(|e| runner_error(id, e), |out| ok_ser(id, &out));
+                }
+            }
+            res = &mut run => {
+                // Drain any events the provider pushed before finishing so
+                // deltas never arrive after the final response frame.
+                while let Ok(ev) = rx.try_recv() {
+                    if send_delta(socket, id, &ev).await.is_err() {
+                        break;
+                    }
+                }
+                break res.map_or_else(|e| runner_error(id, e), |out| ok_ser(id, &out));
+            }
+        }
+    }
+}
+
+async fn send_delta(
+    socket: &mut WebSocket,
+    id: u64,
+    ev: &agentd_ai::StreamEvent,
+) -> Result<(), axum::Error> {
+    let frame = json!({ "event": "runner.delta", "id": id, "delta": ev });
+    socket.send(Message::Text(frame.to_string().into())).await
 }
 
 /// Control-plane socket. Any authenticated control connection IS an approver:
@@ -602,6 +673,10 @@ struct RunParams {
     /// End-user id as seen by the bridging interface.
     #[serde(default)]
     user: Option<String>,
+    /// Push `runner.delta` event frames while the run is in flight. The
+    /// final complete response envelope is sent either way.
+    #[serde(default)]
+    stream: bool,
 }
 
 fn ok(id: u64, result: Value) -> WsResponse {
