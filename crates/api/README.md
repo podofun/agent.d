@@ -5,8 +5,11 @@
 Routes:
 
 - `GET /health` returns `ok` without authentication.
+- `GET /ready` reports admission readiness and returns 503 during shutdown draining.
 - `/ws` is the data plane for tools, actions, runners, skills, and services.
 - `/control` is the operator plane for approval requests and decisions.
 - `POST /webhooks/<name>` verifies a configured HMAC-SHA256 signature and dispatches the route's action through the permission engine.
 
 The data and control planes can use different bearer tokens. WebSocket requests use `{ "id", "method", "params" }`. Responses include the same `id`, an `ok` flag, and either a result or an error.
+
+Runner requests accept explicit message history and bounded per-call deadlines. Requests are multiplexed by ID, streaming queues are bounded, and `runners.cancel` cancels a runner on the same connection. A final success envelope is required before treating streamed text as a completed answer. IDs and webhook delivery IDs are not durable idempotency keys.
