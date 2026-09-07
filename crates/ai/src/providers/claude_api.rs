@@ -128,10 +128,15 @@ impl Provider for ClaudeApiProvider {
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
         if !(200..300).contains(&resp.status) {
-            return Err(ProviderError::Upstream(format!(
-                "anthropic {}: {}",
-                resp.status, resp.body
-            )));
+            return Err(ProviderError::Http {
+                status: resp.status,
+                message: resp.body,
+                retry_after_ms: resp
+                    .headers
+                    .get("retry-after")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .and_then(|v| v.checked_mul(1000)),
+            });
         }
 
         let parsed: MessagesResponse = serde_json::from_str(&resp.body).map_err(|e| {
@@ -178,10 +183,15 @@ impl Provider for ClaudeApiProvider {
         .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
         if !(200..300).contains(&resp.status) {
-            return Err(ProviderError::Upstream(format!(
-                "anthropic {}: {}",
-                resp.status, resp.body
-            )));
+            return Err(ProviderError::Http {
+                status: resp.status,
+                message: resp.body,
+                retry_after_ms: resp
+                    .headers
+                    .get("retry-after")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .and_then(|v| v.checked_mul(1000)),
+            });
         }
         acc.finish(req.model)
     }
@@ -196,6 +206,9 @@ struct StreamAccumulator {
     /// Content blocks by stream index, in arrival order semantics.
     blocks: std::collections::BTreeMap<u64, StreamBlock>,
     error: Option<String>,
+    done: bool,
+    usage: Option<crate::types::Usage>,
+    usage_complete: bool,
 }
 
 enum StreamBlock {
@@ -210,10 +223,12 @@ enum StreamBlock {
 impl StreamAccumulator {
     fn feed(&mut self, data: &str, sink: &StreamSink) {
         let Ok(ev) = serde_json::from_str::<serde_json::Value>(data) else {
+            self.error = Some("malformed event JSON".into());
             return;
         };
         match ev["type"].as_str().unwrap_or("") {
             "message_start" => {
+                self.usage = serde_json::from_value(ev["message"]["usage"].clone()).ok();
                 if let Some(m) = ev["message"]["model"].as_str() {
                     self.model = Some(m.to_string());
                 }
@@ -264,11 +279,18 @@ impl StreamAccumulator {
                 }
             }
             "message_delta" => {
+                if let (Some(usage), Some(output)) =
+                    (&mut self.usage, ev["usage"]["output_tokens"].as_u64())
+                {
+                    usage.output_tokens = output;
+                    self.usage_complete = true;
+                }
                 if let Some(s) = ev["delta"]["stop_reason"].as_str() {
                     self.stop_reason = Some(s.to_string());
                 }
             }
             "message_stop" => {
+                self.done = true;
                 let _ = sink.send(StreamEvent::TurnEnd);
             }
             "error" => {
@@ -281,6 +303,11 @@ impl StreamAccumulator {
     fn finish(self, requested_model: Option<String>) -> Result<CompletionResponse, ProviderError> {
         if let Some(e) = self.error {
             return Err(ProviderError::Upstream(format!("anthropic stream: {e}")));
+        }
+        if !self.done || self.stop_reason.is_none() {
+            return Err(ProviderError::Upstream(
+                "anthropic stream ended before completion".into(),
+            ));
         }
         let mut text = String::new();
         let mut tool_calls = Vec::new();
@@ -306,6 +333,11 @@ impl StreamAccumulator {
                             ))
                         })?
                     };
+                    if id.is_empty() || name.is_empty() || !arguments.is_object() {
+                        return Err(ProviderError::Upstream(
+                            "anthropic stream: invalid tool call".into(),
+                        ));
+                    }
                     tool_calls.push(ToolCall {
                         id,
                         name,
@@ -315,6 +347,7 @@ impl StreamAccumulator {
             }
         }
         Ok(CompletionResponse {
+            usage: self.usage_complete.then_some(self.usage).flatten(),
             text,
             model: self.model.or(requested_model),
             stop_reason: self.stop_reason,
@@ -422,6 +455,8 @@ fn build_request_body(req: &CompletionRequest, default_model: &str) -> serde_jso
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MessagesResponse {
     #[serde(default)]
+    usage: Option<crate::types::Usage>,
+    #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     stop_reason: Option<String>,
@@ -470,6 +505,7 @@ fn translate_response(
         }
     }
     CompletionResponse {
+        usage: parsed.usage,
         text,
         model: parsed.model.or(requested_model),
         stop_reason: parsed.stop_reason,
@@ -584,7 +620,7 @@ mod tests {
     #[test]
     fn stream_accumulator_rebuilds_full_response_and_emits_deltas() {
         use crate::types::StreamEvent;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::types::stream_channel();
         let mut acc = StreamAccumulator::default();
         for ev in [
             r#"{"type":"message_start","message":{"model":"claude-x"}}"#,
@@ -621,8 +657,52 @@ mod tests {
     }
 
     #[test]
+    fn rejects_incomplete_and_malformed_streams() {
+        for events in [
+            vec![],
+            vec![r#"{"type":"message_start","message":{"model":"m"}}"#],
+            vec![r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#],
+            vec![r#"{"type":"message_stop"}"#],
+            vec![
+                "{broken",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        ] {
+            let (tx, _) = crate::types::stream_channel();
+            let mut acc = StreamAccumulator::default();
+            for event in events {
+                acc.feed(event, &tx);
+            }
+            assert!(acc.finish(None).is_err());
+        }
+    }
+
+    #[test]
+    fn streaming_usage_uses_final_output_count() {
+        let (tx, _) = crate::types::stream_channel();
+        let mut acc = StreamAccumulator::default();
+        for event in [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":8,"output_tokens":1,"cache_read_input_tokens":4}}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#,
+            r#"{"type":"message_stop"}"#,
+        ] {
+            acc.feed(event, &tx);
+        }
+        let usage = acc.finish(None).unwrap().usage.unwrap();
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_input_tokens
+            ),
+            (8, 9, 4)
+        );
+    }
+
+    #[test]
     fn stream_accumulator_surfaces_error_events() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = crate::types::stream_channel();
         let mut acc = StreamAccumulator::default();
         acc.feed(r#"{"type":"error","error":{"message":"overloaded"}}"#, &tx);
         let err = acc.finish(None).unwrap_err();

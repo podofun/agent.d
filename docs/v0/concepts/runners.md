@@ -27,7 +27,7 @@ agentd.runner({
 When a caller invokes `runners.run` (or `ctx.run`), the runtime:
 
 1. Composes the system prompt from the runner's `system` text and its resolved skills.
-2. Sends the prompt to the model via the named provider.
+2. Checks the runner’s `ai:<provider>` grant and policy, then sends the prompt and history to the named provider.
 3. If the model returns a tool call, the runtime checks the permission engine and, if approved, dispatches the action.
 4. The result is fed back to the model and the loop continues.
 5. The loop ends when the model returns a final text response or `max_turns` is reached.
@@ -51,6 +51,7 @@ A runner with no `actions` list has no constraint at layer 3 — the other four 
 
 ```toml
 [runner.backend_reviewer]
+granted = ["ai:anthropic"]
 allowed_actions = ["git.diff", "git.status"]
 ```
 

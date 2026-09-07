@@ -67,9 +67,26 @@ pub struct CodexAppServerProvider {
 }
 
 struct ActiveClient {
+    tainted: Arc<std::sync::atomic::AtomicBool>,
     client: Client,
     /// Mutex around the inbox receiver so turns serialize cleanly.
     inbox: Arc<Mutex<mpsc::UnboundedReceiver<Inbound>>>,
+}
+
+struct TurnGuard<'a> {
+    active: &'a ActiveClient,
+    completed: bool,
+}
+
+impl Drop for TurnGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.active
+                .tainted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.active.client.abort();
+        }
+    }
 }
 
 impl CodexAppServerProvider {
@@ -115,6 +132,15 @@ impl Provider for CodexAppServerProvider {
         let active = self.ensure_active().await?;
         // Serialize turns: lock the inbox for the lifetime of this call.
         let mut inbox = active.inbox.lock().await;
+        if active.tainted.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ProviderError::Transport(
+                "previous app-server turn was abandoned; retry with a fresh client".into(),
+            ));
+        }
+        let mut guard = TurnGuard {
+            active: &active,
+            completed: false,
+        };
 
         let model = req.model.clone();
 
@@ -291,7 +317,9 @@ impl Provider for CodexAppServerProvider {
         if final_text.is_empty() {
             return Err(ProviderError::EmptyResponse);
         }
+        guard.completed = true;
         Ok(CompletionResponse {
+            usage: None,
             text: final_text,
             model: req.model,
             stop_reason: Some("end_turn".into()),
@@ -304,8 +332,11 @@ impl CodexAppServerProvider {
     /// Lazy-spawn the app-server on first use.
     async fn ensure_active(&self) -> Result<ActiveClient, ProviderError> {
         let mut slot = self.state.lock().await;
-        if let Some(a) = slot.as_ref() {
+        if let Some(a) = slot.as_ref()
+            && !a.tainted.load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Ok(ActiveClient {
+                tainted: a.tainted.clone(),
                 client: a.client.clone(),
                 inbox: a.inbox.clone(),
             });
@@ -338,11 +369,17 @@ impl CodexAppServerProvider {
             .await
             .map_err(map_err)?;
         let inbox = Arc::new(Mutex::new(inbox));
+        let tainted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let active = ActiveClient {
+            tainted: tainted.clone(),
             client: client.clone(),
             inbox: inbox.clone(),
         };
-        *slot = Some(ActiveClient { client, inbox });
+        *slot = Some(ActiveClient {
+            client,
+            inbox,
+            tainted,
+        });
         Ok(active)
     }
 }
