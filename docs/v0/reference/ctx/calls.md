@@ -19,6 +19,8 @@ ctx.run(name: string, opts: {
   model?:    string,
   messages?: { role: string, content: string }[],
   history?:  { role: string, content: string }[],
+  max_tokens?: integer,
+  timeout_ms?: integer,
 }) -> RunResult
 
 -- Run a runner and decode/validate JSON from its reply
@@ -55,13 +57,13 @@ Invokes the action named `name` with the given `args` table. The callee's `requi
 
 ### `ctx.run(name, prompt_or_opts)`
 
-Runs the named runner with a prompt and drives its full tool-use loop until `stop_reason` is reached or `runtime.max_turns` is hit (default 16). Returns a `RunResult`.
+Runs the named runner with a prompt and drives its full tool-use loop until `stop_reason` is reached or `runtime.max_turns` is hit (default 16). Returns a `RunResult`. The target runner needs an `ai:<provider>` grant. The same [history validation, deadlines, concurrency limits, and optional usage result](/v0/reference/protocol#runners-run) apply to Lua and WebSocket calls.
 
 | Field | Type | Description |
 |---|---|---|
 | `name` | `string` | Runner name registered with `agentd.runner`. |
 | `prompt` | `string` | The user prompt. |
-| `system` | `string` | Override the runner's system prompt. |
+| `system` | `string` | Append additional system instructions. |
 | `model` | `string` | Override the runner's model for this call. |
 | `messages` | `table[]` | Full message history for the request. |
 | `history` | `table[]` | Prior conversation turns to prepend. |
@@ -130,6 +132,7 @@ schemas; see
 |---|---|---|
 | `text` | `string` | The runner's final text response. |
 | `provider` | `string` | Provider prefix used for the call. |
+| `usage` | `table \| nil` | Cumulative provider-reported tokens when every turn reports usage; see [runner results](/v0/reference/protocol#runners-run). |
 | `model` | `string` | Exact model string used. |
 | `stop_reason` | `string \| nil` | Why the runner stopped (e.g. `"end_turn"`, `"max_turns"`). |
 

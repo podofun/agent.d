@@ -105,10 +105,12 @@ granted = [
 Gates model calls. The specifier is the **provider prefix** (the part before
 the `/` in a `"<provider>/<model_id>"` string).
 
-This covers both direct calls through `ctx.ai` **and** running a runner: a
-caller that invokes `ctx.run` (or `runners.run`) needs the `ai:` grant for that
-runner's model provider. In the Discord example below, the service holds
-`ai:openai` because it runs a runner whose model is `openai/gpt-5.5`.
+For direct `ctx.ai` calls, the executing tool or service holds the `ai:` grant. For `ctx.run` and `runners.run`, the target runner must hold `ai:<resolved-provider>` in `[runner.<name>].granted`. This check also applies to nested calls, streaming, and per-call model overrides. A tool or service delegates model execution by calling a configured runner; its own AI grant is not transferred to that runner. Global `deny_permissions` overrides the runner grant.
+
+```toml
+[runner.discord_chat]
+granted = ["ai:openai"]
+```
 
 The specifier must match the prefix exactly — `ai:anthropic` does **not** grant
 `anthropic-cli/…`. Each backend is its own slug:

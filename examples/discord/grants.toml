@@ -22,4 +22,5 @@ granted = [
 allowed_actions = ["discord.send"]
 
 [runner.discord_chat]
+granted = ["ai:openai"]
 allowed_actions = []

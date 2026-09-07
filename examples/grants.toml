@@ -22,8 +22,9 @@ granted = ["shell.exec:git"]
 
 # Per-runner action allowlist. Empty = no constraint at this layer.
 #
-# [runner.backend_reviewer]
-# allowed_actions = ["git.diff", "git.status", "github.comment_pr"]
+[runner.backend_reviewer]
+granted = ["ai:anthropic"]
+allowed_actions = ["git.diff", "git.status"]
 
 # Per-interface action allowlist. Empty = no constraint.
 #

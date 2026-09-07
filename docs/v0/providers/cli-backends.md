@@ -56,6 +56,7 @@ Add each permitted action to the runner entry in `grants.toml`:
 
 ```toml
 [runner.local_reviewer]
+granted = ["ai:anthropic-cli"]
 allowed_actions = ["git.diff"]
 ```
 

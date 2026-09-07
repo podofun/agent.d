@@ -36,6 +36,7 @@ granted = ["shell.exec:git"]
 
 # Layer 3: restrict the reviewer runner to only these two actions
 [runner.backend_reviewer]
+granted = ["ai:anthropic"]
 allowed_actions = ["git.diff", "git.status"]
 
 # Layer 4: restrict a hypothetical Telegram interface
