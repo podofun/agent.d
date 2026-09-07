@@ -97,6 +97,16 @@ impl Drop for ClientInner {
 }
 
 impl Client {
+    /// Immediately stop an abandoned app-server request. The provider discards
+    /// this client before its next turn.
+    pub fn abort(&self) {
+        if let Ok(mut child) = self.inner.child.try_lock()
+            && let Some(child) = child.as_mut()
+        {
+            let _ = child.start_kill();
+        }
+    }
+
     /// Spawn `codex app-server` and return a handle plus the inbox
     /// channel for notifications + server requests.
     pub async fn spawn(bin: impl Into<String>) -> Result<(Self, mpsc::UnboundedReceiver<Inbound>)> {

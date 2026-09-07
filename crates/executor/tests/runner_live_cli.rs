@@ -115,7 +115,10 @@ async fn live_full_loop_lua_action_through_cli_and_mcp() {
             granted: PermissionSet::from_iter([format!("fs.write:{}", marker_str)]),
         },
     );
-    let mut runner_grants = RunnerGrants::default();
+    let mut runner_grants = RunnerGrants {
+        granted: PermissionSet::from_iter(["ai:anthropic-cli"]),
+        ..Default::default()
+    };
     runner_grants.allowed_actions.insert("notes.lookup".into());
     file.runner.insert("researcher".into(), runner_grants);
     let engine = Arc::new(Engine::new(Grants::from_file(file)));

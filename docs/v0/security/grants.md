@@ -116,6 +116,7 @@ granted = ["shell.exec:git"]
 
 # runner action allowlist (empty = no constraint)
 [runner.backend_reviewer]
+granted = ["ai:anthropic"]
 allowed_actions = ["git.diff", "git.status"]
 
 # interface action allowlist

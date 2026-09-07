@@ -26,7 +26,7 @@ use agentd_permissions::{
     ActionMeta as PermActionMeta, Caller, Decision, Engine, PermissionSet,
     ToolMeta as PermToolMeta, engine::DenyLayer,
 };
-use agentd_runners::{RunnerError, RunnerOutcome, RunnerRegistry};
+use agentd_runners::{RunOptions, RunnerError, RunnerOutcome, RunnerRegistry};
 use agentd_services::{ServiceRegistry, ServiceState};
 use agentd_skills::SkillRegistry;
 use agentd_trace::{TraceEvent, TraceSink};
@@ -338,6 +338,7 @@ pub struct Executor {
     skills: SkillRegistry,
     providers: Arc<ProviderRegistry>,
     max_runner_turns: u32,
+    runner_slots: tokio::sync::Semaphore,
     /// Optional approval broker. `None` ⇒ escalatable denials reject
     /// immediately (the pre-approvals behavior).
     broker: Option<Arc<dyn agentd_types::ApprovalBroker>>,
@@ -373,6 +374,7 @@ impl Executor {
             skills,
             providers,
             max_runner_turns: Self::DEFAULT_MAX_RUNNER_TURNS,
+            runner_slots: tokio::sync::Semaphore::new(32),
             broker: None,
             grants_path: None,
             reload_grants: None,
@@ -1205,89 +1207,15 @@ impl RunnerDispatcher for ExecutorHandle {
         name: &str,
         opts: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let prompt = opts
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let messages = opts
-            .get("messages")
-            .or_else(|| opts.get("history"))
-            .cloned();
-        let system_override = opts
-            .get("system")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let model_override = opts
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let options: RunOptions =
+            serde_json::from_value(opts).map_err(|e| format!("invalid runner options: {e}"))?;
 
-        // Time the runner run and emit a correlated trace event. Runner runs
-        // were previously invisible in the trace — an action that fanned out
-        // to N agents showed one event, hiding per-agent latency entirely.
-        // The `execution` id (carried verbatim on the caller) ties this run
-        // back to its parent action.
-        let execution = caller.execution_str();
-        let trace_action = format!("runner:{name}");
-        let trace_args = serde_json::json!({ "runner": name });
-        let started = Instant::now();
-        let result = self
+        let out = self
             .0
-            .run_runner_extended(
-                caller,
-                name,
-                prompt,
-                messages,
-                system_override,
-                model_override,
-                None,
-            )
-            .await;
-        let dur = started.elapsed().as_millis();
-        match result {
-            Ok(out) => {
-                self.0
-                    .trace
-                    .record(
-                        TraceEvent::ok(
-                            &trace_action,
-                            trace_args,
-                            dur,
-                            serde_json::json!({
-                                "model": out.model,
-                                "provider": out.provider,
-                                "stop_reason": out.stop_reason,
-                                "chars": out.text.chars().count(),
-                            }),
-                        )
-                        .with_execution(execution)
-                        .with_kind("runner"),
-                    )
-                    .await;
-                Ok(serde_json::json!({
-                    "text": out.text,
-                    "provider": out.provider,
-                    "model": out.model,
-                    "stop_reason": out.stop_reason,
-                }))
-            }
-            Err(e) => {
-                self.0
-                    .trace
-                    .record(
-                        TraceEvent::err(
-                            &trace_action,
-                            serde_json::json!({ "runner": name }),
-                            dur,
-                            e.to_string(),
-                        )
-                        .with_execution(execution)
-                        .with_kind("runner"),
-                    )
-                    .await;
-                Err(e.to_string())
-            }
-        }
+            .run_runner_with_options(caller, name, options, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(out).map_err(|e| e.to_string())
     }
 
     fn runner_names(&self) -> Vec<String> {
@@ -1300,8 +1228,7 @@ impl Executor {
     /// `agentd.runners.run` accepts. Equivalent to `run_runner` for the
     /// simple-prompt case; extends it with explicit `messages` and per-call
     /// `system` / `model` overrides.
-    // The extended surface is a set of orthogonal optional inputs; bundling
-    // them into an options struct would just move the noise to every caller.
+    // Retained for Rust callers of the earlier argument-based API.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_runner_extended(
         self: &Arc<Self>,
@@ -1313,6 +1240,80 @@ impl Executor {
         model_override: Option<String>,
         sink: Option<agentd_ai::StreamSink>,
     ) -> Result<RunnerOutcome, RunnerError> {
+        let options = RunOptions {
+            prompt,
+            messages: messages.map(parse_messages).transpose()?,
+            system: system_override,
+            model: model_override,
+            ..Default::default()
+        };
+        self.run_runner_with_options(caller, runner_name, options, sink)
+            .await
+    }
+
+    /// Validate and bound every runner entry point, including nested Lua calls.
+    pub async fn run_runner_with_options(
+        self: &Arc<Self>,
+        caller: Caller,
+        runner_name: &str,
+        options: RunOptions,
+        sink: Option<agentd_ai::StreamSink>,
+    ) -> Result<RunnerOutcome, RunnerError> {
+        options.validate()?;
+        let _slot = self
+            .runner_slots
+            .try_acquire()
+            .map_err(|_| RunnerError::Busy)?;
+        let deadline = std::time::Duration::from_millis(
+            options.timeout_ms.unwrap_or(RunOptions::DEFAULT_TIMEOUT_MS),
+        );
+        let started = Instant::now();
+        let execution = caller.execution_str();
+        let mut result = tokio::time::timeout(
+            deadline,
+            self.run_runner_inner(caller, runner_name, options, sink.clone()),
+        )
+        .await
+        .unwrap_or(Err(RunnerError::Timeout));
+        if sink.as_ref().is_some_and(|s| s.overflowed()) {
+            result = Err(RunnerError::SlowConsumer);
+        }
+        let action = format!("runner:{runner_name}");
+        let args = serde_json::json!({ "runner": runner_name });
+        let duration = started.elapsed().as_millis();
+        let event = match &result {
+            Ok(out) => TraceEvent::ok(
+                &action,
+                args,
+                duration,
+                serde_json::json!({
+                    "model": out.model, "provider": out.provider, "stop_reason": out.stop_reason,
+                    "usage": out.usage, "chars": out.text.chars().count(),
+                }),
+            ),
+            Err(error) => TraceEvent::err(&action, args, duration, error.to_string()),
+        };
+        self.trace
+            .record(event.with_execution(execution).with_kind("runner"))
+            .await;
+        result
+    }
+
+    async fn run_runner_inner(
+        self: &Arc<Self>,
+        caller: Caller,
+        runner_name: &str,
+        options: RunOptions,
+        sink: Option<agentd_ai::StreamSink>,
+    ) -> Result<RunnerOutcome, RunnerError> {
+        let RunOptions {
+            prompt,
+            messages,
+            system: system_override,
+            model: model_override,
+            max_tokens,
+            ..
+        } = options;
         let def = self
             .runners
             .get(runner_name)
@@ -1346,6 +1347,13 @@ impl Executor {
             c.runner = Some(runner_name.into());
             c
         };
+        if let Decision::Deny { reason, .. } = self
+            .engine
+            .load()
+            .check_runner_provider(runner_name, &provider_name)
+        {
+            return Err(RunnerError::Denied(reason));
+        }
         let tools = self.build_tool_catalog(&composition.allowed_actions);
 
         let mut composed_system = composition.system.clone();
@@ -1369,7 +1377,7 @@ impl Executor {
             req.model = Some(model_id);
         }
         if let Some(msgs) = messages {
-            req.messages = parse_messages(msgs)?;
+            req.messages = msgs;
         }
         if let Some(p) = prompt
             && !p.is_empty()
@@ -1385,6 +1393,7 @@ impl Executor {
             });
         }
         req.tools = tools;
+        req.max_tokens = max_tokens;
 
         let req_model_echo = req.model.clone();
         match provider.loop_mode() {
@@ -1425,14 +1434,16 @@ impl Executor {
                 })?;
                 drop(loopback);
                 Ok(RunnerOutcome {
+                    usage: resp.usage,
                     text: resp.text,
                     provider: provider_name,
-                    model: req_model_echo,
+                    model: resp.model.or(req_model_echo),
                     stop_reason: resp.stop_reason,
                 })
             }
             agentd_ai::LoopMode::ExecutorOwned => {
                 let mut turns = 0u32;
+                let mut usage = Some(agentd_ai::types::Usage::default());
                 loop {
                     if turns >= self.max_runner_turns {
                         return Err(RunnerError::Provider {
@@ -1452,11 +1463,19 @@ impl Executor {
                         provider: provider_name.clone(),
                         source: e,
                     })?;
+                    if sink.as_ref().is_some_and(|s| s.overflowed()) {
+                        return Err(RunnerError::SlowConsumer);
+                    }
+                    match (&mut usage, &resp.usage) {
+                        (Some(total), Some(turn)) => total.add(turn),
+                        _ => usage = None,
+                    }
                     if resp.tool_calls.is_empty() {
                         return Ok(RunnerOutcome {
+                            usage,
                             text: resp.text,
                             provider: provider_name,
-                            model: req_model_echo,
+                            model: resp.model.or(req_model_echo),
                             stop_reason: resp.stop_reason,
                         });
                     }
@@ -1487,48 +1506,6 @@ impl Executor {
 }
 
 fn parse_messages(v: serde_json::Value) -> Result<Vec<agentd_ai::Message>, RunnerError> {
-    let arr = match v {
-        serde_json::Value::Array(a) => a,
-        _ => {
-            return Err(RunnerError::Provider {
-                provider: String::new(),
-                source: agentd_ai::ProviderError::Config(
-                    "the `messages` argument to `runners.run` must be an array of message tables"
-                        .into(),
-                ),
-            });
-        }
-    };
-    let mut out = Vec::with_capacity(arr.len());
-    for (idx, item) in arr.into_iter().enumerate() {
-        let obj = item.as_object().ok_or_else(|| RunnerError::Provider {
-            provider: String::new(),
-            source: agentd_ai::ProviderError::Config(format!(
-                "message {idx} in the `messages` list must be a table with `role` and `content` fields"
-            )),
-        })?;
-        let role_s = obj
-            .get("role")
-            .and_then(|v| v.as_str())
-            .unwrap_or("user")
-            .to_string();
-        let content = obj
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let role = match role_s.as_str() {
-            "system" => agentd_ai::Role::System,
-            "assistant" => agentd_ai::Role::Assistant,
-            "tool" => agentd_ai::Role::Tool,
-            _ => agentd_ai::Role::User,
-        };
-        out.push(agentd_ai::Message {
-            role,
-            content,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        });
-    }
-    Ok(out)
+    serde_json::from_value(v)
+        .map_err(|e| RunnerError::InvalidInput(format!("invalid message history: {e}")))
 }

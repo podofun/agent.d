@@ -224,6 +224,7 @@ granted = [
 allowed_actions = ["discord.send"]
 
 [runner.discord_chat]
+granted = ["ai:openai"]
 allowed_actions = []
 ```
 
@@ -232,7 +233,7 @@ Each section explains itself:
 - `[tool.discord]` — grants the tool's declared `requires` so actions under it can run.
 - `[service.discord_gateway]` — the gateway service gets `net:` grants for both the gateway WebSocket host and the REST API host, plus `secret:discord_token` to read the token.
 - `[service.discord_handler]` — gets `ai:openai` to call the runner, `net:discord.com` to send messages, and `memory.read/write:discord/**` for durable history. `allowed_actions = ["discord.send"]` is the layer-3 action allowlist for this service.
-- `[runner.discord_chat]` — empty `allowed_actions` means no constraint at that layer (the runner has no tools of its own).
+- `[runner.discord_chat]` grants model access through `ai:openai`; its empty `allowed_actions` adds no action constraint (the runner has no tools of its own).
 
 ## Key patterns explained
 

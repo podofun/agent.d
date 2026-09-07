@@ -32,7 +32,7 @@ agent.d sets the Codex sandbox to `read-only`, the approval policy to `untrusted
 
 agent.d disables the built-in Codex tools, so Codex can use only the runner actions through a private local connection to agent.d.
 
-agent.d returns a timeout error if the Codex turn does not complete in 180 seconds.
+The Codex provider has a 180-second turn timeout. Runner calls also have a whole-run deadline, which defaults to 120 seconds; see [runner request limits](/v0/reference/protocol#runners-run).
 
 ## Use the provider with a runner
 
@@ -50,6 +50,7 @@ Add each permitted action to the runner entry in `grants.toml`:
 
 ```toml
 [runner.codex_reviewer]
+granted = ["ai:codex"]
 allowed_actions = ["git.diff", "git.status"]
 ```
 

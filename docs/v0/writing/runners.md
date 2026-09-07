@@ -90,6 +90,7 @@ advisory.
 ```toml
 # grants.toml — actual enforcement
 [runner.backend_reviewer]
+granted = ["ai:anthropic"]
 allowed_actions = ["git.diff", "git.status"]
 ```
 

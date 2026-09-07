@@ -218,8 +218,34 @@ impl CompletionRequest {
     }
 }
 
+/// Provider-reported tokens. Cache tokens are separate from uncached input.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+}
+
+impl Usage {
+    pub fn add(&mut self, other: &Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .saturating_add(other.cache_read_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(other.cache_creation_input_tokens);
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompletionResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
     pub text: String,
     #[serde(default)]
     pub model: Option<String>,
@@ -251,13 +277,51 @@ pub enum StreamEvent {
     TurnEnd,
 }
 
-/// Sender half providers push [`StreamEvent`]s into. Unbounded on purpose:
-/// producers are network-paced and events are small; a slow consumer must
-/// never stall the completion that the caller still expects in full.
-pub type StreamSink = tokio::sync::mpsc::UnboundedSender<StreamEvent>;
+/// Bounded event delivery. Overflow is recorded so the executor can fail the
+/// run instead of reporting success with missing deltas.
+#[derive(Clone)]
+pub struct StreamSink {
+    sender: tokio::sync::mpsc::Sender<StreamEvent>,
+    overflowed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StreamSink {
+    pub fn send(
+        &self,
+        event: StreamEvent,
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<StreamEvent>> {
+        let result = self.sender.try_send(event);
+        if matches!(result, Err(tokio::sync::mpsc::error::TrySendError::Full(_))) {
+            self.overflowed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+
+    pub fn overflowed(&self) -> bool {
+        self.overflowed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+pub fn stream_channel() -> (StreamSink, tokio::sync::mpsc::Receiver<StreamEvent>) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(256);
+    (
+        StreamSink {
+            sender,
+            overflowed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+        receiver,
+    )
+}
 
 #[derive(Debug, Error)]
 pub enum ProviderError {
+    #[error("HTTP {status}: {message}")]
+    Http {
+        status: u16,
+        message: String,
+        retry_after_ms: Option<u64>,
+    },
     // Messages must be self-explanatory: they render under a
     // `provider `<name>`: ` wrap, so no generic prefixes here (the final
     // render stays at two colons or fewer).
