@@ -130,6 +130,7 @@ impl ClaudeCliProvider {
         req: CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
         let mut cmd = agentd_process::command(&self.bin);
+        cmd.kill_on_drop(true);
         cmd.arg("-p");
         if let Some(model) = &req.model {
             cmd.arg("--model").arg(model);
@@ -179,6 +180,7 @@ impl ClaudeCliProvider {
             return Err(ProviderError::EmptyResponse);
         }
         Ok(CompletionResponse {
+            usage: None,
             text,
             model: req.model,
             stop_reason: Some("end_turn".into()),
@@ -229,6 +231,7 @@ impl ClaudeCliProvider {
         let cfg_path = tmp.into_temp_path();
 
         let mut cmd = agentd_process::command(&self.bin);
+        cmd.kill_on_drop(true);
         cmd.arg("-p")
             .arg("--output-format")
             .arg("stream-json")
@@ -323,6 +326,7 @@ impl ClaudeCliProvider {
         }
         let text = extract_final_text(&stdout).ok_or(ProviderError::EmptyResponse)?;
         Ok(CompletionResponse {
+            usage: None,
             text,
             model: req.model,
             stop_reason: Some("end_turn".into()),
@@ -529,7 +533,7 @@ mod tests {
 
     #[test]
     fn relay_stream_line_maps_partial_events() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::types::stream_channel();
         for line in [
             r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp__agentd__note.save"}}}"#,

@@ -48,6 +48,7 @@ impl MockProvider {
         arguments: serde_json::Value,
     ) -> CompletionResponse {
         CompletionResponse {
+            usage: None,
             text: String::new(),
             model: None,
             stop_reason: Some("tool_use".into()),
@@ -60,6 +61,7 @@ impl MockProvider {
     }
     pub fn text_only(text: impl Into<String>) -> CompletionResponse {
         CompletionResponse {
+            usage: None,
             text: text.into(),
             model: None,
             stop_reason: Some("end_turn".into()),
@@ -92,6 +94,7 @@ impl Provider for MockProvider {
         }
         let text = self.reply.clone().unwrap_or_else(|| req.flatten());
         Ok(CompletionResponse {
+            usage: None,
             text,
             model: req.model,
             stop_reason: Some("end_turn".into()),

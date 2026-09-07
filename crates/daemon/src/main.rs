@@ -243,7 +243,9 @@ async fn run(cli: Cli) -> Result<()> {
 
     let auth_token = resolve_ws_token(&cfg)?;
     let admin_token = resolve_admin_token(&cfg)?;
+    let lifecycle = Arc::new(agentd_api::Lifecycle::default());
     let state = AppState {
+        lifecycle: lifecycle.clone(),
         executor,
         auth_token: auth_token.map(Arc::new),
         admin_token: admin_token.map(Arc::new),
@@ -253,20 +255,55 @@ async fn run(cli: Cli) -> Result<()> {
 
     println!("{}", startup.render());
     tracing::debug!(addr = %local_addr, "listening");
-    // Serve until Ctrl+C. On a graceful shutdown, revoke every filesystem ACE
-    // the sandbox stamped this session so the user's files are left untouched.
-    // (A hard kill can't run this; startup crash-recovery — see `run` entry —
-    // heals any leftover on the next launch.)
+    use std::future::IntoFuture;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = serve(listener, router(state))
+        .with_graceful_shutdown(async {
+            let _ = stop_rx.await;
+        })
+        .into_future();
+    tokio::pin!(server);
     let serve_result = tokio::select! {
-        r = serve(listener, router(state)) => r,
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutting down — reverting sandbox filesystem grants");
-            Ok(())
+        result = &mut server => result,
+        _ = shutdown_signal() => {
+            tracing::info!("shutting down; draining requests for up to 30 seconds");
+            let _ = stop_tx.send(());
+            let grace = std::time::Duration::from_secs(30);
+            match tokio::time::timeout(grace, async {
+                let (result, ()) = tokio::join!(&mut server, lifecycle.drain(grace));
+                result
+            }).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!("shutdown grace period expired; stopping remaining work");
+                    Ok(())
+                }
+            }
         }
     };
     sandbox::revoke_all_stamps();
     serve_result?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = terminate.recv() => {},
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "could not install SIGTERM handler");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Build the secret store the whole daemon reads from, per `daemon.secrets`

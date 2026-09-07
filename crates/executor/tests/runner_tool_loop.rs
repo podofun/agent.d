@@ -90,7 +90,10 @@ fn build_executor(
             granted: PermissionSet::from_iter(["notes.read"]),
         },
     );
-    let mut runner_grants = RunnerGrants::default();
+    let mut runner_grants = RunnerGrants {
+        granted: PermissionSet::from_iter(["ai:mock"]),
+        ..Default::default()
+    };
     runner_grants.allowed_actions.insert("notes.lookup".into());
     file.runner.insert("researcher".into(), runner_grants);
     let engine = Arc::new(Engine::new(Grants::from_file(file)));
@@ -170,8 +173,13 @@ async fn tool_call_denied_when_runner_lacks_allowlist() {
             granted: PermissionSet::from_iter(["notes.read"]),
         },
     );
-    file.runner
-        .insert("researcher".into(), RunnerGrants::default());
+    file.runner.insert(
+        "researcher".into(),
+        RunnerGrants {
+            granted: PermissionSet::from_iter(["ai:mock"]),
+            ..Default::default()
+        },
+    );
     let engine = Arc::new(Engine::new(Grants::from_file(file)));
     let runners = RunnerRegistry::new();
     runners.insert(RunnerDef {
@@ -263,7 +271,7 @@ async fn streaming_run_emits_deltas_and_returns_complete_outcome() {
     ]);
     let (exec, calls) = build_executor(Arc::new(mock));
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = agentd_ai::types::stream_channel();
     let outcome = exec
         .run_runner_streaming(
             Caller::interface("ws").with_runner("researcher"),
@@ -304,4 +312,107 @@ async fn streaming_run_emits_deltas_and_returns_complete_outcome() {
             .count(),
         2
     );
+}
+
+#[tokio::test]
+async fn nested_runner_dispatch_enforces_provider_grants() {
+    use agentd_types::RunnerDispatcher;
+    let (exec, _) = build_executor(Arc::new(MockProvider::new()));
+    exec.runners().insert(RunnerDef {
+        name: "ungranted".into(),
+        model: Some("mock/test".into()),
+        ..Default::default()
+    });
+    let dispatcher = agentd_executor::ExecutorHandle::new(exec);
+    let result = dispatcher
+        .run_runner_json(
+            Caller::service("worker"),
+            "ungranted",
+            serde_json::json!({"prompt":"hello"}),
+        )
+        .await;
+    assert!(result.unwrap_err().contains("ai:mock"));
+    let result = dispatcher
+        .run_runner_json(
+            Caller::service("worker"),
+            "researcher",
+            serde_json::json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":64}),
+        )
+        .await;
+    assert!(result.is_ok(), "{result:?}");
+}
+
+#[tokio::test]
+async fn usage_is_summed_across_turns_and_missing_usage_stays_unknown() {
+    for known in [true, false] {
+        let mut tool = MockProvider::tool_call("t1", "notes.lookup", serde_json::json!({}));
+        tool.usage = Some(agentd_ai::types::Usage {
+            input_tokens: 10,
+            output_tokens: 3,
+            ..Default::default()
+        });
+        let mut final_reply = MockProvider::text_only("done");
+        if known {
+            final_reply.usage = Some(agentd_ai::types::Usage {
+                input_tokens: 20,
+                output_tokens: 5,
+                ..Default::default()
+            });
+        }
+        let (exec, _) = build_executor(Arc::new(
+            MockProvider::new().with_script(vec![tool, final_reply]),
+        ));
+        let out = exec
+            .run_runner(Caller::interface("ws"), "researcher", "hello".into())
+            .await
+            .unwrap();
+        if known {
+            let usage = out.usage.unwrap();
+            assert_eq!((usage.input_tokens, usage.output_tokens), (30, 8));
+        } else {
+            assert!(out.usage.is_none());
+        }
+    }
+}
+
+struct BurstProvider;
+#[async_trait]
+impl agentd_ai::Provider for BurstProvider {
+    fn name(&self) -> &str {
+        "mock"
+    }
+    async fn complete(
+        &self,
+        _: agentd_ai::CompletionRequest,
+    ) -> Result<agentd_ai::CompletionResponse, agentd_ai::ProviderError> {
+        Ok(MockProvider::tool_call(
+            "t1",
+            "notes.lookup",
+            serde_json::json!({}),
+        ))
+    }
+    async fn complete_streaming(
+        &self,
+        req: agentd_ai::CompletionRequest,
+        sink: agentd_ai::StreamSink,
+    ) -> Result<agentd_ai::CompletionResponse, agentd_ai::ProviderError> {
+        for _ in 0..300 {
+            let _ = sink.send(agentd_ai::StreamEvent::TextDelta { text: "x".into() });
+        }
+        self.complete(req).await
+    }
+}
+
+#[tokio::test]
+async fn overflow_stops_before_dispatching_tools() {
+    let (exec, calls) = build_executor(Arc::new(BurstProvider));
+    let (sink, _receiver) = agentd_ai::types::stream_channel();
+    let result = exec
+        .run_runner_streaming(Caller::interface("ws"), "researcher", "hello".into(), sink)
+        .await;
+    assert!(matches!(
+        result,
+        Err(agentd_runners::RunnerError::SlowConsumer)
+    ));
+    assert!(calls.lock().unwrap().is_empty());
 }

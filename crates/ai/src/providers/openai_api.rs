@@ -130,10 +130,15 @@ impl Provider for OpenAiApiProvider {
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
         if !(200..300).contains(&resp.status) {
-            return Err(ProviderError::Upstream(format!(
-                "openai {}: {}",
-                resp.status, resp.body
-            )));
+            return Err(ProviderError::Http {
+                status: resp.status,
+                message: resp.body,
+                retry_after_ms: resp
+                    .headers
+                    .get("retry-after")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .and_then(|v| v.checked_mul(1000)),
+            });
         }
 
         let parsed: ChatResponse = serde_json::from_str(&resp.body).map_err(|e| {
@@ -152,6 +157,7 @@ impl Provider for OpenAiApiProvider {
 
         let mut body = build_request_body(&req, self.default_model());
         body["stream"] = serde_json::Value::Bool(true);
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
 
         let mut http_req = HttpRequest {
             method: "POST".into(),
@@ -176,10 +182,15 @@ impl Provider for OpenAiApiProvider {
         .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
         if !(200..300).contains(&resp.status) {
-            return Err(ProviderError::Upstream(format!(
-                "openai {}: {}",
-                resp.status, resp.body
-            )));
+            return Err(ProviderError::Http {
+                status: resp.status,
+                message: resp.body,
+                retry_after_ms: resp
+                    .headers
+                    .get("retry-after")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .and_then(|v| v.checked_mul(1000)),
+            });
         }
         acc.finish(req.model)
     }
@@ -191,21 +202,38 @@ impl Provider for OpenAiApiProvider {
 struct ChunkAccumulator {
     model: Option<String>,
     finish_reason: Option<String>,
+    usage: Option<crate::types::Usage>,
     text: String,
     /// Tool calls by chunk index; arguments accumulate as string fragments.
     tool_calls: std::collections::BTreeMap<u64, (String, String, String)>,
     saw_chunk: bool,
+    done: bool,
+    error: Option<String>,
 }
 
 impl ChunkAccumulator {
     fn feed(&mut self, data: &str, sink: &StreamSink) {
         if data.trim() == "[DONE]" {
+            self.done = true;
             let _ = sink.send(StreamEvent::TurnEnd);
             return;
         }
         let Ok(ev) = serde_json::from_str::<serde_json::Value>(data) else {
+            self.error = Some("malformed event JSON".into());
             return;
         };
+        if let Some(error) = ev.get("error") {
+            self.error = Some(
+                error["message"]
+                    .as_str()
+                    .unwrap_or("provider error")
+                    .to_string(),
+            );
+            return;
+        }
+        if let Some(usage) = parse_usage(&ev["usage"]) {
+            self.usage = Some(usage);
+        }
         self.saw_chunk = true;
         if let Some(m) = ev["model"].as_str() {
             self.model = Some(m.to_string());
@@ -249,8 +277,16 @@ impl ChunkAccumulator {
     }
 
     fn finish(self, requested_model: Option<String>) -> Result<CompletionResponse, ProviderError> {
+        if let Some(error) = self.error {
+            return Err(ProviderError::Upstream(format!("openai stream: {error}")));
+        }
         if !self.saw_chunk {
             return Err(ProviderError::EmptyResponse);
+        }
+        if !self.done || self.finish_reason.is_none() {
+            return Err(ProviderError::Upstream(
+                "openai stream ended before completion".into(),
+            ));
         }
         let tool_calls = self
             .tool_calls
@@ -259,22 +295,45 @@ impl ChunkAccumulator {
                 let arguments = if args.trim().is_empty() {
                     serde_json::json!({})
                 } else {
-                    serde_json::from_str(&args).unwrap_or(serde_json::Value::String(args))
+                    serde_json::from_str(&args).map_err(|e| {
+                        ProviderError::Upstream(format!(
+                            "openai stream: invalid tool arguments ({e})"
+                        ))
+                    })?
                 };
-                ToolCall {
+                if id.is_empty() || name.is_empty() || !arguments.is_object() {
+                    return Err(ProviderError::Upstream(
+                        "openai stream: invalid tool call".into(),
+                    ));
+                }
+                Ok(ToolCall {
                     id,
                     name,
                     arguments,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, ProviderError>>()?;
         Ok(CompletionResponse {
+            usage: self.usage,
             text: self.text,
             model: self.model.or(requested_model),
             stop_reason: self.finish_reason.map(normalize_stop_reason),
             tool_calls,
         })
     }
+}
+
+fn parse_usage(value: &serde_json::Value) -> Option<crate::types::Usage> {
+    let input = value["prompt_tokens"].as_u64()?;
+    let cached = value["prompt_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+    Some(crate::types::Usage {
+        input_tokens: input.saturating_sub(cached),
+        output_tokens: value["completion_tokens"].as_u64()?,
+        cache_read_input_tokens: cached,
+        cache_creation_input_tokens: 0,
+    })
 }
 
 /// Accepts a base URL (`.../v1`), with or without trailing slash, or a full
@@ -392,6 +451,8 @@ fn build_request_body(req: &CompletionRequest, default_model: &str) -> serde_jso
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChatResponse {
     #[serde(default)]
+    usage: serde_json::Value,
+    #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     choices: Vec<Choice>,
@@ -460,6 +521,7 @@ fn translate_response(
         .collect();
 
     Ok(CompletionResponse {
+        usage: parse_usage(&parsed.usage),
         text,
         model: parsed.model.or(requested_model),
         stop_reason: choice.finish_reason.map(normalize_stop_reason),
@@ -625,7 +687,7 @@ mod tests {
     #[test]
     fn chunk_accumulator_rebuilds_full_response_and_emits_deltas() {
         use crate::types::StreamEvent;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::types::stream_channel();
         let mut acc = ChunkAccumulator::default();
         for ev in [
             r#"{"model":"gpt-x","choices":[{"delta":{"content":"Hel"}}]}"#,
@@ -654,6 +716,53 @@ mod tests {
         assert!(matches!(&deltas[1], StreamEvent::TextDelta { text } if text == "lo"));
         assert!(matches!(&deltas[2], StreamEvent::ToolCall { name } if name == "notes.lookup"));
         assert!(matches!(deltas.last(), Some(StreamEvent::TurnEnd)));
+    }
+
+    #[test]
+    fn rejects_incomplete_malformed_and_error_streams() {
+        for events in [
+            vec![r#"{"choices":[{"delta":{"content":"partial"}}]}"#],
+            vec![r#"{"choices":[{"delta":{"content":"partial"}}]}"#, "[DONE]"],
+            vec![r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#],
+            vec![r#"{"error":{"message":"overloaded"}}"#, "[DONE]"],
+            vec![
+                "{broken",
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+                "[DONE]",
+            ],
+            vec![
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"write","arguments":"{"}}]},"finish_reason":"tool_calls"}]}"#,
+                "[DONE]",
+            ],
+        ] {
+            let (tx, _) = crate::types::stream_channel();
+            let mut acc = ChunkAccumulator::default();
+            for event in events {
+                acc.feed(event, &tx);
+            }
+            assert!(acc.finish(None).is_err());
+        }
+    }
+
+    #[test]
+    fn usage_chunk_after_finish_is_preserved() {
+        let (tx, _) = crate::types::stream_channel();
+        let mut acc = ChunkAccumulator::default();
+        acc.feed(
+            r#"{"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}]}"#,
+            &tx,
+        );
+        acc.feed(r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":4}}}"#, &tx);
+        acc.feed("[DONE]", &tx);
+        let usage = acc.finish(None).unwrap().usage.unwrap();
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_input_tokens
+            ),
+            (6, 3, 4)
+        );
     }
 
     #[test]
