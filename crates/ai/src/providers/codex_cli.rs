@@ -90,6 +90,7 @@ impl CodexCliProvider {
         req: CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
         let mut cmd = agentd_process::command(&self.bin);
+        cmd.kill_on_drop(true);
         cmd.arg("exec")
             .arg("--json")
             .arg("--skip-git-repo-check")
@@ -138,6 +139,7 @@ impl CodexCliProvider {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let text = extract_final_text(&stdout).ok_or(ProviderError::EmptyResponse)?;
         Ok(CompletionResponse {
+            usage: None,
             text,
             model: req.model,
             stop_reason: Some("end_turn".into()),

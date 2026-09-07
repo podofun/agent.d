@@ -55,6 +55,16 @@ pub struct RunnerDef {
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
+    #[error("{0}")]
+    Denied(String),
+    #[error("{0}")]
+    InvalidInput(String),
+    #[error("runner deadline exceeded")]
+    Timeout,
+    #[error("stream consumer could not keep up; run stopped")]
+    SlowConsumer,
+    #[error("runner capacity exhausted; retry later")]
+    Busy,
     #[error("runner `{0}` not registered")]
     NotFound(String),
     #[error("runner `{name}` references unknown skill `{skill}`")]
@@ -89,10 +99,117 @@ pub struct RunnerComposition {
     pub allowed_actions: Vec<String>,
 }
 
-/// Output of a runner run. Currently a single text reply; the field shape is
-/// set up to grow (e.g. `tool_calls`, `usage`) without a breaking rename.
+/// Per-run inputs shared by the transport and executor. History is caller-owned.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunOptions {
+    pub prompt: Option<String>,
+    #[serde(alias = "history")]
+    pub messages: Option<Vec<agentd_ai::Message>>,
+    pub system: Option<String>,
+    pub model: Option<String>,
+    pub max_tokens: Option<u32>,
+    pub timeout_ms: Option<u64>,
+}
+
+impl RunOptions {
+    pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+    pub const MAX_TIMEOUT_MS: u64 = 600_000;
+    pub const MAX_INPUT_BYTES: usize = 1_048_576;
+
+    pub fn validate(&self) -> Result<(), RunnerError> {
+        if self
+            .timeout_ms
+            .is_some_and(|v| v == 0 || v > Self::MAX_TIMEOUT_MS)
+        {
+            return Err(RunnerError::InvalidInput(
+                "timeout_ms must be between 1 and 600000".into(),
+            ));
+        }
+        if self.max_tokens.is_some_and(|v| v == 0 || v > 32768) {
+            return Err(RunnerError::InvalidInput(
+                "max_tokens must be between 1 and 32768".into(),
+            ));
+        }
+        let messages = self.messages.as_deref().unwrap_or_default();
+        if messages.len() > 256 {
+            return Err(RunnerError::InvalidInput(
+                "at most 256 history messages are allowed".into(),
+            ));
+        }
+        if messages.is_empty() && self.prompt.as_deref().is_none_or(|p| p.trim().is_empty()) {
+            return Err(RunnerError::InvalidInput(
+                "provide a prompt or message history".into(),
+            ));
+        }
+        let mut bytes = self.prompt.as_ref().map_or(0, String::len)
+            + self.system.as_ref().map_or(0, String::len)
+            + self.model.as_ref().map_or(0, String::len);
+        let mut pending = std::collections::BTreeSet::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for message in messages {
+            bytes = bytes.saturating_add(message.content.len());
+            if message.role == agentd_ai::Role::Tool {
+                if !message.tool_calls.is_empty()
+                    || !message
+                        .tool_call_id
+                        .as_ref()
+                        .is_some_and(|id| pending.remove(id))
+                {
+                    return Err(RunnerError::InvalidInput(
+                        "tool results must answer an outstanding tool call exactly once".into(),
+                    ));
+                }
+            } else {
+                if !pending.is_empty() || message.tool_call_id.is_some() {
+                    return Err(RunnerError::InvalidInput(
+                        "history contains unanswered tool calls or an unexpected tool_call_id"
+                            .into(),
+                    ));
+                }
+                if !message.tool_calls.is_empty() && message.role != agentd_ai::Role::Assistant {
+                    return Err(RunnerError::InvalidInput(
+                        "only assistant messages may contain tool calls".into(),
+                    ));
+                }
+                for call in &message.tool_calls {
+                    if call.id.is_empty()
+                        || call.name.is_empty()
+                        || !call.arguments.is_object()
+                        || !seen.insert(&call.id)
+                    {
+                        return Err(RunnerError::InvalidInput(
+                            "history contains an invalid or duplicate tool call".into(),
+                        ));
+                    }
+                    pending.insert(&call.id);
+                    bytes = bytes
+                        .saturating_add(call.id.len())
+                        .saturating_add(call.name.len())
+                        .saturating_add(call.arguments.to_string().len());
+                }
+            }
+            bytes = bytes.saturating_add(message.tool_call_id.as_ref().map_or(0, String::len));
+        }
+        if !pending.is_empty() {
+            return Err(RunnerError::InvalidInput(
+                "history contains unanswered tool calls".into(),
+            ));
+        }
+        if bytes > Self::MAX_INPUT_BYTES {
+            return Err(RunnerError::InvalidInput(
+                "runner input exceeds 1 MiB".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Final runner output with optional provider-reported token usage.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunnerOutcome {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<agentd_ai::types::Usage>,
     pub text: String,
     pub provider: String,
     pub model: Option<String>,
@@ -235,6 +352,7 @@ pub async fn run(
         })?;
 
     Ok(RunnerOutcome {
+        usage: resp.usage,
         text: resp.text,
         provider: provider_name,
         model: resp.model,

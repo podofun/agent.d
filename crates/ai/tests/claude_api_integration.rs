@@ -160,6 +160,7 @@ async fn upstream_error_surfaces() {
                 let service = service_fn(|_req: hyper::Request<hyper::body::Incoming>| async {
                     let resp: HRes<Full<Bytes>> = HRes::builder()
                         .status(StatusCode::BAD_REQUEST)
+                        .header("retry-after", "2")
                         .body(Full::new(Bytes::from("{\"error\":\"nope\"}")))
                         .unwrap();
                     Ok::<_, std::convert::Infallible>(resp)
@@ -176,6 +177,14 @@ async fn upstream_error_surfaces() {
         .complete(CompletionRequest::prompt("x"))
         .await
         .unwrap_err();
+    assert!(matches!(
+        &err,
+        agentd_ai::ProviderError::Http {
+            status: 400,
+            retry_after_ms: Some(2000),
+            ..
+        }
+    ));
     let msg = err.to_string();
     assert!(msg.contains("400") || msg.contains("nope"), "got {msg}");
 }

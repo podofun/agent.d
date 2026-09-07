@@ -71,6 +71,7 @@ async fn boot_with_grants(
         .unwrap(),
     )]);
     let state = AppState {
+        lifecycle: Arc::new(agentd_api::Lifecycle::default()),
         executor: Arc::new(arc_swap::ArcSwap::from(executor)),
         auth_token: None,
         admin_token: None,

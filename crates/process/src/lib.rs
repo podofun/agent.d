@@ -11,6 +11,7 @@ pub struct Command {
     stdin: Option<Stdio>,
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
+    kill_on_drop: bool,
 }
 
 impl Command {
@@ -50,8 +51,14 @@ impl Command {
         self
     }
 
+    pub fn kill_on_drop(&mut self, enabled: bool) -> &mut Self {
+        self.kill_on_drop = enabled;
+        self
+    }
+
     pub fn spawn(&mut self) -> std::io::Result<Child> {
         let mut command = platform_command(&self.program, &self.args);
+        command.kill_on_drop(self.kill_on_drop);
         command.envs(self.env.iter().map(|(key, value)| (key, value)));
         if let Some(value) = self.stdin.take() {
             command.stdin(value);
@@ -86,6 +93,7 @@ pub fn command(program: &str) -> Command {
         stdin: None,
         stdout: None,
         stderr: None,
+        kill_on_drop: false,
     }
 }
 

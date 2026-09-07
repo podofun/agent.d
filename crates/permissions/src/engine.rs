@@ -54,6 +54,31 @@ impl Engine {
         &self.grants
     }
 
+    /// Authorize the model capability independently of tool dispatch.
+    pub fn check_runner_provider(&self, runner: &str, provider: &str) -> Decision {
+        let permission = crate::Permission::new(format!("ai:{provider}"));
+        if self.grants.policy().denies_permission(&permission) {
+            return Decision::Deny {
+                layer: DenyLayer::Policy,
+                reason: format!("permission `{}` is denied by policy", permission.as_str()),
+            };
+        }
+        if !self
+            .grants
+            .runner(runner)
+            .is_some_and(|g| g.granted.contains(&permission))
+        {
+            return Decision::Deny {
+                layer: DenyLayer::Runner,
+                reason: format!(
+                    "runner `{runner}` requires `{}` in its granted permissions",
+                    permission.as_str()
+                ),
+            };
+        }
+        Decision::Allow
+    }
+
     /// Check whether `caller` may execute `action` under `tool`.
     ///
     /// `tool` is the package metadata for the tool the action belongs to. If
@@ -630,5 +655,49 @@ mod tests {
             c.interface = Some(s.into());
             c
         }
+    }
+}
+
+#[cfg(test)]
+mod runner_capability_tests {
+    use super::*;
+    use crate::{GrantsFile, PermissionSet, RunnerGrants};
+
+    #[test]
+    fn runner_provider_requires_explicit_grant_and_policy_wins() {
+        let mut file = GrantsFile::default();
+        assert!(matches!(
+            Engine::new(Grants::from_file(file.clone())).check_runner_provider("chat", "mock"),
+            Decision::Deny { .. }
+        ));
+        file.runner.insert(
+            "chat".into(),
+            RunnerGrants {
+                granted: PermissionSet::from_iter(["ai:mock"]),
+                ..Default::default()
+            },
+        );
+        let engine = Engine::new(Grants::from_file(file.clone()));
+        assert_eq!(
+            engine.check_runner_provider("chat", "mock"),
+            Decision::Allow
+        );
+        assert!(matches!(
+            engine.check_runner_provider("chat", "other"),
+            Decision::Deny { .. }
+        ));
+        file.runner.get_mut("chat").unwrap().granted = PermissionSet::from_iter(["ai:*"]);
+        assert_eq!(
+            Engine::new(Grants::from_file(file.clone())).check_runner_provider("chat", "other"),
+            Decision::Allow
+        );
+        file.policy.deny_permissions = PermissionSet::from_iter(["ai:other"]);
+        assert!(matches!(
+            Engine::new(Grants::from_file(file)).check_runner_provider("chat", "other"),
+            Decision::Deny {
+                layer: DenyLayer::Policy,
+                ..
+            }
+        ));
     }
 }

@@ -35,7 +35,7 @@
 
 use agentd_executor::Executor;
 use agentd_permissions::Caller;
-use agentd_runners::{RunnerError, compose};
+use agentd_runners::{RunOptions, RunnerError, compose};
 use agentd_types::{ActionCall, RegistryError};
 pub use axum::serve;
 use axum::{
@@ -49,6 +49,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
+use futures_util::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -111,8 +112,63 @@ impl Webhook {
     }
 }
 
+/// Coordinates admission and bounded draining for HTTP requests and upgraded sockets.
+#[derive(Default)]
+pub struct Lifecycle {
+    draining: std::sync::atomic::AtomicBool,
+    active: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+struct ActiveRequest(Arc<Lifecycle>);
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+        self.0.changed.notify_waiters();
+    }
+}
+
+impl Lifecycle {
+    fn enter(self: &Arc<Self>) -> ActiveRequest {
+        self.active.fetch_add(1, Ordering::SeqCst);
+        ActiveRequest(self.clone())
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
+    async fn stopping(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.is_draining() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Reject new work, then give existing requests time to finish.
+    pub async fn drain(&self, timeout: std::time::Duration) {
+        self.draining.store(true, Ordering::SeqCst);
+        self.changed.notify_waiters();
+        let _ = tokio::time::timeout(timeout, async {
+            loop {
+                let changed = self.changed.notified();
+                if self.active.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await;
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
+    pub lifecycle: Arc<Lifecycle>,
     /// Hot-swappable executor. `agentd --watch` rebuilds the Lua runtime and
     /// `store()`s a fresh executor here; in-flight requests keep the `Arc` they
     /// `load()`ed and drain on the old runtime. Without `--watch` the pointer
@@ -136,10 +192,27 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(health))
         .route("/ws", any(ws_upgrade))
         .route("/control", any(control_upgrade))
         .route("/webhooks/{name}", post(webhook))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admission,
+        ))
         .with_state(state)
+}
+
+async fn admission(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let _active = state.lifecycle.enter();
+    if state.lifecycle.is_draining() && request.uri().path() != "/health" {
+        return (StatusCode::SERVICE_UNAVAILABLE, "daemon is draining").into_response();
+    }
+    next.run(request).await
 }
 
 async fn health() -> &'static str {
@@ -275,7 +348,9 @@ async fn ws_upgrade(
             return (axum::http::StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
     }
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    ws.max_message_size(1_100_000)
+        .max_frame_size(1_100_000)
+        .on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 /// `/control` handshake. Gated by the **admin** token (separate from the public
@@ -294,7 +369,9 @@ async fn control_upgrade(
             return (axum::http::StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
     }
-    ws.on_upgrade(move |socket| handle_control_socket(socket, state))
+    ws.max_message_size(1_100_000)
+        .max_frame_size(1_100_000)
+        .on_upgrade(move |socket| handle_control_socket(socket, state))
 }
 
 #[derive(Deserialize)]
@@ -308,6 +385,10 @@ struct WsRequest {
 
 #[derive(Serialize, Default)]
 struct WsResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_ms: Option<u64>,
     id: u64,
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -335,115 +416,136 @@ static EXEC_SEQ: AtomicU64 = AtomicU64::new(1);
 /// Monotonic fallback request id for webhook routes without `id_header`.
 static WEBHOOK_REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
+const MAX_IN_FLIGHT: usize = 32;
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct Outbound {
+    frame: Value,
+    finished: Option<u64>,
+}
+
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
-    // Every connection gets a stable session id (`ws-<n>`); callers can
-    // override it per request via the optional `session` param when they
-    // bridge an external session space (Telegram chat, Discord channel, …).
+    let _connection = state.lifecycle.enter();
+    let mut draining = state.lifecycle.is_draining();
     let session = format!("ws-{}", WS_CONN_SEQ.fetch_add(1, Ordering::Relaxed));
-    while let Some(msg) = socket.recv().await {
-        let frame = match msg {
-            Ok(Message::Text(t)) => t.to_string(),
-            Ok(Message::Binary(b)) => match std::str::from_utf8(&b) {
-                Ok(s) => s.to_string(),
-                Err(_) => continue,
-            },
-            Ok(Message::Close(_)) => break,
-            Ok(_) => continue,
-            Err(e) => {
-                tracing::warn!(error = %e, "ws recv error");
-                break;
-            }
-        };
-        let req: WsRequest = match serde_json::from_str(&frame) {
-            Ok(r) => r,
-            Err(e) => {
-                let resp = WsResponse {
-                    id: 0,
-                    ok: false,
-                    code: Some("invalid_envelope".into()),
-                    error: Some(e.to_string()),
-                    ..Default::default()
-                };
-                let _ = send(&mut socket, &resp).await;
-                continue;
-            }
-        };
-        // A streaming runner run pushes `runner.delta` event frames onto the
-        // socket while the run is in flight, then the ordinary final response;
-        // it needs the socket, so it cannot go through `dispatch`.
-        let resp = match streaming_run_params(&req) {
-            Some(p) => handle_streaming_run(&state, req.id, p, &session, &mut socket).await,
-            None => dispatch(state.clone(), req, &session).await,
-        };
-        if send(&mut socket, &resp).await.is_err() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(64);
+    let mut tasks = FuturesUnordered::<BoxFuture<'static, ()>>::new();
+    let mut active = HashMap::<u64, Option<tokio::sync::oneshot::Sender<()>>>::new();
+    loop {
+        if draining && active.is_empty() {
             break;
         }
+        tokio::select! {
+            _ = state.lifecycle.stopping(), if !draining => { draining = true; }
+            Some(out) = rx.recv() => {
+                if let Some(id) = out.finished {
+                    active.remove(&id);
+                }
+                if !matches!(tokio::time::timeout(WRITE_TIMEOUT, socket.send(Message::Text(out.frame.to_string().into()))).await, Ok(Ok(()))) {
+                    break;
+                }
+            }
+            Some(()) = tasks.next(), if !tasks.is_empty() => {}
+            msg = socket.recv(), if !draining => {
+                let frame = match msg {
+                    Some(Ok(Message::Text(t))) => t.to_string(),
+                    Some(Ok(Message::Binary(b))) => match String::from_utf8(b.to_vec()) {
+                        Ok(s) => s,
+                        Err(_) => break,
+                    },
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    _ => continue,
+                };
+                let req: WsRequest = match serde_json::from_str(&frame) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        if send(&mut socket, &err(0, "invalid_envelope", e.to_string())).await.is_err() { break; }
+                        continue;
+                    }
+                };
+                if active.contains_key(&req.id) {
+                    // Reusing an active id makes response correlation ambiguous.
+                    break;
+                }
+                if req.method == "runners.cancel" {
+                    #[derive(Deserialize)]
+                    struct CancelParams { id: u64 }
+                    let response = match serde_json::from_value::<CancelParams>(req.params) {
+                        Ok(p) => match active.get_mut(&p.id).and_then(Option::take) {
+                            Some(cancel) => {
+                                let accepted = cancel.send(()).is_ok();
+                                ok(req.id, json!({ "cancelled": accepted }))
+                            }
+                            None => ok(req.id, json!({ "cancelled": false })),
+                        },
+                        Err(e) => bad_params(req.id, e),
+                    };
+                    if send(&mut socket, &response).await.is_err() { break; }
+                    continue;
+                }
+                if active.len() >= MAX_IN_FLIGHT {
+                    if send(&mut socket, &err(req.id, "busy", "connection has 32 in-flight requests")).await.is_err() { break; }
+                    continue;
+                }
+                let state = state.clone();
+                let session = session.clone();
+                let tx = tx.clone();
+                let id = req.id;
+                let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+                let is_runner = req.method == "runners.run";
+                active.insert(id, is_runner.then_some(cancel_tx));
+                tasks.push(Box::pin(async move {
+                    let response = if is_runner {
+                        match serde_json::from_value::<RunParams>(req.params) {
+                            Ok(p) => {
+                                tokio::select! {
+                                    result = handle_run(&state, id, p, &session, &tx) => result,
+                                    _ = cancel_rx => err(id, "cancelled", "runner cancelled; completed side effects are not undone"),
+                                }
+                            }
+                            Err(e) => bad_params(id, e),
+                        }
+                    } else {
+                        dispatch(state, req, &session).await
+                    };
+                    let _ = tx.send(Outbound { frame: json!(response), finished: Some(id) }).await;
+                }));
+            }
+        }
     }
+    // Dropping the in-flight futures stops further model turns on disconnect.
+    // Already dispatched external side effects cannot be rolled back.
 }
 
-/// Returns the parsed params when `req` is a `runners.run` with
-/// `stream: true`; `None` sends the request down the ordinary dispatch path.
-fn streaming_run_params(req: &WsRequest) -> Option<RunParams> {
-    if req.method != "runners.run" {
-        return None;
-    }
-    let p: RunParams = serde_json::from_value(req.params.clone()).ok()?;
-    p.stream.then_some(p)
-}
-
-/// Run a runner while relaying its stream events as `runner.delta` frames:
-///
-/// ```json
-/// { "event": "runner.delta", "id": <request id>, "delta": { "type": "text_delta", "text": "…" } }
-/// ```
-///
-/// The final frame is the same complete response envelope a non-streaming
-/// `runners.run` returns, so callers always end on the full result even if
-/// they ignored (or missed) every delta.
-async fn handle_streaming_run(
+async fn handle_run(
     state: &AppState,
     id: u64,
     p: RunParams,
     conn_session: &str,
-    socket: &mut WebSocket,
+    outbound: &tokio::sync::mpsc::Sender<Outbound>,
 ) -> WsResponse {
-    let executor = state.executor.load();
+    let executor = state.executor.load_full();
     let caller = ws_caller(conn_session, p.session, p.user).with_runner(p.name.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<agentd_ai::StreamEvent>();
-    let run = executor.run_runner_streaming(caller, &p.name, p.prompt, tx);
+    let (tx, mut rx) = agentd_ai::types::stream_channel();
+    let run = executor.run_runner_with_options(caller, &p.name, p.options, p.stream.then_some(tx));
     tokio::pin!(run);
     loop {
         tokio::select! {
-            ev = rx.recv() => {
-                if let Some(ev) = ev
-                    && send_delta(socket, id, &ev).await.is_err()
-                {
-                    // The socket is gone; let the run finish so side effects
-                    // and the trace complete, then the outer loop closes.
-                    break run.await.map_or_else(|e| runner_error(id, e), |out| ok_ser(id, &out));
+            Some(ev) = rx.recv(), if p.stream => {
+                if outbound.send(Outbound { frame: json!({ "event": "runner.delta", "id": id, "delta": ev }), finished: None }).await.is_err() {
+                    return err(id, "slow_consumer", "stream consumer could not keep up; run stopped");
                 }
             }
             res = &mut run => {
-                // Drain any events the provider pushed before finishing so
-                // deltas never arrive after the final response frame.
                 while let Ok(ev) = rx.try_recv() {
-                    if send_delta(socket, id, &ev).await.is_err() {
-                        break;
+                    if outbound.send(Outbound { frame: json!({ "event": "runner.delta", "id": id, "delta": ev }), finished: None }).await.is_err() {
+                        return err(id, "slow_consumer", "stream consumer could not keep up");
                     }
                 }
-                break res.map_or_else(|e| runner_error(id, e), |out| ok_ser(id, &out));
+                return res.map_or_else(|e| runner_error(id, e), |out| ok_ser(id, &out));
             }
         }
     }
-}
-
-async fn send_delta(
-    socket: &mut WebSocket,
-    id: u64,
-    ev: &agentd_ai::StreamEvent,
-) -> Result<(), axum::Error> {
-    let frame = json!({ "event": "runner.delta", "id": id, "delta": ev });
-    socket.send(Message::Text(frame.to_string().into())).await
 }
 
 /// Control-plane socket. Any authenticated control connection IS an approver:
@@ -532,7 +634,9 @@ async fn send(socket: &mut WebSocket, resp: &WsResponse) -> Result<(), axum::Err
             serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"encode error\"".into()),
         )
     });
-    socket.send(Message::Text(body.into())).await
+    tokio::time::timeout(WRITE_TIMEOUT, socket.send(Message::Text(body.into())))
+        .await
+        .map_err(axum::Error::new)?
 }
 
 /// Build the `Caller` for one request: interface is always `ws`; session
@@ -608,7 +712,10 @@ async fn dispatch(state: AppState, req: WsRequest, conn_session: &str) -> WsResp
         "runners.run" => match serde_json::from_value::<RunParams>(req.params) {
             Ok(p) => {
                 let caller = ws_caller(conn_session, p.session, p.user).with_runner(p.name.clone());
-                match executor.run_runner(caller, &p.name, p.prompt).await {
+                match executor
+                    .run_runner_with_options(caller, &p.name, p.options, None)
+                    .await
+                {
                     Ok(out) => ok_ser(id, &out),
                     Err(e) => runner_error(id, e),
                 }
@@ -664,9 +771,11 @@ struct NameParam {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RunParams {
     name: String,
-    prompt: String,
+    #[serde(flatten)]
+    options: RunOptions,
     /// Override the per-connection session id (e.g. a Telegram chat id).
     #[serde(default)]
     session: Option<String>,
@@ -756,11 +865,18 @@ fn action_error(id: u64, e: RegistryError, dur: u128) -> WsResponse {
         code: Some(code.into()),
         error: Some(e.to_string()),
         result: Some(json!({ "duration_ms": dur })),
+        ..Default::default()
     }
 }
 
 fn runner_error(id: u64, e: RunnerError) -> WsResponse {
     let code = match &e {
+        RunnerError::Denied(_) => "denied",
+        RunnerError::InvalidInput(_) => "bad_params",
+        RunnerError::Timeout => "timeout",
+        RunnerError::Busy => "busy",
+        RunnerError::SlowConsumer => "slow_consumer",
+
         RunnerError::NotFound(_) => "runner_not_found",
         RunnerError::UnknownSkill { .. } => "unknown_skill",
         RunnerError::NoProvider { .. } => "no_provider",
@@ -770,7 +886,21 @@ fn runner_error(id: u64, e: RunnerError) -> WsResponse {
         } => "provider_misconfigured",
         RunnerError::Provider { .. } => "provider_upstream",
     };
-    err(id, code, e.to_string())
+    let mut response = err(id, code, e.to_string());
+    if let RunnerError::Provider {
+        source:
+            agentd_ai::ProviderError::Http {
+                status,
+                retry_after_ms,
+                ..
+            },
+        ..
+    } = e
+    {
+        response.provider_status = Some(status);
+        response.retry_after_ms = retry_after_ms;
+    }
+    response
 }
 
 impl IntoResponse for WsResponse {
