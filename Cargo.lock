@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-ai"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "agentd-codex",
  "agentd-mcp",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-api"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "agentd-ai",
  "agentd-approvals",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-approvals"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "agentd-types",
  "async-trait",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-cli"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "agentd-luals",
  "agentd-packages",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-codex"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "agentd-process",
  "async-trait",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-executor"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "agentd-ai",
  "agentd-mcp",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-fs"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "serde",
  "tempfile",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-luals"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-mcp"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "agentd-ai",
  "agentd-permissions",
@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-memory"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "redb",
  "tempfile",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-net"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "futures-util",
  "http-body-util",
@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-netbroker"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "agentd-shell",
  "anyhow",
@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-packages"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "agentd-permissions",
  "serde",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-permissions"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "serde",
  "serde_json",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-process"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "tempfile",
  "tokio",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-runners"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "agentd-ai",
  "agentd-skills",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-scripting"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "agentd-ai",
  "agentd-fs",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-secrets"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "apple-native-keyring-store",
  "keyring-core",
@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-services"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "serde",
  "thiserror",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-shell"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "agentd-permissions",
  "anyhow",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-skills"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "serde",
  "tempfile",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-trace"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "agentd-types",
  "anyhow",
@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-types"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "agentd-permissions",
  "async-trait",
@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "daemon"
-version = "0.8.3-alpha"
+version = "0.9.0-alpha"
 dependencies = [
  "agentd-ai",
  "agentd-api",
