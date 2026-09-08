@@ -15,8 +15,6 @@ jobs:
   build:
     if: >-
       github.ref == 'refs/heads/main' &&
-      github.actor == 'MrF0o' &&
-      github.triggering_actor == 'MrF0o' &&
       (github.event_name == 'workflow_dispatch' ||
        (github.event_name == 'push' && contains(github.event.head_commit.message, '[release]')))
     strategy:
@@ -80,10 +78,7 @@ jobs:
 
   draft:
     needs: build
-    if: >-
-      github.ref == 'refs/heads/main' &&
-      github.actor == 'MrF0o' &&
-      github.triggering_actor == 'MrF0o'
+    if: github.ref == 'refs/heads/main'
     permissions:
       contents: write
     runs-on: ubuntu-latest
