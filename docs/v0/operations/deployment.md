@@ -184,14 +184,6 @@ location /webhooks/ {
 }
 ```
 
-## Repository releases
-
-The Release workflow builds only from `main`, and both the original actor and the actor starting a rerun must be `MrF0o`. After merging a workspace version bump into `main`, trigger it with a push whose head commit message contains `[release]`, or run `gh workflow run release.yml --ref main`. Manual runs against branches other than `main` or against tags skip the release jobs.
-
-The workflow creates a draft release with Linux, macOS, and Windows archives and SHA-256 checksums. New release tags point to the exact commit used for the build. If the version tag already points elsewhere, the workflow fails; use a new workspace version rather than moving an existing release tag. The owner publishes the draft after reviewing it.
-
-Owner-only publishing also depends on repository access: keep other contributors at Read or Triage and accept their changes through fork pull requests. GitHub's Write role permits creating and editing releases directly, and workflow conditions do not restrict that permission or prevent a writer from modifying a workflow on another branch.
-
 ## See also
 
 - [Observability](/v0/operations/observability) — trace log and log-level configuration
