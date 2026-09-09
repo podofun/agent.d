@@ -99,14 +99,18 @@ jobs:
       # Install the freshly packed launcher + native tarballs into a scratch
       # prefix and run the real binary through the shim, on this runner's OS.
       # --offline makes npm skip the three optional deps that don't exist yet
-      # instead of failing on them.
+      # instead of failing on them. --force lets npm install a package whose
+      # os/cpu gate doesn't match the runner, which the darwin-x64 row needs:
+      # it builds on an arm64 Mac and the binary runs under Rosetta. Nothing
+      # else is in play for --force to override in an offline two-tarball
+      # install.
       - name: Smoke test the packed packages
         shell: bash
         run: |
           node npm/scripts/stage.mjs cli - dist/npm-cli
           mkdir -p dist/smoke-pack dist/smoke
           npm pack ./dist/npm-cli --pack-destination dist/smoke-pack
-          npm install --prefix dist/smoke --offline --no-audit --no-fund ./dist/npm/*.tgz ./dist/smoke-pack/*.tgz
+          npm install --prefix dist/smoke --offline --no-audit --no-fund --force ./dist/npm/*.tgz ./dist/smoke-pack/*.tgz
           version="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
           out="$(node dist/smoke/node_modules/@podofun/agentd/bin/agentd.js --version)"
           echo "$out"
