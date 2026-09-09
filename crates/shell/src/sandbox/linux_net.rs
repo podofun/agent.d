@@ -26,12 +26,12 @@ pub fn bring_loopback_up() -> bool {
         for (i, &c) in name.iter().enumerate() {
             ifr.ifr_name[i] = c as libc::c_char;
         }
-        if libc::ioctl(sock, libc::SIOCGIFFLAGS, &mut ifr) < 0 {
+        if libc::ioctl(sock, libc::SIOCGIFFLAGS as libc::Ioctl, &mut ifr) < 0 {
             libc::close(sock);
             return false;
         }
         ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-        let ok = libc::ioctl(sock, libc::SIOCSIFFLAGS, &ifr) >= 0;
+        let ok = libc::ioctl(sock, libc::SIOCSIFFLAGS as libc::Ioctl, &ifr) >= 0;
         libc::close(sock);
         ok
     }

@@ -1,6 +1,10 @@
 # Local agentd container. `docker compose up --build` starts the daemon with
 # the example userland from examples/docker/.
 #
+# For a server, prefer the published image over a local build: replace
+# `build: .` with `image: ghcr.io/podofun/agent.d:<version>` and point the
+# /etc/agentd mount at your own userland directory.
+#
 # Secrets: the image defaults to the `env` backend, so any AGENTD_SECRET_<NAME>
 # variable becomes a secret named <name>. The commented block below shows the
 # file-based alternative (`dir:/run/secrets`), which keeps values out of
