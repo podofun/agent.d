@@ -112,12 +112,21 @@ jobs:
           npm pack ./dist/npm-cli --pack-destination dist/smoke-pack
           npm install --prefix dist/smoke --offline --no-audit --no-fund --force ./dist/npm/*.tgz ./dist/smoke-pack/*.tgz
           version="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
-          out="$(node dist/smoke/node_modules/@podofun/agentd/bin/agentd.js --version)"
-          echo "$out"
-          [ "$out" = "agentd $version" ]
-          out="$(node dist/smoke/node_modules/@podofun/agentd/bin/agentctl.js --version)"
-          echo "$out"
-          [ "$out" = "agentctl $version" ]
+          # The shim picks the package for the machine it runs on, so it can
+          # only be exercised on rows that build for the runner's own platform.
+          # On a cross row (darwin-x64 on an arm64 Mac) call the native binary
+          # directly; that still proves the build runs here.
+          runner="$(node -p 'process.platform + "-" + process.arch')"
+          ext=""; [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
+          for bin in agentd agentctl; do
+            if [ "$runner" = "${{ matrix.npm_platform }}" ]; then
+              out="$(node dist/smoke/node_modules/@podofun/agentd/bin/$bin.js --version)"
+            else
+              out="$(dist/smoke/node_modules/@podofun/agentd-${{ matrix.npm_platform }}/bin/$bin$ext --version)"
+            fi
+            echo "$out"
+            [ "$out" = "$bin $version" ]
+          done
 
       - name: Upload native npm package
         uses: actions/upload-artifact@v4
