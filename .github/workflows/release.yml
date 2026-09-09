@@ -24,18 +24,27 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: agentd-x86_64-linux.tar.gz
+            npm_platform: linux-x64
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: agentd-aarch64-macos.tar.gz
+            npm_platform: darwin-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: agentd-x86_64-macos.tar.gz
+            npm_platform: darwin-x64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: agentd-x86_64-windows.zip
+            npm_platform: win32-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
@@ -43,18 +52,18 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binaries
-        run: cargo build --release -p daemon -p agentd-cli
+        run: cargo build --release --target ${{ matrix.target }} -p daemon -p agentd-cli
 
       # Windows-only helper; built and shipped only in the Windows archive.
       - name: Build network broker (Windows)
         if: runner.os == 'Windows'
-        run: cargo build --release -p agentd-netbroker
+        run: cargo build --release --target ${{ matrix.target }} -p agentd-netbroker
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          cp target/release/agentd target/release/agentctl dist/
+          cp target/${{ matrix.target }}/release/agentd target/${{ matrix.target }}/release/agentctl dist/
           cp README.md LICENSE dist/
           tar -czf "${{ matrix.archive }}" -C dist .
 
@@ -63,10 +72,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/agentd.exe dist/
-          Copy-Item target/release/agentctl.exe dist/
+          Copy-Item target/${{ matrix.target }}/release/agentd.exe dist/
+          Copy-Item target/${{ matrix.target }}/release/agentctl.exe dist/
           # Ships alongside agentd.exe; the daemon locates it in its own folder.
-          Copy-Item target/release/agentd-netbroker.exe dist/
+          Copy-Item target/${{ matrix.target }}/release/agentd-netbroker.exe dist/
           Copy-Item README.md, LICENSE dist/
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.archive }}"
 
@@ -75,6 +84,42 @@ jobs:
         with:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Stage and pack the native npm package
+        shell: bash
+        run: |
+          node npm/scripts/stage.mjs ${{ matrix.npm_platform }} target/${{ matrix.target }}/release dist/npm-native
+          mkdir -p dist/npm
+          npm pack ./dist/npm-native --pack-destination dist/npm
+
+      # Install the freshly packed launcher + native tarballs into a scratch
+      # prefix and run the real binary through the shim, on this runner's OS.
+      # --offline makes npm skip the three optional deps that don't exist yet
+      # instead of failing on them.
+      - name: Smoke test the packed packages
+        shell: bash
+        run: |
+          node npm/scripts/stage.mjs cli - dist/npm-cli
+          mkdir -p dist/smoke-pack dist/smoke
+          npm pack ./dist/npm-cli --pack-destination dist/smoke-pack
+          npm install --prefix dist/smoke --offline --no-audit --no-fund ./dist/npm/*.tgz ./dist/smoke-pack/*.tgz
+          version="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          out="$(node dist/smoke/node_modules/@podofun/agentd/bin/agentd.js --version)"
+          echo "$out"
+          [ "$out" = "agentd $version" ]
+          out="$(node dist/smoke/node_modules/@podofun/agentd/bin/agentctl.js --version)"
+          echo "$out"
+          [ "$out" = "agentctl $version" ]
+
+      - name: Upload native npm package
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-${{ matrix.npm_platform }}
+          path: dist/npm/*.tgz
 
   draft:
     needs: build
@@ -193,3 +238,62 @@ jobs:
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Publish the launcher and the four native packages. Natives go first so the
+  # launcher never references a version that is not on the registry yet.
+  # Authentication is npm trusted publishing (OIDC): no token in secrets.
+  npm-publish:
+    needs: build
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && contains(github.event.head_commit.message, '[release]')))
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm 11.5.1 or newer; Node 22 ships an older one.
+      - name: Update npm
+        run: npm install -g npm@latest && npm --version
+
+      - name: Read workspace version
+        id: version
+        run: echo "version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*\"(.*)\".*/\1/')" >> "$GITHUB_OUTPUT"
+
+      - name: Download native packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: npm-*
+          path: artifacts/npm
+          merge-multiple: true
+
+      - name: Stage and pack the launcher
+        run: |
+          node npm/scripts/stage.mjs cli - dist/npm-cli
+          mkdir -p artifacts/launcher
+          npm pack ./dist/npm-cli --pack-destination artifacts/launcher
+
+      - name: Publish
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          case "$VERSION" in
+            *-*) tag=next ;;
+            *)   tag=latest ;;
+          esac
+          natives=(artifacts/npm/*.tgz)
+          if [ "${#natives[@]}" -ne 4 ]; then
+            echo "::error::Expected 4 native tarballs, found ${#natives[@]}"; ls artifacts/npm; exit 1
+          fi
+          for f in "${natives[@]}"; do
+            npm publish "./$f" --provenance --access public --tag "$tag"
+          done
+          npm publish ./artifacts/launcher/*.tgz --provenance --access public --tag "$tag"
