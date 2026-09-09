@@ -78,7 +78,16 @@ jobs:
           docker run -d --name agentd -p 7777:7777 \
             -v "$PWD/examples/docker:/etc/agentd:ro" agentd:ci
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:7777/health; then exit 0; fi
+            if curl -fsS http://127.0.0.1:7777/health; then ok=1; break; fi
             sleep 1
           done
-          echo "daemon never became healthy"; docker logs agentd; exit 1
+          if [ -z "${ok:-}" ]; then
+            echo "daemon never became healthy"; docker logs agentd; exit 1
+          fi
+
+      # The mounted userland must be loaded, not merely parsed: call an action
+      # that lives in a file init.lua import()s.
+      - name: Call an action from the mounted userland
+        run: |
+          docker exec agentd agentctl call greet -j '{"name":"ci"}' | tee /tmp/greet.json
+          grep -q "hello, ci" /tmp/greet.json
