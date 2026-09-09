@@ -1,0 +1,32 @@
+{
+  "name": "@podofun/agentd",
+  "version": "0.0.0",
+  "description": "agent.d runtime and command-line client",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/podofun/agent.d.git",
+    "directory": "npm/agentd"
+  },
+  "homepage": "https://github.com/podofun/agent.d",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "agentd": "bin/agentd.js",
+    "agentctl": "bin/agentctl.js"
+  },
+  "files": [
+    "bin",
+    "native.js",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "optionalDependencies": {}
+}
