@@ -136,6 +136,8 @@ async fn run(cli: Cli) -> Result<()> {
 
     let keyring = build_secret_store(&cfg.secrets);
     let webhooks = resolve_webhooks(&cfg, keyring.as_ref())?;
+    let auth_token = resolve_ws_token(&cfg)?;
+    let interface_tokens = resolve_interface_tokens(&cfg, keyring.as_ref(), auth_token.as_deref())?;
     let mut providers = ProviderRegistry::new();
     let anthropic_api: Arc<dyn AIProvider> = Arc::new(ClaudeApiProvider::new(keyring.clone()));
     let anthropic_cli: Arc<dyn AIProvider> = Arc::new(ClaudeCliProvider::new());
@@ -178,6 +180,14 @@ async fn run(cli: Cli) -> Result<()> {
         }
     })?;
 
+    // Chat sessions share the file with `ctx.memory`.
+    let sessions = agentd_sessions::RedbSessionStore::new(memory.database()).map_err(|e| {
+        anyhow!(
+            "could not open the session tables in `{}` ({e})",
+            memory_path.display()
+        )
+    })?;
+
     let trace = JsonlSink::open(&cfg.trace_file).await?;
     tracing::debug!(trace = %trace.path().display(), "trace open");
 
@@ -192,6 +202,7 @@ async fn run(cli: Cli) -> Result<()> {
         providers,
         secrets: keyring,
         memory: Arc::new(memory),
+        sessions: Arc::new(sessions),
         trace: Arc::new(trace),
         broker: broker.clone(),
         async_handle: tokio::runtime::Handle::current(),
@@ -241,7 +252,6 @@ async fn run(cli: Cli) -> Result<()> {
         watch::spawn(cfg.clone(), shared, executor.clone(), built);
     }
 
-    let auth_token = resolve_ws_token(&cfg)?;
     let admin_token = resolve_admin_token(&cfg)?;
     let lifecycle = Arc::new(agentd_api::Lifecycle::default());
     let state = AppState {
@@ -249,6 +259,7 @@ async fn run(cli: Cli) -> Result<()> {
         executor,
         auth_token: auth_token.map(Arc::new),
         admin_token: admin_token.map(Arc::new),
+        interface_tokens: Arc::new(interface_tokens),
         broker,
         webhooks: Arc::new(webhooks),
     };
@@ -364,6 +375,39 @@ fn resolve_webhooks(cfg: &Config, secrets: &dyn SecretStore) -> Result<HashMap<S
             Ok((name.clone(), webhook))
         })
         .collect()
+}
+
+/// Resolve every `[interfaces.<name>]` token to a `token -> interface` map.
+/// Two interfaces sharing a token, or an interface reusing the daemon token,
+/// would make identity ambiguous, so both are startup errors.
+fn resolve_interface_tokens(
+    cfg: &Config,
+    secrets: &dyn SecretStore,
+    ws_token: Option<&str>,
+) -> Result<HashMap<String, String>> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    for (name, source) in &cfg.interfaces {
+        let token = match source {
+            config::InterfaceToken::Literal(t) => t.clone(),
+            config::InterfaceToken::Secret(key) => secrets.get(key).with_context(|| {
+                format!(
+                    "interface `{name}` could not read secret `{key}` — {}",
+                    secret_hint(&cfg.secrets, key)
+                )
+            })?,
+        };
+        if ws_token == Some(token.as_str()) {
+            anyhow::bail!(
+                "interface `{name}` uses the same token as the daemon itself — give it a token of its own"
+            );
+        }
+        if let Some(other) = out.insert(token, name.clone()) {
+            anyhow::bail!(
+                "interfaces `{other}` and `{name}` share one token — each interface needs its own"
+            );
+        }
+    }
+    Ok(out)
 }
 
 /// Register user-configured `[providers.<name>]` entries on top of the

@@ -54,6 +54,7 @@ dependencies = [
  "agentd-permissions",
  "agentd-runners",
  "agentd-scripting",
+ "agentd-sessions",
  "agentd-skills",
  "agentd-trace",
  "agentd-types",
@@ -127,6 +128,7 @@ dependencies = [
  "agentd-scripting",
  "agentd-secrets",
  "agentd-services",
+ "agentd-sessions",
  "agentd-skills",
  "agentd-trace",
  "agentd-types",
@@ -271,6 +273,7 @@ dependencies = [
  "agentd-runners",
  "agentd-secrets",
  "agentd-services",
+ "agentd-sessions",
  "agentd-shell",
  "agentd-skills",
  "agentd-types",
@@ -309,6 +312,20 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "agentd-sessions"
+version = "0.8.3-alpha"
+dependencies = [
+ "agentd-ai",
+ "agentd-memory",
+ "redb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -1008,6 +1025,7 @@ dependencies = [
  "agentd-runners",
  "agentd-scripting",
  "agentd-secrets",
+ "agentd-sessions",
  "agentd-shell",
  "agentd-skills",
  "agentd-trace",
@@ -3462,6 +3480,7 @@ version = "1.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
 dependencies = [
+ "getrandom 0.4.2",
  "js-sys",
  "serde_core",
  "wasm-bindgen",

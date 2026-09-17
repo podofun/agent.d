@@ -96,6 +96,7 @@ export default defineConfig({
             { text: 'ctx.ws', link: '/v0/reference/ctx/websocket' },
             { text: 'ctx.secret', link: '/v0/reference/ctx/secrets' },
             { text: 'ctx.memory & ctx.state', link: '/v0/reference/ctx/memory' },
+            { text: 'ctx.sessions', link: '/v0/reference/ctx/sessions' },
             { text: 'ctx.ai', link: '/v0/reference/ctx/ai' },
             { text: 'ctx.call / run / structured', link: '/v0/reference/ctx/calls' },
             { text: 'ctx.caller', link: '/v0/reference/ctx/caller' },

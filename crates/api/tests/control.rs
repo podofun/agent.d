@@ -55,6 +55,7 @@ async fn boot() -> Booted {
         executor: Arc::new(arc_swap::ArcSwap::from(executor)),
         auth_token: Some(Arc::new("public-tok".into())),
         admin_token: Some(Arc::new("admin-tok".into())),
+        interface_tokens: Arc::new(std::collections::HashMap::new()),
         broker: broker.clone(),
         webhooks: Arc::new(HashMap::new()),
     };

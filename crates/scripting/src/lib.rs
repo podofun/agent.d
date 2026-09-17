@@ -14,9 +14,10 @@ use agentd_memory::MemoryStore;
 use agentd_net::http::{Request as HttpRequest, host_of, send as http_send};
 use agentd_net::ws::{Connection as WsConnection, Frame as WsFrame, host_of as ws_host_of};
 use agentd_permissions::{Permission, PermissionSet};
-use agentd_runners::{RunnerDef, RunnerRegistry};
+use agentd_runners::{CompactPolicy, RunnerDef, RunnerRegistry};
 use agentd_secrets::SecretStore;
 use agentd_services::{ServiceDef, ServiceRegistry};
+use agentd_sessions::{NewSession, Scope, SessionStore};
 use agentd_shell::policy::concrete_ancestor;
 use agentd_shell::{ExecRequest, SandboxPolicy, exec as shell_exec};
 use agentd_skills::{SkillDef, SkillRegistry};
@@ -180,6 +181,10 @@ struct SecretsHolder(Option<Arc<dyn SecretStore>>);
 /// Backend handle for `ctx.memory.*`.
 #[derive(Clone)]
 struct MemoryHolder(Option<Arc<dyn MemoryStore>>);
+
+/// Backend handle for `ctx.sessions.*`.
+#[derive(Clone)]
+struct SessionsHolder(Option<Arc<dyn SessionStore>>);
 
 /// Backend handles for `context.ai.*`.
 #[derive(Clone, Default)]
@@ -369,6 +374,13 @@ impl LuaHost {
     pub fn set_memory(&self, store: Arc<dyn MemoryStore>) {
         let lua = self.lua.lock().unwrap();
         lua.set_app_data(MemoryHolder(Some(store)));
+    }
+
+    /// Wire the session store backend. `RedbSessionStore` in production,
+    /// `MemSessionStore` in tests. Call before `load_dir`/`load_file`.
+    pub fn set_sessions(&self, store: Arc<dyn SessionStore>) {
+        let lua = self.lua.lock().unwrap();
+        lua.set_app_data(SessionsHolder(Some(store)));
     }
 
     /// Register a named AI provider.
@@ -668,6 +680,7 @@ fn build_and_store_ctx(lua: &Lua) -> mlua::Result<()> {
     ctx.set("mailer", mailer_t)?;
     ctx.set("state", build_state_table(lua)?)?;
     ctx.set("memory", build_memory_table(lua)?)?;
+    ctx.set("sessions", build_sessions_table(lua)?)?;
     ctx.set("caller", build_caller_table(lua)?)?;
     ctx.set("tools", lua.create_function(tools_list_binding)?)?;
     // `ctx.validate_output(value)` — check a value against the enclosing
@@ -908,6 +921,7 @@ fn register_runner(lua: &Lua, t: Table) -> mlua::Result<()> {
     }
 
     let cwd: Option<String> = t.get::<Option<String>>("cwd")?;
+    let compact = read_compact_policy(lua, &t)?;
     let def = RunnerDef {
         name: name.clone(),
         system,
@@ -915,6 +929,7 @@ fn register_runner(lua: &Lua, t: Table) -> mlua::Result<()> {
         skills,
         allowed_actions,
         cwd,
+        compact,
     };
     let runners = lua
         .app_data_ref::<RunnerRegistry>()
@@ -922,6 +937,41 @@ fn register_runner(lua: &Lua, t: Table) -> mlua::Result<()> {
     runners.insert(def);
     tracing::info!(runner = %name, "registered runner");
     Ok(())
+}
+
+/// `compact = false` disables session compaction; `compact = { after_turns =
+/// 40, keep_recent = 10, prompt = "..." }` overrides any subset of the
+/// defaults; absent = daemon defaults.
+fn read_compact_policy(lua: &Lua, t: &Table) -> mlua::Result<Option<CompactPolicy>> {
+    match t.get::<Value>("compact")? {
+        Value::Nil => Ok(None),
+        Value::Boolean(true) => Ok(None),
+        Value::Boolean(false) => Ok(Some(CompactPolicy {
+            enabled: false,
+            ..Default::default()
+        })),
+        Value::Table(ct) => {
+            let json: serde_json::Value = lua.from_value(Value::Table(ct)).map_err(|e| {
+                mlua::Error::external(format!(
+                    "the `compact` table of `agentd.runner{{...}}` could not be read ({e}) — use `after_turns`, `keep_recent` and `prompt`"
+                ))
+            })?;
+            let policy: CompactPolicy = serde_json::from_value(json).map_err(|e| {
+                mlua::Error::external(format!(
+                    "the `compact` table of `agentd.runner{{...}}` is invalid ({e}) — allowed fields are `enabled`, `after_turns`, `keep_recent` and `prompt`"
+                ))
+            })?;
+            if policy.keep_recent >= policy.after_turns {
+                return Err(mlua::Error::external(
+                    "`compact.keep_recent` must be smaller than `compact.after_turns`",
+                ));
+            }
+            Ok(Some(policy))
+        }
+        _ => Err(mlua::Error::external(
+            "the `compact` field of `agentd.runner{...}` must be `false` or a table",
+        )),
+    }
 }
 
 // ---------- sleep (bare global, yieldable) ----------
@@ -2739,6 +2789,157 @@ fn build_memory_table(lua: &Lua) -> mlua::Result<Table> {
         .set_name("ctx.memory.create")
         .call((get, set, del, exists, keys, clear))?;
     t.set("create", ctor)?;
+    Ok(t)
+}
+
+// ---------- ctx.sessions ----------
+//
+// Durable chat sessions consumed by `ctx.run(name, { session_id = ... })`.
+// Reads gate on `sessions.read`, writes on `sessions.write`. Ids are minted
+// by the daemon; `label` is the caller's own id (e.g. a Telegram chat id).
+
+fn with_sessions<F, T>(lua: &Lua, f: F) -> mlua::Result<T>
+where
+    F: FnOnce(&Arc<dyn SessionStore>) -> mlua::Result<T>,
+{
+    let h = lua
+        .app_data_ref::<SessionsHolder>()
+        .ok_or_else(|| mlua::Error::external("the session store holder is not available in this Lua state — this is a bug in agentd, please report it"))?;
+    let store = h.0.as_ref().ok_or_else(|| {
+        mlua::Error::external("no session store is configured, so `ctx.sessions` is unavailable")
+    })?;
+    f(store)
+}
+
+fn sess_err(e: agentd_sessions::SessionError) -> mlua::Error {
+    mlua::Error::external(e.to_string())
+}
+
+/// The calling handler's session scope, from `ctx.caller`. A `user` passed
+/// by the interface narrows it; scripts cannot widen it.
+fn session_scope(lua: &Lua) -> mlua::Result<Scope> {
+    let active = lua
+        .app_data_ref::<ActiveContext>()
+        .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
+    let c = &active.caller;
+    Ok(Scope::from_caller(
+        c.interface.as_ref().map(|i| i.as_str()),
+        c.service.as_ref().map(|s| s.as_str()),
+        c.user.as_ref().map(|u| u.as_str()),
+    ))
+}
+
+fn sessions_create_binding(lua: &Lua, opts: Option<Table>) -> mlua::Result<Value> {
+    check_permission_inline(lua, &Permission::new("sessions.write"))?;
+    let scope = session_scope(lua)?;
+    let mut new = NewSession::in_scope(&scope);
+    if let Some(t) = opts {
+        if t.get::<Option<String>>("user")?.is_some() {
+            return Err(mlua::Error::external(
+                "`ctx.sessions.create` takes the user from `ctx.caller.user`, not from its options — the interface that authenticated the user sets it",
+            ));
+        }
+        new = new.label(t.get("label")?).runner(t.get("runner")?);
+    }
+    let meta = with_sessions(lua, |s| s.create(new).map_err(sess_err))?;
+    lua.to_value(&meta)
+}
+
+fn sessions_get_binding(lua: &Lua, id: String) -> mlua::Result<Value> {
+    check_permission_inline(lua, &Permission::new("sessions.read"))?;
+    let scope = session_scope(lua)?;
+    match with_sessions(lua, |s| s.get_in(&scope, &id).map_err(sess_err))? {
+        Some(m) => lua.to_value(&m),
+        None => Ok(Value::Nil),
+    }
+}
+
+fn sessions_find_binding(lua: &Lua, label: String) -> mlua::Result<Value> {
+    check_permission_inline(lua, &Permission::new("sessions.read"))?;
+    let scope = session_scope(lua)?;
+    match with_sessions(lua, |s| s.find_in(&scope, &label).map_err(sess_err))? {
+        Some(m) => lua.to_value(&m),
+        None => Ok(Value::Nil),
+    }
+}
+
+fn sessions_list_binding(lua: &Lua, limit: Option<usize>) -> mlua::Result<Value> {
+    check_permission_inline(lua, &Permission::new("sessions.read"))?;
+    let scope = session_scope(lua)?;
+    let v = with_sessions(lua, |s| {
+        s.list(&scope, limit.unwrap_or(50).min(500))
+            .map_err(sess_err)
+    })?;
+    lua.to_value(&v)
+}
+
+fn sessions_turns_binding(lua: &Lua, id: String) -> mlua::Result<Value> {
+    check_permission_inline(lua, &Permission::new("sessions.read"))?;
+    let scope = session_scope(lua)?;
+    if with_sessions(lua, |s| s.get_in(&scope, &id).map_err(sess_err))?.is_none() {
+        return Err(mlua::Error::external(format!(
+            "session `{id}` does not exist"
+        )));
+    }
+    let v = with_sessions(lua, |s| s.turns(&id).map_err(sess_err))?;
+    lua.to_value(&v)
+}
+
+fn sessions_delete_binding(lua: &Lua, id: String) -> mlua::Result<bool> {
+    check_permission_inline(lua, &Permission::new("sessions.write"))?;
+    let scope = session_scope(lua)?;
+    if with_sessions(lua, |s| s.get_in(&scope, &id).map_err(sess_err))?.is_none() {
+        return Ok(false);
+    }
+    with_sessions(lua, |s| s.delete(&id).map_err(sess_err))
+}
+
+fn build_sessions_table(lua: &Lua) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    t.set(
+        "create",
+        yieldable_wrap(lua, lua.create_function(sessions_create_binding)?)?,
+    )?;
+    t.set(
+        "get",
+        yieldable_wrap(lua, lua.create_function(sessions_get_binding)?)?,
+    )?;
+    t.set(
+        "find",
+        yieldable_wrap(lua, lua.create_function(sessions_find_binding)?)?,
+    )?;
+    t.set(
+        "list",
+        yieldable_wrap(lua, lua.create_function(sessions_list_binding)?)?,
+    )?;
+    t.set(
+        "turns",
+        yieldable_wrap(lua, lua.create_function(sessions_turns_binding)?)?,
+    )?;
+    t.set(
+        "delete",
+        yieldable_wrap(lua, lua.create_function(sessions_delete_binding)?)?,
+    )?;
+    // `open(label, opts?)`: find-or-create by label. The common bridge call.
+    let open: Function = lua
+        .load(
+            r#"
+        local find, create = ...
+        return function(label, opts)
+          if type(label) ~= "string" or label == "" then
+            error("ctx.sessions.open: label must be a non-empty string", 0)
+          end
+          local s = find(label)
+          if s then return s end
+          opts = opts or {}
+          opts.label = label
+          return create(opts)
+        end
+    "#,
+        )
+        .set_name("ctx.sessions.open")
+        .call((t.get::<Function>("find")?, t.get::<Function>("create")?))?;
+    t.set("open", open)?;
     Ok(t)
 }
 

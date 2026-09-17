@@ -12,6 +12,8 @@ The only interface type supported today is WebSocket. Clients connect to `/ws` w
 
 Each WebSocket connection receives an auto-generated session id (`ws-1`, `ws-2`, …).
 
+The connection's token determines its interface identity. The daemon token identifies interface `ws`; a token configured under `[interfaces.<name>]` identifies interface `<name>`. This lets the daemon apply separate `[interface.<name>]` grants and session ownership to clients that use the same WebSocket protocol. See [`[interfaces.<name>]`](/v0/reference/configuration#interfaces-name-sections).
+
 You can restrict which actions a given interface may invoke by adding an `allowed_actions` entry to `grants.toml`:
 
 ```toml
@@ -32,7 +34,7 @@ Every inbound call — whether from a WebSocket client, a runner tool-use step, 
 ```lua
 -- Available in any handler or service body (no permission required)
 local c = ctx.caller
--- c.interface  string|nil  -- interface name (always "ws" for WebSocket connections)
+-- c.interface  string|nil  -- interface name: "ws" for the daemon token, else the [interfaces.<name>] that matched
 -- c.runner     string|nil  -- runner name, if called from a runner tool-use step
 -- c.service    string|nil  -- service name, if called from a service
 -- c.session    string|nil  -- WebSocket session id or logical override (e.g. "ws-1")
@@ -57,7 +59,7 @@ When a client bridges an external identity space (e.g. a Telegram bot mapping ch
 }}
 ```
 
-These override the auto-generated WebSocket session id in `ctx.caller.session` and `ctx.caller.user`. Handlers can read them to scope memory namespaces or apply per-user logic:
+The `session` parameter replaces the generated id in `ctx.caller.session`, and `user` sets `ctx.caller.user`. The daemon trusts the interface to identify its users, so the bridge must authenticate each user before passing their id. Chat sessions are scoped by interface and by this `user` (see [`ctx.sessions`](/v0/reference/ctx/sessions)). Handlers can also read them to scope memory namespaces or apply per-user logic:
 
 ```lua
 handler = function(args, ctx)

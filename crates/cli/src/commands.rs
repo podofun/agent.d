@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use tokio::io::AsyncSeekExt;
 
-use crate::cli::{RunnerCmd, ServicesCmd, SkillsCmd};
+use crate::cli::{RunnerCmd, ServicesCmd, SessionCmd, SkillsCmd};
 use crate::render::print_result;
 use crate::ws::ws_call;
 
@@ -101,9 +101,18 @@ pub(crate) async fn cmd_runner(base: &str, timeout: u64, cmd: RunnerCmd) -> Resu
         RunnerCmd::Run {
             name,
             prompt,
+            session,
+            user,
             text_only,
             stream,
         } => {
+            let mut params = serde_json::json!({ "name": name, "prompt": prompt });
+            if let Some(s) = session {
+                params["session_id"] = serde_json::Value::String(s);
+            }
+            if let Some(u) = user {
+                params["user"] = serde_json::Value::String(u);
+            }
             if stream {
                 use std::io::Write;
                 let mut streamed_any = false;
@@ -111,7 +120,11 @@ pub(crate) async fn cmd_runner(base: &str, timeout: u64, cmd: RunnerCmd) -> Resu
                     base,
                     timeout,
                     "runners.run",
-                    serde_json::json!({ "name": name, "prompt": prompt, "stream": true }),
+                    {
+                        let mut p = params.clone();
+                        p["stream"] = serde_json::Value::Bool(true);
+                        p
+                    },
                     |delta| match delta.get("type").and_then(|t| t.as_str()) {
                         Some("text_delta") => {
                             if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
@@ -149,13 +162,7 @@ pub(crate) async fn cmd_runner(base: &str, timeout: u64, cmd: RunnerCmd) -> Resu
                 }
                 return print_result(&resp, false);
             }
-            let resp = ws_call(
-                base,
-                timeout,
-                "runners.run",
-                serde_json::json!({ "name": name, "prompt": prompt }),
-            )
-            .await?;
+            let resp = ws_call(base, timeout, "runners.run", params).await?;
             if resp.ok
                 && text_only
                 && let Some(t) = resp
@@ -170,6 +177,79 @@ pub(crate) async fn cmd_runner(base: &str, timeout: u64, cmd: RunnerCmd) -> Resu
             print_result(&resp, false)
         }
     }
+}
+
+pub(crate) async fn cmd_session(base: &str, timeout: u64, cmd: SessionCmd) -> Result<()> {
+    match cmd {
+        SessionCmd::New { label, user } => {
+            let mut params = serde_json::Map::new();
+            if let Some(l) = label {
+                params.insert("label".into(), Value::String(l));
+            }
+            if let Some(u) = user {
+                params.insert("user".into(), Value::String(u));
+            }
+            let resp = ws_call(base, timeout, "sessions.create", Value::Object(params)).await?;
+            if !resp.ok {
+                return print_result(&resp, false);
+            }
+            if let Some(id) = resp
+                .result
+                .as_ref()
+                .and_then(|r| r.get("id"))
+                .and_then(|v| v.as_str())
+            {
+                println!("{id}");
+            }
+            Ok(())
+        }
+        SessionCmd::Ls { limit, user } => {
+            let mut params = serde_json::json!({ "limit": limit });
+            if let Some(u) = user {
+                params["user"] = Value::String(u);
+            }
+            let resp = ws_call(base, timeout, "sessions.list", params).await?;
+            if !resp.ok {
+                return print_result(&resp, false);
+            }
+            if let Some(Value::Array(arr)) = resp.result {
+                for s in arr {
+                    let id = s.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let label = s.get("label").and_then(|v| v.as_str()).unwrap_or("-");
+                    let turns = s.get("turn_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let runner = s.get("runner").and_then(|v| v.as_str()).unwrap_or("-");
+                    println!("{id}\t{label}\t{runner}\t{turns} turns");
+                }
+            }
+            Ok(())
+        }
+        SessionCmd::Show { id, user } => {
+            // A uuid is 36 chars with dashes; anything else is treated as a label.
+            let key = if looks_like_uuid(&id) { "id" } else { "label" };
+            let mut params = serde_json::json!({ key: id });
+            if let Some(u) = user {
+                params["user"] = Value::String(u);
+            }
+            let resp = ws_call(base, timeout, "sessions.get", params).await?;
+            print_result(&resp, false)
+        }
+        SessionCmd::Rm { id, user } => {
+            let mut params = serde_json::json!({ "id": id });
+            if let Some(u) = user {
+                params["user"] = Value::String(u);
+            }
+            let resp = ws_call(base, timeout, "sessions.delete", params).await?;
+            print_result(&resp, false)
+        }
+    }
+}
+
+fn looks_like_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
 }
 
 pub(crate) async fn cmd_skills(base: &str, timeout: u64, cmd: SkillsCmd) -> Result<()> {

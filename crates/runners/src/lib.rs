@@ -51,6 +51,11 @@ pub struct RunnerDef {
     /// values anchor to the workspace root. `None` inherits/defaults to it.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Session compaction policy. `None` = daemon defaults
+    /// ([`CompactPolicy::default`]); `Some(CompactPolicy { enabled: false, .. })`
+    /// turns compaction off for this runner.
+    #[serde(default)]
+    pub compact: Option<CompactPolicy>,
 }
 
 #[derive(Debug, Error)]
@@ -67,6 +72,12 @@ pub enum RunnerError {
     Busy,
     #[error("runner `{0}` not registered")]
     NotFound(String),
+    #[error("session `{0}` does not exist")]
+    SessionNotFound(String),
+    #[error("session `{0}` already has a run in flight")]
+    SessionBusy(String),
+    #[error("{0}")]
+    Session(String),
     #[error("runner `{name}` references unknown skill `{skill}`")]
     UnknownSkill { name: String, skill: String },
     #[error("runner `{name}` could not resolve a provider for model `{}`", model.as_deref().unwrap_or("(none configured)"))]
@@ -99,13 +110,48 @@ pub struct RunnerComposition {
     pub allowed_actions: Vec<String>,
 }
 
-/// Per-run inputs shared by the transport and executor. History is caller-owned.
+/// How a runner compacts a long session before a run. Every field is
+/// optional in Lua; unset fields take these defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompactPolicy {
+    pub enabled: bool,
+    /// Compact once the stored turn count reaches this many.
+    pub after_turns: u64,
+    /// Turns left verbatim at the tail of the log.
+    pub keep_recent: u64,
+    /// Instruction sent to the runner's model along with the old turns.
+    pub prompt: String,
+}
+
+impl CompactPolicy {
+    pub const DEFAULT_PROMPT: &str = "Summarize the conversation so far for your own future reference. \
+Keep every fact, decision, name, number and open question the user would expect you to remember. \
+Write in plain prose, no preamble.";
+}
+
+impl Default for CompactPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            after_turns: 60,
+            keep_recent: 20,
+            prompt: Self::DEFAULT_PROMPT.to_string(),
+        }
+    }
+}
+
+/// Per-run inputs shared by the transport and executor. History is either
+/// caller-owned (`messages`) or daemon-owned (`session_id`), never both.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunOptions {
     pub prompt: Option<String>,
     #[serde(alias = "history")]
     pub messages: Option<Vec<agentd_ai::Message>>,
+    /// Daemon-minted session id. The executor loads the session's turns as
+    /// history, appends `prompt`, and stores what the run produced.
+    pub session_id: Option<String>,
     pub system: Option<String>,
     pub model: Option<String>,
     pub max_tokens: Option<u32>,
@@ -130,6 +176,18 @@ impl RunOptions {
             return Err(RunnerError::InvalidInput(
                 "max_tokens must be between 1 and 32768".into(),
             ));
+        }
+        if self.session_id.is_some() {
+            if self.messages.is_some() {
+                return Err(RunnerError::InvalidInput(
+                    "pass either `session_id` or `messages`, not both".into(),
+                ));
+            }
+            if self.prompt.as_deref().is_none_or(|p| p.trim().is_empty()) {
+                return Err(RunnerError::InvalidInput(
+                    "a session run needs a `prompt`".into(),
+                ));
+            }
         }
         let messages = self.messages.as_deref().unwrap_or_default();
         if messages.len() > 256 {
@@ -210,6 +268,9 @@ impl RunOptions {
 pub struct RunnerOutcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<agentd_ai::types::Usage>,
+    /// Echo of the session the run appended to, when one was used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub text: String,
     pub provider: String,
     pub model: Option<String>,
@@ -353,6 +414,7 @@ pub async fn run(
 
     Ok(RunnerOutcome {
         usage: resp.usage,
+        session_id: None,
         text: resp.text,
         provider: provider_name,
         model: resp.model,

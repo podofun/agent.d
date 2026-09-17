@@ -14,6 +14,7 @@ agentd-approvals.workspace = true
 agentd-executor.workspace = true
 agentd-luals.workspace = true
 agentd-memory.workspace = true
+agentd-sessions.workspace = true
 agentd-packages.workspace = true
 agentd-permissions.workspace = true
 agentd-runners.workspace = true

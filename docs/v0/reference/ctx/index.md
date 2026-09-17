@@ -15,6 +15,7 @@
 | [`ctx.secret`](/v0/reference/ctx/secrets) | OS keyring get/set/delete | `secret:<key>` |
 | [`ctx.memory`](/v0/reference/ctx/memory) | Durable namespaced key/value (redb) | `memory.read:<ns>` / `memory.write:<ns>` |
 | [`ctx.state`](/v0/reference/ctx/memory) | Ephemeral in-process key/value | none |
+| [`ctx.sessions`](/v0/reference/ctx/sessions) | Stored chat history for `ctx.run` | `sessions.read` / `sessions.write` |
 | [`ctx.ai`](/v0/reference/ctx/ai) | Model calls through registered providers | `ai:<provider>` |
 | [`ctx.call` / `ctx.run` / `ctx.structured`](/v0/reference/ctx/calls) | Cross-component action and runner invocation | depends on target |
 | [`ctx.caller`](/v0/reference/ctx/caller) | Read-only caller identity | none |

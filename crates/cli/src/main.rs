@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
             compact,
         } => commands::cmd_call(url, timeout, action, json, data, result_only, compact).await,
         Cmd::Runner { cmd } => commands::cmd_runner(url, timeout, cmd).await,
+        Cmd::Session { cmd } => commands::cmd_session(url, timeout, cmd).await,
         Cmd::Skills { cmd } => commands::cmd_skills(url, timeout, cmd).await,
         Cmd::Services { cmd } => commands::cmd_services(url, timeout, cmd).await,
         Cmd::Grants { cmd } => match cmd {
