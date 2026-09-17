@@ -126,12 +126,14 @@ agentctl runner inspect backend_reviewer
 
 Run a runner with a text prompt and print the result.
 
-```bash
-agentctl runner run <name> "<prompt>" [--text-only] [--stream]
+```text
+agentctl runner run <name> "<prompt>" [--session <id>] [--user <user>] [--text-only] [--stream]
 ```
 
 | Flag | Description |
 |---|---|
+| `--session <id>` | Continue a chat session from `agentctl session new`. The daemon loads its history and stores this exchange |
+| `--user <user>` | Act as this end user. Needed for sessions created with `--user` |
 | `--text-only` | Print only the `text` field of the response |
 | `--stream` | Print the response as it is generated; tool calls show as dim `[tool: name]` markers on stderr |
 
@@ -151,6 +153,45 @@ agentctl runner run <name> "<prompt>" [--text-only] [--stream]
 ```bash
 agentctl runner run backend_reviewer "Review the latest diff" --text-only
 ```
+
+---
+
+### `agentctl session new`
+
+Create a chat session and print its id. Use `--label` to give it a name, such as a chat id or ticket number, that you can use to find it later. Labels are unique per interface, including across users.
+
+```text
+agentctl session new [--label <label>] [--user <user>]
+```
+
+```bash
+# Requires the support runner and provider grant from the session example.
+SID=$(agentctl session new --label demo --user fathi)
+agentctl runner run support "My name is Fathi." --session "$SID" --user fathi --text-only
+agentctl runner run support "What is my name?" --session "$SID" --user fathi --text-only
+```
+
+First register the `support` runner and configure its provider and grants as shown in [Running a session](/v0/reference/ctx/sessions#running-a-session). Use a new label each time you run this example.
+
+Sessions belong to the interface whose token `agentctl` connects with (`AGENTD_TOKEN`), and to the `--user` they were created with. Every later command must carry the same `--user`, or the daemon treats the session as missing. See [who can see a session](/v0/reference/ctx/sessions#who-can-see-a-session).
+
+---
+
+### `agentctl session ls [--user <user>] [--limit <n>]`
+
+List sessions from newest to oldest, with one line showing each session's id, label, runner and stored message count; `--limit` defaults to 50. Only sessions visible to your token and `--user` appear.
+
+---
+
+### `agentctl session show <id-or-label> [--user <user>]`
+
+Print a session with every stored turn. A 36-character UUID is looked up by id; anything else is treated as a label.
+
+---
+
+### `agentctl session rm <id> [--user <user>]`
+
+Delete a session and its turns.
 
 ---
 

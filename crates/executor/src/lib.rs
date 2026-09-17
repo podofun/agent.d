@@ -26,8 +26,9 @@ use agentd_permissions::{
     ActionMeta as PermActionMeta, Caller, Decision, Engine, PermissionSet,
     ToolMeta as PermToolMeta, engine::DenyLayer,
 };
-use agentd_runners::{RunOptions, RunnerError, RunnerOutcome, RunnerRegistry};
+use agentd_runners::{CompactPolicy, RunOptions, RunnerError, RunnerOutcome, RunnerRegistry};
 use agentd_services::{ServiceRegistry, ServiceState};
+use agentd_sessions::{Compaction, Scope, SessionStore};
 use agentd_skills::SkillRegistry;
 use agentd_trace::{TraceEvent, TraceSink};
 use agentd_types::{
@@ -352,6 +353,24 @@ pub struct Executor {
     approval_seq: std::sync::atomic::AtomicU64,
     /// Serializes concurrent "allow forever" read-modify-write + engine swap.
     forever_write_lock: tokio::sync::Mutex<()>,
+    /// Durable chat sessions behind `runners.run { session_id }`. `None` ⇒
+    /// session runs are rejected with a configuration error.
+    sessions: Option<Arc<dyn SessionStore>>,
+    /// Session ids with a run in flight; a second run on the same id is
+    /// refused rather than interleaved.
+    active_sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+/// Removes the session id from the in-flight set when the run ends.
+struct SessionGuard {
+    id: String,
+    set: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.id);
+    }
 }
 
 impl Executor {
@@ -380,7 +399,20 @@ impl Executor {
             reload_grants: None,
             approval_seq: std::sync::atomic::AtomicU64::new(1),
             forever_write_lock: tokio::sync::Mutex::new(()),
+            sessions: None,
+            active_sessions: Arc::new(std::sync::Mutex::new(Default::default())),
         }
+    }
+
+    /// Wire the durable session store. `RedbSessionStore` in production,
+    /// `MemSessionStore` in tests.
+    pub fn set_sessions(&mut self, store: Arc<dyn SessionStore>) {
+        self.sessions = Some(store);
+    }
+
+    /// The session store, when one is wired.
+    pub fn sessions(&self) -> Option<&Arc<dyn SessionStore>> {
+        self.sessions.as_ref()
     }
 
     /// Wire the approval broker. Without it, escalatable denials reject
@@ -1303,9 +1335,192 @@ impl Executor {
         self: &Arc<Self>,
         caller: Caller,
         runner_name: &str,
-        options: RunOptions,
+        mut options: RunOptions,
         sink: Option<agentd_ai::StreamSink>,
     ) -> Result<RunnerOutcome, RunnerError> {
+        let Some(session_id) = options.session_id.take() else {
+            let (out, _) = self.run_model(caller, runner_name, options, sink).await?;
+            return Ok(out);
+        };
+        let store = self.sessions.clone().ok_or_else(|| {
+            RunnerError::Session(
+                "no session store is configured, so `session_id` cannot be used".into(),
+            )
+        })?;
+        // A session outside the caller's scope reads as missing: no oracle for
+        // other tenants' ids.
+        let scope = scope_of(&caller);
+        let meta = store
+            .get_in(&scope, &session_id)
+            .map_err(|e| RunnerError::Session(e.to_string()))?
+            .ok_or_else(|| RunnerError::SessionNotFound(session_id.clone()))?;
+        let _guard = {
+            let mut set = self.active_sessions.lock().unwrap();
+            if !set.insert(session_id.clone()) {
+                return Err(RunnerError::SessionBusy(session_id));
+            }
+            SessionGuard {
+                id: session_id.clone(),
+                set: self.active_sessions.clone(),
+            }
+        };
+        let mut history = store
+            .turns(&session_id)
+            .map_err(|e| RunnerError::Session(e.to_string()))?;
+        let def = self
+            .runners
+            .get(runner_name)
+            .ok_or_else(|| RunnerError::NotFound(runner_name.to_string()))?;
+        let policy = def.compact.clone().unwrap_or_default();
+        if policy.enabled && meta.turn_count >= policy.after_turns {
+            match self
+                .compact_history(&caller, runner_name, &options, &policy, &history)
+                .await
+            {
+                Ok(Some(compaction)) => {
+                    let kept = history.split_off(compaction.drop_count);
+                    history = std::iter::once(compaction.summary.clone())
+                        .chain(kept)
+                        .collect();
+                    store
+                        .compact(&session_id, compaction)
+                        .map_err(|e| RunnerError::Session(e.to_string()))?;
+                    tracing::info!(session = %session_id, runner = runner_name, "compacted session");
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(session = %session_id, runner = runner_name, error = %e, "session compaction failed; running with full history");
+                }
+            }
+        }
+        options.messages = Some(history);
+        let (mut out, new_turns) = self.run_model(caller, runner_name, options, sink).await?;
+        store
+            .append(&session_id, &new_turns)
+            .map_err(|e| RunnerError::Session(e.to_string()))?;
+        out.session_id = Some(session_id);
+        Ok(out)
+    }
+
+    /// Summarize the oldest turns of `history` per `policy`. Returns `None`
+    /// when there is nothing safe to drop (too few turns, or no clean
+    /// user-turn boundary outside the tool-call groups).
+    async fn compact_history(
+        self: &Arc<Self>,
+        caller: &Caller,
+        runner_name: &str,
+        options: &RunOptions,
+        policy: &CompactPolicy,
+        history: &[agentd_ai::Message],
+    ) -> Result<Option<Compaction>, RunnerError> {
+        let Some(drop_count) = compaction_cut(history, policy.keep_recent as usize) else {
+            return Ok(None);
+        };
+        let def = self
+            .runners
+            .get(runner_name)
+            .ok_or_else(|| RunnerError::NotFound(runner_name.to_string()))?;
+        let composition = agentd_runners::compose(&def, &self.skills)?;
+        let (provider_name, provider, model_id) =
+            self.resolve_provider(&def, options.model.clone().or(composition.model.clone()))?;
+        if let Decision::Deny { reason, .. } = self
+            .engine
+            .load()
+            .check_runner_provider(runner_name, &provider_name)
+        {
+            return Err(RunnerError::Denied(reason));
+        }
+        let mut req = agentd_ai::CompletionRequest::default();
+        if !composition.system.is_empty() {
+            req.system = Some(composition.system.clone());
+        }
+        if !model_id.is_empty() {
+            req.model = Some(model_id);
+        }
+        // Old turns may end mid tool-call group; the boundary rule above
+        // guarantees they don't, but strip tool plumbing anyway so every
+        // provider accepts the transcript as plain text.
+        req.messages = history[..drop_count]
+            .iter()
+            .map(|m| agentd_ai::Message {
+                role: match m.role {
+                    agentd_ai::Role::Tool => agentd_ai::Role::User,
+                    other => other,
+                },
+                content: if m.tool_calls.is_empty() {
+                    m.content.clone()
+                } else {
+                    let calls: Vec<String> = m
+                        .tool_calls
+                        .iter()
+                        .map(|c| format!("{}({})", c.name, c.arguments))
+                        .collect();
+                    format!("{}\n[called tools: {}]", m.content, calls.join(", "))
+                },
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            })
+            .collect();
+        req.messages
+            .push(agentd_ai::Message::user(policy.prompt.clone()));
+        req.max_tokens = Some(1024);
+        req.caller = Some(caller.clone());
+        let resp = provider
+            .complete(req)
+            .await
+            .map_err(|e| RunnerError::Provider {
+                provider: provider_name,
+                source: e,
+            })?;
+        let text = resp.text.trim().to_string();
+        if text.is_empty() {
+            return Err(RunnerError::Session(
+                "the model returned an empty summary".into(),
+            ));
+        }
+        Ok(Some(Compaction {
+            drop_count,
+            summary: agentd_ai::Message::user(format!("[Conversation summary]\n{text}")),
+        }))
+    }
+
+    /// Resolve `(provider name, provider, upstream model id)` for a runner.
+    fn resolve_provider(
+        &self,
+        def: &agentd_runners::RunnerDef,
+        model: Option<String>,
+    ) -> Result<(String, Arc<dyn agentd_ai::Provider>, String), RunnerError> {
+        match model.as_deref() {
+            Some(m) => self
+                .providers
+                .resolve_for_model(m)
+                .ok_or_else(|| RunnerError::NoProvider {
+                    name: def.name.clone(),
+                    model: model.clone(),
+                }),
+            None => {
+                let (n, p) =
+                    self.providers
+                        .resolve(None)
+                        .ok_or_else(|| RunnerError::NoProvider {
+                            name: def.name.clone(),
+                            model: None,
+                        })?;
+                Ok((n, p, String::new()))
+            }
+        }
+    }
+
+    /// One model run over an explicit history. Returns the outcome plus every
+    /// turn the run produced (user prompt, assistant replies, tool results) so
+    /// a session can persist them.
+    async fn run_model(
+        self: &Arc<Self>,
+        caller: Caller,
+        runner_name: &str,
+        options: RunOptions,
+        sink: Option<agentd_ai::StreamSink>,
+    ) -> Result<(RunnerOutcome, Vec<agentd_ai::Message>), RunnerError> {
         let RunOptions {
             prompt,
             messages,
@@ -1321,26 +1536,7 @@ impl Executor {
         let composition = agentd_runners::compose(&def, &self.skills)?;
 
         let model_for_resolve = model_override.clone().or_else(|| composition.model.clone());
-        let (provider_name, provider, model_id) = match model_for_resolve.as_deref() {
-            Some(m) => {
-                self.providers
-                    .resolve_for_model(m)
-                    .ok_or_else(|| RunnerError::NoProvider {
-                        name: def.name.clone(),
-                        model: model_for_resolve.clone(),
-                    })?
-            }
-            None => {
-                let (n, p) =
-                    self.providers
-                        .resolve(None)
-                        .ok_or_else(|| RunnerError::NoProvider {
-                            name: def.name.clone(),
-                            model: None,
-                        })?;
-                (n, p, String::new())
-            }
-        };
+        let (provider_name, provider, model_id) = self.resolve_provider(&def, model_for_resolve)?;
 
         let tool_caller = {
             let mut c = caller.clone();
@@ -1379,6 +1575,8 @@ impl Executor {
         if let Some(msgs) = messages {
             req.messages = msgs;
         }
+        // Everything pushed from here on is new this run.
+        let base_len = req.messages.len();
         if let Some(p) = prompt
             && !p.is_empty()
         {
@@ -1398,32 +1596,43 @@ impl Executor {
         let req_model_echo = req.model.clone();
         match provider.loop_mode() {
             agentd_ai::LoopMode::ProviderOwned => {
-                let dispatcher: Arc<dyn Dispatcher> = self.clone();
-                // A provider that bakes the token into a long-lived subprocess
-                // (codex) dictates a stable token; header-based providers
-                // (claude) get a fresh random one per invocation.
-                let token = provider
-                    .preferred_mcp_token()
-                    .unwrap_or_else(agentd_mcp::gen_token);
-                let loopback = agentd_mcp::bind_loopback(
-                    dispatcher,
-                    tool_caller.clone(),
-                    req.tools.clone(),
-                    token,
-                )
-                .await
-                .map_err(|e| RunnerError::Provider {
-                    provider: provider_name.clone(),
-                    source: agentd_ai::ProviderError::Config(format!(
-                        "could not start the local MCP bridge that lets the model call tools ({e})"
-                    )),
-                })?;
-                req.mcp_endpoint = Some(agentd_ai::McpEndpoint::Http {
-                    url: loopback.url.clone(),
-                    token: loopback.token.clone(),
-                });
-                req.dispatcher = Some(self.clone());
-                req.caller = Some(tool_caller.clone());
+                // Only stand up the MCP loopback when the runner actually has
+                // tools to offer. A tool-less run stays plain text, which is
+                // also the only shape text-only CLIs (codex exec) accept.
+                let loopback = if req.tools.is_empty() {
+                    None
+                } else {
+                    let dispatcher: Arc<dyn Dispatcher> = self.clone();
+                    // A provider that bakes the token into a long-lived subprocess
+                    // (codex) dictates a stable token; header-based providers
+                    // (claude) get a fresh random one per invocation.
+                    let token = provider
+                        .preferred_mcp_token()
+                        .unwrap_or_else(agentd_mcp::gen_token);
+                    let loopback = agentd_mcp::bind_loopback(
+                        dispatcher,
+                        tool_caller.clone(),
+                        req.tools.clone(),
+                        token,
+                    )
+                    .await
+                    .map_err(|e| RunnerError::Provider {
+                        provider: provider_name.clone(),
+                        source: agentd_ai::ProviderError::Config(format!(
+                            "could not start the local MCP bridge that lets the model call tools ({e})"
+                        )),
+                    })?;
+                    req.mcp_endpoint = Some(agentd_ai::McpEndpoint::Http {
+                        url: loopback.url.clone(),
+                        token: loopback.token.clone(),
+                    });
+                    req.dispatcher = Some(self.clone());
+                    req.caller = Some(tool_caller.clone());
+                    Some(loopback)
+                };
+                // The provider runs its own tool loop, so only the prompt and
+                // the final reply are visible to us.
+                let mut new_turns: Vec<agentd_ai::Message> = req.messages[base_len..].to_vec();
                 let resp = match &sink {
                     Some(s) => provider.complete_streaming(req, s.clone()).await,
                     None => provider.complete(req).await,
@@ -1433,13 +1642,18 @@ impl Executor {
                     source: e,
                 })?;
                 drop(loopback);
-                Ok(RunnerOutcome {
-                    usage: resp.usage,
-                    text: resp.text,
-                    provider: provider_name,
-                    model: resp.model.or(req_model_echo),
-                    stop_reason: resp.stop_reason,
-                })
+                new_turns.push(agentd_ai::Message::assistant(resp.text.clone()));
+                Ok((
+                    RunnerOutcome {
+                        usage: resp.usage,
+                        session_id: None,
+                        text: resp.text,
+                        provider: provider_name,
+                        model: resp.model.or(req_model_echo),
+                        stop_reason: resp.stop_reason,
+                    },
+                    new_turns,
+                ))
             }
             agentd_ai::LoopMode::ExecutorOwned => {
                 let mut turns = 0u32;
@@ -1471,13 +1685,19 @@ impl Executor {
                         _ => usage = None,
                     }
                     if resp.tool_calls.is_empty() {
-                        return Ok(RunnerOutcome {
-                            usage,
-                            text: resp.text,
-                            provider: provider_name,
-                            model: resp.model.or(req_model_echo),
-                            stop_reason: resp.stop_reason,
-                        });
+                        let mut new_turns = req.messages.split_off(base_len);
+                        new_turns.push(agentd_ai::Message::assistant(resp.text.clone()));
+                        return Ok((
+                            RunnerOutcome {
+                                usage,
+                                session_id: None,
+                                text: resp.text,
+                                provider: provider_name,
+                                model: resp.model.or(req_model_echo),
+                                stop_reason: resp.stop_reason,
+                            },
+                            new_turns,
+                        ));
                     }
                     req.messages.push(agentd_ai::Message {
                         role: agentd_ai::Role::Assistant,
@@ -1503,6 +1723,30 @@ impl Executor {
             }
         }
     }
+}
+
+/// Session visibility for a caller: its interface (or service) plus user.
+pub fn scope_of(caller: &Caller) -> Scope {
+    Scope::from_caller(
+        caller.interface.as_ref().map(|i| i.as_str()),
+        caller.service.as_ref().map(|s| s.as_str()),
+        caller.user.as_ref().map(|u| u.as_str()),
+    )
+}
+
+/// Number of oldest turns to fold into a summary so that `keep_recent` turns
+/// survive and the first surviving turn is a real user message (never a tool
+/// result or an assistant turn whose tool calls would be orphaned). `None`
+/// when no such cut exists.
+fn compaction_cut(history: &[agentd_ai::Message], keep_recent: usize) -> Option<usize> {
+    let target = history.len().checked_sub(keep_recent)?;
+    if target == 0 {
+        return None;
+    }
+    (1..=target).rev().find(|&cut| {
+        let m = &history[cut];
+        m.role == agentd_ai::Role::User && m.tool_call_id.is_none()
+    })
 }
 
 fn parse_messages(v: serde_json::Value) -> Result<Vec<agentd_ai::Message>, RunnerError> {

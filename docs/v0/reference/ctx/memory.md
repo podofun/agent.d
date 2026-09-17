@@ -2,6 +2,10 @@
 
 agent.d provides two key/value stores: **durable memory** (`ctx.memory`) that survives restarts and hot reloads, and **ephemeral state** (`ctx.state`) that exists only for the lifetime of the current runtime process.
 
+::: tip Chat history?
+For a runner's conversation history use [`ctx.sessions`](/v0/reference/ctx/sessions): the daemon loads, stores and compacts it for you. `ctx.memory` is for everything else you want to keep.
+:::
+
 ## Durable memory — `ctx.memory`
 
 `ctx.memory` is backed by an embedded [redb](https://github.com/cberner/redb) database stored at `$XDG_DATA_HOME/agentd/memory.redb`. Values are JSON-serialized automatically.

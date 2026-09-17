@@ -23,7 +23,11 @@
 //! | `actions.call`    | `{ name, args, session?, user? }`          | `{ result, duration_ms }`           |
 //! | `runners.list`    | none                                       | `[{name, model, skills, ...}]`      |
 //! | `runners.inspect` | `{ name }`                                 | `RunnerComposition`                 |
-//! | `runners.run`     | `{ name, prompt, session?, user? }`        | `RunnerOutcome`                     |
+//! | `runners.run`     | `{ name, prompt, session_id?, session?, user? }` | `RunnerOutcome`               |
+//! | `sessions.create` | `{ label?, user?, runner? }`               | `SessionMeta`                       |
+//! | `sessions.get`    | `{ id }` or `{ label }`                    | `{ ...SessionMeta, turns }`         |
+//! | `sessions.list`   | `{ limit? }`                               | `[SessionMeta]`                     |
+//! | `sessions.delete` | `{ id }`                                   | `{ deleted }`                       |
 //! | `skills.list`     | none                                       | `[{name, description, actions}]`    |
 //! | `skills.inspect`  | `{ name }`                                 | `SkillDef`                          |
 //! | `services.list`   | none                                       | `[ServiceStatus]`                   |
@@ -33,7 +37,7 @@
 //! interfaces (Telegram, Discord, …) can carry their own identity space.
 //! Lua handlers read it back via `ctx.caller`.
 
-use agentd_executor::Executor;
+use agentd_executor::{Executor, scope_of};
 use agentd_permissions::Caller;
 use agentd_runners::{RunOptions, RunnerError, compose};
 use agentd_types::{ActionCall, RegistryError};
@@ -176,7 +180,12 @@ pub struct AppState {
     pub executor: Arc<arc_swap::ArcSwap<Executor>>,
     /// Bearer token required on the public `/ws` handshake. `None` disables auth
     /// (the daemon's `--no-auth`); `/health` is always open for liveness probes.
+    /// A connection authenticated with it is interface `ws`.
     pub auth_token: Option<Arc<String>>,
+    /// Per-interface bearer tokens (`[interfaces.<name>] token = ...`), keyed
+    /// by token. A connection presenting one becomes that interface, which is
+    /// what `[interface.<name>]` grants and session ownership key on.
+    pub interface_tokens: Arc<HashMap<String, String>>,
     /// Bearer token required on the `/control` handshake. Distinct from
     /// `auth_token` so a public-token holder can never reach the control plane.
     /// `None` disables the control gate (`--no-auth`).
@@ -334,23 +343,53 @@ fn webhook_error(status: StatusCode, message: &'static str) -> Response {
     (status, Json(json!({ "ok": false, "error": message }))).into_response()
 }
 
+/// Constant-time equality so token checks do not leak prefix matches.
+fn token_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Which interface a `/ws` handshake is. The public token (or `--no-auth`)
+/// means `ws`; an interface token names its interface; anything else is refused.
+fn resolve_interface(state: &AppState, headers: &axum::http::HeaderMap) -> Option<String> {
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if let Some(p) = presented {
+        // Scan every entry so timing does not reveal which token matched.
+        let mut hit: Option<&String> = None;
+        for (token, name) in state.interface_tokens.iter() {
+            if token_eq(token, p) {
+                hit = Some(name);
+            }
+        }
+        if let Some(name) = hit {
+            return Some(name.clone());
+        }
+    }
+    match &state.auth_token {
+        None => Some("ws".to_string()),
+        Some(token) => presented
+            .filter(|p| token_eq(p, token))
+            .map(|_| "ws".to_string()),
+    }
+}
+
 async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    if let Some(token) = &state.auth_token {
-        let presented = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        if presented != Some(token.as_str()) {
-            return (axum::http::StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-        }
-    }
+    let Some(interface) = resolve_interface(&state, &headers) else {
+        return (axum::http::StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    };
     ws.max_message_size(1_100_000)
         .max_frame_size(1_100_000)
-        .on_upgrade(move |socket| handle_socket(socket, state))
+        .on_upgrade(move |socket| handle_socket(socket, state, interface))
 }
 
 /// `/control` handshake. Gated by the **admin** token (separate from the public
@@ -424,10 +463,11 @@ struct Outbound {
     finished: Option<u64>,
 }
 
-async fn handle_socket(mut socket: WebSocket, state: AppState) {
+async fn handle_socket(mut socket: WebSocket, state: AppState, interface: String) {
     let _connection = state.lifecycle.enter();
     let mut draining = state.lifecycle.is_draining();
     let session = format!("ws-{}", WS_CONN_SEQ.fetch_add(1, Ordering::Relaxed));
+    let conn = Arc::new(ConnIdentity { interface, session });
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(64);
     let mut tasks = FuturesUnordered::<BoxFuture<'static, ()>>::new();
     let mut active = HashMap::<u64, Option<tokio::sync::oneshot::Sender<()>>>::new();
@@ -488,7 +528,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                     continue;
                 }
                 let state = state.clone();
-                let session = session.clone();
+                let conn = conn.clone();
                 let tx = tx.clone();
                 let id = req.id;
                 let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
@@ -499,14 +539,14 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         match serde_json::from_value::<RunParams>(req.params) {
                             Ok(p) => {
                                 tokio::select! {
-                                    result = handle_run(&state, id, p, &session, &tx) => result,
+                                    result = handle_run(&state, id, p, &conn, &tx) => result,
                                     _ = cancel_rx => err(id, "cancelled", "runner cancelled; completed side effects are not undone"),
                                 }
                             }
                             Err(e) => bad_params(id, e),
                         }
                     } else {
-                        dispatch(state, req, &session).await
+                        dispatch(state, req, &conn).await
                     };
                     let _ = tx.send(Outbound { frame: json!(response), finished: Some(id) }).await;
                 }));
@@ -521,11 +561,11 @@ async fn handle_run(
     state: &AppState,
     id: u64,
     p: RunParams,
-    conn_session: &str,
+    conn: &ConnIdentity,
     outbound: &tokio::sync::mpsc::Sender<Outbound>,
 ) -> WsResponse {
     let executor = state.executor.load_full();
-    let caller = ws_caller(conn_session, p.session, p.user).with_runner(p.name.clone());
+    let caller = ws_caller(conn, p.session, p.user).with_runner(p.name.clone());
     let (tx, mut rx) = agentd_ai::types::stream_channel();
     let run = executor.run_runner_with_options(caller, &p.name, p.options, p.stream.then_some(tx));
     tokio::pin!(run);
@@ -639,13 +679,21 @@ async fn send(socket: &mut WebSocket, resp: &WsResponse) -> Result<(), axum::Err
         .map_err(axum::Error::new)?
 }
 
-/// Build the `Caller` for one request: interface is always `ws`; session
-/// defaults to the connection id but a request-level `session` param wins.
-/// The handshake bearer token authenticates the *connection*; `user` is still
-/// caller-supplied identity within that trusted channel, not separately verified.
-fn ws_caller(conn_session: &str, session: Option<String>, user: Option<String>) -> Caller {
-    let mut c = Caller::interface("ws")
-        .with_session(session.unwrap_or_else(|| conn_session.to_string()))
+/// What the handshake established for one connection.
+struct ConnIdentity {
+    /// `ws` for the public token, otherwise the `[interfaces.<name>]` that matched.
+    interface: String,
+    /// Auto-minted `ws-<n>` connection id.
+    session: String,
+}
+
+/// Build the `Caller` for one request: the interface comes from the handshake
+/// token; session defaults to the connection id but a request-level `session`
+/// param wins. `user` is identity the interface vouches for within its own
+/// channel; the daemon trusts the interface, not the end user.
+fn ws_caller(conn: &ConnIdentity, session: Option<String>, user: Option<String>) -> Caller {
+    let mut c = Caller::interface(conn.interface.as_str())
+        .with_session(session.unwrap_or_else(|| conn.session.clone()))
         .with_execution(next_execution_id());
     if let Some(u) = user {
         c = c.with_user(u);
@@ -657,7 +705,7 @@ fn next_execution_id() -> String {
     format!("exec-{}", EXEC_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
-async fn dispatch(state: AppState, req: WsRequest, conn_session: &str) -> WsResponse {
+async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsResponse {
     let id = req.id;
     // Pin the current runtime for this request. A concurrent hot-reload swap
     // only affects requests dispatched after it; this one finishes on `executor`.
@@ -672,7 +720,7 @@ async fn dispatch(state: AppState, req: WsRequest, conn_session: &str) -> WsResp
                     action: p.name,
                     args: p.args.unwrap_or(Value::Null),
                 };
-                let caller = ws_caller(conn_session, p.session, p.user);
+                let caller = ws_caller(conn, p.session, p.user);
                 match executor.run(caller, call).await {
                     Ok((res, dur)) => ok(id, json!({ "result": res.value, "duration_ms": dur })),
                     Err((e, dur)) => action_error(id, e, dur),
@@ -711,7 +759,7 @@ async fn dispatch(state: AppState, req: WsRequest, conn_session: &str) -> WsResp
         },
         "runners.run" => match serde_json::from_value::<RunParams>(req.params) {
             Ok(p) => {
-                let caller = ws_caller(conn_session, p.session, p.user).with_runner(p.name.clone());
+                let caller = ws_caller(conn, p.session, p.user).with_runner(p.name.clone());
                 match executor
                     .run_runner_with_options(caller, &p.name, p.options, None)
                     .await
@@ -748,6 +796,99 @@ async fn dispatch(state: AppState, req: WsRequest, conn_session: &str) -> WsResp
 
         "services.list" => ok_ser(id, &executor.services().statuses()),
 
+        "sessions.create" => {
+            let Some(store) = executor.sessions() else {
+                return no_sessions(id);
+            };
+            match serde_json::from_value::<CreateSessionParams>(req.params) {
+                Ok(p) => {
+                    let caller = ws_caller(conn, p.session, p.user);
+                    let new = agentd_sessions::NewSession::in_scope(&scope_of(&caller))
+                        .label(p.label)
+                        .runner(p.runner);
+                    match store.create(new) {
+                        Ok(meta) => ok_ser(id, &meta),
+                        Err(e) => session_error(id, e),
+                    }
+                }
+                Err(e) => bad_params(id, e),
+            }
+        }
+        "sessions.get" => {
+            let Some(store) = executor.sessions() else {
+                return no_sessions(id);
+            };
+            let p = match serde_json::from_value::<SessionRef>(req.params) {
+                Ok(p) => p,
+                Err(e) => return bad_params(id, e),
+            };
+            let scope = scope_of(&ws_caller(conn, p.session.clone(), p.user.clone()));
+            let meta = match (&p.id, &p.label) {
+                (Some(i), _) => store.get_in(&scope, i),
+                (None, Some(l)) => store.find_in(&scope, l),
+                (None, None) => {
+                    return err(id, "bad_params", "pass a session `id` or `label`");
+                }
+            };
+            match meta {
+                Ok(Some(meta)) => match store.turns(&meta.id) {
+                    Ok(turns) => {
+                        let mut v = serde_json::to_value(&meta).unwrap_or_default();
+                        v["turns"] = serde_json::to_value(turns).unwrap_or_default();
+                        ok(id, v)
+                    }
+                    Err(e) => session_error(id, e),
+                },
+                Ok(None) => err(
+                    id,
+                    "session_not_found",
+                    format!(
+                        "session `{}` does not exist",
+                        p.id.or(p.label).unwrap_or_default()
+                    ),
+                ),
+                Err(e) => session_error(id, e),
+            }
+        }
+        "sessions.list" => {
+            let Some(store) = executor.sessions() else {
+                return no_sessions(id);
+            };
+            match serde_json::from_value::<LimitParam>(req.params) {
+                Ok(p) => match store.list(
+                    &scope_of(&ws_caller(conn, p.session, p.user)),
+                    p.limit.unwrap_or(50).min(500),
+                ) {
+                    Ok(v) => ok_ser(id, &v),
+                    Err(e) => session_error(id, e),
+                },
+                Err(e) => bad_params(id, e),
+            }
+        }
+        "sessions.delete" => {
+            let Some(store) = executor.sessions() else {
+                return no_sessions(id);
+            };
+            match serde_json::from_value::<IdParam>(req.params) {
+                Ok(p) => {
+                    let scope = scope_of(&ws_caller(conn, p.session, p.user));
+                    // Out-of-scope ids delete nothing and say so like a missing id would.
+                    let visible = match store.get_in(&scope, &p.id) {
+                        Ok(v) => v.is_some(),
+                        Err(e) => return session_error(id, e),
+                    };
+                    if !visible {
+                        return ok(id, json!({ "deleted": false }));
+                    }
+                    match store.delete(&p.id) {
+                        Ok(deleted) => ok(id, json!({ "deleted": deleted })),
+                        Err(e) => session_error(id, e),
+                    }
+                }
+                Err(e) => bad_params(id, e),
+            }
+        }
+
         other => err(id, "unknown_method", format!("unknown method `{other}`")),
     }
 }
@@ -768,6 +909,61 @@ struct CallParams {
 #[derive(Deserialize)]
 struct NameParam {
     name: String,
+}
+
+/// `sessions.create`. The owner is the connection's interface; `user` is the
+/// same caller-identity override every other method takes.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CreateSessionParams {
+    label: Option<String>,
+    runner: Option<String>,
+    session: Option<String>,
+    user: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IdParam {
+    id: String,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct LimitParam {
+    limit: Option<usize>,
+    session: Option<String>,
+    user: Option<String>,
+}
+
+/// `sessions.get` accepts either the daemon id or the caller's label.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SessionRef {
+    id: Option<String>,
+    label: Option<String>,
+    session: Option<String>,
+    user: Option<String>,
+}
+
+fn no_sessions(id: u64) -> WsResponse {
+    err(
+        id,
+        "sessions_unavailable",
+        "no session store is configured on this daemon",
+    )
+}
+
+fn session_error(id: u64, e: agentd_sessions::SessionError) -> WsResponse {
+    let code = match &e {
+        agentd_sessions::SessionError::NotFound(_) => "session_not_found",
+        agentd_sessions::SessionError::LabelTaken(_) => "session_label_taken",
+        agentd_sessions::SessionError::Backend(_) => "session_store",
+    };
+    err(id, code, e.to_string())
 }
 
 #[derive(Deserialize)]
@@ -816,6 +1012,11 @@ fn tip_for(code: &str) -> Option<String> {
         }
         "not_found" => "Run `agentctl tools` to list registered actions",
         "runner_not_found" => "Run `agentctl runner ls` to list runners",
+        "session_not_found" => {
+            "Run `agentctl session ls` to list sessions, or `agentctl session new` to start one"
+        }
+        "session_busy" => "Wait for the in-flight run on this session to finish, then retry",
+        "session_label_taken" => "Fetch the existing one with `sessions.get { label }` instead",
         "denied" | "needs_confirmation" => {
             "Grants live in `grants.toml`; run `agentctl grants listen` to approve interactively"
         }
@@ -878,6 +1079,9 @@ fn runner_error(id: u64, e: RunnerError) -> WsResponse {
         RunnerError::SlowConsumer => "slow_consumer",
 
         RunnerError::NotFound(_) => "runner_not_found",
+        RunnerError::SessionNotFound(_) => "session_not_found",
+        RunnerError::SessionBusy(_) => "session_busy",
+        RunnerError::Session(_) => "session_store",
         RunnerError::UnknownSkill { .. } => "unknown_skill",
         RunnerError::NoProvider { .. } => "no_provider",
         RunnerError::Provider {

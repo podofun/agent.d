@@ -9,6 +9,7 @@ agentd-approvals.workspace = true
 agentd-executor.workspace = true
 agentd-permissions.workspace = true
 agentd-runners.workspace = true
+agentd-sessions.workspace = true
 agentd-skills.workspace = true
 agentd-types.workspace = true
 arc-swap = "1.7"

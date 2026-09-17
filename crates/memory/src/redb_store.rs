@@ -7,6 +7,8 @@
 
 use std::path::Path;
 
+use std::sync::Arc;
+
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::{MemoryError, MemoryStore, Result, check_no_nul};
@@ -14,7 +16,7 @@ use crate::{MemoryError, MemoryStore, Result, check_no_nul};
 const KV: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv");
 
 pub struct RedbStore {
-    db: Database,
+    db: Arc<Database>,
 }
 
 fn backend<E: std::fmt::Display>(e: E) -> MemoryError {
@@ -44,7 +46,12 @@ impl RedbStore {
     /// Open or create the database file and ensure the `kv` table exists (so
     /// read transactions never hit `TableDoesNotExist` on a fresh file).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let db = Database::create(path).map_err(backend)?;
+        Self::from_database(open_database(path)?)
+    }
+
+    /// Wrap an already-open database (shared with other stores living in the
+    /// same file, e.g. the session store) and ensure the `kv` table exists.
+    pub fn from_database(db: Arc<Database>) -> Result<Self> {
         let wtx = db.begin_write().map_err(backend)?;
         {
             wtx.open_table(KV).map_err(backend)?;
@@ -52,7 +59,19 @@ impl RedbStore {
         wtx.commit().map_err(backend)?;
         Ok(Self { db })
     }
+
+    /// Handle to the underlying database, for other stores sharing the file.
+    pub fn database(&self) -> Arc<Database> {
+        self.db.clone()
+    }
 }
+
+/// Open (or create) the redb file every durable store in the daemon shares.
+pub fn open_database(path: impl AsRef<Path>) -> Result<Arc<Database>> {
+    Database::create(path).map(Arc::new).map_err(backend)
+}
+
+impl RedbStore {}
 
 impl MemoryStore for RedbStore {
     fn get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {

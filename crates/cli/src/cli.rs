@@ -51,6 +51,12 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         cmd: RunnerCmd,
     },
+    /// Chat session operations.
+    #[command(name = "session", visible_alias = "sessions")]
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCmd,
+    },
     /// Skill operations.
     #[command(name = "skill", visible_alias = "skills")]
     Skills {
@@ -119,12 +125,51 @@ pub(crate) enum RunnerCmd {
     Run {
         name: String,
         prompt: String,
+        /// Continue a chat session (id from `agentctl session new`). The
+        /// daemon loads its history and stores this exchange.
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+        /// Act as this end user; needed for sessions created with `--user`.
+        #[arg(long)]
+        user: Option<String>,
         #[arg(long)]
         text_only: bool,
         /// Print the response as it is generated (token deltas), then exit
         /// with the complete result.
         #[arg(long)]
         stream: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum SessionCmd {
+    /// Start a session and print its id.
+    New {
+        /// Your own id for it (e.g. a chat id); must be unique.
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        user: Option<String>,
+    },
+    Ls {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Act as this end user; only their sessions are listed.
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Show a session with its turns. Accepts an id or a label.
+    Show {
+        id: String,
+        /// Act as this end user (required for sessions created with one).
+        #[arg(long)]
+        user: Option<String>,
+    },
+    Rm {
+        id: String,
+        /// Act as this end user (required for sessions created with one).
+        #[arg(long)]
+        user: Option<String>,
     },
 }
 

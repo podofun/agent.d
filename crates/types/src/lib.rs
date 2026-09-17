@@ -170,6 +170,7 @@ pub trait RunnerDispatcher: Send + Sync {
     /// - `prompt`   : string, optional. Becomes the final user message.
     /// - `messages` : `[{role, content}]`, optional. Full conversation.
     /// - `history`  : alias for `messages`.
+    /// - `session_id`: string, optional. Daemon-stored history; excludes `messages`.
     /// - `model`    : string, optional. Overrides the runner's default.
     /// - `system`   : string, optional. Appended after the composed system.
     ///

@@ -15,6 +15,7 @@ members = [
     "crates/netbroker",
     "crates/skills",
     "crates/memory",
+    "crates/sessions",
     "crates/fs",
     "crates/codex",
     "crates/mcp",
@@ -45,6 +46,7 @@ agentd-fs          = { path = "crates/fs" }
 agentd-luals       = { path = "crates/luals" }
 agentd-mcp         = { path = "crates/mcp" }
 agentd-memory      = { path = "crates/memory" }
+agentd-sessions    = { path = "crates/sessions" }
 agentd-net         = { path = "crates/net" }
 agentd-packages    = { path = "crates/packages" }
 agentd-process     = { path = "crates/process" }
@@ -72,6 +74,7 @@ hex                = "0.4.3"
 hmac               = "0.12.1"
 mlua               = { version = "0.11.6", features = ["lua54", "vendored", "send"] }
 redb               = "4"
+uuid               = { version = "1", features = ["v4"] }
 reqwest            = { version = "0.13.3", default-features = false }
 serde              = { version = "1.0.228", features = ["derive"] }
 serde_json         = "1.0.149"

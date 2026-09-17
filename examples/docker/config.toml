@@ -17,3 +17,7 @@ log_level = "info"
 # secret = "webhook_secret"
 # signature_header = "x-webhook-signature-256"
 # signature_prefix = "sha256="
+
+# Give each client its own identity and token; sessions it creates are its own.
+# [interfaces.webapp]
+# token_secret = "webapp_ws_token"      # AGENTD_SECRET_WEBAPP_WS_TOKEN with the env backend

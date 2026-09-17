@@ -8,6 +8,7 @@ agentd-ai.workspace = true
 agentd-fs.workspace = true
 agentd-net.workspace = true
 agentd-memory.workspace = true
+agentd-sessions.workspace = true
 agentd-permissions.workspace = true
 agentd-packages.workspace = true
 agentd-runners.workspace = true

@@ -66,6 +66,7 @@ async fn boot_with_auth(auth_token: Option<String>) -> (String, Option<String>) 
         executor: Arc::new(arc_swap::ArcSwap::from(executor)),
         auth_token: auth_token.clone().map(Arc::new),
         admin_token: None,
+        interface_tokens: Arc::new(HashMap::new()),
         broker: Arc::new(agentd_approvals::Broker::new(
             std::time::Duration::from_secs(30),
         )),
@@ -193,6 +194,16 @@ async fn boot_runner(
     provider: Arc<dyn agentd_ai::Provider>,
     grant: bool,
 ) -> (String, Arc<agentd_api::Lifecycle>) {
+    boot_runner_with_interfaces(provider, grant, HashMap::new()).await
+}
+
+/// Like `boot_runner`, with the public token disabled and the given
+/// `token -> interface` map, so tests can connect as distinct interfaces.
+async fn boot_runner_with_interfaces(
+    provider: Arc<dyn agentd_ai::Provider>,
+    grant: bool,
+    interface_tokens: HashMap<String, String>,
+) -> (String, Arc<agentd_api::Lifecycle>) {
     let host = LuaHost::new().expect("lua host");
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -223,7 +234,7 @@ async fn boot_runner(
         );
     }
     providers.set_default("mock");
-    let executor = Arc::new(Executor::new(
+    let mut executor = Executor::new(
         registry,
         Arc::new(NullSink),
         Arc::new(Engine::new(Grants::from_file(grants))),
@@ -231,7 +242,9 @@ async fn boot_runner(
         services,
         skills,
         Arc::new(providers),
-    ));
+    );
+    executor.set_sessions(Arc::new(agentd_sessions::MemSessionStore::new()));
+    let executor = Arc::new(executor);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -239,8 +252,10 @@ async fn boot_runner(
     let state = AppState {
         lifecycle: lifecycle.clone(),
         executor: Arc::new(arc_swap::ArcSwap::from(executor)),
-        auth_token: None,
+        // With interfaces configured, auth is on: the public token is `ws`.
+        auth_token: (!interface_tokens.is_empty()).then(|| Arc::new("public-token".to_string())),
         admin_token: None,
+        interface_tokens: Arc::new(interface_tokens),
         broker: Arc::new(agentd_approvals::Broker::new(
             std::time::Duration::from_secs(30),
         )),
@@ -250,6 +265,15 @@ async fn boot_runner(
         let _ = serve(listener, router(state)).await;
     });
     (format!("ws://{addr}/ws"), lifecycle)
+}
+
+/// Connect to `url` presenting `token` as the bearer.
+async fn connect_as(url: &str, token: &str) -> Socket {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    tokio_tungstenite::connect_async(req).await.unwrap().0
 }
 
 #[tokio::test]
@@ -581,4 +605,236 @@ async fn burst_stream_drains_in_order_without_false_slow_consumer_failure() {
         assert_eq!(receive(&mut socket).await["event"], "runner.delta");
     }
     assert_eq!(receive(&mut socket).await["ok"], true);
+}
+
+#[tokio::test]
+async fn sessions_roundtrip_over_ws() {
+    let provider = ControlledProvider::new();
+    let (url, _) = boot_runner(provider.clone(), true).await;
+    let (mut sock, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+    let created = call(
+        &mut sock,
+        serde_json::json!({"id": 1, "method": "sessions.create", "params": {"label": "tg-1", "user": "bob"}}),
+    )
+    .await;
+    assert_eq!(created["ok"], true, "{created}");
+    let sid = created["result"]["id"].as_str().unwrap().to_string();
+    assert_eq!(created["result"]["label"], "tg-1");
+    assert_eq!(created["result"]["owner"], "interface:ws");
+    assert_eq!(created["result"]["user"], "bob");
+
+    let dup = call(
+        &mut sock,
+        serde_json::json!({"id": 2, "method": "sessions.create", "params": {"label": "tg-1", "user": "bob"}}),
+    )
+    .await;
+    assert_eq!(dup["ok"], false);
+    assert_eq!(dup["code"], "session_label_taken");
+
+    // The session belongs to `bob`; a run without that user cannot see it.
+    let anon = call(
+        &mut sock,
+        serde_json::json!({"id": 3, "method": "runners.run", "params": {"name": "helper", "prompt": "first", "session_id": sid}}),
+    )
+    .await;
+    assert_eq!(anon["code"], "session_not_found", "{anon}");
+
+    let run = call(
+        &mut sock,
+        serde_json::json!({"id": 4, "method": "runners.run", "params": {"name": "helper", "prompt": "first", "session_id": sid, "user": "bob"}}),
+    )
+    .await;
+    assert_eq!(run["ok"], true, "{run}");
+    assert_eq!(run["result"]["session_id"], sid);
+
+    let run2 = call(
+        &mut sock,
+        serde_json::json!({"id": 5, "method": "runners.run", "params": {"name": "helper", "prompt": "second", "session_id": sid, "user": "bob"}}),
+    )
+    .await;
+    assert_eq!(run2["ok"], true, "{run2}");
+    {
+        let reqs = provider.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        let hist: Vec<&str> = reqs[1]
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(hist[0], "first");
+        assert_eq!(hist[2], "second");
+    }
+
+    let by_label = call(
+        &mut sock,
+        serde_json::json!({"id": 6, "method": "sessions.get", "params": {"label": "tg-1", "user": "bob"}}),
+    )
+    .await;
+    assert_eq!(by_label["ok"], true, "{by_label}");
+    assert_eq!(by_label["result"]["id"], sid);
+    assert_eq!(by_label["result"]["turn_count"], 4);
+    assert_eq!(by_label["result"]["turns"].as_array().unwrap().len(), 4);
+
+    let missing = call(
+        &mut sock,
+        serde_json::json!({"id": 7, "method": "runners.run", "params": {"name": "helper", "prompt": "x", "session_id": "nope", "user": "bob"}}),
+    )
+    .await;
+    assert_eq!(missing["code"], "session_not_found");
+    assert!(
+        missing["tip"]
+            .as_str()
+            .unwrap()
+            .contains("agentctl session")
+    );
+
+    let both = call(
+        &mut sock,
+        serde_json::json!({"id": 8, "method": "runners.run", "params": {"name": "helper", "prompt": "x", "session_id": sid, "messages": [], "user": "bob"}}),
+    )
+    .await;
+    assert_eq!(both["code"], "bad_params");
+
+    // list: bob sees his session, an unnamed caller sees nothing.
+    let list = call(
+        &mut sock,
+        serde_json::json!({"id": 9, "method": "sessions.list", "params": {"user": "bob"}}),
+    )
+    .await;
+    assert_eq!(list["result"].as_array().unwrap().len(), 1);
+    let list_anon = call(
+        &mut sock,
+        serde_json::json!({"id": 10, "method": "sessions.list", "params": {}}),
+    )
+    .await;
+    assert_eq!(list_anon["result"].as_array().unwrap().len(), 0);
+
+    // delete by someone else is a no-op that looks like "already gone".
+    let del_eve = call(
+        &mut sock,
+        serde_json::json!({"id": 11, "method": "sessions.delete", "params": {"id": sid, "user": "eve"}}),
+    )
+    .await;
+    assert_eq!(del_eve["result"]["deleted"], false);
+    let del = call(
+        &mut sock,
+        serde_json::json!({"id": 12, "method": "sessions.delete", "params": {"id": sid, "user": "bob"}}),
+    )
+    .await;
+    assert_eq!(del["result"]["deleted"], true);
+    let gone = call(
+        &mut sock,
+        serde_json::json!({"id": 13, "method": "sessions.get", "params": {"id": sid, "user": "bob"}}),
+    )
+    .await;
+    assert_eq!(gone["code"], "session_not_found");
+}
+
+#[tokio::test]
+async fn interface_tokens_isolate_sessions_between_interfaces() {
+    let provider = ControlledProvider::new();
+    let tokens = HashMap::from([
+        ("web-token".to_string(), "webapp".to_string()),
+        ("tg-token".to_string(), "telegram".to_string()),
+    ]);
+    let (url, _) = boot_runner_with_interfaces(provider.clone(), true, tokens).await;
+
+    // An unknown token is refused even though the public token is disabled.
+    {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = url.as_str().into_client_request().unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer nope".parse().unwrap());
+        assert!(tokio_tungstenite::connect_async(req).await.is_err());
+    }
+
+    let mut web = connect_as(&url, "web-token").await;
+    let mut tg = connect_as(&url, "tg-token").await;
+    // The public token is still interface `ws`.
+    let mut pub_sock = connect_as(&url, "public-token").await;
+    let p = call(
+        &mut pub_sock,
+        serde_json::json!({"id": 1, "method": "sessions.create", "params": {}}),
+    )
+    .await;
+    assert_eq!(p["result"]["owner"], "interface:ws", "{p}");
+
+    // Same label on both interfaces → two distinct sessions, each owned by its interface.
+    let w = call(
+        &mut web,
+        serde_json::json!({"id": 1, "method": "sessions.create", "params": {"label": "chat-1", "user": "alice"}}),
+    )
+    .await;
+    let t = call(
+        &mut tg,
+        serde_json::json!({"id": 1, "method": "sessions.create", "params": {"label": "chat-1", "user": "alice"}}),
+    )
+    .await;
+    assert_eq!(w["ok"], true, "{w}");
+    assert_eq!(t["ok"], true, "{t}");
+    assert_eq!(w["result"]["owner"], "interface:webapp");
+    assert_eq!(t["result"]["owner"], "interface:telegram");
+    let wid = w["result"]["id"].as_str().unwrap().to_string();
+    let tid = t["result"]["id"].as_str().unwrap().to_string();
+    assert_ne!(wid, tid);
+
+    // alice on webapp writes a secret into her session.
+    let run = call(
+        &mut web,
+        serde_json::json!({"id": 2, "method": "runners.run", "params": {"name": "helper", "prompt": "PIN 4242", "session_id": wid, "user": "alice"}}),
+    )
+    .await;
+    assert_eq!(run["ok"], true, "{run}");
+
+    // telegram, even claiming to be alice, cannot read, run on, list, or delete it.
+    let steal_get = call(
+        &mut tg,
+        serde_json::json!({"id": 2, "method": "sessions.get", "params": {"id": wid, "user": "alice"}}),
+    )
+    .await;
+    assert_eq!(steal_get["code"], "session_not_found");
+    let steal_run = call(
+        &mut tg,
+        serde_json::json!({"id": 3, "method": "runners.run", "params": {"name": "helper", "prompt": "what pin?", "session_id": wid, "user": "alice"}}),
+    )
+    .await;
+    assert_eq!(steal_run["code"], "session_not_found");
+    let tg_list = call(
+        &mut tg,
+        serde_json::json!({"id": 4, "method": "sessions.list", "params": {"user": "alice"}}),
+    )
+    .await;
+    let ids: Vec<&str> = tg_list["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![tid.as_str()]);
+    let steal_del = call(
+        &mut tg,
+        serde_json::json!({"id": 5, "method": "sessions.delete", "params": {"id": wid, "user": "alice"}}),
+    )
+    .await;
+    assert_eq!(steal_del["result"]["deleted"], false);
+
+    // Within webapp, bob cannot read alice's session either.
+    let bob = call(
+        &mut web,
+        serde_json::json!({"id": 3, "method": "sessions.get", "params": {"id": wid, "user": "bob"}}),
+    )
+    .await;
+    assert_eq!(bob["code"], "session_not_found");
+    // ...but alice can, by label too.
+    let alice = call(
+        &mut web,
+        serde_json::json!({"id": 4, "method": "sessions.get", "params": {"label": "chat-1", "user": "alice"}}),
+    )
+    .await;
+    assert_eq!(alice["result"]["id"], wid);
+    assert_eq!(alice["result"]["turns"][0]["content"], "PIN 4242");
+
+    // The provider only ever saw alice's own run.
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
 }

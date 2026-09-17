@@ -17,6 +17,7 @@ use agentd_memory::RedbStore;
 use agentd_permissions::{Engine, Grants, GrantsFile, load_grants_file};
 use agentd_scripting::LuaHost;
 use agentd_secrets::SecretStore;
+use agentd_sessions::RedbSessionStore;
 use agentd_trace::JsonlSink;
 use agentd_types::Registry;
 use anyhow::{Result, anyhow, bail};
@@ -30,6 +31,7 @@ pub struct Shared {
     pub providers: Arc<ProviderRegistry>,
     pub secrets: Arc<dyn SecretStore>,
     pub memory: Arc<RedbStore>,
+    pub sessions: Arc<RedbSessionStore>,
     pub trace: Arc<JsonlSink>,
     pub broker: Arc<agentd_approvals::Broker>,
     pub async_handle: tokio::runtime::Handle,
@@ -64,6 +66,7 @@ pub fn build_runtime(cfg: &Config, shared: &Shared) -> Result<BuiltRuntime> {
     host.start_async_runtime(shared.async_handle.clone());
     host.set_secrets(shared.secrets.clone());
     host.set_memory(shared.memory.clone());
+    host.set_sessions(shared.sessions.clone());
     for name in shared.providers.names() {
         if let Some(p) = shared.providers.get(&name) {
             host.set_ai_provider(name, p);
@@ -111,6 +114,7 @@ pub fn build_runtime(cfg: &Config, shared: &Shared) -> Result<BuiltRuntime> {
         shared.providers.clone(),
     );
     executor.set_max_runner_turns(cfg.max_turns);
+    executor.set_sessions(shared.sessions.clone());
 
     // "allow forever" reload pipeline: rebuild the engine from grants.toml,
     // re-applying this build's package desugaring.

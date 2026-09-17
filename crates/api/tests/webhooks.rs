@@ -75,6 +75,7 @@ async fn boot_with_grants(
         executor: Arc::new(arc_swap::ArcSwap::from(executor)),
         auth_token: None,
         admin_token: None,
+        interface_tokens: Arc::new(HashMap::new()),
         broker: Arc::new(agentd_approvals::Broker::new(
             std::time::Duration::from_secs(30),
         )),

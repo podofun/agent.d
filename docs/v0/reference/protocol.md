@@ -98,6 +98,10 @@ Token resolution order (same as `agentctl`):
 
 `/health` is always open and requires no token.
 
+### Interface tokens
+
+Besides the daemon token, `config.toml` can declare `[interfaces.<name>]` entries, each with its own bearer token. A connection presenting one is interface `<name>` for every request it makes: `ctx.caller.interface` reports it, `[interface.<name>]` grants apply, and chat sessions it creates belong to it. The daemon token remains interface `ws`. See [configuration](/v0/reference/configuration#interfaces-name-sections).
+
 ### `/control` token
 
 The control plane uses a **separate** admin token so a public `/ws` token can never reach it.
@@ -216,7 +220,7 @@ Return the full composition of a runner (resolved system prompt, skills, allowed
 
 ### `runners.run`
 
-Run a runner with a prompt, explicit message history, or both. The runner must hold `ai:<resolved-provider>` in `[runner.<name>].granted`, including when a per-call model selects another provider. Policy denials override this grant.
+Run a runner with a prompt, an explicit message history, or a stored session. The runner must hold `ai:<resolved-provider>` in `[runner.<name>].granted`, including when a per-call model selects another provider. Policy denials override this grant.
 
 **Params:**
 
@@ -224,7 +228,8 @@ Run a runner with a prompt, explicit message history, or both. The runner must h
 |---|---|---|---|
 | `name` | string | yes | Runner name |
 | `prompt` | string | conditional | User prompt appended after history; required if history is empty |
-| `messages` | array | conditional | Ordered history; `history` is an alias |
+| `messages` | array | conditional | Ordered history; `history` is an alias. Not allowed together with `session_id` |
+| `session_id` | string | no | A session from `sessions.create`. Its turns become the history and the exchange is stored afterwards. Requires `prompt`; the session must be visible to this caller's interface and `user` |
 | `system` | string | no | Additional system instructions appended to the runner composition |
 | `model` | string | no | Per-call model override; its provider must be granted to the runner |
 | `max_tokens` | integer | no | Output token limit, 1–32768; provider support varies |
@@ -233,11 +238,11 @@ Run a runner with a prompt, explicit message history, or both. The runner must h
 | `user` | string | no | Caller-supplied user id |
 | `stream` | bool | no | Push `runner.delta` event frames while the run is in flight |
 
-**Result:** `{ "text": "...", "provider": "...", "model": "...", "stop_reason"?: "..." }`
+**Result:** `{ "text": "...", "provider": "...", "model": "...", "stop_reason"?: "...", "session_id"?: "..." }`
 
 History messages require a valid `role` (`system`, `user`, `assistant`, or `tool`) and string `content`. Assistant messages may contain `tool_calls` (`id`, `name`, object `arguments`); tool results require the matching `tool_call_id`. Every tool call must receive exactly one result before another non-tool message. Unknown options, invalid histories, more than 256 history messages, or input text and tool-call data exceeding 1 MiB return `bad_params` before provider access.
 
-`session` and `user` describe the caller; they do not store or restore conversation history. The client supplies history on each run. The runtime admits up to 32 concurrent runner invocations across connections and nested Lua calls; excess invocations return `busy` without queueing.
+`session` and `user` describe the caller for permission purposes; they do not store or restore conversation history. To have the daemon keep history, create a session with `sessions.create` and pass its id as `session_id`. A run on a session that is already mid-run returns `session_busy`; a failed model run does not append the exchange, but any compaction completed before it remains stored. The runtime admits up to 32 concurrent runner invocations across connections and nested Lua calls; excess invocations return `busy` without queueing.
 
 When every model turn reports token usage, the result also contains `usage` with cumulative `input_tokens`, `output_tokens`, `cache_read_input_tokens`, and `cache_creation_input_tokens`. Input tokens exclude the separately reported cache tokens. Missing usage is omitted rather than reported as zero; failed or cancelled runs do not return an accounting total. This is token reporting, not billing or quota enforcement.
 
@@ -279,6 +284,44 @@ These are connection-local requests, not durable jobs. IDs do not deduplicate wo
 On SIGINT or SIGTERM the daemon stops admitting work and allows up to 30 seconds for active requests to drain. `/ready` returns 503 while `/health` remains a liveness check. Readiness does not make a paid provider request or verify remote credentials.
 
 ---
+
+### `sessions.create`
+
+Create a chat session to store conversation history. The result contains session metadata; pass its `id` as `session_id` in `runners.run`.
+
+The optional parameters are `label`, `runner`, `session` and `user`, all strings. A label is a name you choose, such as a chat id or ticket number. Labels are unique per interface, including across users; an existing label returns `session_label_taken`. The `runner` field is informational and does not restrict which runner can use the session. The `session` and `user` fields set the caller identity, as they do for `actions.call` and `runners.run`.
+
+The session belongs to the connection's interface (`interface:ws` for the daemon token, or `interface:<name>` for an [interface token](#interface-tokens)). If you pass `user`, later requests must carry the same user to access it. Without `user`, the session is visible to all callers from that interface.
+
+Send this request over `/ws`:
+
+```json
+{ "id": 10, "method": "sessions.create", "params": { "label": "telegram-42", "user": "alice" } }
+```
+
+A successful response has `ok: true` and the session metadata in `result`, including its generated `id`, `owner`, `label`, `user`, `turn_count`, `next_seq`, `compactions`, `created_at` and `updated_at`. Timestamps are Unix seconds.
+
+### `sessions.get`
+
+Get a session and its stored messages by `id` or `label`. Pass the same `user` used when creating the session. A missing session or one outside the caller's scope returns `session_not_found`.
+
+```json
+{ "id": 11, "method": "sessions.get", "params": { "label": "telegram-42", "user": "alice" } }
+```
+
+The result contains the session metadata and a `turns` array, ordered from oldest to newest. For the newly created session above, `turns` is empty.
+
+### `sessions.list`
+
+List visible sessions from newest to oldest. The optional parameters are `limit` (an integer, default 50, capped at 500), `session` and `user` (strings). Without `user`, the list contains only sessions that have no user attached.
+
+```json
+{ "id": 12, "method": "sessions.list", "params": { "limit": 50, "user": "alice" } }
+```
+
+### `sessions.delete`
+
+Delete a session and its stored messages. Pass the required string `id` and, if needed, the string parameters `session` and `user`. The result is `{ "deleted": true }` if the session was deleted, or `{ "deleted": false }` if no visible session matched.
 
 ### `skills.list`
 
@@ -329,6 +372,10 @@ List background services with their current state.
 | `lua_error` | A Lua script raised an error; `trace` carries the cleaned traceback | — |
 | `invocation_failed` | The action failed outside the script itself (e.g. join errors, output validation) | — |
 | `runner_not_found` | Named runner does not exist | Run `agentctl runner ls` to list runners |
+| `session_not_found` | The session does not exist or is not visible to this caller | Run `agentctl session ls` to list sessions, or `agentctl session new` to start one |
+| `session_busy` | Another run is using that session | Wait for it to finish, then retry |
+| `session_label_taken` | `sessions.create` reused a label | Fetch the existing one with `sessions.get { label }` instead |
+| `sessions_unavailable` | No session store is configured | — |
 | `unknown_skill` | Runner references a skill that is not registered | Run `agentctl skills ls` to list skills |
 | `no_provider` | The runner could not resolve a provider for its model | You can configure new providers in your `config.toml` |
 | `provider_upstream` | AI provider returned an error | — |

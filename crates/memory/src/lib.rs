@@ -5,7 +5,8 @@
 //! `RedbStore` is the production impl.
 
 mod redb_store;
-pub use redb_store::RedbStore;
+pub use redb::Database;
+pub use redb_store::{RedbStore, open_database};
 
 use std::collections::BTreeMap;
 use std::sync::RwLock;

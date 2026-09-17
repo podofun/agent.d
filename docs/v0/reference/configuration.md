@@ -170,6 +170,25 @@ See [Receive a signed webhook](/v0/recipes/webhook) for the setup procedure.
 
 ---
 
+### `[interfaces.<name>]` sections
+
+Give each client its own token so the daemon can identify it. This lets you apply separate `[interface.<name>]` grants in `grants.toml` to a web backend, a Telegram bridge or a Discord bot. Each client can access only the chat sessions owned by its interface.
+
+```toml
+[interfaces.webapp]
+token_secret = "webapp_ws_token"   # read from the secrets backend
+
+[interfaces.telegram]
+token = "a-literal-token"          # fine for local development
+```
+
+| Field | Description |
+|---|---|
+| `token` | Literal bearer token the client presents on `/ws`. |
+| `token_secret` | Name of a secret holding the token. Exactly one of `token` / `token_secret` is required. |
+
+When a client connects with an interface token, `ctx.caller.interface` reports its name. A connection presenting the daemon token (`daemon.token`) is interface `ws`, which is why `ws` cannot be used as an interface name. The daemon refuses to start if two interfaces share a token or an interface uses the daemon token.
+
 ## Auto-minted tokens
 
 When auth is enabled and no explicit token is configured, the daemon generates random tokens at startup and persists them to the state directory (mode `0600`) so that local `agentctl` can find them automatically:

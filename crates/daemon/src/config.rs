@@ -105,6 +105,31 @@ pub struct RawConfig {
     /// Signed webhook endpoints keyed by route name.
     #[serde(default)]
     pub webhooks: Option<std::collections::HashMap<String, RawWebhook>>,
+    /// Named client interfaces, each with its own `/ws` bearer token.
+    #[serde(default)]
+    pub interfaces: Option<std::collections::HashMap<String, RawInterface>>,
+}
+
+/// One `[interfaces.<name>]` entry. A client presenting this token on `/ws`
+/// becomes interface `<name>`: `[interface.<name>]` grants apply to it and
+/// every session it creates is owned by it. Exactly one of `token` /
+/// `token_secret` is required.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawInterface {
+    /// Literal bearer token.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// SecretStore key holding the bearer token.
+    #[serde(default)]
+    pub token_secret: Option<String>,
+}
+
+/// Where an interface's token comes from, after validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterfaceToken {
+    Literal(String),
+    Secret(String),
 }
 
 /// One `[webhooks.<name>]` entry. Requests arrive at `/webhooks/<name>`, are
@@ -223,6 +248,8 @@ pub struct Config {
     pub default_provider: String,
     /// Signed webhook routes, sorted by name for deterministic setup.
     pub webhooks: Vec<(String, RawWebhook)>,
+    /// Client interfaces with their own tokens, sorted by name.
+    pub interfaces: Vec<(String, InterfaceToken)>,
     /// Where the daemon reads secrets from.
     pub secrets: SecretsBackend,
 }
@@ -423,6 +450,36 @@ impl Config {
             );
         }
 
+        let mut interfaces: Vec<(String, InterfaceToken)> = Vec::new();
+        for (name, spec) in raw.interfaces.unwrap_or_default() {
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                anyhow::bail!(
+                    "interface name `{name}` is invalid — use only letters, numbers, hyphens, and underscores"
+                );
+            }
+            if name == "ws" {
+                anyhow::bail!(
+                    "interface name `ws` is reserved for connections using the daemon token — pick another name"
+                );
+            }
+            let token = match (spec.token, spec.token_secret) {
+                (Some(t), None) if !t.trim().is_empty() => InterfaceToken::Literal(t),
+                (None, Some(k)) if !k.trim().is_empty() => InterfaceToken::Secret(k),
+                (Some(_), Some(_)) => anyhow::bail!(
+                    "interface `{name}` sets both `token` and `token_secret` — keep exactly one"
+                ),
+                _ => anyhow::bail!(
+                    "interface `{name}` needs a `token` or a `token_secret` naming where its bearer token lives"
+                ),
+            };
+            interfaces.push((name, token));
+        }
+        interfaces.sort_by(|a, b| a.0.cmp(&b.0));
+
         let mut webhooks: Vec<(String, RawWebhook)> =
             raw.webhooks.unwrap_or_default().into_iter().collect();
         webhooks.sort_by(|a, b| a.0.cmp(&b.0));
@@ -476,6 +533,7 @@ impl Config {
             providers,
             default_provider,
             webhooks,
+            interfaces,
             secrets,
         })
     }
@@ -639,6 +697,23 @@ mod tests {
             Some("openrouter_api_key")
         );
         assert_eq!(provs["ollama"].auth.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn parses_interfaces_table() {
+        let src = r#"
+            [interfaces.webapp]
+            token = "abc"
+            [interfaces.telegram]
+            token_secret = "telegram_ws_token"
+        "#;
+        let raw: RawConfig = toml::from_str(src).expect("parse");
+        let ifs = raw.interfaces.expect("interfaces");
+        assert_eq!(ifs["webapp"].token.as_deref(), Some("abc"));
+        assert_eq!(
+            ifs["telegram"].token_secret.as_deref(),
+            Some("telegram_ws_token")
+        );
     }
 
     #[test]
