@@ -12,6 +12,7 @@ agentd-ai.workspace = true
 agentd-api.workspace = true
 agentd-approvals.workspace = true
 agentd-executor.workspace = true
+agentd-fs.workspace = true
 agentd-luals.workspace = true
 agentd-memory.workspace = true
 agentd-sessions.workspace = true

@@ -147,6 +147,7 @@ name = "agentd-fs"
 version = "0.10.0-alpha"
 dependencies = [
  "serde",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1018,6 +1019,7 @@ dependencies = [
  "agentd-api",
  "agentd-approvals",
  "agentd-executor",
+ "agentd-fs",
  "agentd-luals",
  "agentd-memory",
  "agentd-packages",

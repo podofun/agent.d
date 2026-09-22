@@ -1,6 +1,6 @@
 # ctx.fs — Filesystem
 
-Read and write files from inside an action or runner.
+Read and write files from inside an action or runner. Lua strings carry arbitrary bytes, including NUL and non-UTF-8 data; the same methods handle text and binary files.
 
 ```lua
 agentd.action{
@@ -18,15 +18,49 @@ Every call needs a matching grant in `grants.toml`. Reads need `fs.read:<path>`;
 
 | Method                         | Grant needed      | Returns   | What it does                                                  |
 | ------------------------------ | ----------------- | --------- | ------------------------------------------------------------- |
-| `ctx.fs.read(path)`            | `fs.read:<path>`  | `string`  | Read the whole file as a string.                              |
-| `ctx.fs.write(path, content)`  | `fs.write:<path>` | —         | Write `content`, replacing the file. Creates parent folders.  |
-| `ctx.fs.append(path, content)` | `fs.write:<path>` | —         | Add `content` to the end of the file (creates it if missing). |
+| `ctx.fs.read(path)`            | `fs.read:<path>`  | `string`  | Read the whole file as a binary-safe Lua string.                              |
+| `ctx.fs.write(path, content)`  | `fs.write:<path>` | `integer` | Write `content`, replacing the file. Creates parent folders.  |
+| `ctx.fs.append(path, content)` | `fs.write:<path>` | `integer` | Append bytes, creating the file and parent folders if missing. |
 | `ctx.fs.exists(path)`          | `fs.read:<path>`  | `boolean` | `true` if the path exists.                                    |
 | `ctx.fs.stat(path)`            | `fs.read:<path>`  | `table`   | File metadata — see [stat](#stat).                            |
 | `ctx.fs.list_dir(path)`        | `fs.read:<path>`  | `table[]` | List a directory — see [list_dir](#list-dir).                 |
-| `ctx.fs.remove(path)`          | `fs.write:<path>` | —         | Delete a file.                                                |
+| `ctx.fs.remove(path)`          | `fs.write:<path>` | `integer` | Delete a file.                                                |
+| `ctx.fs.history(path)` | `fs.read:<path>` | `table` | Current revision and all retained revision metadata. |
+| `ctx.fs.diff(path, revision)` | `fs.read:<path>` | `table` | Binary splice for one revision. |
+| `ctx.fs.undo(path)` | `fs.write:<path>` | `integer` | Restore the current revision's parent. |
+| `ctx.fs.redo(path)` | `fs.write:<path>` | `integer` | Reapply the most recently undone revision. |
+| `ctx.fs.restore(path, revision)` | `fs.write:<path>` | `integer` | Restore any retained revision, including zero. |
 
-A missing file makes `read`, `stat`, and `list_dir` throw and error. It's advised that you guard with `exists` first if the file might not be there.
+A missing file makes `read`, `stat`, and `list_dir` throw an error. It's advised that you guard with `exists` first if the file might not be there.
+
+## Binary diffs and undo/redo
+
+Every successful `write`, `append`, and `remove` records a diff and returns its per-file revision ID. Reads and metadata queries do not change the file or create revisions. Revision `0` represents the file's original state before its first tracked mutation, including whether it existed. Empty files and missing files are distinct.
+
+```lua
+-- Requires both fs.read:images/** and fs.write:images/**.
+local first = ctx.fs.write("images/sample.bin", string.char(0, 255, 128))
+local second = ctx.fs.append("images/sample.bin", string.char(254))
+ctx.fs.undo("images/sample.bin")          -- returns first
+ctx.fs.redo("images/sample.bin")          -- returns second
+ctx.fs.restore("images/sample.bin", 0)    -- restores the original file, or removes a new file
+ctx.fs.restore("images/sample.bin", second)
+
+local change = ctx.fs.diff("images/sample.bin", second)
+-- change.revision.offset == 3 (zero-based byte offset)
+-- change.removed == ""
+-- change.added == string.char(254)
+```
+
+`history(path)` returns `{ current = id, revisions = { ... } }`. Each revision has `id`, `parent`, `operation` (`write`, `append`, or `remove`), `timestamp_ms`, `offset`, `removed_bytes`, `added_bytes`, `before_size`, and `after_size`. An absent size means that the file did not exist on that side of the diff. `diff(path, id)` returns `{ revision = metadata, removed = bytes, added = bytes }`. Replace `removed` bytes at the zero-based `offset` with `added` to apply the splice; reverse them to undo it. File existence is recorded separately in the sizes.
+
+Undo and redo follow the current branch. Writing after undo clears the redo stack but retains every earlier revision, so `restore` can still reach the old branch. Explicit `restore` clears the redo stack. Unknown revision IDs and exhausted undo/redo stacks raise errors. Revision IDs are scoped to the resolved absolute file path; there is no atomic multi-file checkpoint.
+
+History is shared by actions, runners, and services for the daemon's lifetime and survives hot reloads. Restarting the daemon discards it. Only mutations through `ctx.fs` are recorded; shell commands and external programs are not intercepted. If current bytes or permissions differ from the tracked state, mutation and replay fail with a conflict instead of overwriting the outside change. Coordinate outside writers: conflict checks are not an operating-system lock against other processes.
+
+Diff computation is linear in file size and retains only the changed middle span, omitting the common prefix and suffix. There is no text parsing or quadratic line comparison. Widely separated edits can retain a large span. Writes and replay stage the complete target file before atomic replacement; appends therefore also require work proportional to file size. History stays in memory without automatic eviction, and replay cost grows with the file size and number of intervening revisions.
+
+Undoing file creation also removes parent directories created by that write if they remain empty. Existing file permissions are preserved. The API operates on regular files; directories, special files, and multiply linked files on Unix are rejected for tracked mutation. Symlinks resolve to their targets before authorization. Inode identity, ownership, ACLs, extended attributes, and timestamps are not versioned. This is file-content history, not a filesystem snapshot or crash recovery.
 
 ### stat
 
