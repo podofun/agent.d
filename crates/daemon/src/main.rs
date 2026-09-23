@@ -32,6 +32,8 @@ fn main() -> Result<()> {
     sandbox::run_netns_supervisor_if_requested();
 
     let cli = Cli::parse();
+    // SAFETY: still single-threaded; the async runtime starts in `run`.
+    let env_secrets = unsafe { scrub_secret_env() };
     // One-time sandbox setup runs synchronously and exits. The daemon itself
     // never elevates: it creates the (non-privileged) sandbox profiles, then
     // launches the separate broker binary through UAC to register the SYSTEM
@@ -92,7 +94,28 @@ fn main() -> Result<()> {
         println!("Sandbox setup removed.");
         return Ok(());
     }
-    run(cli)
+    run(cli, env_secrets)
+}
+
+/// Env vars that carry the daemon's own credentials. Clap has already read
+/// them into `Cli`, so they are removed like the `AGENTD_SECRET_*` values.
+const CREDENTIAL_ENV: &[&str] = &["AGENTD_TOKEN", "AGENTD_ADMIN_TOKEN"];
+
+/// Move every secret out of the process environment so no child process
+/// (shell commands, the netns supervisor, MCP servers, runners) inherits it.
+/// Returns the `AGENTD_SECRET_*` values for the `env` secrets backend.
+///
+/// # Safety
+///
+/// Mutates the process environment; call only while single-threaded.
+unsafe fn scrub_secret_env() -> agentd_secrets::EnvStore {
+    // SAFETY: forwarded from the caller.
+    let store = unsafe { agentd_secrets::EnvStore::take_from_env() };
+    for name in CREDENTIAL_ENV {
+        // SAFETY: forwarded from the caller.
+        unsafe { std::env::remove_var(name) };
+    }
+    store
 }
 
 /// The broker binary that ships next to `agentd.exe`.
@@ -112,7 +135,7 @@ fn broker_path() -> Result<std::path::PathBuf> {
 }
 
 #[tokio::main]
-async fn run(cli: Cli) -> Result<()> {
+async fn run(cli: Cli, env_secrets: agentd_secrets::EnvStore) -> Result<()> {
     let started = Instant::now();
     let cfg = Config::resolve(cli)?;
     tracing_subscriber::fmt()
@@ -134,7 +157,7 @@ async fn run(cli: Cli) -> Result<()> {
     // Windows and when the ledger is empty (the normal, cleanly-shut-down case).
     sandbox::revoke_all_stamps();
 
-    let keyring = build_secret_store(&cfg.secrets);
+    let keyring = build_secret_store(&cfg.secrets, env_secrets);
     let webhooks = resolve_webhooks(&cfg, keyring.as_ref())?;
     let auth_token = resolve_ws_token(&cfg)?;
     let interface_tokens = resolve_interface_tokens(&cfg, keyring.as_ref(), auth_token.as_deref())?;
@@ -320,10 +343,13 @@ async fn shutdown_signal() {
 /// Build the secret store the whole daemon reads from, per `daemon.secrets`
 /// (`AGENTD_SECRETS`). Keyring is the default; env and dir are read-only
 /// backends for containers, where the platform injects secrets.
-fn build_secret_store(backend: &config::SecretsBackend) -> Arc<dyn SecretStore> {
+fn build_secret_store(
+    backend: &config::SecretsBackend,
+    env_secrets: agentd_secrets::EnvStore,
+) -> Arc<dyn SecretStore> {
     match backend {
         config::SecretsBackend::Keyring => Arc::new(KeyringStore::default_service()),
-        config::SecretsBackend::Env => Arc::new(agentd_secrets::EnvStore::new()),
+        config::SecretsBackend::Env => Arc::new(env_secrets),
         config::SecretsBackend::Dir(path) => Arc::new(agentd_secrets::DirStore::new(path)),
     }
 }
@@ -665,16 +691,34 @@ mod tests {
     fn build_secret_store_dir_backend_reads_mounted_files() {
         let td = tempfile::tempdir().unwrap();
         std::fs::write(td.path().join("webhook_secret"), "s3cret\n").unwrap();
-        let store = build_secret_store(&config::SecretsBackend::Dir(td.path().to_path_buf()));
+        let store = build_secret_store(
+            &config::SecretsBackend::Dir(td.path().to_path_buf()),
+            agentd_secrets::EnvStore::default(),
+        );
         assert_eq!(store.get("webhook_secret").unwrap(), "s3cret");
     }
 
     #[test]
     fn build_secret_store_env_backend_reads_environment() {
         unsafe { std::env::set_var("AGENTD_SECRET_DAEMON_WIRING_TEST", "v") };
-        let store = build_secret_store(&config::SecretsBackend::Env);
+        let store = build_secret_store(
+            &config::SecretsBackend::Env,
+            agentd_secrets::EnvStore::new(),
+        );
         assert_eq!(store.get("daemon_wiring_test").unwrap(), "v");
         unsafe { std::env::remove_var("AGENTD_SECRET_DAEMON_WIRING_TEST") };
+    }
+
+    #[test]
+    fn scrub_secret_env_removes_secrets_and_tokens_but_keeps_values() {
+        unsafe {
+            std::env::set_var("AGENTD_SECRET_DAEMON_SCRUB_TEST", "v");
+            std::env::set_var("AGENTD_ADMIN_TOKEN", "admin");
+        }
+        let store = unsafe { scrub_secret_env() };
+        assert!(std::env::var_os("AGENTD_SECRET_DAEMON_SCRUB_TEST").is_none());
+        assert!(std::env::var_os("AGENTD_ADMIN_TOKEN").is_none());
+        assert_eq!(store.get("daemon_scrub_test").unwrap(), "v");
     }
 
     #[test]
@@ -701,7 +745,7 @@ mod tests {
             signature_header = "x-signature"
         "#,
         );
-        let store = build_secret_store(&cfg.secrets);
+        let store = build_secret_store(&cfg.secrets, agentd_secrets::EnvStore::new());
         let Err(err) = resolve_webhooks(&cfg, store.as_ref()) else {
             panic!("missing secret must fail webhook resolution");
         };
