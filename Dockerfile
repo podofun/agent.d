@@ -9,10 +9,12 @@
 # relative to init.lua's directory and refuses to escape it, so a whole
 # multi-file userland tree can be mounted read-only.
 #
-# The native shell sandbox (Landlock + seccomp + network namespaces) is not
-# available under default container seccomp profiles, so sandboxed shell
-# actions fail closed inside this image — the container boundary is the
-# confinement layer. Secrets default to the `env` backend
+# The native shell sandbox still confines every shell command inside the
+# container. Commands without a `net:` grant need only Landlock and seccomp,
+# which Docker's default profile allows. Commands with a `net:` grant also need
+# a nested user + network namespace; run with docker/seccomp/default.json (see
+# docker-compose.yml) to allow exactly that. Without it those commands fail
+# closed. Secrets default to the `env` backend
 # (AGENTD_SECRET_<NAME>); set AGENTD_SECRETS=dir:/run/secrets to read
 # Docker/Kubernetes secret mounts instead.
 
@@ -28,6 +30,10 @@ COPY crates ./crates
 RUN cargo build --release -p daemon -p agentd-cli
 
 FROM alpine:latest
+
+# nft installs the per-command NAT redirect inside the nested network namespace;
+# busybox already provides `ip`.
+RUN apk add --no-cache nftables
 
 RUN adduser -S -D -H -h /var/lib/agentd agentd \
     && mkdir -p /var/lib/agentd /etc/agentd \

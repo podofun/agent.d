@@ -13,7 +13,13 @@ pub const READ_BASELINE: &[&str] = &[
     "/lib64",
     "/etc",
     "/opt",
-    "/proc/self",
+    // All of /proc, not /proc/self: a rule on /proc/self pins the pid that
+    // applied it, so every process the command spawns would lose its own
+    // /proc/self (status, maps, exe, fd) and ordinary binaries break. Landlock
+    // still refuses the ptrace-gated entries (environ, mem, maps, fd targets,
+    // cwd, root, exe) of any process outside the command's sandbox, including
+    // the daemon. Other processes' cmdline and status stay readable.
+    "/proc",
     "/dev/null",
     "/dev/zero",
     "/dev/urandom",

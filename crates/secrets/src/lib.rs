@@ -224,12 +224,47 @@ pub const ENV_PREFIX: &str = "AGENTD_SECRET_";
 /// Read-only store backed by `AGENTD_SECRET_<KEY>` environment variables.
 /// The key is uppercased and dashes become underscores: the secret
 /// `github-webhook` reads `AGENTD_SECRET_GITHUB_WEBHOOK`.
+///
+/// The store holds a snapshot of those variables. The daemon builds it with
+/// [`EnvStore::take_from_env`], which also removes them from the process
+/// environment so child processes (shell commands, MCP servers, runners)
+/// never inherit secret values.
 #[derive(Default)]
-pub struct EnvStore;
+pub struct EnvStore {
+    vars: std::collections::BTreeMap<String, String>,
+}
 
 impl EnvStore {
+    /// Snapshot the current `AGENTD_SECRET_*` variables, leaving them in place.
     pub fn new() -> Self {
-        Self
+        Self::from_vars(std::env::vars())
+    }
+
+    /// Build the store from `(name, value)` pairs; names without the
+    /// `AGENTD_SECRET_` prefix are ignored.
+    pub fn from_vars(vars: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self {
+            vars: vars
+                .into_iter()
+                .filter(|(name, _)| name.starts_with(ENV_PREFIX))
+                .collect(),
+        }
+    }
+
+    /// Snapshot the `AGENTD_SECRET_*` variables and remove them from the
+    /// process environment.
+    ///
+    /// # Safety
+    ///
+    /// Mutates the process environment, so it must run while the process is
+    /// still single-threaded (see [`std::env::remove_var`]).
+    pub unsafe fn take_from_env() -> Self {
+        let store = Self::new();
+        for name in store.vars.keys() {
+            // SAFETY: the caller guarantees no other thread is running.
+            unsafe { std::env::remove_var(name) };
+        }
+        store
     }
 
     fn var_name(key: &str) -> String {
@@ -249,7 +284,10 @@ impl EnvStore {
 
 impl SecretStore for EnvStore {
     fn get(&self, key: &str) -> Result<String> {
-        std::env::var(Self::var_name(key)).map_err(|_| SecretError::NotFound(key.to_string()))
+        self.vars
+            .get(&Self::var_name(key))
+            .cloned()
+            .ok_or_else(|| SecretError::NotFound(key.to_string()))
     }
     fn set(&self, _key: &str, _value: &str) -> Result<()> {
         Err(SecretError::Backend(
@@ -262,14 +300,12 @@ impl SecretStore for EnvStore {
         ))
     }
     fn list(&self) -> Result<Vec<String>> {
-        let mut keys: Vec<String> = std::env::vars()
-            .filter_map(|(name, _)| {
-                name.strip_prefix(ENV_PREFIX)
-                    .map(|k| k.to_ascii_lowercase())
-            })
-            .collect();
-        keys.sort();
-        Ok(keys)
+        Ok(self
+            .vars
+            .keys()
+            .filter_map(|name| name.strip_prefix(ENV_PREFIX))
+            .map(|k| k.to_ascii_lowercase())
+            .collect())
     }
 }
 

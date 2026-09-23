@@ -5,6 +5,12 @@
 # `build: .` with `image: ghcr.io/podofun/agent.d:<version>` and point the
 # /etc/agentd mount at your own userland directory.
 #
+# Sandbox: every shell command still runs in agentd's per-command sandbox
+# inside the container. The container gets no capabilities, and the seccomp
+# profile is Docker's default plus one rule: `unshare(CLONE_NEWUSER |
+# CLONE_NEWNET)`, which commands with a `net:` grant need. Without the profile
+# those commands fail closed; everything else still works.
+#
 # Secrets: the image defaults to the `env` backend, so any AGENTD_SECRET_<NAME>
 # variable becomes a secret named <name>. The commented block below shows the
 # file-based alternative (`dir:/run/secrets`), which keeps values out of
@@ -18,6 +24,11 @@ services:
     volumes:
       - agentd-data:/var/lib/agentd
       - ./examples/docker:/etc/agentd:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./docker/seccomp/default.json
     environment:
       AGENTD_LOG: info
       # AGENTD_SECRET_ANTHROPIC_API_KEY: sk-ant-...

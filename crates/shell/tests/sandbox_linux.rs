@@ -81,3 +81,60 @@ async fn binary_still_runs_under_read_baseline() {
     .unwrap();
     assert_eq!(res.stdout.trim(), "alive");
 }
+
+/// Ordinary binaries read `/proc/self/*` (status, maps, exe, fd) and system
+/// files like `/proc/cpuinfo`. That must work for any process in the sandboxed
+/// tree, not only the one exec'd directly: here `cat` is a child of `sh`.
+#[tokio::test]
+async fn descendants_can_read_their_own_proc_entries() {
+    if !is_supported() {
+        eprintln!("landlock unsupported; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let res = exec(req(
+        "/bin/sh",
+        vec![
+            "-c".into(),
+            "cat /proc/self/status >/dev/null && readlink /proc/self/exe >/dev/null \
+             && ls /proc/self/fd >/dev/null && head -c1 /proc/cpuinfo >/dev/null && echo OK"
+                .into(),
+        ],
+        policy_writing_only(dir.path()),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(res.stdout.trim(), "OK", "stderr: {}", res.stderr);
+}
+
+/// Reading `/proc` must not expose processes outside the sandbox: Landlock
+/// refuses ptrace-gated entries (environ, maps, mem, fd targets, cwd, root,
+/// exe) of any process that is not inside the child's own sandbox domain,
+/// including its parent.
+#[tokio::test]
+async fn other_processes_proc_secrets_stay_denied() {
+    if !is_supported() {
+        eprintln!("landlock unsupported; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let me = std::process::id();
+    let res = exec(req(
+        "/bin/sh",
+        vec![
+            "-c".into(),
+            format!(
+                "for f in /proc/{me}/environ /proc/{me}/maps /proc/{me}/mem /proc/1/environ; do \
+                 if head -c1 $f >/dev/null 2>&1; then echo LEAK $f; fi; done; \
+                 for l in /proc/{me}/fd/0 /proc/{me}/cwd /proc/{me}/root /proc/{me}/exe; do \
+                 if readlink $l >/dev/null 2>&1; then echo LEAK $l; fi; done; \
+                 if ls /proc/{me}/cwd/ >/dev/null 2>&1; then echo LEAK cwd-dir; fi; echo DONE"
+            ),
+        ],
+        policy_writing_only(dir.path()),
+    ))
+    .await
+    .unwrap();
+    assert!(!res.stdout.contains("LEAK"), "{res:?}");
+    assert!(res.stdout.contains("DONE"), "{res:?}");
+}

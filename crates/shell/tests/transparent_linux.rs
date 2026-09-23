@@ -171,3 +171,122 @@ async fn dns_denied_name_does_not_resolve() {
         "denied name must not resolve: {res:?}"
     );
 }
+
+fn sh_req(script: &str, net_hosts: Vec<&str>) -> ExecRequest {
+    ExecRequest {
+        bin: "/bin/sh".into(),
+        args: vec!["-c".into(), script.into()],
+        cwd: None,
+        stdin: None,
+        separate_stderr: true,
+        sandbox: Some(policy(net_hosts)),
+    }
+}
+
+/// The command runs as root of the nested user namespace; it must hold no
+/// capabilities there, so it cannot rewrite the supervisor's nft redirect or
+/// reconfigure the namespace's interfaces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn net_child_holds_no_capabilities_and_cannot_touch_nft() {
+    if !netns_e2e_enabled() || !userns_net_supported() || !tooling_present() {
+        eprintln!("skip: set AGENTD_TEST_NETNS=1 (needs userns + nft/ip)");
+        return;
+    }
+    supervisor_env();
+    let res = agentd_shell::exec(sh_req(
+        // Builtins only: /proc/self is granted to the exec'd pid, not to
+        // grandchildren like grep.
+        "while read -r k v; do case $k in CapPrm:|CapEff:|CapBnd:|CapAmb:) echo \"$k $v\";; esac; done < /proc/self/status; \
+         if nft flush ruleset 2>/dev/null; then echo NFT_FLUSHED; fi; \
+         if ip link set lo down 2>/dev/null; then echo LO_DOWN; fi",
+        vec!["net:203.0.113.77"],
+    ))
+    .await
+    .expect("exec");
+    for line in res.stdout.lines() {
+        assert!(
+            line.ends_with("0000000000000000"),
+            "capability left in the sandboxed child: {res:?}"
+        );
+    }
+    assert_eq!(res.stdout.lines().count(), 4, "{res:?}");
+    assert!(!res.stdout.contains("NFT_FLUSHED"), "{res:?}");
+    assert!(!res.stdout.contains("LO_DOWN"), "{res:?}");
+}
+
+/// A UDP echo server bound on all interfaces; returns its port.
+fn udp_echo_server() -> u16 {
+    let s = UdpSocket::bind("0.0.0.0:0").unwrap();
+    let port = s.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut b = [0u8; 1500];
+        while let Ok((n, peer)) = s.recv_from(&mut b) {
+            let _ = s.send_to(&b[..n], peer);
+        }
+    });
+    port
+}
+
+/// bash `/dev/udp` opens a *connected* UDP socket, as a QUIC client does, so
+/// the echo only arrives if the reply's source is rewritten back to the
+/// original destination. `dd` reads one whole datagram; bash `read` would take
+/// a single byte and drop the rest.
+fn udp_echo_req(dst: SocketAddr, net_hosts: Vec<&str>) -> ExecRequest {
+    let script = format!(
+        "exec 3<>/dev/udp/{}/{} && printf ping >&3 && echo \"got:$(timeout 3 dd bs=512 count=1 status=none <&3)\"",
+        dst.ip(),
+        dst.port()
+    );
+    ExecRequest {
+        bin: "/bin/bash".into(),
+        args: vec!["-c".into(), script],
+        cwd: None,
+        stdin: None,
+        separate_stderr: true,
+        sandbox: Some(policy(net_hosts)),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn udp_to_allowed_ip_round_trips() {
+    if !netns_e2e_enabled() || !userns_net_supported() || !tooling_present() {
+        eprintln!("skip: set AGENTD_TEST_NETNS=1 (needs userns + nft/ip)");
+        return;
+    }
+    let Some(ip) = host_ip() else {
+        eprintln!("skip: no non-loopback host IP");
+        return;
+    };
+    supervisor_env();
+    let dst = SocketAddr::new(ip, udp_echo_server());
+    let res = agentd_shell::exec(udp_echo_req(dst, vec![&format!("net:{ip}")]))
+        .await
+        .expect("exec");
+    assert_eq!(
+        res.stdout.trim(),
+        "got:ping",
+        "allowed UDP must round-trip: {res:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn udp_to_denied_ip_is_dropped() {
+    if !netns_e2e_enabled() || !userns_net_supported() || !tooling_present() {
+        eprintln!("skip: set AGENTD_TEST_NETNS=1 (needs userns + nft/ip)");
+        return;
+    }
+    let Some(ip) = host_ip() else {
+        eprintln!("skip: no non-loopback host IP");
+        return;
+    };
+    supervisor_env();
+    let dst = SocketAddr::new(ip, udp_echo_server());
+    let res = agentd_shell::exec(udp_echo_req(dst, vec!["net:203.0.113.77"]))
+        .await
+        .expect("exec");
+    assert_eq!(
+        res.stdout.trim(),
+        "got:",
+        "denied UDP must not arrive: {res:?}"
+    );
+}

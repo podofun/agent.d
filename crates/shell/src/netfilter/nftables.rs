@@ -5,15 +5,14 @@
 
 /// Architecture-B NAT ruleset: transparently REDIRECT the child's egress to the
 /// in-namespace intercept ports. All outbound TCP (except loopback) is bounced to
-/// `tcp_port`; outbound UDP/53 (DNS) to `dns_port`. The original destination is
-/// recovered host-side via `SO_ORIGINAL_DST`. Non-DNS UDP (e.g. QUIC) is left
-/// unredirected and has no route out of the loopback-only netns — a documented
-/// residual (apps fall back to TCP).
+/// `tcp_port`; outbound UDP/53 (DNS) to `dns_port`; every other outbound UDP
+/// (QUIC/HTTP/3 and the rest) to `udp_port`. The original destination is
+/// recovered host-side via `SO_ORIGINAL_DST` (TCP) or a conntrack lookup (UDP).
 ///
 /// DNS (udp/53) is redirected FIRST, before the loopback accept, so queries aimed
 /// at a loopback stub resolver (systemd-resolved's 127.0.0.53, very common) are
 /// still captured.
-pub fn build_nat_ruleset(table: &str, tcp_port: u16, dns_port: u16) -> String {
+pub fn build_nat_ruleset(table: &str, tcp_port: u16, dns_port: u16, udp_port: u16) -> String {
     format!(
         "table inet {table} {{\n\
          \tchain output {{\n\
@@ -22,6 +21,7 @@ pub fn build_nat_ruleset(table: &str, tcp_port: u16, dns_port: u16) -> String {
          \t\tip daddr 127.0.0.0/8 accept\n\
          \t\tip6 daddr ::1 accept\n\
          \t\tmeta l4proto tcp redirect to :{tcp_port}\n\
+         \t\tmeta l4proto udp redirect to :{udp_port}\n\
          \t}}\n\
          }}\n"
     )
@@ -32,11 +32,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nat_ruleset_redirects_tcp_and_dns_only() {
-        let rs = build_nat_ruleset("sbxnat", 40001, 40002);
+    fn nat_ruleset_redirects_tcp_dns_and_udp() {
+        let rs = build_nat_ruleset("sbxnat", 40001, 40002, 40003);
         assert!(rs.contains("type nat hook output priority -100;"));
         assert!(rs.contains("udp dport 53 redirect to :40002"));
         assert!(rs.contains("meta l4proto tcp redirect to :40001"));
+        assert!(rs.contains("meta l4proto udp redirect to :40003"));
+        // The catch-all UDP redirect comes after DNS and the loopback accepts.
+        assert!(rs.find("udp dport 53").unwrap() < rs.find("l4proto udp").unwrap());
+        assert!(rs.find("ip6 daddr ::1").unwrap() < rs.find("l4proto udp").unwrap());
         // Loopback is never redirected (the intercept lives on loopback).
         assert!(rs.contains("ip daddr 127.0.0.0/8 accept"));
         assert!(rs.contains("ip6 daddr ::1 accept"));

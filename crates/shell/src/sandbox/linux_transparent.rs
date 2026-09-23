@@ -5,8 +5,9 @@
 //!
 //! 1. In the netns: `lo` up + a default route via `lo` so connects to external
 //!    IPs reach the OUTPUT path, where an nft NAT ruleset REDIRECTs all TCP to an
-//!    in-namespace intercept and UDP/53 to a DNS intercept (validated: the
-//!    original destination survives via `SO_ORIGINAL_DST`).
+//!    in-namespace intercept, UDP/53 to a DNS intercept, and all other UDP to a
+//!    UDP intercept (see `linux_udp`). The original destination survives
+//!    via `SO_ORIGINAL_DST` for TCP and a conntrack lookup for UDP.
 //! 2. The supervisor passes each intercepted TCP connection's fd + original
 //!    destination to the host over a `ctrl` socketpair, and bridges each DNS
 //!    query over a `dns` socketpair.
@@ -37,6 +38,9 @@ use crate::{ExecRequest, ExecResult, SandboxPolicy, ShellError};
 /// Env var carrying the JSON [`TConfig`] to the re-exec'd transparent supervisor.
 pub const TPROXY_ENV: &str = "AGENTD_NETNS_TPROXY";
 
+/// Status byte the supervisor writes once the netns is fully configured.
+const READY: u8 = 0;
+
 /// Default DNS pin TTL applied to resolved IPs.
 const PIN_TTL: Duration = Duration::from_secs(120);
 
@@ -46,9 +50,15 @@ pub struct TConfig {
     pub ctrl_fd: RawFd,
     /// Datagram socketpair end: supervisor bridges DNS queries/responses here.
     pub dns_fd: RawFd,
+    /// SEQPACKET socketpair end carrying non-DNS UDP frames (see `linux_udp`).
+    pub udp_fd: RawFd,
     pub stdout_fd: RawFd,
     pub stderr_fd: RawFd,
     pub stdin_fd: RawFd,
+    /// Pipe write end for setup status: the supervisor writes `READY` once the
+    /// netns is configured, and any setup failure (its own or the command
+    /// child's) as text. Closed on the command's successful `execve`.
+    pub status_fd: RawFd,
     pub bin: String,
     pub args: Vec<String>,
     pub read_paths: Vec<String>,
@@ -87,7 +97,7 @@ fn original_dst<F: std::os::fd::AsFd>(sock: &F) -> Option<SocketAddr> {
 
 /// Encode a `SocketAddr` to a fixed wire form for the ctrl-socket payload:
 /// `[fam:1][port:2][addr:16]` (v4 left-padded). 19 bytes.
-fn encode_dst(a: &SocketAddr) -> [u8; 19] {
+pub(super) fn encode_dst(a: &SocketAddr) -> [u8; 19] {
     let mut b = [0u8; 19];
     b[1..3].copy_from_slice(&a.port().to_be_bytes());
     match a.ip() {
@@ -103,7 +113,7 @@ fn encode_dst(a: &SocketAddr) -> [u8; 19] {
     b
 }
 
-fn decode_dst(b: &[u8]) -> Option<SocketAddr> {
+pub(super) fn decode_dst(b: &[u8]) -> Option<SocketAddr> {
     if b.len() < 19 {
         return None;
     }
@@ -125,57 +135,99 @@ mod supervisor {
     use std::ffi::CString;
     use std::io::Write;
     use std::net::{TcpListener, UdpSocket};
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, RawFd};
     use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
 
     use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
     use nix::sys::wait::{WaitStatus, waitpid};
     use nix::unistd::{Pid, close, execvp};
 
-    use super::{TConfig, encode_dst, original_dst};
+    use super::{READY, TConfig, encode_dst, original_dst};
     use crate::SandboxPolicy;
     use crate::netfilter::nftables;
-    use crate::sandbox::linux_net::bring_loopback_up;
+    use crate::sandbox::linux_net::{bring_loopback_up, set_cloexec};
+    use crate::sandbox::linux_udp;
+
+    /// Report a setup failure to the host and return the supervisor's exit code.
+    /// The command never runs after this.
+    fn fail(status_fd: RawFd, msg: &str) -> i32 {
+        report(status_fd, msg.as_bytes());
+        127
+    }
+
+    fn report(status_fd: RawFd, bytes: &[u8]) {
+        // SAFETY: `status_fd` is the inherited status pipe; the borrow lives only
+        // for this write.
+        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(status_fd) };
+        let _ = nix::unistd::write(fd, bytes);
+    }
 
     pub fn run(cfg: TConfig) -> i32 {
+        // Keep the status pipe out of `ip`/`nft`; the command child inherits it
+        // across fork and it closes on the command's successful execve.
+        set_cloexec(cfg.status_fd, true);
+        let status = cfg.status_fd;
+
         if !bring_loopback_up() {
-            eprintln!("tproxy: lo up failed");
-            return 127;
+            return fail(status, "the loopback interface could not be brought up");
         }
         // Default route via lo so external connects reach the OUTPUT nat hook.
         // CRITICAL: `src 127.0.0.1` — without an explicit source the kernel picks
         // 0.0.0.0 for a route via lo, the intercept's accepted peer becomes
         // 0.0.0.0, and replies are undeliverable (validated the hard way).
-        // `route_localnet` lets the loopback REDIRECT target be reached.
+        // `route_localnet` is best-effort: containers mount /proc/sys read-only,
+        // and the output-hook REDIRECT to loopback works without it.
         let _ = std::fs::write("/proc/sys/net/ipv4/conf/all/route_localnet", "1");
         let _ = std::fs::write("/proc/sys/net/ipv4/conf/lo/route_localnet", "1");
-        let _ = Command::new("ip")
-            .args(["route", "add", "default", "dev", "lo", "src", "127.0.0.1"])
-            .status();
+        if let Err(msg) = run_tool(
+            "ip",
+            &["route", "add", "default", "dev", "lo", "src", "127.0.0.1"],
+            None,
+        ) {
+            return fail(status, &msg);
+        }
 
         let tcp = match TcpListener::bind("127.0.0.1:0") {
             Ok(l) => l,
-            Err(e) => {
-                eprintln!("tproxy: tcp bind: {e}");
-                return 127;
-            }
+            Err(e) => return fail(status, &format!("the TCP intercept could not bind ({e})")),
         };
         let udp = match UdpSocket::bind("127.0.0.1:0") {
             Ok(u) => u,
-            Err(e) => {
-                eprintln!("tproxy: udp bind: {e}");
-                return 127;
-            }
+            Err(e) => return fail(status, &format!("the DNS intercept could not bind ({e})")),
+        };
+        let relay = match UdpSocket::bind("127.0.0.1:0") {
+            Ok(u) => Arc::new(u),
+            Err(e) => return fail(status, &format!("the UDP intercept could not bind ({e})")),
         };
         let tcp_port = tcp.local_addr().map(|a| a.port()).unwrap_or(0);
         let dns_port = udp.local_addr().map(|a| a.port()).unwrap_or(0);
+        let udp_port = relay.local_addr().map(|a| a.port()).unwrap_or(0);
+
+        // IPv6: the nft REDIRECT sends v6 traffic to [::1] on the same ports, so
+        // mirror both intercepts there and route v6 via lo. Best-effort: when the
+        // namespace has no IPv6 (no ::1, or the route is refused) v6 simply has
+        // no route out, which fails closed.
+        let v6 = match (
+            TcpListener::bind(("::1", tcp_port)),
+            UdpSocket::bind(("::1", dns_port)),
+            UdpSocket::bind(("::1", udp_port)),
+        ) {
+            (Ok(t), Ok(u), Ok(r))
+                if run_tool("ip", &["-6", "route", "add", "default", "dev", "lo"], None)
+                    .is_ok() =>
+            {
+                Some((t, u, Arc::new(r)))
+            }
+            _ => None,
+        };
 
         // Install the NAT redirect ruleset.
-        let ruleset = nftables::build_nat_ruleset("agentd_sbxnat", tcp_port, dns_port);
-        if !apply_nft(&ruleset) {
-            eprintln!("tproxy: nft apply failed");
-            return 127;
+        let ruleset = nftables::build_nat_ruleset("agentd_sbxnat", tcp_port, dns_port, udp_port);
+        if let Err(msg) = run_tool("nft", &["-f", "-"], Some(&ruleset)) {
+            return fail(status, &msg);
         }
+        report(status, &[READY]);
 
         // Fork the command. SAFETY: this process is single-threaded (just
         // execve'd as the supervisor), so the child may run normal code before
@@ -186,14 +238,38 @@ mod supervisor {
             pid => pid,
         };
         // Parent: close the inherited command-side fds.
+        let _ = close(cfg.status_fd);
         let _ = close(cfg.stdout_fd);
         let _ = close(cfg.stderr_fd);
         if cfg.stdin_fd >= 0 {
             let _ = close(cfg.stdin_fd);
         }
 
-        // TCP intercept thread: pass each accepted fd + original dst to the host.
-        let ctrl_fd = cfg.ctrl_fd;
+        // One intercept pair per address family. Both share the ctrl/dns
+        // socketpairs, so each exchange holds that pair's lock.
+        let ctrl = Arc::new(Mutex::new(cfg.ctrl_fd));
+        let dns = Arc::new(Mutex::new(cfg.dns_fd));
+        spawn_tcp_intercept(tcp, ctrl.clone());
+        spawn_dns_intercept(udp, dns.clone());
+        linux_udp::spawn_supervisor_intercept(relay.clone(), cfg.udp_fd);
+        let relay6 = if let Some((tcp6, udp6, relay6)) = v6 {
+            spawn_tcp_intercept(tcp6, ctrl);
+            spawn_dns_intercept(udp6, dns);
+            linux_udp::spawn_supervisor_intercept(relay6.clone(), cfg.udp_fd);
+            Some(relay6)
+        } else {
+            None
+        };
+        linux_udp::spawn_supervisor_replies(cfg.udp_fd, relay, relay6);
+
+        match waitpid(Pid::from_raw(child), None) {
+            Ok(WaitStatus::Exited(_, code)) => code,
+            _ => 129,
+        }
+    }
+
+    /// Pass each accepted connection's fd + original destination to the host.
+    fn spawn_tcp_intercept(tcp: TcpListener, ctrl: Arc<Mutex<RawFd>>) {
         std::thread::spawn(move || {
             for stream in tcp.incoming().flatten() {
                 let fd = stream.as_raw_fd();
@@ -205,52 +281,128 @@ mod supervisor {
                 let fds = [fd];
                 let cmsg = [ControlMessage::ScmRights(&fds)];
                 let iov = [std::io::IoSlice::new(&payload)];
+                let ctrl_fd = *ctrl.lock().unwrap();
                 let _ = sendmsg::<()>(ctrl_fd, &iov, &cmsg, MsgFlags::empty(), None);
                 drop(stream); // host owns the dup'd fd now
             }
         });
+    }
 
-        // DNS intercept thread: bridge each query to the host, return its answer.
-        let dns_fd = cfg.dns_fd;
+    /// Bridge each DNS query to the host and return its answer.
+    fn spawn_dns_intercept(udp: UdpSocket, dns: Arc<Mutex<RawFd>>) {
         std::thread::spawn(move || {
-            use nix::sys::socket::{MsgFlags, recv, send};
+            use nix::sys::socket::{recv, send};
             let mut buf = [0u8; 1500];
             while let Ok((n, src)) = udp.recv_from(&mut buf) {
-                // Forward query bytes to host over the dns socketpair.
-                if send(dns_fd, &buf[..n], MsgFlags::empty()).is_err() {
-                    break;
-                }
                 let mut rbuf = [0u8; 1500];
-                match recv(dns_fd, &mut rbuf, MsgFlags::empty()) {
-                    Ok(got) if got > 0 => {
-                        let _ = udp.send_to(&rbuf[..got], src);
+                // Query and answer are one exchange on the shared socketpair.
+                let got = {
+                    let dns_fd = dns.lock().unwrap();
+                    if send(*dns_fd, &buf[..n], MsgFlags::empty()).is_err() {
+                        break;
                     }
-                    _ => continue,
+                    recv(*dns_fd, &mut rbuf, MsgFlags::empty())
+                };
+                if let Ok(got) = got
+                    && got > 0
+                {
+                    let _ = udp.send_to(&rbuf[..got], src);
                 }
             }
         });
-
-        match waitpid(Pid::from_raw(child), None) {
-            Ok(WaitStatus::Exited(_, code)) => code,
-            _ => 129,
-        }
     }
 
-    fn apply_nft(ruleset: &str) -> bool {
-        let mut c = match Command::new("nft")
-            .args(["-f", "-"])
-            .stdin(Stdio::piped())
+    /// Run a netns setup tool (`ip`, `nft`) to completion. Any failure is fatal
+    /// to the exec: a half-configured namespace must never run the command.
+    fn run_tool(bin: &str, args: &[&str], stdin: Option<&str>) -> Result<(), String> {
+        let mut c = Command::new(bin)
+            .args(args)
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
-        {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        if let Some(mut sin) = c.stdin.take() {
-            let _ = sin.write_all(ruleset.as_bytes());
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    format!("the `{bin}` command is not installed")
+                }
+                _ => format!("the `{bin}` command could not start ({e})"),
+            })?;
+        if let (Some(input), Some(mut sin)) = (stdin, c.stdin.take()) {
+            let _ = sin.write_all(input.as_bytes());
         }
-        c.wait().map(|s| s.success()).unwrap_or(false)
+        let out = c
+            .wait_with_output()
+            .map_err(|e| format!("the `{bin}` command failed ({e})"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        let err = err
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        Err(format!("`{bin} {}` failed ({err})", args.join(" ")))
+    }
+
+    /// Clear every capability the command would otherwise hold as root of the
+    /// nested user namespace, so it cannot rewrite the supervisor's nftables
+    /// rules, reconfigure interfaces, or open raw sockets. Emptying the bounding
+    /// set keeps `execve` from handing root's capabilities back.
+    fn drop_all_capabilities() -> Result<(), String> {
+        #[repr(C)]
+        struct CapHeader {
+            version: u32,
+            pid: i32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct CapData {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+        // SAFETY: plain prctl/capset syscalls on the calling (single-threaded,
+        // pre-exec) process with valid, stack-owned arguments.
+        unsafe {
+            if libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+                0,
+                0,
+                0,
+            ) != 0
+            {
+                return Err("the ambient capabilities could not be cleared".into());
+            }
+            let mut cap: libc::c_ulong = 0;
+            // PR_CAPBSET_READ fails with EINVAL past the kernel's last capability.
+            while libc::prctl(libc::PR_CAPBSET_READ, cap, 0, 0, 0) >= 0 {
+                if libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) != 0 {
+                    return Err("the capability bounding set could not be cleared".into());
+                }
+                cap += 1;
+            }
+            let header = CapHeader {
+                version: LINUX_CAPABILITY_VERSION_3,
+                pid: 0,
+            };
+            let data = [CapData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            }; 2];
+            if libc::syscall(libc::SYS_capset, &header, data.as_ptr()) != 0 {
+                return Err("the process capabilities could not be cleared".into());
+            }
+        }
+        Ok(())
     }
 
     fn exec_command(cfg: &TConfig) -> ! {
@@ -270,6 +422,12 @@ mod supervisor {
             }
             libc::close(cfg.ctrl_fd);
             libc::close(cfg.dns_fd);
+            libc::close(cfg.udp_fd);
+        }
+
+        if let Err(msg) = drop_all_capabilities() {
+            report(cfg.status_fd, msg.as_bytes());
+            unsafe { libc::_exit(126) };
         }
 
         // No proxy env: enforcement is transparent (kernel redirect + host allowlist).
@@ -281,7 +439,10 @@ mod supervisor {
             unrestricted: false,
         };
         if let Err(e) = crate::sandbox::apply(&policy) {
-            eprintln!("tproxy: landlock apply failed: {e}");
+            report(
+                cfg.status_fd,
+                format!("the filesystem sandbox could not be applied ({e})").as_bytes(),
+            );
             unsafe { libc::_exit(126) };
         }
 
@@ -291,8 +452,11 @@ mod supervisor {
         for a in &cfg.args {
             argv.push(CString::new(a.as_str()).unwrap_or_default());
         }
-        let _ = execvp(&bin, &argv);
-        eprintln!("tproxy: exec {} failed", cfg.bin);
+        let err = execvp(&bin, &argv).unwrap_err();
+        report(
+            cfg.status_fd,
+            format!("could not start `{}` ({err})", cfg.bin).as_bytes(),
+        );
         unsafe { libc::_exit(127) }
     }
 }
@@ -340,10 +504,13 @@ fn run_contained_blocking(
     // SEQPACKET (not DGRAM): preserves DNS message boundaries AND signals EOF when
     // the supervisor end closes, so the host DNS loop unblocks on teardown.
     let (dns_host, dns_sup) = socketpair(SockType::SeqPacket).map_err(|e| sb(e.to_string()))?;
+    let (udp_host, udp_sup) = socketpair(SockType::SeqPacket).map_err(|e| sb(e.to_string()))?;
     set_cloexec(ctrl_host, true);
     set_cloexec(ctrl_sup, false);
     set_cloexec(dns_host, true);
     set_cloexec(dns_sup, false);
+    set_cloexec(udp_host, true);
+    set_cloexec(udp_sup, false);
 
     let out = make_pipe().map_err(|e| sb(e.to_string()))?;
     let err = make_pipe().map_err(|e| sb(e.to_string()))?;
@@ -354,13 +521,19 @@ fn run_contained_blocking(
 
     let s1 = make_pipe().map_err(|e| sb(e.to_string()))?; // child->parent "unshared"
     let s2 = make_pipe().map_err(|e| sb(e.to_string()))?; // parent->child "maps written"
+    // supervisor->parent setup status. Both ends stay CLOEXEC in the daemon so
+    // concurrent spawns never inherit the write end; the forked child clears it
+    // on its own copy just before execve.
+    let st = make_pipe().map_err(|e| sb(e.to_string()))?;
 
     let cfg = TConfig {
         ctrl_fd: ctrl_sup,
         dns_fd: dns_sup,
+        udp_fd: udp_sup,
         stdout_fd: out.wr,
         stderr_fd: err.wr,
         stdin_fd: if req.stdin.is_some() { sin.rd } else { -1 },
+        status_fd: st.wr,
         bin: req.bin.clone(),
         args: req.args.clone(),
         read_paths: policy
@@ -398,29 +571,52 @@ fn run_contained_blocking(
             let one = [1u8];
             libc::write(s1.wr, one.as_ptr() as *const _, 1);
             let mut b = [0u8; 1];
-            libc::read(s2.rd, b.as_mut_ptr() as *mut _, 1);
+            if libc::read(s2.rd, b.as_mut_ptr() as *mut _, 1) != 1 {
+                libc::_exit(125);
+            }
+            if libc::fcntl(st.wr, libc::F_SETFD, 0) != 0 {
+                libc::_exit(125);
+            }
             libc::execve(argv[0], argv.as_ptr(), envp.as_ptr());
             libc::_exit(127);
         }
     }
 
     // Close the ends the child/supervisor owns (parent keeps its own).
-    for fd in [ctrl_sup, dns_sup, out.wr, err.wr, sin.rd, s1.wr, s2.rd] {
+    for fd in [
+        ctrl_sup, dns_sup, udp_sup, out.wr, err.wr, sin.rd, s1.wr, s2.rd, st.wr,
+    ] {
         let _ = close(fd);
     }
+    // On any setup failure below: close the parent's ends and reap the child, so
+    // the command never runs and nothing leaks.
+    let abort = |msg: String| {
+        for fd in [
+            ctrl_host, dns_host, udp_host, out.rd, err.rd, sin.wr, s1.rd, s2.wr, st.rd,
+        ] {
+            let _ = close(fd);
+        }
+        // SAFETY: `child` is our own unreaped fork, so the pid cannot be reused.
+        unsafe { libc::kill(child, libc::SIGKILL) };
+        let _ = waitpid(Pid::from_raw(child), None);
+        sb(msg)
+    };
 
     // Wait for the child's "unshared" signal.
     let mut tmp = [0u8; 1];
     if read(s1.rd, &mut tmp) != Ok(1) {
-        let _ = close(s1.rd);
-        let _ = close(s2.wr);
-        return Err(sb(
-            "the sandbox child process failed to unshare its namespaces".into(),
+        return Err(abort(
+            "the command's user and network namespaces could not be created".into(),
         ));
     }
-    let _ = write_file(&format!("/proc/{child}/uid_map"), &format!("0 {uid} 1\n"));
-    let _ = write_file(&format!("/proc/{child}/setgroups"), "deny");
-    let _ = write_file(&format!("/proc/{child}/gid_map"), &format!("0 {gid} 1\n"));
+    let maps = write_file(&format!("/proc/{child}/uid_map"), &format!("0 {uid} 1\n"))
+        .and_then(|_| write_file(&format!("/proc/{child}/setgroups"), "deny"))
+        .and_then(|_| write_file(&format!("/proc/{child}/gid_map"), &format!("0 {gid} 1\n")));
+    if let Err(e) = maps {
+        return Err(abort(format!(
+            "the user namespace id mapping could not be written ({e})"
+        )));
+    }
     // Release the child into execve. SAFETY: `s2.wr` is a live fd we own; the
     // borrow lives only for this write.
     let _ = write(
@@ -429,6 +625,33 @@ fn run_contained_blocking(
     );
     let _ = close(s1.rd);
     let _ = close(s2.wr);
+
+    // Block until the supervisor reports READY and the command has exec'd (EOF),
+    // or a setup step failed. Anything but a lone READY byte means the command
+    // did not start confined, so it must not be treated as having run.
+    let status = {
+        // SAFETY: the parent owns the read end of the status pipe; adopt it.
+        let mut f = unsafe { std::fs::File::from_raw_fd(st.rd) };
+        let mut v = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut f, &mut v);
+        v
+    };
+    if status != [READY] {
+        let detail = String::from_utf8_lossy(status.strip_prefix(&[READY]).unwrap_or(&status))
+            .trim()
+            .to_string();
+        let detail = if detail.is_empty() {
+            "the network sandbox supervisor exited before the command started".to_string()
+        } else {
+            detail
+        };
+        // `st.rd` is already closed by the File above; skip it in abort.
+        for fd in [ctrl_host, dns_host, udp_host, out.rd, err.rd, sin.wr] {
+            let _ = close(fd);
+        }
+        let _ = waitpid(Pid::from_raw(child), None);
+        return Err(sb(detail));
+    }
 
     // Shared permitted set, seeded with literal IP grants.
     let set: SharedSet = {
@@ -446,6 +669,10 @@ fn run_contained_blocking(
     let set_dns = set.clone();
     let grants = host_grants;
     let dns_join = std::thread::spawn(move || dns_handler_loop(dns_host, grants, set_dns));
+    let set_udp = set.clone();
+    // SAFETY: the parent owns `udp_host`; the relay loop adopts it.
+    let udp_host = unsafe { std::os::fd::OwnedFd::from_raw_fd(udp_host) };
+    let udp_join = std::thread::spawn(move || super::linux_udp::host_relay_loop(udp_host, set_udp));
 
     // Drain stdio. SAFETY: the parent owns the read ends of these pipes; adopt
     // them into `File`s that close on drop.
@@ -480,6 +707,7 @@ fn run_contained_blocking(
     let stderr_text = String::from_utf8_lossy(&err_join.join().unwrap_or_default()).into_owned();
     let _ = ctrl_join.join();
     let _ = dns_join.join();
+    let _ = udp_join.join();
 
     let (stdout, stderr) = if req.separate_stderr {
         (stdout, stderr_text)

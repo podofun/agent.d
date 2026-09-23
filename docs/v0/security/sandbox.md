@@ -22,57 +22,36 @@ This protection applies only to the shell invocation itself. If you pass user in
 
 ## Filesystem confinement
 
-A child process spawned by `ctx.shell` can only write to the paths you grant with `fs.write`, and read only its `fs.read` grants plus its `cwd`. Access anywhere else fails, even with `shell.exec` granted — so a tool cannot read or modify files outside what its grants allow. Enforced on Linux, macOS, and Windows.
+Every program that `ctx.shell` starts, and every program that it starts in turn, has these file rules:
+
+- **Write:** only inside the directories granted with `fs.write`.
+- **Read:** inside the directories granted with `fs.read` or `fs.write`, plus the system files that any program needs to start (binaries, libraries, and system configuration).
+
+Any other read or write fails with a permission error. The `shell.exec` grant does not change these rules. For example, with `fs.write:/srv/app/**`, a tool can edit files under `/srv/app`, but it cannot read `/home/alice/.ssh` or write to `/etc`.
 
 Keep grants narrow, and use the `cwd` option to scope where a tool's relative paths resolve.
 
-::: warning Windows performance and footprint
-Linux (Landlock) and macOS (Seatbelt) confine the filesystem at runtime and change nothing on disk. Windows has no equivalent lightweight primitive, so agent.d confines by temporarily adjusting the ACLs of the granted paths. Two things follow:
-
-- **Granting a large directory can be slow** the first time it's used (Windows applies the grant to every file in the subtree). Keep grants narrow; small grants are instant.
-- **The change is transient.** agent.d records its ACL entries and removes them on shutdown, on `agentd --uninstall-sandbox`, and on the next start after a crash.
-
-:::
-
 ## Network confinement
 
-A child process can only reach hosts you allow with `net:` grants. With no `net:` grant it has no outbound network, and it cannot bypass the grants by connecting directly — the hosts allowed at the Lua API layer are the only ones a spawned binary can reach. Enforced on Linux, macOS, and Windows.
+A child process can only reach hosts you allow with `net:` grants. With no `net:` grant it has no outbound network, and it cannot bypass the grants by connecting directly. The hosts allowed at the Lua API layer are the only ones a spawned binary can reach. This covers every protocol (TCP, UDP, and QUIC) over both IPv4 and IPv6.
 
-The grant syntax is identical everywhere: `net:1.2.3.4` (literal IP), `net:api.example.com` (host), `net:api.example.*` (suffix wildcard). You write the same `grants.toml` on every platform.
+A `net:` grant names a destination in one of three forms: `net:1.2.3.4` (an IP address), `net:api.example.com` (a host name), or `net:api.example.*` (a host name with a wildcard suffix).
 
-### One-time network setup (macOS and Windows)
+## One-time setup
 
-The daemon **never runs elevated**. Sandboxed networking needs a small one-time setup that does — run it once per machine, then the daemon runs unprivileged from then on.
-
-**macOS:**
+On macOS and Windows, only the operating system's administrator can change firewall rules. agent.d itself always runs as a normal user, so it installs a small helper service, once per machine, that applies these rules for it. On macOS, the helper is a system service with a few dedicated sandbox user accounts. On Windows, it is a Windows service. Install it with administrator rights:
 
 ```bash
-sudo agentd --install-sandbox    # sudo agentd --uninstall-sandbox to reverse
-```
-
-**Windows** (elevated terminal):
-
-```powershell
 agentd --install-sandbox
 ```
 
-Each prints a confirmation and exits. Until you run it, `ctx.shell` calls that need network fail closed with a message pointing here; calls that don't use the network are unaffected. **Linux needs no setup.**
+On macOS, prefix it with `sudo`. On Windows, run it from an elevated terminal.
 
-### Platform notes
-
-On every platform a binary can reach exactly the hosts and IPs your `net:` grants cover — literal IPs, host names, and suffix wildcards — and nothing else, over both IPv4 and IPv6. Two behaviors differ slightly today:
-
-- **macOS wildcards** rely on the destination having correct reverse DNS, which is true for most services. If a wildcard-granted host isn't reachable, grant it by its concrete name or IP instead.
-- **Windows** does not yet honor wildcard host grants — a connection to a wildcard-granted host fails closed. Grant those hosts by concrete name or IP on Windows for now.
+Until you run it, `ctx.shell` calls that need network fail closed with a message pointing here. Calls that don't use the network are unaffected. `agentd --uninstall-sandbox` reverses it. Linux needs no setup.
 
 ## Fail-closed
 
-The sandbox fails closed: if confinement cannot be established, the call errors rather than running unconfined.
-
-## What the sandbox does not cover
-
-- **CPU and memory**: there are no resource limits on child processes at this time.
-- **Specifier matching**: the `shell.exec:<bin>` specifier is matched against the first argument to `ctx.shell`. Prefer specific specifiers (`shell.exec:git`) over the bare `shell.exec` to limit which binaries can run.
+The sandbox fails closed: if confinement cannot be established, the call errors rather than running unconfined. The error names what is missing.
 
 ## See also
 

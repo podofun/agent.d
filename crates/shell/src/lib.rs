@@ -65,10 +65,23 @@ pub enum ShellError {
     },
     #[error("I/O error ({0})")]
     Io(#[from] std::io::Error),
-    #[error(
-        "the native shell sandbox is unavailable, so shell commands are denied — run `agentd --install-sandbox` to set it up"
+    #[cfg_attr(
+        target_os = "linux",
+        error(
+            "the native shell sandbox is unavailable because this kernel does not enforce Landlock, so shell commands are denied. See https://docs.podo.fun/agentd/v0/security/sandbox"
+        )
+    )]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        error(
+            "the native shell sandbox is unavailable, so shell commands are denied. Run `agentd --install-sandbox` to set it up"
+        )
     )]
     SandboxUnavailable,
+    #[error(
+        "shell commands with a `net:` grant need unprivileged user and network namespaces, which this host or container does not allow, so the command was denied. See https://docs.podo.fun/agentd/v0/security/sandbox"
+    )]
+    NetSandboxUnavailable,
     #[error("the shell sandbox could not be set up ({0})")]
     Sandbox(String),
 }
@@ -100,7 +113,7 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
         #[cfg(target_os = "linux")]
         {
             if !sandbox::net_supported() {
-                return Err(ShellError::SandboxUnavailable);
+                return Err(ShellError::NetSandboxUnavailable);
             }
             let (host_grants, literal_ips) = dns_pin::split_grants(&policy.net_hosts);
             return sandbox::linux_transparent::run_contained(

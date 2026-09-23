@@ -46,6 +46,28 @@ fn env_is_read_only() {
     assert!(matches!(s.delete("k"), Err(SecretError::Backend(_))));
 }
 
+#[test]
+fn env_take_removes_secrets_from_the_environment() {
+    unsafe { std::env::set_var("AGENTD_SECRET_ENV_TAKE_TOKEN", "s3cret") };
+    let s = unsafe { EnvStore::take_from_env() };
+    assert!(
+        std::env::var_os("AGENTD_SECRET_ENV_TAKE_TOKEN").is_none(),
+        "the secret must leave the process environment"
+    );
+    assert_eq!(s.get("env_take_token").unwrap(), "s3cret");
+    assert!(s.list().unwrap().contains(&"env_take_token".to_string()));
+}
+
+#[test]
+fn env_from_vars_ignores_unprefixed_names() {
+    let s = EnvStore::from_vars([
+        ("AGENTD_SECRET_API".to_string(), "k".to_string()),
+        ("HOME".to_string(), "/root".to_string()),
+    ]);
+    assert_eq!(s.list().unwrap(), vec!["api".to_string()]);
+    assert_eq!(s.get("api").unwrap(), "k");
+}
+
 // ---------- DirStore ----------
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
