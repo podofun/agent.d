@@ -203,6 +203,7 @@ async fn run(cli: Cli) -> Result<()> {
         secrets: keyring,
         memory: Arc::new(memory),
         sessions: Arc::new(sessions),
+        file_history: agentd_fs::History::default(),
         trace: Arc::new(trace),
         broker: broker.clone(),
         async_handle: tokio::runtime::Handle::current(),

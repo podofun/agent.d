@@ -4,7 +4,7 @@
 //!
 //! The daemon calls it once at startup and again on every `--watch` hot reload.
 //! The pieces that must survive a reload (providers, secrets, durable memory,
-//! the trace sink, the approval broker, the async runtime handle) live in
+//! file history, the trace sink, the approval broker, the async runtime handle) live in
 //! [`Shared`] and are built once in `main::run`; everything else is rebuilt
 //! fresh so a reload leaves no stale registrations behind.
 
@@ -32,6 +32,7 @@ pub struct Shared {
     pub secrets: Arc<dyn SecretStore>,
     pub memory: Arc<RedbStore>,
     pub sessions: Arc<RedbSessionStore>,
+    pub file_history: agentd_fs::History,
     pub trace: Arc<JsonlSink>,
     pub broker: Arc<agentd_approvals::Broker>,
     pub async_handle: tokio::runtime::Handle,
@@ -67,6 +68,7 @@ pub fn build_runtime(cfg: &Config, shared: &Shared) -> Result<BuiltRuntime> {
     host.set_secrets(shared.secrets.clone());
     host.set_memory(shared.memory.clone());
     host.set_sessions(shared.sessions.clone());
+    host.set_file_history(shared.file_history.clone());
     for name in shared.providers.names() {
         if let Some(p) = shared.providers.get(&name) {
             host.set_ai_provider(name, p);

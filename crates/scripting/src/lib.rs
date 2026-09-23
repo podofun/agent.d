@@ -225,6 +225,11 @@ pub struct LuaHost {
 }
 
 impl LuaHost {
+    /// Share file history across Lua VM rebuilds and hot reloads.
+    pub fn set_file_history(&self, history: fs::History) {
+        self.lua.lock().unwrap().set_app_data(history);
+    }
+
     pub fn new() -> Result<Self> {
         let lua = Lua::new();
         let catalog: SharedCatalog = Arc::new(RwLock::new(Catalog::default()));
@@ -245,6 +250,7 @@ impl LuaHost {
         lua.set_app_data(RunnerDispatcherHolder::default());
         lua.set_app_data(PackagesRoot::default());
         lua.set_app_data(WorkspaceRoot::default());
+        lua.set_app_data(fs::History::default());
         lua.set_app_data(PackageScope::default());
 
         install_agentd_globals(&lua, &catalog)?;
@@ -2218,6 +2224,11 @@ fn build_fs_table(lua: &Lua) -> mlua::Result<Table> {
     t.set("stat", lua.create_function(fs_stat_binding)?)?;
     t.set("list_dir", lua.create_function(fs_list_dir_binding)?)?;
     t.set("remove", lua.create_function(fs_remove_binding)?)?;
+    t.set("history", lua.create_function(fs_history_binding)?)?;
+    t.set("diff", lua.create_function(fs_diff_binding)?)?;
+    t.set("restore", lua.create_function(fs_restore_binding)?)?;
+    t.set("undo", lua.create_function(fs_undo_binding)?)?;
+    t.set("redo", lua.create_function(fs_redo_binding)?)?;
     t.set("getcwd", lua.create_function(fs_getcwd_binding)?)?;
     t.set("chdir", lua.create_function(fs_chdir_binding)?)?;
     // `with_cwd(dir, fn)` runs `fn` with cwd temporarily set to `dir`, restoring
@@ -2300,26 +2311,24 @@ fn resolve_path(lua: &Lua, path: String) -> std::path::PathBuf {
     if let Ok(canon) = p.canonicalize() {
         return strip_verbatim(canon);
     }
-    // Target may not exist yet (writing a new file): canonicalize the parent
-    // chain so symlinks / `..` there still collapse, then re-attach the leaf.
-    if let (Some(parent), Some(name)) = (p.parent(), p.file_name())
-        && let Ok(canon_parent) = parent.canonicalize()
-    {
-        return strip_verbatim(canon_parent).join(name);
-    }
-    // Nothing on disk to resolve against — strip `.`/`..` lexically so a
-    // traversal can't survive into the slug even on a fully novel path.
-    let mut out = std::path::PathBuf::new();
-    for comp in p.components() {
-        match comp {
-            std::path::Component::ParentDir => {
-                out.pop();
+    // Resolve each existing ancestor even when descendants are missing.
+    // Resolving as we walk also handles a symlink reached after `missing/..`.
+    let mut resolved = PathBuf::new();
+    for component in p.components() {
+        match component {
+            Component::ParentDir => {
+                resolved.pop();
             }
-            std::path::Component::CurDir => {}
-            other => out.push(other.as_os_str()),
+            Component::CurDir => {}
+            other => {
+                resolved.push(other.as_os_str());
+                if let Ok(canonical) = resolved.canonicalize() {
+                    resolved = strip_verbatim(canonical);
+                }
+            }
         }
     }
-    out
+    resolved
 }
 
 pub(crate) fn block_on<F: std::future::Future<Output = T>, T>(fut: F) -> mlua::Result<T> {
@@ -2355,47 +2364,44 @@ fn fs_chdir_binding(lua: &Lua, path: String) -> mlua::Result<String> {
     Ok(new.to_string_lossy().into_owned())
 }
 
-fn fs_read_binding(lua: &Lua, path: String) -> mlua::Result<String> {
+fn fs_read_binding(lua: &Lua, path: String) -> mlua::Result<mlua::String> {
     let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.read:{}", p.display())))?;
-    block_on(fs::read_to_string(&p))?.map_err(|e| mlua::Error::external(e.to_string()))
+    let bytes = block_on(fs::read_bytes(&p))?.map_err(mlua::Error::external)?;
+    lua.create_string(bytes)
 }
 
-fn fs_write_binding(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
+fn fs_write_binding(lua: &Lua, args: MultiValue) -> mlua::Result<usize> {
     let mut it = args.into_iter();
     let path: String = lua.unpack(it.next().ok_or_else(|| {
         mlua::Error::external(
             "`ctx.fs.write` is missing the file path — pass a path string as the first argument",
         )
     })?)?;
-    let content: String = lua.unpack(it.next().ok_or_else(|| {
+    let content: mlua::String = lua.unpack(it.next().ok_or_else(|| {
         mlua::Error::external(
-            "`ctx.fs.write` is missing the content — pass the text to write as the second argument",
+            "`ctx.fs.write` is missing the content — pass the bytes to write as the second argument",
         )
     })?)?;
     let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
-    block_on(fs::write(&p, content.as_bytes()))?
-        .map_err(|e| mlua::Error::external(e.to_string()))?;
-    Ok(())
+    block_on(file_history(lua).write(&p, &content.as_bytes()))?.map_err(mlua::Error::external)
 }
 
-fn fs_append_binding(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
+fn fs_append_binding(lua: &Lua, args: MultiValue) -> mlua::Result<usize> {
     let mut it = args.into_iter();
     let path: String = lua.unpack(it.next().ok_or_else(|| {
         mlua::Error::external(
             "`ctx.fs.append` is missing the file path — pass a path string as the first argument",
         )
     })?)?;
-    let content: String = lua.unpack(
+    let content: mlua::String = lua.unpack(
         it.next()
-            .ok_or_else(|| mlua::Error::external("`ctx.fs.append` is missing the content — pass the text to append as the second argument"))?,
+            .ok_or_else(|| mlua::Error::external("`ctx.fs.append` is missing the content — pass the bytes to append as the second argument"))?,
     )?;
     let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
-    block_on(fs::append(&p, content.as_bytes()))?
-        .map_err(|e| mlua::Error::external(e.to_string()))?;
-    Ok(())
+    block_on(file_history(lua).append(&p, &content.as_bytes()))?.map_err(mlua::Error::external)
 }
 
 fn fs_exists_binding(lua: &Lua, path: String) -> mlua::Result<bool> {
@@ -2451,11 +2457,52 @@ fn fs_list_dir_binding(lua: &Lua, path: String) -> mlua::Result<Table> {
     Ok(arr)
 }
 
-fn fs_remove_binding(lua: &Lua, path: String) -> mlua::Result<()> {
+fn fs_remove_binding(lua: &Lua, path: String) -> mlua::Result<usize> {
     let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
-    block_on(fs::remove_file(&p))?.map_err(|e| mlua::Error::external(e.to_string()))?;
-    Ok(())
+    block_on(file_history(lua).remove(&p))?.map_err(mlua::Error::external)
+}
+
+fn file_history(lua: &Lua) -> fs::History {
+    lua.app_data_ref::<fs::History>()
+        .expect("file history installed")
+        .clone()
+}
+
+fn fs_history_binding(lua: &Lua, path: String) -> mlua::Result<Value> {
+    let p = resolve_path(lua, path);
+    check_permission_inline(lua, &Permission::new(format!("fs.read:{}", p.display())))?;
+    let history = block_on(file_history(lua).history(&p))?.map_err(mlua::Error::external)?;
+    lua.to_value(&history)
+}
+
+fn fs_diff_binding(lua: &Lua, (path, revision): (String, usize)) -> mlua::Result<Table> {
+    let p = resolve_path(lua, path);
+    check_permission_inline(lua, &Permission::new(format!("fs.read:{}", p.display())))?;
+    let diff = block_on(file_history(lua).diff(&p, revision))?.map_err(mlua::Error::external)?;
+    let t = lua.create_table()?;
+    t.set("revision", lua.to_value(&diff.revision)?)?;
+    t.set("removed", lua.create_string(diff.removed)?)?;
+    t.set("added", lua.create_string(diff.added)?)?;
+    Ok(t)
+}
+
+fn fs_restore_binding(lua: &Lua, (path, revision): (String, usize)) -> mlua::Result<usize> {
+    let p = resolve_path(lua, path);
+    check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
+    block_on(file_history(lua).restore(&p, revision))?.map_err(mlua::Error::external)
+}
+
+fn fs_undo_binding(lua: &Lua, path: String) -> mlua::Result<usize> {
+    let p = resolve_path(lua, path);
+    check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
+    block_on(file_history(lua).undo(&p))?.map_err(mlua::Error::external)
+}
+
+fn fs_redo_binding(lua: &Lua, path: String) -> mlua::Result<usize> {
+    let p = resolve_path(lua, path);
+    check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
+    block_on(file_history(lua).redo(&p))?.map_err(mlua::Error::external)
 }
 
 // ---------- context.http ----------

@@ -171,12 +171,37 @@ function string.split(s, sep) end
 
 ---@class Ctx.Fs
 ---@field read fun(path: string): string
----@field write fun(path: string, content: string)
----@field append fun(path: string, content: string)
+---@field write fun(path: string, content: string): integer
+---@field append fun(path: string, content: string): integer
 ---@field exists fun(path: string): boolean
 ---@field stat fun(path: string): table
 ---@field list_dir fun(path: string): table[]
----@field remove fun(path: string)
+---@field remove fun(path: string): integer
+---@field history fun(path: string): Ctx.FileHistory
+---@field diff fun(path: string, revision: integer): Ctx.FileDiff
+---@field undo fun(path: string): integer
+---@field redo fun(path: string): integer
+---@field restore fun(path: string, revision: integer): integer
+
+---@class Ctx.FileRevision
+---@field id integer
+---@field parent integer
+---@field operation "write"|"append"|"remove"
+---@field timestamp_ms integer
+---@field offset integer
+---@field removed_bytes integer
+---@field added_bytes integer
+---@field before_size? integer
+---@field after_size? integer
+
+---@class Ctx.FileHistory
+---@field current integer
+---@field revisions Ctx.FileRevision[]
+
+---@class Ctx.FileDiff
+---@field revision Ctx.FileRevision
+---@field removed string
+---@field added string
 
 ---@class Ctx.HttpResponse
 ---@field status integer

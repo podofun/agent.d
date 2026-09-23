@@ -6,6 +6,10 @@
 //! permission slug the gate checks is unambiguous; callers may normalize
 //! relative inputs first.
 
+mod history;
+
+pub use history::{FileDiff, FileHistory, History, Operation, Revision};
+
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -13,6 +17,20 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum FsError {
+    #[error("file changed outside runtime history: {0}")]
+    Conflict(PathBuf),
+    #[error(
+        "history requires an absolute regular-file path without symlink ancestors or multiple hard links: {0}"
+    )]
+    Unsupported(PathBuf),
+    #[error("unknown file revision: {0}")]
+    UnknownRevision(usize),
+    #[error("no file revision to undo")]
+    NoUndo,
+    #[error("no file revision to redo")]
+    NoRedo,
+    #[error("file history lock poisoned")]
+    HistoryPoisoned,
     #[error("not found: {0}")]
     NotFound(PathBuf),
     #[error("io: {0}")]
