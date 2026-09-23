@@ -5,8 +5,9 @@
 //!
 //! 1. In the netns: `lo` up + a default route via `lo` so connects to external
 //!    IPs reach the OUTPUT path, where an nft NAT ruleset REDIRECTs all TCP to an
-//!    in-namespace intercept and UDP/53 to a DNS intercept (validated: the
-//!    original destination survives via `SO_ORIGINAL_DST`).
+//!    in-namespace intercept, UDP/53 to a DNS intercept, and all other UDP to a
+//!    UDP intercept (see `linux_udp`). The original destination survives
+//!    via `SO_ORIGINAL_DST` for TCP and a conntrack lookup for UDP.
 //! 2. The supervisor passes each intercepted TCP connection's fd + original
 //!    destination to the host over a `ctrl` socketpair, and bridges each DNS
 //!    query over a `dns` socketpair.
@@ -49,6 +50,8 @@ pub struct TConfig {
     pub ctrl_fd: RawFd,
     /// Datagram socketpair end: supervisor bridges DNS queries/responses here.
     pub dns_fd: RawFd,
+    /// SEQPACKET socketpair end carrying non-DNS UDP frames (see `linux_udp`).
+    pub udp_fd: RawFd,
     pub stdout_fd: RawFd,
     pub stderr_fd: RawFd,
     pub stdin_fd: RawFd,
@@ -94,7 +97,7 @@ fn original_dst<F: std::os::fd::AsFd>(sock: &F) -> Option<SocketAddr> {
 
 /// Encode a `SocketAddr` to a fixed wire form for the ctrl-socket payload:
 /// `[fam:1][port:2][addr:16]` (v4 left-padded). 19 bytes.
-fn encode_dst(a: &SocketAddr) -> [u8; 19] {
+pub(super) fn encode_dst(a: &SocketAddr) -> [u8; 19] {
     let mut b = [0u8; 19];
     b[1..3].copy_from_slice(&a.port().to_be_bytes());
     match a.ip() {
@@ -110,7 +113,7 @@ fn encode_dst(a: &SocketAddr) -> [u8; 19] {
     b
 }
 
-fn decode_dst(b: &[u8]) -> Option<SocketAddr> {
+pub(super) fn decode_dst(b: &[u8]) -> Option<SocketAddr> {
     if b.len() < 19 {
         return None;
     }
@@ -144,6 +147,7 @@ mod supervisor {
     use crate::SandboxPolicy;
     use crate::netfilter::nftables;
     use crate::sandbox::linux_net::{bring_loopback_up, set_cloexec};
+    use crate::sandbox::linux_udp;
 
     /// Report a setup failure to the host and return the supervisor's exit code.
     /// The command never runs after this.
@@ -192,8 +196,13 @@ mod supervisor {
             Ok(u) => u,
             Err(e) => return fail(status, &format!("the DNS intercept could not bind ({e})")),
         };
+        let relay = match UdpSocket::bind("127.0.0.1:0") {
+            Ok(u) => Arc::new(u),
+            Err(e) => return fail(status, &format!("the UDP intercept could not bind ({e})")),
+        };
         let tcp_port = tcp.local_addr().map(|a| a.port()).unwrap_or(0);
         let dns_port = udp.local_addr().map(|a| a.port()).unwrap_or(0);
+        let udp_port = relay.local_addr().map(|a| a.port()).unwrap_or(0);
 
         // IPv6: the nft REDIRECT sends v6 traffic to [::1] on the same ports, so
         // mirror both intercepts there and route v6 via lo. Best-effort: when the
@@ -202,18 +211,19 @@ mod supervisor {
         let v6 = match (
             TcpListener::bind(("::1", tcp_port)),
             UdpSocket::bind(("::1", dns_port)),
+            UdpSocket::bind(("::1", udp_port)),
         ) {
-            (Ok(t), Ok(u))
+            (Ok(t), Ok(u), Ok(r))
                 if run_tool("ip", &["-6", "route", "add", "default", "dev", "lo"], None)
                     .is_ok() =>
             {
-                Some((t, u))
+                Some((t, u, Arc::new(r)))
             }
             _ => None,
         };
 
         // Install the NAT redirect ruleset.
-        let ruleset = nftables::build_nat_ruleset("agentd_sbxnat", tcp_port, dns_port);
+        let ruleset = nftables::build_nat_ruleset("agentd_sbxnat", tcp_port, dns_port, udp_port);
         if let Err(msg) = run_tool("nft", &["-f", "-"], Some(&ruleset)) {
             return fail(status, &msg);
         }
@@ -241,10 +251,16 @@ mod supervisor {
         let dns = Arc::new(Mutex::new(cfg.dns_fd));
         spawn_tcp_intercept(tcp, ctrl.clone());
         spawn_dns_intercept(udp, dns.clone());
-        if let Some((tcp6, udp6)) = v6 {
+        linux_udp::spawn_supervisor_intercept(relay.clone(), cfg.udp_fd);
+        let relay6 = if let Some((tcp6, udp6, relay6)) = v6 {
             spawn_tcp_intercept(tcp6, ctrl);
             spawn_dns_intercept(udp6, dns);
-        }
+            linux_udp::spawn_supervisor_intercept(relay6.clone(), cfg.udp_fd);
+            Some(relay6)
+        } else {
+            None
+        };
+        linux_udp::spawn_supervisor_replies(cfg.udp_fd, relay, relay6);
 
         match waitpid(Pid::from_raw(child), None) {
             Ok(WaitStatus::Exited(_, code)) => code,
@@ -406,6 +422,7 @@ mod supervisor {
             }
             libc::close(cfg.ctrl_fd);
             libc::close(cfg.dns_fd);
+            libc::close(cfg.udp_fd);
         }
 
         if let Err(msg) = drop_all_capabilities() {
@@ -487,10 +504,13 @@ fn run_contained_blocking(
     // SEQPACKET (not DGRAM): preserves DNS message boundaries AND signals EOF when
     // the supervisor end closes, so the host DNS loop unblocks on teardown.
     let (dns_host, dns_sup) = socketpair(SockType::SeqPacket).map_err(|e| sb(e.to_string()))?;
+    let (udp_host, udp_sup) = socketpair(SockType::SeqPacket).map_err(|e| sb(e.to_string()))?;
     set_cloexec(ctrl_host, true);
     set_cloexec(ctrl_sup, false);
     set_cloexec(dns_host, true);
     set_cloexec(dns_sup, false);
+    set_cloexec(udp_host, true);
+    set_cloexec(udp_sup, false);
 
     let out = make_pipe().map_err(|e| sb(e.to_string()))?;
     let err = make_pipe().map_err(|e| sb(e.to_string()))?;
@@ -509,6 +529,7 @@ fn run_contained_blocking(
     let cfg = TConfig {
         ctrl_fd: ctrl_sup,
         dns_fd: dns_sup,
+        udp_fd: udp_sup,
         stdout_fd: out.wr,
         stderr_fd: err.wr,
         stdin_fd: if req.stdin.is_some() { sin.rd } else { -1 },
@@ -563,7 +584,7 @@ fn run_contained_blocking(
 
     // Close the ends the child/supervisor owns (parent keeps its own).
     for fd in [
-        ctrl_sup, dns_sup, out.wr, err.wr, sin.rd, s1.wr, s2.rd, st.wr,
+        ctrl_sup, dns_sup, udp_sup, out.wr, err.wr, sin.rd, s1.wr, s2.rd, st.wr,
     ] {
         let _ = close(fd);
     }
@@ -571,7 +592,7 @@ fn run_contained_blocking(
     // the command never runs and nothing leaks.
     let abort = |msg: String| {
         for fd in [
-            ctrl_host, dns_host, out.rd, err.rd, sin.wr, s1.rd, s2.wr, st.rd,
+            ctrl_host, dns_host, udp_host, out.rd, err.rd, sin.wr, s1.rd, s2.wr, st.rd,
         ] {
             let _ = close(fd);
         }
@@ -625,7 +646,7 @@ fn run_contained_blocking(
             detail
         };
         // `st.rd` is already closed by the File above; skip it in abort.
-        for fd in [ctrl_host, dns_host, out.rd, err.rd, sin.wr] {
+        for fd in [ctrl_host, dns_host, udp_host, out.rd, err.rd, sin.wr] {
             let _ = close(fd);
         }
         let _ = waitpid(Pid::from_raw(child), None);
@@ -648,6 +669,10 @@ fn run_contained_blocking(
     let set_dns = set.clone();
     let grants = host_grants;
     let dns_join = std::thread::spawn(move || dns_handler_loop(dns_host, grants, set_dns));
+    let set_udp = set.clone();
+    // SAFETY: the parent owns `udp_host`; the relay loop adopts it.
+    let udp_host = unsafe { std::os::fd::OwnedFd::from_raw_fd(udp_host) };
+    let udp_join = std::thread::spawn(move || super::linux_udp::host_relay_loop(udp_host, set_udp));
 
     // Drain stdio. SAFETY: the parent owns the read ends of these pipes; adopt
     // them into `File`s that close on drop.
@@ -682,6 +707,7 @@ fn run_contained_blocking(
     let stderr_text = String::from_utf8_lossy(&err_join.join().unwrap_or_default()).into_owned();
     let _ = ctrl_join.join();
     let _ = dns_join.join();
+    let _ = udp_join.join();
 
     let (stdout, stderr) = if req.separate_stderr {
         (stdout, stderr_text)
