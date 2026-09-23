@@ -134,6 +134,7 @@ mod supervisor {
     use std::net::{TcpListener, UdpSocket};
     use std::os::fd::{AsRawFd, RawFd};
     use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
 
     use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
     use nix::sys::wait::{WaitStatus, waitpid};
@@ -194,6 +195,23 @@ mod supervisor {
         let tcp_port = tcp.local_addr().map(|a| a.port()).unwrap_or(0);
         let dns_port = udp.local_addr().map(|a| a.port()).unwrap_or(0);
 
+        // IPv6: the nft REDIRECT sends v6 traffic to [::1] on the same ports, so
+        // mirror both intercepts there and route v6 via lo. Best-effort: when the
+        // namespace has no IPv6 (no ::1, or the route is refused) v6 simply has
+        // no route out, which fails closed.
+        let v6 = match (
+            TcpListener::bind(("::1", tcp_port)),
+            UdpSocket::bind(("::1", dns_port)),
+        ) {
+            (Ok(t), Ok(u))
+                if run_tool("ip", &["-6", "route", "add", "default", "dev", "lo"], None)
+                    .is_ok() =>
+            {
+                Some((t, u))
+            }
+            _ => None,
+        };
+
         // Install the NAT redirect ruleset.
         let ruleset = nftables::build_nat_ruleset("agentd_sbxnat", tcp_port, dns_port);
         if let Err(msg) = run_tool("nft", &["-f", "-"], Some(&ruleset)) {
@@ -217,8 +235,25 @@ mod supervisor {
             let _ = close(cfg.stdin_fd);
         }
 
-        // TCP intercept thread: pass each accepted fd + original dst to the host.
-        let ctrl_fd = cfg.ctrl_fd;
+        // One intercept pair per address family. Both share the ctrl/dns
+        // socketpairs, so each exchange holds that pair's lock.
+        let ctrl = Arc::new(Mutex::new(cfg.ctrl_fd));
+        let dns = Arc::new(Mutex::new(cfg.dns_fd));
+        spawn_tcp_intercept(tcp, ctrl.clone());
+        spawn_dns_intercept(udp, dns.clone());
+        if let Some((tcp6, udp6)) = v6 {
+            spawn_tcp_intercept(tcp6, ctrl);
+            spawn_dns_intercept(udp6, dns);
+        }
+
+        match waitpid(Pid::from_raw(child), None) {
+            Ok(WaitStatus::Exited(_, code)) => code,
+            _ => 129,
+        }
+    }
+
+    /// Pass each accepted connection's fd + original destination to the host.
+    fn spawn_tcp_intercept(tcp: TcpListener, ctrl: Arc<Mutex<RawFd>>) {
         std::thread::spawn(move || {
             for stream in tcp.incoming().flatten() {
                 let fd = stream.as_raw_fd();
@@ -230,35 +265,35 @@ mod supervisor {
                 let fds = [fd];
                 let cmsg = [ControlMessage::ScmRights(&fds)];
                 let iov = [std::io::IoSlice::new(&payload)];
+                let ctrl_fd = *ctrl.lock().unwrap();
                 let _ = sendmsg::<()>(ctrl_fd, &iov, &cmsg, MsgFlags::empty(), None);
                 drop(stream); // host owns the dup'd fd now
             }
         });
+    }
 
-        // DNS intercept thread: bridge each query to the host, return its answer.
-        let dns_fd = cfg.dns_fd;
+    /// Bridge each DNS query to the host and return its answer.
+    fn spawn_dns_intercept(udp: UdpSocket, dns: Arc<Mutex<RawFd>>) {
         std::thread::spawn(move || {
-            use nix::sys::socket::{MsgFlags, recv, send};
+            use nix::sys::socket::{recv, send};
             let mut buf = [0u8; 1500];
             while let Ok((n, src)) = udp.recv_from(&mut buf) {
-                // Forward query bytes to host over the dns socketpair.
-                if send(dns_fd, &buf[..n], MsgFlags::empty()).is_err() {
-                    break;
-                }
                 let mut rbuf = [0u8; 1500];
-                match recv(dns_fd, &mut rbuf, MsgFlags::empty()) {
-                    Ok(got) if got > 0 => {
-                        let _ = udp.send_to(&rbuf[..got], src);
+                // Query and answer are one exchange on the shared socketpair.
+                let got = {
+                    let dns_fd = dns.lock().unwrap();
+                    if send(*dns_fd, &buf[..n], MsgFlags::empty()).is_err() {
+                        break;
                     }
-                    _ => continue,
+                    recv(*dns_fd, &mut rbuf, MsgFlags::empty())
+                };
+                if let Ok(got) = got
+                    && got > 0
+                {
+                    let _ = udp.send_to(&rbuf[..got], src);
                 }
             }
         });
-
-        match waitpid(Pid::from_raw(child), None) {
-            Ok(WaitStatus::Exited(_, code)) => code,
-            _ => 129,
-        }
     }
 
     /// Run a netns setup tool (`ip`, `nft`) to completion. Any failure is fatal
