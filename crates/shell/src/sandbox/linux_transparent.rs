@@ -298,6 +298,62 @@ mod supervisor {
         Err(format!("`{bin} {}` failed ({err})", args.join(" ")))
     }
 
+    /// Clear every capability the command would otherwise hold as root of the
+    /// nested user namespace, so it cannot rewrite the supervisor's nftables
+    /// rules, reconfigure interfaces, or open raw sockets. Emptying the bounding
+    /// set keeps `execve` from handing root's capabilities back.
+    fn drop_all_capabilities() -> Result<(), String> {
+        #[repr(C)]
+        struct CapHeader {
+            version: u32,
+            pid: i32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct CapData {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+        // SAFETY: plain prctl/capset syscalls on the calling (single-threaded,
+        // pre-exec) process with valid, stack-owned arguments.
+        unsafe {
+            if libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+                0,
+                0,
+                0,
+            ) != 0
+            {
+                return Err("the ambient capabilities could not be cleared".into());
+            }
+            let mut cap: libc::c_ulong = 0;
+            // PR_CAPBSET_READ fails with EINVAL past the kernel's last capability.
+            while libc::prctl(libc::PR_CAPBSET_READ, cap, 0, 0, 0) >= 0 {
+                if libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) != 0 {
+                    return Err("the capability bounding set could not be cleared".into());
+                }
+                cap += 1;
+            }
+            let header = CapHeader {
+                version: LINUX_CAPABILITY_VERSION_3,
+                pid: 0,
+            };
+            let data = [CapData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            }; 2];
+            if libc::syscall(libc::SYS_capset, &header, data.as_ptr()) != 0 {
+                return Err("the process capabilities could not be cleared".into());
+            }
+        }
+        Ok(())
+    }
+
     fn exec_command(cfg: &TConfig) -> ! {
         // SAFETY: runs in the forked child before execve — async-signal-safe raw
         // syscalls only (dup2/close), then execvp. No safe wrapper is permitted
@@ -315,6 +371,11 @@ mod supervisor {
             }
             libc::close(cfg.ctrl_fd);
             libc::close(cfg.dns_fd);
+        }
+
+        if let Err(msg) = drop_all_capabilities() {
+            report(cfg.status_fd, msg.as_bytes());
+            unsafe { libc::_exit(126) };
         }
 
         // No proxy env: enforcement is transparent (kernel redirect + host allowlist).
