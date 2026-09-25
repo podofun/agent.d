@@ -16,6 +16,7 @@ mod grants;
 mod packages;
 mod render;
 mod secret;
+mod tui;
 mod ws;
 
 use anyhow::Result;
@@ -28,6 +29,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let (url, timeout) = (&cli.url, cli.timeout);
     match cli.cmd {
+        Cmd::Chat { runner, session } => tui::run(url, timeout, runner, session).await,
         Cmd::Health => commands::cmd_health(url, timeout).await,
         Cmd::Tools => commands::cmd_tools(url, timeout).await,
         Cmd::Call {
@@ -153,6 +155,18 @@ mod tests {
     fn global_short_url_parses() {
         let c = parse(&["-u", "http://x:1", "health"]);
         assert_eq!(c.url, "http://x:1");
+    }
+
+    #[test]
+    fn chat_needs_its_subcommand_and_accepts_resume_options() {
+        assert!(Cli::try_parse_from(["agentctl"]).is_err());
+        assert!(matches!(
+            parse(&["chat", "--runner", "helper", "--session", "abc"]).cmd,
+            Cmd::Chat {
+                runner: Some(_),
+                session: Some(_)
+            }
+        ));
     }
 
     #[test]

@@ -11,9 +11,13 @@ path = "src/main.rs"
 agentd-luals.workspace = true
 agentd-packages.workspace = true
 agentd-secrets.workspace = true
+agentd-types.workspace = true
 anyhow.workspace = true
 clap.workspace = true
-crossterm = "0.29.0"
+crossterm = { version = "0.28.1", features = ["event-stream"] }
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+ratatui = "0.29.0"
+pulldown-cmark = { version = "0.13", default-features = false }
 tempfile.workspace = true
 dirs.workspace = true
 futures-util = { workspace = true, features = ["std", "sink"] }
@@ -23,3 +27,5 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "sync"] }
 tokio-tungstenite = { workspace = true, features = ["connect", "rustls-tls-webpki-roots"] }
 url.workspace = true
+unicode-width = "0.2.0"
+unicode-segmentation = "1.13.3"

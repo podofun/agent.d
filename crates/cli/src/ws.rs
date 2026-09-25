@@ -148,6 +148,17 @@ pub(crate) async fn ws_call_streaming(
     timeout: u64,
     method: &str,
     params: Value,
+    on_delta: impl FnMut(&Value),
+) -> Result<WsResponse> {
+    ws_call_streaming_cancelable(base, timeout, method, params, None, on_delta).await
+}
+
+pub(crate) async fn ws_call_streaming_cancelable(
+    base: &str,
+    timeout: u64,
+    method: &str,
+    params: Value,
+    mut cancel: Option<tokio::sync::oneshot::Receiver<()>>,
     mut on_delta: impl FnMut(&Value),
 ) -> Result<WsResponse> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -175,7 +186,28 @@ pub(crate) async fn ws_call_streaming(
     let body = serde_json::to_string(&req)?;
     ws.send(Message::Text(body.into())).await?;
 
-    while let Some(msg) = ws.next().await {
+    loop {
+        let msg = if let Some(receiver) = cancel.as_mut() {
+            tokio::select! {
+                msg = ws.next() => msg,
+                _ = receiver => {
+                    cancel = None;
+                    let cancel_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                    let request = WsRequest {
+                        id: cancel_id,
+                        method: "runners.cancel",
+                        params: serde_json::json!({ "id": id }),
+                    };
+                    ws.send(Message::Text(serde_json::to_string(&request)?.into())).await?;
+                    continue;
+                }
+            }
+        } else {
+            ws.next().await
+        };
+        let Some(msg) = msg else {
+            break;
+        };
         let text = match msg? {
             Message::Text(t) => t.to_string(),
             Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
@@ -194,8 +226,75 @@ pub(crate) async fn ws_call_streaming(
         let resp: WsResponse = serde_json::from_str(&text).with_context(|| {
             format!("the daemon sent a response that could not be decoded ({text})")
         })?;
+        if resp.id != id {
+            continue;
+        }
         let _ = ws.send(Message::Close(None)).await;
         return Ok(resp);
     }
     Err(anyhow!("ws closed before response"))
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{Value, json};
+    use tokio::sync::oneshot;
+    use tokio_tungstenite::tungstenite::Message;
+
+    use super::ws_call_streaming_cancelable;
+
+    #[tokio::test]
+    async fn cancellation_uses_the_run_connection_and_waits_for_its_final_response() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("could not bind test socket: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let (started_tx, started_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let Message::Text(run) = socket.next().await.unwrap().unwrap() else {
+                panic!("run request expected")
+            };
+            let run: Value = serde_json::from_str(&run).unwrap();
+            assert_eq!(run["method"], "runners.run");
+            started_tx.send(()).unwrap();
+            let Message::Text(cancel) = socket.next().await.unwrap().unwrap() else {
+                panic!("cancel request expected")
+            };
+            let cancel: Value = serde_json::from_str(&cancel).unwrap();
+            assert_eq!(cancel["method"], "runners.cancel");
+            assert_eq!(cancel["params"]["id"], run["id"]);
+            socket
+                .send(Message::Text(
+                    json!({ "id": cancel["id"], "ok": true, "result": { "cancelled": true } })
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            socket.send(Message::Text(json!({ "id": run["id"], "ok": false, "code": "cancelled", "error": "runner cancelled" }).to_string().into())).await.unwrap();
+        });
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let client = tokio::spawn(async move {
+            ws_call_streaming_cancelable(
+                &format!("ws://{address}"),
+                1000,
+                "runners.run",
+                json!({ "name": "test", "prompt": "go" }),
+                Some(cancel_rx),
+                |_| {},
+            )
+            .await
+            .unwrap()
+        });
+        started_rx.await.unwrap();
+        cancel_tx.send(()).unwrap();
+        let response = client.await.unwrap();
+        assert_eq!(response.code.as_deref(), Some("cancelled"));
+        server.await.unwrap();
+    }
 }
