@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthStr;
 use super::super::app::{App, Entry, EntryKind};
 use super::super::commands;
 use super::{
-    ERROR, MUTED, PRIMARY, SECONDARY, SUCCESS, WARNING, markdown, palette, screen_rows,
+    ERROR, MUTED, PRIMARY, SECONDARY, SUCCESS, WARNING, markdown, palette, screen_rows, selection,
     spinner_frame,
 };
 
@@ -19,7 +19,10 @@ pub(super) fn draw_conversation(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     }
     let inner = conversation_inner(area);
-    let conversation = conversation_lines(app, inner.width.saturating_sub(1).max(1) as usize);
+    let mut conversation = conversation_for(app, inner.width.saturating_sub(1).max(1) as usize);
+    if let Some(selection) = &app.selection {
+        selection::highlight(&mut conversation.lines, &conversation.selectable, selection);
+    }
     let offset = conversation.offset(inner.height, app.scroll);
     frame.render_widget(
         Paragraph::new(conversation.lines).scroll((offset.min(u16::MAX as usize) as u16, 0)),
@@ -27,13 +30,20 @@ pub(super) fn draw_conversation(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-struct Conversation {
-    lines: Vec<Line<'static>>,
+pub(super) struct Conversation {
+    pub(super) lines: Vec<Line<'static>>,
+    /// Selectable column range of each line, parallel to `lines`.
+    pub(super) selectable: Vec<std::ops::Range<usize>>,
     tool_headers: Vec<(usize, usize)>,
 }
 
+/// The rendered conversation at `width` text columns.
+pub(super) fn conversation_for(app: &App, width: usize) -> Conversation {
+    conversation_lines(app, width)
+}
+
 impl Conversation {
-    fn offset(&self, height: u16, scroll: usize) -> usize {
+    pub(super) fn offset(&self, height: u16, scroll: usize) -> usize {
         self.lines
             .len()
             .saturating_sub(height as usize)
@@ -41,7 +51,7 @@ impl Conversation {
     }
 }
 
-fn conversation_inner(area: Rect) -> Rect {
+pub(in crate::tui) fn conversation_inner(area: Rect) -> Rect {
     Rect::new(
         area.x.saturating_add(2),
         area.y,
@@ -78,22 +88,52 @@ fn with_gutter(glyph: &str, color: Color, body: Vec<Line<'static>>) -> Vec<Line<
 fn conversation_lines(app: &App, width: usize) -> Conversation {
     let body_width = width.saturating_sub(GUTTER).max(1);
     let mut lines = Vec::new();
+    let mut selectable = Vec::new();
     let mut tool_headers = Vec::new();
     for (index, entry) in app.entries.iter().enumerate() {
         if entry.is_expandable_tool() {
             tool_headers.push((lines.len(), index));
         }
         let block = entry.lines(body_width, || entry_lines(entry, body_width));
+        selectable.extend(
+            block
+                .iter()
+                .enumerate()
+                .map(|(row, line)| selectable_range(entry, row, line)),
+        );
         lines.extend(block);
         lines.push(Line::raw(""));
+        selectable.push(0..0);
     }
     if app.pending {
         let live = markdown::render(&app.streamed, body_width, palette());
-        lines.extend(with_gutter(spinner_frame(app), WARNING, live));
+        let live = with_gutter(spinner_frame(app), WARNING, live);
+        // The live block changes every tick, so it is never selectable.
+        selectable.extend(live.iter().map(|_| 0..0));
+        lines.extend(live);
     }
     Conversation {
         lines,
+        selectable,
         tool_headers,
+    }
+}
+
+/// Columns of `line` (row `row` of its entry) that hold the entry's own
+/// text: past the gutter or indent, past the `│ ` prefix on tool output,
+/// and before the collapsed/expanded summary on a tool row.
+fn selectable_range(entry: &Entry, row: usize, line: &Line<'static>) -> std::ops::Range<usize> {
+    let width = line.width();
+    match entry.kind {
+        EntryKind::Tool if row == 0 => {
+            let title = line
+                .spans
+                .get(1)
+                .map_or(0, |span| span.content.trim_end().width());
+            GUTTER.min(width)..(GUTTER + title).min(width)
+        }
+        EntryKind::Tool => (GUTTER + 2).min(width)..width,
+        _ => GUTTER.min(width)..width,
     }
 }
 
@@ -169,6 +209,7 @@ pub(in crate::tui) fn toggle_tool(app: &mut App, screen: Rect, index: usize) {
     }
     let expanded = !app.entries[index].expanded;
     app.entries[index].set_expanded(expanded);
+    app.selection = None;
     let inner = conversation_inner(screen_rows(screen, app)[1]);
     let conversation = conversation_lines(app, inner.width.saturating_sub(1).max(1) as usize);
     if let Some((header, _)) = conversation

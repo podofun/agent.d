@@ -7,11 +7,14 @@ use ratatui::text::Line;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
+use super::clipboard;
 use super::commands;
 use super::editor::Editor;
 use super::presentation;
 use super::search;
+use super::ui::{self, Selection};
 use crate::ws::{WsResponse, ws_call, ws_call_streaming_cancelable};
+use ratatui::layout::Rect;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Tab {
@@ -92,6 +95,7 @@ const HELP: &str = "\
 - `/rename NAME` labels the current chat
 - `Ctrl+N` starts a new chat, `F5` refreshes daemon state
 - `Ctrl+E` or a click expands the latest tool output
+- Drag with the mouse to select text; `Ctrl+C` copies it
 - `PageUp`, `PageDown`, or the mouse wheel scroll
 - `Esc` or `End` on an empty draft jumps to the bottom and clears the notice
 - `Ctrl+C` copies a selection, cancels a run, clears the draft, or quits
@@ -124,6 +128,10 @@ pub(super) struct App {
     cancel: Option<oneshot::Sender<()>>,
     started: Option<std::time::Instant>,
     pub(super) scroll: usize,
+    /// Mouse selection over the conversation.
+    pub(super) selection: Option<Selection>,
+    /// Terminal size from the last event, for selection math.
+    pub(super) screen: Rect,
     unread: bool,
     pub(super) selected: [usize; 7],
     /// Browser search text, shared by every section.
@@ -164,6 +172,8 @@ impl App {
             cancel: None,
             started: None,
             scroll: 0,
+            selection: None,
+            screen: Rect::new(0, 0, 80, 24),
             unread: false,
             selected: [0; 7],
             query: String::new(),
@@ -334,6 +344,29 @@ impl App {
         search::rows(self, self.tab, &self.query)
     }
 
+    /// Text under the mouse selection at the current terminal width, if any.
+    pub(super) fn selected_text(&self) -> Option<String> {
+        let selection = self.selection.as_ref()?;
+        let text = ui::selected_text(self, self.screen, selection);
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Copy the mouse selection to the clipboard and release it.
+    pub(super) fn copy_selection(&mut self) -> Option<Result<(), String>> {
+        let text = self.selected_text()?;
+        self.selection = None;
+        Some(clipboard::copy(text))
+    }
+
+    /// Remember the terminal size; a new size re-wraps lines, so any
+    /// selection no longer points at the right cells.
+    pub(super) fn resized(&mut self, screen: Rect) {
+        if self.screen != screen {
+            self.screen = screen;
+            self.selection = None;
+        }
+    }
+
     pub(super) fn selected_index(&self) -> usize {
         self.selected[self.tab.index()]
     }
@@ -409,6 +442,7 @@ impl App {
         self.entries.clear();
         self.streamed.clear();
         self.scroll = 0;
+        self.selection = None;
         self.unread = false;
         self.notice = None;
     }

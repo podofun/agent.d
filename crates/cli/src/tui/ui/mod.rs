@@ -10,8 +10,12 @@ mod approval;
 mod browser;
 mod conversation;
 mod markdown;
+mod selection;
 
 pub(super) use conversation::{suggestion_at, toggle_tool, tool_at};
+pub(super) use selection::{Selection, point_at, selected_text};
+#[cfg(test)]
+pub(super) use {conversation::conversation_inner, selection::Point};
 
 pub(super) const PRIMARY: Color = Color::Rgb(177, 124, 245);
 pub(super) const SECONDARY: Color = Color::Rgb(122, 180, 234);
@@ -176,6 +180,11 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Line::styled(
             format!("  {} working  {elapsed}s", spinner_frame(app)),
             Style::default().fg(WARNING),
+        )
+    } else if app.selection.is_some() {
+        Line::styled(
+            "  Ctrl+C copy  ·  Esc clear selection",
+            Style::default().fg(SECONDARY),
         )
     } else if app.has_unread() {
         Line::styled(
