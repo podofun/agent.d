@@ -218,6 +218,43 @@ impl SessionStore for RedbSessionStore {
         Ok(meta)
     }
 
+    fn relabel(&self, id: &str, label: Option<String>) -> Result<SessionMeta> {
+        let wtx = self.db.begin_write().map_err(backend)?;
+        let meta = {
+            let mut sessions = wtx.open_table(SESSIONS).map_err(backend)?;
+            let mut meta = Self::read_meta(&sessions, id)?
+                .ok_or_else(|| SessionError::NotFound(id.to_string()))?;
+            let mut labels = wtx.open_table(LABELS).map_err(backend)?;
+            if let Some(new) = label.as_deref() {
+                let holder = labels
+                    .get(label_key(&meta.owner, new).as_str())
+                    .map_err(backend)?
+                    .map(|v| v.value().to_string());
+                if holder.is_some_and(|holder| holder != id) {
+                    return Err(SessionError::LabelTaken(new.to_string()));
+                }
+            }
+            if let Some(old) = meta.label.as_deref() {
+                labels
+                    .remove(label_key(&meta.owner, old).as_str())
+                    .map_err(backend)?;
+            }
+            if let Some(new) = label.as_deref() {
+                labels
+                    .insert(label_key(&meta.owner, new).as_str(), id)
+                    .map_err(backend)?;
+            }
+            meta.label = label;
+            meta.updated_at = now_secs();
+            sessions
+                .insert(id, encode(&meta)?.as_slice())
+                .map_err(backend)?;
+            meta
+        };
+        wtx.commit().map_err(backend)?;
+        Ok(meta)
+    }
+
     fn delete(&self, id: &str) -> Result<bool> {
         let wtx = self.db.begin_write().map_err(backend)?;
         let existed = {
@@ -405,5 +442,30 @@ mod tests {
             .map(|m| m.id)
             .collect();
         assert!(ids.contains(&a.id) && ids.contains(&b.id));
+    }
+
+    #[test]
+    fn relabel_updates_the_label_index() {
+        let (_dir, s) = store();
+        let a = s.create(new().label(Some("old".into()))).unwrap();
+        let b = s.create(new().label(Some("taken".into()))).unwrap();
+        let renamed = s.relabel(&a.id, Some("new".into())).unwrap();
+        assert_eq!(renamed.label.as_deref(), Some("new"));
+        assert!(s.find_by_label("interface:ws", "old").unwrap().is_none());
+        assert_eq!(
+            s.find_by_label("interface:ws", "new").unwrap().unwrap().id,
+            a.id
+        );
+        assert!(matches!(
+            s.relabel(&a.id, Some("taken".into())),
+            Err(SessionError::LabelTaken(_))
+        ));
+        assert!(matches!(
+            s.relabel("missing", None),
+            Err(SessionError::NotFound(_))
+        ));
+        s.relabel(&b.id, None).unwrap();
+        assert!(s.find_by_label("interface:ws", "taken").unwrap().is_none());
+        assert_eq!(s.get(&b.id).unwrap().unwrap().label, None);
     }
 }

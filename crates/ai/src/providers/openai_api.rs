@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::sse::SseBuffer;
+use super::tool_names::{ToolNames, wire_tool_name};
 use crate::types::{
     CompletionRequest, CompletionResponse, LoopMode, Message, Provider, ProviderError, Role,
     StreamEvent, StreamSink, ToolCall,
@@ -145,7 +146,8 @@ impl Provider for OpenAiApiProvider {
             ProviderError::Upstream(format!("decode openai response: {e}\nbody: {}", resp.body))
         })?;
 
-        translate_response(parsed, req.model)
+        let tool_names = ToolNames::new(&req);
+        translate_response(parsed, req.model, &tool_names)
     }
 
     async fn complete_streaming(
@@ -173,7 +175,7 @@ impl Provider for OpenAiApiProvider {
                 .insert("authorization".into(), format!("Bearer {key}"));
         }
 
-        let mut acc = ChunkAccumulator::default();
+        let mut acc = ChunkAccumulator::new(ToolNames::new(&req));
         let mut sse = SseBuffer::new();
         let resp = send_streaming(http_req, |chunk| {
             sse.push(chunk, |data| acc.feed(data, &sink));
@@ -204,14 +206,30 @@ struct ChunkAccumulator {
     finish_reason: Option<String>,
     usage: Option<crate::types::Usage>,
     text: String,
-    /// Tool calls by chunk index; arguments accumulate as string fragments.
-    tool_calls: std::collections::BTreeMap<u64, (String, String, String)>,
+    /// Tool calls by chunk index; id, name and arguments arrive as fragments.
+    tool_calls: std::collections::BTreeMap<u64, PartialToolCall>,
+    tool_names: ToolNames,
     saw_chunk: bool,
     done: bool,
     error: Option<String>,
 }
 
+#[derive(Default)]
+struct PartialToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+    announced: bool,
+}
+
 impl ChunkAccumulator {
+    fn new(tool_names: ToolNames) -> Self {
+        Self {
+            tool_names,
+            ..Default::default()
+        }
+    }
+
     fn feed(&mut self, data: &str, sink: &StreamSink) {
         if data.trim() == "[DONE]" {
             self.done = true;
@@ -243,6 +261,15 @@ impl ChunkAccumulator {
         };
         if let Some(f) = choice["finish_reason"].as_str() {
             self.finish_reason = Some(f.to_string());
+            // A call whose arguments never arrived is still a call.
+            for entry in self.tool_calls.values_mut() {
+                if !entry.announced && !entry.name.is_empty() {
+                    entry.announced = true;
+                    let _ = sink.send(StreamEvent::ToolCall {
+                        name: self.tool_names.canonical(&entry.name).to_string(),
+                    });
+                }
+            }
         }
         let delta = &choice["delta"];
         if let Some(t) = delta["content"].as_str()
@@ -256,21 +283,26 @@ impl ChunkAccumulator {
         if let Some(calls) = delta["tool_calls"].as_array() {
             for c in calls {
                 let idx = c["index"].as_u64().unwrap_or(0);
-                let entry = self
-                    .tool_calls
-                    .entry(idx)
-                    .or_insert_with(|| (String::new(), String::new(), String::new()));
+                let entry = self.tool_calls.entry(idx).or_default();
                 if let Some(id) = c["id"].as_str() {
-                    entry.0.push_str(id);
+                    entry.id.push_str(id);
                 }
                 if let Some(n) = c["function"]["name"].as_str() {
-                    entry.1.push_str(n);
-                    let _ = sink.send(StreamEvent::ToolCall {
-                        name: entry.1.clone(),
-                    });
+                    entry.name.push_str(n);
                 }
                 if let Some(a) = c["function"]["arguments"].as_str() {
-                    entry.2.push_str(a);
+                    entry.arguments.push_str(a);
+                }
+                // Announce once, as soon as the name is complete. Arguments
+                // only start once the name has fully arrived.
+                let name_complete = !entry.name.is_empty()
+                    && (!entry.arguments.is_empty()
+                        || self.tool_names.canonical(&entry.name) != entry.name);
+                if name_complete && !entry.announced {
+                    entry.announced = true;
+                    let _ = sink.send(StreamEvent::ToolCall {
+                        name: self.tool_names.canonical(&entry.name).to_string(),
+                    });
                 }
             }
         }
@@ -291,27 +323,34 @@ impl ChunkAccumulator {
         let tool_calls = self
             .tool_calls
             .into_values()
-            .map(|(id, name, args)| {
-                let arguments = if args.trim().is_empty() {
-                    serde_json::json!({})
-                } else {
-                    serde_json::from_str(&args).map_err(|e| {
-                        ProviderError::Upstream(format!(
-                            "openai stream: invalid tool arguments ({e})"
-                        ))
-                    })?
-                };
-                if id.is_empty() || name.is_empty() || !arguments.is_object() {
-                    return Err(ProviderError::Upstream(
-                        "openai stream: invalid tool call".into(),
-                    ));
-                }
-                Ok(ToolCall {
-                    id,
-                    name,
-                    arguments,
-                })
-            })
+            .map(
+                |PartialToolCall {
+                     id,
+                     name,
+                     arguments: args,
+                     ..
+                 }| {
+                    let arguments = if args.trim().is_empty() {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::from_str(&args).map_err(|e| {
+                            ProviderError::Upstream(format!(
+                                "openai stream: invalid tool arguments ({e})"
+                            ))
+                        })?
+                    };
+                    if id.is_empty() || name.is_empty() || !arguments.is_object() {
+                        return Err(ProviderError::Upstream(
+                            "openai stream: invalid tool call".into(),
+                        ));
+                    }
+                    Ok(ToolCall {
+                        id,
+                        name: self.tool_names.canonical(&name).to_string(),
+                        arguments,
+                    })
+                },
+            )
             .collect::<Result<Vec<_>, ProviderError>>()?;
         Ok(CompletionResponse {
             usage: self.usage,
@@ -394,7 +433,7 @@ fn build_request_body(req: &CompletionRequest, default_model: &str) -> serde_jso
                                 "id": tc.id,
                                 "type": "function",
                                 "function": {
-                                    "name": tc.name,
+                                    "name": wire_tool_name(&tc.name),
                                     // OpenAI wants arguments as a JSON *string*.
                                     "arguments": serde_json::to_string(&tc.arguments)
                                         .unwrap_or_else(|_| "{}".into()),
@@ -432,7 +471,7 @@ fn build_request_body(req: &CompletionRequest, default_model: &str) -> serde_jso
                 serde_json::json!({
                     "type": "function",
                     "function": {
-                        "name": t.name,
+                        "name": wire_tool_name(&t.name),
                         "description": t.description.clone().unwrap_or_default(),
                         "parameters": if t.input_schema.is_null() {
                             serde_json::json!({ "type": "object" })
@@ -491,6 +530,7 @@ struct FunctionWire {
 fn translate_response(
     parsed: ChatResponse,
     requested_model: Option<String>,
+    tool_names: &ToolNames,
 ) -> Result<CompletionResponse, ProviderError> {
     let choice = parsed
         .choices
@@ -514,7 +554,7 @@ fn translate_response(
             };
             ToolCall {
                 id: tc.id,
-                name: tc.function.name,
+                name: tool_names.canonical(&tc.function.name).to_string(),
                 arguments,
             }
         })
@@ -631,7 +671,8 @@ mod tests {
         let body = build_request_body(&req, DEFAULT_MODEL);
         assert_eq!(body["model"], "gpt-foo");
         assert_eq!(body["tools"][0]["type"], "function");
-        assert_eq!(body["tools"][0]["function"]["name"], "notes.lookup");
+        let wire_name = wire_tool_name("notes.lookup");
+        assert_eq!(body["tools"][0]["function"]["name"], wire_name);
         let msgs = body["messages"].as_array().unwrap();
         // system + user + assistant + tool
         assert_eq!(msgs.len(), 4);
@@ -640,7 +681,7 @@ mod tests {
         assert_eq!(msgs[2]["role"], "assistant");
         let calls = msgs[2]["tool_calls"].as_array().unwrap();
         assert_eq!(calls[0]["id"], "c1");
-        assert_eq!(calls[0]["function"]["name"], "notes.lookup");
+        assert_eq!(calls[0]["function"]["name"], wire_name);
         // Arguments serialized as a JSON string, not an object.
         assert!(calls[0]["function"]["arguments"].is_string());
         // Tool result is its own role w/ tool_call_id.
@@ -659,13 +700,21 @@ mod tests {
                     "tool_calls": [{
                         "id": "c1",
                         "type": "function",
-                        "function": { "name": "notes.lookup", "arguments": "{\"q\":\"x\"}" },
+                        "function": { "name": wire_tool_name("notes.lookup"), "arguments": "{\"q\":\"x\"}" },
                     }],
                 },
             }],
         });
         let parsed: ChatResponse = serde_json::from_value(raw).unwrap();
-        let r = translate_response(parsed, None).unwrap();
+        let request = CompletionRequest {
+            tools: vec![ToolDef {
+                name: "notes.lookup".into(),
+                description: None,
+                input_schema: serde_json::Value::Null,
+            }],
+            ..Default::default()
+        };
+        let r = translate_response(parsed, None, &ToolNames::new(&request)).unwrap();
         assert_eq!(r.text, "let me check");
         assert_eq!(r.tool_calls.len(), 1);
         assert_eq!(r.tool_calls[0].name, "notes.lookup");
@@ -675,11 +724,47 @@ mod tests {
     }
 
     #[test]
+    fn streaming_tool_name_is_restored_before_emission_and_dispatch() {
+        let request = CompletionRequest {
+            tools: vec![ToolDef {
+                name: "demo.echo".into(),
+                description: None,
+                input_schema: serde_json::Value::Null,
+            }],
+            ..Default::default()
+        };
+        let wire_name = wire_tool_name("demo.echo");
+        let (sink, mut events) = crate::types::stream_channel();
+        let mut accumulator = ChunkAccumulator::new(ToolNames::new(&request));
+        let split = wire_name.len() / 2;
+        for fragment in [&wire_name[..split], &wire_name[split..]] {
+            let event = serde_json::json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": if fragment == &wire_name[..split] { "call_1" } else { "" },
+                    "function": {"name": fragment, "arguments": if fragment == &wire_name[..split] { "" } else { "{}" }}
+                }]}}]
+            });
+            accumulator.feed(&event.to_string(), &sink);
+        }
+        accumulator.feed(
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            &sink,
+        );
+        accumulator.feed("[DONE]", &sink);
+        let response = accumulator.finish(None).unwrap();
+        assert_eq!(response.tool_calls[0].name, "demo.echo");
+        assert!(
+            matches!(events.try_recv(), Ok(StreamEvent::ToolCall { name }) if name == "demo.echo")
+        );
+    }
+
+    #[test]
     fn empty_choices_is_error() {
         let parsed: ChatResponse =
             serde_json::from_value(serde_json::json!({ "choices": [] })).unwrap();
         assert!(matches!(
-            translate_response(parsed, None),
+            translate_response(parsed, None, &ToolNames::default()),
             Err(ProviderError::EmptyResponse)
         ));
     }
@@ -688,16 +773,17 @@ mod tests {
     fn chunk_accumulator_rebuilds_full_response_and_emits_deltas() {
         use crate::types::StreamEvent;
         let (tx, mut rx) = crate::types::stream_channel();
-        let mut acc = ChunkAccumulator::default();
+        let mut acc = ChunkAccumulator::new(ToolNames::new(&request_with_tool("notes.lookup")));
+        let wire_name = wire_tool_name("notes.lookup");
         for ev in [
-            r#"{"model":"gpt-x","choices":[{"delta":{"content":"Hel"}}]}"#,
-            r#"{"choices":[{"delta":{"content":"lo"}}]}"#,
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"notes.lookup"}}]}}]}"#,
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":\"x\"}"}}]}}]}"#,
-            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
-            "[DONE]",
+            r#"{"model":"gpt-x","choices":[{"delta":{"content":"Hel"}}]}"#.to_string(),
+            r#"{"choices":[{"delta":{"content":"lo"}}]}"#.to_string(),
+            format!(r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,"id":"c1","function":{{"name":"{wire_name}"}}}}]}}}}]}}"#),
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"{\"q\":\"x\"}"}}]}}]}"#.to_string(),
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+            "[DONE]".to_string(),
         ] {
-            acc.feed(ev, &tx);
+            acc.feed(&ev, &tx);
         }
         let resp = acc.finish(None).unwrap();
         assert_eq!(resp.text, "Hello");
@@ -715,7 +801,38 @@ mod tests {
         assert!(matches!(&deltas[0], StreamEvent::TextDelta { text } if text == "Hel"));
         assert!(matches!(&deltas[1], StreamEvent::TextDelta { text } if text == "lo"));
         assert!(matches!(&deltas[2], StreamEvent::ToolCall { name } if name == "notes.lookup"));
+        assert!(
+            matches!(&deltas[3], StreamEvent::TurnEnd),
+            "one tool call event only: {deltas:?}"
+        );
         assert!(matches!(deltas.last(), Some(StreamEvent::TurnEnd)));
+    }
+
+    fn request_with_tool(name: &str) -> CompletionRequest {
+        CompletionRequest {
+            tools: vec![ToolDef {
+                name: name.into(),
+                description: None,
+                input_schema: serde_json::Value::Null,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unknown_streamed_tool_name_is_still_announced_and_returned() {
+        let (tx, mut rx) = crate::types::stream_channel();
+        let mut acc = ChunkAccumulator::new(ToolNames::new(&request_with_tool("notes.lookup")));
+        for ev in [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"made_up","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ] {
+            acc.feed(ev, &tx);
+        }
+        let resp = acc.finish(None).unwrap();
+        assert_eq!(resp.tool_calls[0].name, "made_up");
+        assert!(matches!(rx.try_recv(), Ok(StreamEvent::ToolCall { name }) if name == "made_up"));
     }
 
     #[test]

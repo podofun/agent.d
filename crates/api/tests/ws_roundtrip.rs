@@ -709,6 +709,37 @@ async fn sessions_roundtrip_over_ws() {
     )
     .await;
     assert_eq!(list_anon["result"].as_array().unwrap().len(), 0);
+    let list_no_params = call(
+        &mut sock,
+        serde_json::json!({"id": 30, "method": "sessions.list"}),
+    )
+    .await;
+    assert_eq!(list_no_params["ok"], true, "{list_no_params}");
+
+    // rename: other users cannot see it, the owner can, and labels stay unique.
+    let rename_eve = call(
+        &mut sock,
+        serde_json::json!({"id": 20, "method": "sessions.rename", "params": {"id": sid, "label": "renamed", "user": "eve"}}),
+    )
+    .await;
+    assert_eq!(rename_eve["code"], "session_not_found");
+    let renamed = call(
+        &mut sock,
+        serde_json::json!({"id": 21, "method": "sessions.rename", "params": {"id": sid, "label": "renamed", "user": "bob"}}),
+    )
+    .await;
+    assert_eq!(renamed["result"]["label"], "renamed");
+    let other = call(
+        &mut sock,
+        serde_json::json!({"id": 22, "method": "sessions.create", "params": {"label": "second", "user": "bob"}}),
+    )
+    .await;
+    let clash = call(
+        &mut sock,
+        serde_json::json!({"id": 23, "method": "sessions.rename", "params": {"id": other["result"]["id"], "label": "renamed", "user": "bob"}}),
+    )
+    .await;
+    assert_eq!(clash["code"], "session_label_taken");
 
     // delete by someone else is a no-op that looks like "already gone".
     let del_eve = call(

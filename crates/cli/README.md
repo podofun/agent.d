@@ -4,6 +4,7 @@
 
 The client can:
 
+- Open a chat-focused terminal interface with `agentctl chat`, stream runner replies, resume sessions, and browse daemon state.
 - Check daemon health and list or call actions.
 - List, inspect, and run runners and skills.
 - List services and read execution traces.

@@ -29,6 +29,34 @@
 
 `agentctl pkg ls` and `agentctl runners ls` are equivalent to `agentctl package ls` and `agentctl runner ls`.
 
+### `agentctl chat`
+
+Chat with your agents right in your terminal.
+
+```bash
+agentctl chat
+```
+
+If you have one runner, chat selects it for you. Otherwise pick one with `/runner`, and switch runners or reopen past chats the same way at any time. To start with a choice already made, pass `--runner <name>` or `--session <id>`.
+
+When a runner needs permission for something, chat asks you on the spot, and you allow or deny it without leaving the conversation.
+
+Type `/` to see what you can do:
+
+| Command | Description |
+|---|---|
+| `/runner <name>` | Switch to another runner |
+| `/new` | Start a new chat |
+| `/open <id>` | Reopen a past chat |
+| `/rename <name>` | Name the current chat so it is easy to find later |
+| `/call <action> [json]` | Run an action |
+| `/help` | Show every command and shortcut |
+| `/quit` | Leave chat |
+
+Enter sends your message, Shift+Enter adds a new line, Ctrl+P lets you browse runners, chats, actions, services, and skills, and Ctrl+C stops a reply or leaves chat.
+
+---
+
 ### `agentctl health`
 
 Check daemon liveness via `GET /health`. Returns `ok` when the daemon is up.

@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::sse::SseBuffer;
+use super::tool_names::{ToolNames, wire_tool_name};
 use crate::types::{
     CompletionRequest, CompletionResponse, LoopMode, Message, Provider, ProviderError, Role,
     StreamEvent, StreamSink, ToolCall,
@@ -146,7 +147,8 @@ impl Provider for ClaudeApiProvider {
             ))
         })?;
 
-        Ok(translate_response(parsed, req.model))
+        let tool_names = ToolNames::new(&req);
+        Ok(translate_response(parsed, req.model, &tool_names))
     }
 
     async fn complete_streaming(
@@ -174,7 +176,7 @@ impl Provider for ClaudeApiProvider {
             .headers
             .insert("anthropic-version".into(), ANTHROPIC_VERSION.into());
 
-        let mut acc = StreamAccumulator::default();
+        let mut acc = StreamAccumulator::new(ToolNames::new(&req));
         let mut sse = SseBuffer::new();
         let resp = send_streaming(http_req, |chunk| {
             sse.push(chunk, |data| acc.feed(data, &sink));
@@ -209,6 +211,7 @@ struct StreamAccumulator {
     done: bool,
     usage: Option<crate::types::Usage>,
     usage_complete: bool,
+    tool_names: ToolNames,
 }
 
 enum StreamBlock {
@@ -221,6 +224,13 @@ enum StreamBlock {
 }
 
 impl StreamAccumulator {
+    fn new(tool_names: ToolNames) -> Self {
+        Self {
+            tool_names,
+            ..Default::default()
+        }
+    }
+
     fn feed(&mut self, data: &str, sink: &StreamSink) {
         let Ok(ev) = serde_json::from_str::<serde_json::Value>(data) else {
             self.error = Some("malformed event JSON".into());
@@ -238,7 +248,10 @@ impl StreamAccumulator {
                 let block = &ev["content_block"];
                 match block["type"].as_str().unwrap_or("") {
                     "tool_use" => {
-                        let name = block["name"].as_str().unwrap_or("").to_string();
+                        let name = self
+                            .tool_names
+                            .canonical(block["name"].as_str().unwrap_or(""))
+                            .to_string();
                         let _ = sink.send(StreamEvent::ToolCall { name: name.clone() });
                         self.blocks.insert(
                             idx,
@@ -410,7 +423,7 @@ fn build_request_body(req: &CompletionRequest, default_model: &str) -> serde_jso
                     blocks.push(serde_json::json!({
                         "type": "tool_use",
                         "id": tc.id,
-                        "name": tc.name,
+                        "name": wire_tool_name(&tc.name),
                         "input": tc.arguments,
                     }));
                 }
@@ -437,7 +450,7 @@ fn build_request_body(req: &CompletionRequest, default_model: &str) -> serde_jso
             .iter()
             .map(|t| {
                 serde_json::json!({
-                    "name": t.name,
+                    "name": wire_tool_name(&t.name),
                     "description": t.description.clone().unwrap_or_default(),
                     "input_schema": if t.input_schema.is_null() {
                         serde_json::json!({ "type": "object" })
@@ -483,6 +496,7 @@ enum ContentBlock {
 fn translate_response(
     parsed: MessagesResponse,
     requested_model: Option<String>,
+    tool_names: &ToolNames,
 ) -> CompletionResponse {
     let mut text = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -497,7 +511,7 @@ fn translate_response(
             ContentBlock::ToolUse { id, name, input } => {
                 tool_calls.push(ToolCall {
                     id,
-                    name,
+                    name: tool_names.canonical(&name).to_string(),
                     arguments: input,
                 });
             }
@@ -552,7 +566,8 @@ mod tests {
         let body = build_request_body(&req, DEFAULT_MODEL);
         assert_eq!(body["system"], "be terse");
         assert_eq!(body["model"], "claude-foo");
-        assert_eq!(body["tools"][0]["name"], "notes.lookup");
+        let wire_name = wire_tool_name("notes.lookup");
+        assert_eq!(body["tools"][0]["name"], wire_name);
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3);
         // Assistant turn carries the tool_use block.
@@ -621,13 +636,17 @@ mod tests {
     fn stream_accumulator_rebuilds_full_response_and_emits_deltas() {
         use crate::types::StreamEvent;
         let (tx, mut rx) = crate::types::stream_channel();
-        let mut acc = StreamAccumulator::default();
+        let mut acc = StreamAccumulator::new(ToolNames::new(&request_with_tool("notes.lookup")));
+        let tool_start = format!(
+            r#"{{"type":"content_block_start","index":1,"content_block":{{"type":"tool_use","id":"c1","name":"{}"}}}}"#,
+            wire_tool_name("notes.lookup")
+        );
         for ev in [
             r#"{"type":"message_start","message":{"model":"claude-x"}}"#,
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"text"}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}"#,
-            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"c1","name":"notes.lookup"}}"#,
+            tool_start.as_str(),
             r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"q\":"}}"#,
             r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"x\"}"}}"#,
             r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
@@ -716,13 +735,28 @@ mod tests {
             "stop_reason": "tool_use",
             "content": [
                 { "type": "text", "text": "let me check" },
-                { "type": "tool_use", "id": "c1", "name": "notes.lookup", "input": { "q": "x" } },
+                { "type": "tool_use", "id": "c1", "name": wire_tool_name("notes.lookup"), "input": { "q": "x" } },
             ],
         });
         let parsed: MessagesResponse = serde_json::from_value(raw).unwrap();
-        let r = translate_response(parsed, None);
+        let r = translate_response(
+            parsed,
+            None,
+            &ToolNames::new(&request_with_tool("notes.lookup")),
+        );
         assert_eq!(r.text, "let me check");
         assert_eq!(r.tool_calls.len(), 1);
         assert_eq!(r.tool_calls[0].name, "notes.lookup");
+    }
+
+    fn request_with_tool(name: &str) -> CompletionRequest {
+        CompletionRequest {
+            tools: vec![ToolDef {
+                name: name.into(),
+                description: None,
+                input_schema: serde_json::Value::Null,
+            }],
+            ..Default::default()
+        }
     }
 }

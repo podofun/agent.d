@@ -158,6 +158,9 @@ pub trait SessionStore: Send + Sync {
     fn compact(&self, id: &str, compaction: Compaction) -> Result<SessionMeta>;
     /// Returns `false` if there was nothing to delete.
     fn delete(&self, id: &str) -> Result<bool>;
+    /// Replace the label. `None` clears it. `LabelTaken` if another session of
+    /// the same owner already uses it, `NotFound` if the session is gone.
+    fn relabel(&self, id: &str, label: Option<String>) -> Result<SessionMeta>;
 }
 
 pub(crate) fn now_secs() -> u64 {
@@ -291,6 +294,25 @@ impl SessionStore for MemSessionStore {
         g.turns.remove(id);
         Ok(g.metas.remove(id).is_some())
     }
+    fn relabel(&self, id: &str, label: Option<String>) -> Result<SessionMeta> {
+        let mut g = self.inner.write().unwrap();
+        let owner = g
+            .metas
+            .get(id)
+            .map(|m| m.owner.clone())
+            .ok_or_else(|| SessionError::NotFound(id.to_string()))?;
+        if let Some(label) = label.as_deref()
+            && g.metas
+                .values()
+                .any(|m| m.id != id && m.owner == owner && m.label.as_deref() == Some(label))
+        {
+            return Err(SessionError::LabelTaken(label.to_string()));
+        }
+        let meta = g.metas.get_mut(id).unwrap();
+        meta.label = label;
+        meta.updated_at = now_secs();
+        Ok(meta.clone())
+    }
 }
 
 #[cfg(test)]
@@ -401,5 +423,34 @@ mod tests {
         assert!(s.delete(&m.id).unwrap());
         assert!(!s.delete(&m.id).unwrap());
         assert!(matches!(s.turns(&m.id), Err(SessionError::NotFound(_))));
+    }
+
+    #[test]
+    fn relabel_replaces_the_label_and_keeps_it_unique_per_owner() {
+        let s = MemSessionStore::new();
+        let web = scope("interface:web", None);
+        let a = s.create(NewSession::in_scope(&web)).unwrap();
+        let b = s
+            .create(NewSession::in_scope(&web).label(Some("taken".into())))
+            .unwrap();
+        let renamed = s.relabel(&a.id, Some("work".into())).unwrap();
+        assert_eq!(renamed.label.as_deref(), Some("work"));
+        assert_eq!(
+            s.find_by_label("interface:web", "work")
+                .unwrap()
+                .unwrap()
+                .id,
+            a.id
+        );
+        assert!(matches!(
+            s.relabel(&a.id, Some("taken".into())),
+            Err(SessionError::LabelTaken(_))
+        ));
+        assert!(matches!(
+            s.relabel("missing", None),
+            Err(SessionError::NotFound(_))
+        ));
+        s.relabel(&b.id, None).unwrap();
+        assert!(s.find_by_label("interface:web", "taken").unwrap().is_none());
     }
 }

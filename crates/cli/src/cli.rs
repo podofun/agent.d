@@ -29,6 +29,15 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Cmd {
+    /// Open the interactive chat and daemon console.
+    Chat {
+        /// Runner to select on startup.
+        #[arg(long)]
+        runner: Option<String>,
+        /// Resume a session by id.
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Check daemon health (HTTP probe).
     Health,
     /// List registered actions.

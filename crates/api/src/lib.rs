@@ -854,7 +854,12 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
             let Some(store) = executor.sessions() else {
                 return no_sessions(id);
             };
-            match serde_json::from_value::<LimitParam>(req.params) {
+            let params = if req.params.is_null() {
+                json!({})
+            } else {
+                req.params
+            };
+            match serde_json::from_value::<LimitParam>(params) {
                 Ok(p) => match store.list(
                     &scope_of(&ws_caller(conn, p.session, p.user)),
                     p.limit.unwrap_or(50).min(500),
@@ -862,6 +867,32 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
                     Ok(v) => ok_ser(id, &v),
                     Err(e) => session_error(id, e),
                 },
+                Err(e) => bad_params(id, e),
+            }
+        }
+        "sessions.rename" => {
+            let Some(store) = executor.sessions() else {
+                return no_sessions(id);
+            };
+            match serde_json::from_value::<RenameParams>(req.params) {
+                Ok(p) => {
+                    let scope = scope_of(&ws_caller(conn, p.session, p.user));
+                    match store.get_in(&scope, &p.id) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            return err(
+                                id,
+                                "session_not_found",
+                                format!("session `{}` does not exist", p.id),
+                            );
+                        }
+                        Err(e) => return session_error(id, e),
+                    }
+                    match store.relabel(&p.id, p.label) {
+                        Ok(meta) => ok_ser(id, &meta),
+                        Err(e) => session_error(id, e),
+                    }
+                }
                 Err(e) => bad_params(id, e),
             }
         }
@@ -925,6 +956,18 @@ struct CreateSessionParams {
 #[derive(Deserialize)]
 struct IdParam {
     id: String,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+}
+
+/// `sessions.rename`: a missing or null `label` clears it.
+#[derive(Deserialize)]
+struct RenameParams {
+    id: String,
+    #[serde(default)]
+    label: Option<String>,
     #[serde(default)]
     session: Option<String>,
     #[serde(default)]
@@ -1016,7 +1059,9 @@ fn tip_for(code: &str) -> Option<String> {
             "Run `agentctl session ls` to list sessions, or `agentctl session new` to start one"
         }
         "session_busy" => "Wait for the in-flight run on this session to finish, then retry",
-        "session_label_taken" => "Fetch the existing one with `sessions.get { label }` instead",
+        "session_label_taken" => {
+            "Pick another label, or fetch the session that has it with `sessions.get { label }`"
+        }
         "denied" | "needs_confirmation" => {
             "Grants live in `grants.toml`; run `agentctl grants listen` to approve interactively"
         }

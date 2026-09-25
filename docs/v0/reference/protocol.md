@@ -319,6 +319,14 @@ List visible sessions from newest to oldest. The optional parameters are `limit`
 { "id": 12, "method": "sessions.list", "params": { "limit": 50, "user": "alice" } }
 ```
 
+### `sessions.rename`
+
+Change a session's label. Pass the required string `id`, the new `label` (omit it or send `null` to clear the label), and if needed the string parameters `session` and `user`. Labels stay unique per owner, so a label another session already uses returns `session_label_taken`. A session outside the caller's scope returns `session_not_found`. The result is the updated session metadata.
+
+```json
+{ "id": 13, "method": "sessions.rename", "params": { "id": "8f3a1c2d-…", "label": "bugfix", "user": "alice" } }
+```
+
 ### `sessions.delete`
 
 Delete a session and its stored messages. Pass the required string `id` and, if needed, the string parameters `session` and `user`. The result is `{ "deleted": true }` if the session was deleted, or `{ "deleted": false }` if no visible session matched.

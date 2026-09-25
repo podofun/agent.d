@@ -85,6 +85,9 @@ agentd --init init.lua --grants grants.toml
 ```bash
 # Run from another terminal, inside a Git repository
 agentctl runner run review "Review what I am about to commit" --text-only
+
+# Or open the chat and select review with Ctrl+P
+agentctl chat
 ```
 
 The runner can call `git.diff`, and that `git.diff` action can execute `git`.
