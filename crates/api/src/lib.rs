@@ -1058,6 +1058,9 @@ fn tip_for(code: &str) -> Option<String> {
         "session_not_found" => {
             "Run `agentctl session ls` to list sessions, or `agentctl session new` to start one"
         }
+        "runner_turn_limit" => {
+            "Send another message to let it continue, or raise `max_turns` under `[runtime]` in `config.toml`. https://docs.podo.fun/agentd/v0/reference/configuration"
+        }
         "session_busy" => "Wait for the in-flight run on this session to finish, then retry",
         "session_label_taken" => {
             "Pick another label, or fetch the session that has it with `sessions.get { label }`"
@@ -1129,6 +1132,7 @@ fn runner_error(id: u64, e: RunnerError) -> WsResponse {
         RunnerError::Session(_) => "session_store",
         RunnerError::UnknownSkill { .. } => "unknown_skill",
         RunnerError::NoProvider { .. } => "no_provider",
+        RunnerError::TurnLimit { .. } => "runner_turn_limit",
         RunnerError::Provider {
             source: agentd_ai::ProviderError::Config(_),
             ..

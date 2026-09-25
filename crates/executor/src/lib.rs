@@ -1394,7 +1394,19 @@ impl Executor {
             }
         }
         options.messages = Some(history);
-        let (mut out, new_turns) = self.run_model(caller, runner_name, options, sink).await?;
+        let (mut out, new_turns) = match self.run_model(caller, runner_name, options, sink).await {
+            Ok(done) => done,
+            Err(RunnerError::TurnLimit { limit, turns }) => {
+                store
+                    .append(&session_id, &turns)
+                    .map_err(|e| RunnerError::Session(e.to_string()))?;
+                return Err(RunnerError::TurnLimit {
+                    limit,
+                    turns: Vec::new(),
+                });
+            }
+            Err(e) => return Err(e),
+        };
         store
             .append(&session_id, &new_turns)
             .map_err(|e| RunnerError::Session(e.to_string()))?;
@@ -1660,13 +1672,14 @@ impl Executor {
                 let mut usage = Some(agentd_ai::types::Usage::default());
                 loop {
                     if turns >= self.max_runner_turns {
-                        return Err(RunnerError::Provider {
-                            provider: provider_name,
-                            source: agentd_ai::ProviderError::Upstream(format!(
-                                "the runner stopped after {} tool-use turns without producing a final answer — raise the turn limit or simplify the task",
-                                self.max_runner_turns
-                            )),
-                        });
+                        let limit = self.max_runner_turns;
+                        let mut turns = req.messages.split_off(base_len);
+                        // Close the exchange with an assistant turn so the
+                        // stored history stays valid for the next message.
+                        turns.push(agentd_ai::Message::assistant(format!(
+                            "I stopped after using all {limit} turns without finishing."
+                        )));
+                        return Err(RunnerError::TurnLimit { limit, turns });
                     }
                     turns += 1;
                     let resp = match &sink {

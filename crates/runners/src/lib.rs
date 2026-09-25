@@ -82,6 +82,10 @@ pub enum RunnerError {
     UnknownSkill { name: String, skill: String },
     #[error("runner `{name}` could not resolve a provider for model `{}`", model.as_deref().unwrap_or("(none configured)"))]
     NoProvider { name: String, model: Option<String> },
+    /// The tool-use loop hit `runtime.max_turns`. `turns` holds what the run
+    /// did so far, so a session can keep it and the next message can continue.
+    #[error("the runner used all {limit} turns without finishing")]
+    TurnLimit { limit: u32, turns: Vec<Message> },
     #[error("{}", provider_message(provider, source))]
     Provider {
         provider: String,

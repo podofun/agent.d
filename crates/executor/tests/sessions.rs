@@ -66,8 +66,16 @@ impl agentd_ai::Provider for Recording {
 }
 
 fn build(
-    provider: Arc<Recording>,
+    provider: Arc<dyn agentd_ai::Provider>,
     compact: Option<CompactPolicy>,
+) -> (Arc<Executor>, Arc<MemSessionStore>) {
+    build_with_turns(provider, compact, Executor::DEFAULT_MAX_RUNNER_TURNS)
+}
+
+fn build_with_turns(
+    provider: Arc<dyn agentd_ai::Provider>,
+    compact: Option<CompactPolicy>,
+    max_turns: u32,
 ) -> (Arc<Executor>, Arc<MemSessionStore>) {
     let mut file = GrantsFile::default();
     file.runner.insert(
@@ -99,6 +107,7 @@ fn build(
     );
     let store = Arc::new(MemSessionStore::new());
     exec.set_sessions(store.clone());
+    exec.set_max_runner_turns(max_turns);
     (Arc::new(exec), store)
 }
 
@@ -166,6 +175,45 @@ async fn session_history_is_loaded_and_appended() {
         ]
     );
     assert_eq!(store.get(&s.id).unwrap().unwrap().turn_count, 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_limit_keeps_the_work_so_far_in_the_session() {
+    let looping = MockProvider::new().with_script(vec![
+        MockProvider::tool_call("c1", "notes.lookup", serde_json::json!({})),
+        MockProvider::tool_call("c2", "notes.lookup", serde_json::json!({})),
+        MockProvider::text_only("picked up where I left off"),
+    ]);
+    let (exec, store) = build_with_turns(Arc::new(looping), None, 2);
+    let s = store.create(ws_session()).unwrap();
+
+    let err = exec
+        .run_runner_with_options(caller(), "chat", opts(&s.id, "dig in"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RunnerError::TurnLimit { limit: 2, .. }),
+        "{err}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "the runner used all 2 turns without finishing"
+    );
+
+    let stored = store.turns(&s.id).unwrap();
+    assert_eq!(stored.first().unwrap().content, "dig in");
+    assert_eq!(
+        stored.iter().filter(|m| m.tool_call_id.is_some()).count(),
+        2,
+        "both tool results are kept"
+    );
+    assert_eq!(stored.last().unwrap().role, agentd_ai::Role::Assistant);
+
+    let out = exec
+        .run_runner_with_options(caller(), "chat", opts(&s.id, "continue"), None)
+        .await
+        .unwrap();
+    assert_eq!(out.text, "picked up where I left off");
 }
 
 #[tokio::test(flavor = "multi_thread")]
