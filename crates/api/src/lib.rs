@@ -1059,7 +1059,9 @@ fn tip_for(code: &str) -> Option<String> {
             "Run `agentctl session ls` to list sessions, or `agentctl session new` to start one"
         }
         "session_busy" => "Wait for the in-flight run on this session to finish, then retry",
-        "session_label_taken" => "Fetch the existing one with `sessions.get { label }` instead",
+        "session_label_taken" => {
+            "Pick another label, or fetch the session that has it with `sessions.get { label }`"
+        }
         "denied" | "needs_confirmation" => {
             "Grants live in `grants.toml`; run `agentctl grants listen` to approve interactively"
         }
