@@ -1,13 +1,13 @@
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
-use serde_json::Value;
 
 use super::super::app::{App, Tab};
 use super::super::presentation;
-use super::{MUTED, PRIMARY, centered};
+use super::super::search::Row;
+use super::{MUTED, PRIMARY, SECONDARY, centered};
 
 pub(super) fn draw_browser(frame: &mut Frame<'_>, app: &App) {
     let area = centered(frame.area(), 82, 78);
@@ -29,16 +29,21 @@ pub(super) fn draw_browser(frame: &mut Frame<'_>, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
+            Constraint::Length(2),
             Constraint::Min(2),
             Constraint::Length(1),
         ])
         .split(inside);
+    draw_query(frame, app, rows[0]);
+    let rows = [rows[1], rows[2], rows[3]];
     frame.render_widget(
-        Tabs::new(["Runners", "Sessions", "Actions", "Services", "Skills"])
-            .select(app.tab.index().saturating_sub(1))
-            .divider("  ")
-            .style(Style::default().fg(MUTED))
-            .highlight_style(Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD)),
+        Tabs::new([
+            "All", "Runners", "Sessions", "Actions", "Services", "Skills",
+        ])
+        .select(app.tab.index().saturating_sub(1))
+        .divider("  ")
+        .style(Style::default().fg(MUTED))
+        .highlight_style(Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD)),
         rows[0],
     );
     let columns = Layout::default()
@@ -49,10 +54,10 @@ pub(super) fn draw_browser(frame: &mut Frame<'_>, app: &App) {
             Constraint::Min(10),
         ])
         .split(rows[1]);
-    let items: Vec<ListItem> = app
-        .list()
+    let matches = app.rows();
+    let items: Vec<ListItem> = matches
         .iter()
-        .map(|item| ListItem::new(row(app.tab, item)))
+        .map(|row| ListItem::new(row_line(app.tab, row)))
         .collect();
     let mut state = ListState::default();
     if !items.is_empty() {
@@ -65,21 +70,22 @@ pub(super) fn draw_browser(frame: &mut Frame<'_>, app: &App) {
         columns[0],
         &mut state,
     );
-    let selected = app
-        .list()
-        .get(app.selected_index().min(app.list().len().saturating_sub(1)));
+    let selected = matches.get(app.selected_index().min(matches.len().saturating_sub(1)));
     match selected {
-        Some(item) => frame.render_widget(
-            Paragraph::new(presentation::value(item))
+        Some(row) => frame.render_widget(
+            Paragraph::new(presentation::value(row.value))
                 .style(Style::default().fg(MUTED))
                 .wrap(Wrap { trim: false }),
             columns[2],
         ),
         None => {
-            let message = app
-                .notice
-                .clone()
-                .unwrap_or_else(|| "Nothing here yet. Press F5 to refresh.".into());
+            let message = if app.query.is_empty() {
+                app.notice
+                    .clone()
+                    .unwrap_or_else(|| "Nothing here yet. Press F5 to refresh.".into())
+            } else {
+                format!("Nothing matches \"{}\".", app.query)
+            };
             frame.render_widget(
                 Paragraph::new(message)
                     .style(Style::default().fg(MUTED))
@@ -95,35 +101,50 @@ pub(super) fn draw_browser(frame: &mut Frame<'_>, app: &App) {
         }
     }
     frame.render_widget(
-        Paragraph::new(" ↑/↓ select  ·  Enter open  ·  Tab switch  ·  Esc close ")
-            .style(Style::default().fg(MUTED)),
+        Paragraph::new(
+            " type to search  ·  ↑/↓ select  ·  Enter open  ·  Tab switch  ·  Esc close ",
+        )
+        .style(Style::default().fg(MUTED)),
         rows[2],
     );
 }
 
-fn row(tab: Tab, item: &Value) -> String {
-    match tab {
-        Tab::Runners => format!(
-            "{}  ·  {}",
-            item["name"].as_str().unwrap_or("?"),
-            item["model"].as_str().unwrap_or("default")
-        ),
-        Tab::Sessions => format!(
-            "{}  ·  {} turns",
-            item["label"]
-                .as_str()
-                .or_else(|| item["id"].as_str())
-                .unwrap_or("?"),
-            item["turn_count"].as_u64().unwrap_or(0)
-        ),
-        Tab::Actions => item.as_str().unwrap_or("?").to_owned(),
-        Tab::Services => format!(
-            "{}  ·  {}",
-            item["name"].as_str().unwrap_or("?"),
-            item["state"].as_str().unwrap_or("?")
-        ),
-        Tab::Skills => item["name"].as_str().unwrap_or("?").to_owned(),
-        Tab::Chat => String::new(),
+fn draw_query(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let line = if app.query.is_empty() {
+        Line::from(vec![
+            Span::styled(" › ", Style::default().fg(PRIMARY)),
+            Span::styled("Search everywhere…", Style::default().fg(MUTED)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" › ", Style::default().fg(PRIMARY)),
+            Span::raw(app.query.clone()),
+            Span::styled("▏", Style::default().fg(PRIMARY)),
+        ])
+    };
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn row_line(tab: Tab, row: &Row<'_>) -> Line<'static> {
+    let mut spans = Vec::new();
+    if tab == Tab::All {
+        spans.push(Span::styled(
+            format!("{:<9}", section_name(row.section)),
+            Style::default().fg(SECONDARY),
+        ));
+    }
+    spans.push(Span::raw(row.label.clone()));
+    Line::from(spans)
+}
+
+fn section_name(section: Tab) -> &'static str {
+    match section {
+        Tab::Runners => "runner",
+        Tab::Sessions => "session",
+        Tab::Actions => "action",
+        Tab::Services => "service",
+        Tab::Skills => "skill",
+        Tab::Chat | Tab::All => "",
     }
 }
 
@@ -152,6 +173,19 @@ mod tests {
         assert!(rendered.contains("Name: review"));
         assert!(!rendered.contains("\"name\""));
         assert!(!rendered.contains("agent.d"));
+    }
+
+    #[test]
+    fn all_view_prefixes_rows_with_their_section_and_shows_the_query() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.tab = Tab::All;
+        app.runners = vec![json!({ "name": "helper", "model": "m" })];
+        app.actions = vec![json!("git.status")];
+        app.set_query("git".into());
+        let text = rows(&app, 100, 30).join("\n");
+        assert!(text.contains("› git"), "{text}");
+        assert!(text.contains("action   git.status"), "{text}");
+        assert!(!text.contains("helper"), "{text}");
     }
 
     fn rows(app: &App, width: u16, height: u16) -> Vec<String> {

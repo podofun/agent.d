@@ -10,11 +10,13 @@ use tokio::sync::{mpsc, oneshot};
 use super::commands;
 use super::editor::Editor;
 use super::presentation;
+use super::search;
 use crate::ws::{WsResponse, ws_call, ws_call_streaming_cancelable};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Tab {
     Chat,
+    All,
     Runners,
     Sessions,
     Actions,
@@ -23,8 +25,9 @@ pub(super) enum Tab {
 }
 
 impl Tab {
-    pub(super) const ALL: [Self; 6] = [
+    pub(super) const ALL: [Self; 7] = [
         Self::Chat,
+        Self::All,
         Self::Runners,
         Self::Sessions,
         Self::Actions,
@@ -94,8 +97,8 @@ const HELP: &str = "\
 - `Ctrl+C` copies a selection, cancels a run, clears the draft, or quits
 
 ## Browse
-- `Ctrl+P` opens the browser
-- `Tab` changes section, `Enter` opens a row, `Esc` returns
+- `Ctrl+P` opens the browser; type to search everywhere
+- `Tab` changes section, `Enter` opens a row, `Esc` clears the search, then returns
 
 ## Editing
 - `Shift+arrows` select, `Ctrl+V` pastes, `Ctrl+X` cuts
@@ -122,7 +125,9 @@ pub(super) struct App {
     started: Option<std::time::Instant>,
     pub(super) scroll: usize,
     unread: bool,
-    pub(super) selected: [usize; 6],
+    pub(super) selected: [usize; 7],
+    /// Browser search text, shared by every section.
+    pub(super) query: String,
     pub(super) runners: Vec<Value>,
     pub(super) sessions: Vec<Value>,
     pub(super) actions: Vec<Value>,
@@ -160,7 +165,8 @@ impl App {
             started: None,
             scroll: 0,
             unread: false,
-            selected: [0; 6],
+            selected: [0; 7],
+            query: String::new(),
             runners: Vec::new(),
             sessions: Vec::new(),
             actions: Vec::new(),
@@ -311,9 +317,10 @@ impl App {
         };
     }
 
-    pub(super) fn list(&self) -> &[Value] {
-        match self.tab {
-            Tab::Chat => &[],
+    /// The raw items behind one browser section.
+    pub(super) fn section(&self, tab: Tab) -> &[Value] {
+        match tab {
+            Tab::Chat | Tab::All => &[],
             Tab::Runners => &self.runners,
             Tab::Sessions => &self.sessions,
             Tab::Actions => &self.actions,
@@ -322,8 +329,18 @@ impl App {
         }
     }
 
+    /// Browser rows for the current section and query, best matches first.
+    pub(super) fn rows(&self) -> Vec<search::Row<'_>> {
+        search::rows(self, self.tab, &self.query)
+    }
+
     pub(super) fn selected_index(&self) -> usize {
         self.selected[self.tab.index()]
+    }
+
+    pub(super) fn set_query(&mut self, query: String) {
+        self.query = query;
+        self.selected = [0; 7];
     }
 
     pub(super) fn select_previous(&mut self) {
@@ -333,14 +350,18 @@ impl App {
 
     pub(super) fn select_next(&mut self) {
         let index = self.tab.index();
-        self.selected[index] = (self.selected[index] + 1).min(self.list().len().saturating_sub(1));
+        self.selected[index] = (self.selected[index] + 1).min(self.rows().len().saturating_sub(1));
     }
 
     pub(super) async fn activate_selected(&mut self) {
-        let Some(item) = self.list().get(self.selected_index()).cloned() else {
+        let Some((section, item)) = self
+            .rows()
+            .get(self.selected_index())
+            .map(|row| (row.section, row.value.clone()))
+        else {
             return;
         };
-        match self.tab {
+        match section {
             Tab::Runners => {
                 if self.pending {
                     self.notice = Some("Wait for the current reply.".into());

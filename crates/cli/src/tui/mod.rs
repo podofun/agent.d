@@ -3,6 +3,7 @@ mod commands;
 mod control;
 mod editor;
 mod presentation;
+mod search;
 mod ui;
 
 use std::io::{IsTerminal, stdout};
@@ -194,7 +195,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, screen: Rect) -> Result<bool> 
     }
     if key.code == KeyCode::Char('p') && control {
         app.tab = if app.tab == Tab::Chat {
-            Tab::Runners
+            Tab::All
         } else {
             Tab::Chat
         };
@@ -257,7 +258,18 @@ fn handle_approval_key(app: &mut App, key: KeyEvent) {
 
 async fn handle_browser_key(app: &mut App, key: KeyEvent) {
     match key.code {
+        KeyCode::Esc if !app.query.is_empty() => app.set_query(String::new()),
         KeyCode::Esc => app.tab = Tab::Chat,
+        KeyCode::Backspace => {
+            let mut query = app.query.clone();
+            query.pop();
+            app.set_query(query);
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let mut query = app.query.clone();
+            query.push(c);
+            app.set_query(query);
+        }
         KeyCode::Tab => app.tab = app.tab.next(),
         KeyCode::BackTab => app.tab = app.tab.previous(),
         KeyCode::F(5) => app.refresh().await,
@@ -361,6 +373,48 @@ async fn submit_draft(app: &mut App) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn typing_in_the_browser_filters_and_esc_clears_before_closing() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.actions = vec![serde_json::json!("git.status"), serde_json::json!("notes")];
+        app.tab = Tab::All;
+        let screen = Rect::new(0, 0, 80, 24);
+        for c in ['g', 'i'] {
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char(c)), screen)
+                .await
+                .unwrap();
+        }
+        assert_eq!(app.query, "gi");
+        assert_eq!(app.rows().len(), 1);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Backspace), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.query, "g");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.query, "");
+        assert_eq!(app.tab, Tab::All);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.tab, Tab::Chat);
+    }
+
+    #[tokio::test]
+    async fn a_new_query_resets_the_selection() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.actions = vec![serde_json::json!("a"), serde_json::json!("b")];
+        app.tab = Tab::All;
+        app.select_next();
+        assert_eq!(app.selected_index(), 1);
+        let screen = Rect::new(0, 0, 80, 24);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('b')), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.selected_index(), 0);
+    }
 
     #[tokio::test]
     async fn ctrl_e_toggles_latest_tool_without_editing_draft() {

@@ -53,7 +53,7 @@ Type `/` to see what you can do:
 | `/help` | Show every command and shortcut |
 | `/quit` | Leave chat |
 
-Enter sends your message, Shift+Enter adds a new line, Ctrl+P lets you browse runners, chats, actions, services, and skills, and Ctrl+C stops a reply or leaves chat.
+Enter sends your message, Shift+Enter adds a new line, Ctrl+P opens a search across runners, chats, actions, services, and skills (start typing to filter), and Ctrl+C stops a reply or leaves chat.
 
 ---
 
