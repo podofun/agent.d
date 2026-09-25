@@ -428,12 +428,7 @@ impl Editor {
 
     /// Copies the selection to the clipboard. `None` when nothing is selected.
     pub(super) fn copy_selection(&self) -> Option<Result<(), String>> {
-        let selected = self.selected_text()?.to_owned();
-        Some(
-            arboard::Clipboard::new()
-                .and_then(|mut clipboard| clipboard.set_text(selected))
-                .map_err(|error| format!("Clipboard unavailable: {error}")),
-        )
+        Some(super::clipboard::copy(self.selected_text()?.to_owned()))
     }
 }
 

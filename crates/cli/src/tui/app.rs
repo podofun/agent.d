@@ -7,14 +7,19 @@ use ratatui::text::Line;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
+use super::clipboard;
 use super::commands;
 use super::editor::Editor;
 use super::presentation;
+use super::search;
+use super::ui::{self, Selection};
 use crate::ws::{WsResponse, ws_call, ws_call_streaming_cancelable};
+use ratatui::layout::Rect;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Tab {
     Chat,
+    All,
     Runners,
     Sessions,
     Actions,
@@ -23,8 +28,9 @@ pub(super) enum Tab {
 }
 
 impl Tab {
-    pub(super) const ALL: [Self; 6] = [
+    pub(super) const ALL: [Self; 7] = [
         Self::Chat,
+        Self::All,
         Self::Runners,
         Self::Sessions,
         Self::Actions,
@@ -89,13 +95,14 @@ const HELP: &str = "\
 - `/rename NAME` labels the current chat
 - `Ctrl+N` starts a new chat, `F5` refreshes daemon state
 - `Ctrl+E` or a click expands the latest tool output
+- Drag with the mouse to select text; `Ctrl+C` copies it
 - `PageUp`, `PageDown`, or the mouse wheel scroll
 - `Esc` or `End` on an empty draft jumps to the bottom and clears the notice
 - `Ctrl+C` copies a selection, cancels a run, clears the draft, or quits
 
 ## Browse
-- `Ctrl+P` opens the browser
-- `Tab` changes section, `Enter` opens a row, `Esc` returns
+- `Ctrl+P` opens the browser; type to search everywhere
+- `Tab` changes section, `Enter` opens a row, `Esc` clears the search, then returns
 
 ## Editing
 - `Shift+arrows` select, `Ctrl+V` pastes, `Ctrl+X` cuts
@@ -121,8 +128,14 @@ pub(super) struct App {
     cancel: Option<oneshot::Sender<()>>,
     started: Option<std::time::Instant>,
     pub(super) scroll: usize,
+    /// Mouse selection over the conversation.
+    pub(super) selection: Option<Selection>,
+    /// Terminal size from the last event, for selection math.
+    pub(super) screen: Rect,
     unread: bool,
-    pub(super) selected: [usize; 6],
+    pub(super) selected: [usize; 7],
+    /// Browser search text, shared by every section.
+    pub(super) query: String,
     pub(super) runners: Vec<Value>,
     pub(super) sessions: Vec<Value>,
     pub(super) actions: Vec<Value>,
@@ -159,8 +172,11 @@ impl App {
             cancel: None,
             started: None,
             scroll: 0,
+            selection: None,
+            screen: Rect::new(0, 0, 80, 24),
             unread: false,
-            selected: [0; 6],
+            selected: [0; 7],
+            query: String::new(),
             runners: Vec::new(),
             sessions: Vec::new(),
             actions: Vec::new(),
@@ -311,9 +327,10 @@ impl App {
         };
     }
 
-    pub(super) fn list(&self) -> &[Value] {
-        match self.tab {
-            Tab::Chat => &[],
+    /// The raw items behind one browser section.
+    pub(super) fn section(&self, tab: Tab) -> &[Value] {
+        match tab {
+            Tab::Chat | Tab::All => &[],
             Tab::Runners => &self.runners,
             Tab::Sessions => &self.sessions,
             Tab::Actions => &self.actions,
@@ -322,8 +339,41 @@ impl App {
         }
     }
 
+    /// Browser rows for the current section and query, best matches first.
+    pub(super) fn rows(&self) -> Vec<search::Row<'_>> {
+        search::rows(self, self.tab, &self.query)
+    }
+
+    /// Text under the mouse selection at the current terminal width, if any.
+    pub(super) fn selected_text(&self) -> Option<String> {
+        let selection = self.selection.as_ref()?;
+        let text = ui::selected_text(self, self.screen, selection);
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Copy the mouse selection to the clipboard and release it.
+    pub(super) fn copy_selection(&mut self) -> Option<Result<(), String>> {
+        let text = self.selected_text()?;
+        self.selection = None;
+        Some(clipboard::copy(text))
+    }
+
+    /// Remember the terminal size; a new size re-wraps lines, so any
+    /// selection no longer points at the right cells.
+    pub(super) fn resized(&mut self, screen: Rect) {
+        if self.screen != screen {
+            self.screen = screen;
+            self.selection = None;
+        }
+    }
+
     pub(super) fn selected_index(&self) -> usize {
         self.selected[self.tab.index()]
+    }
+
+    pub(super) fn set_query(&mut self, query: String) {
+        self.query = query;
+        self.selected = [0; 7];
     }
 
     pub(super) fn select_previous(&mut self) {
@@ -333,14 +383,18 @@ impl App {
 
     pub(super) fn select_next(&mut self) {
         let index = self.tab.index();
-        self.selected[index] = (self.selected[index] + 1).min(self.list().len().saturating_sub(1));
+        self.selected[index] = (self.selected[index] + 1).min(self.rows().len().saturating_sub(1));
     }
 
     pub(super) async fn activate_selected(&mut self) {
-        let Some(item) = self.list().get(self.selected_index()).cloned() else {
+        let Some((section, item)) = self
+            .rows()
+            .get(self.selected_index())
+            .map(|row| (row.section, row.value.clone()))
+        else {
             return;
         };
-        match self.tab {
+        match section {
             Tab::Runners => {
                 if self.pending {
                     self.notice = Some("Wait for the current reply.".into());
@@ -388,6 +442,7 @@ impl App {
         self.entries.clear();
         self.streamed.clear();
         self.scroll = 0;
+        self.selection = None;
         self.unread = false;
         self.notice = None;
     }

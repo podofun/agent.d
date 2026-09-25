@@ -1,8 +1,10 @@
 mod app;
+mod clipboard;
 mod commands;
 mod control;
 mod editor;
 mod presentation;
+mod search;
 mod ui;
 
 use std::io::{IsTerminal, stdout};
@@ -132,6 +134,7 @@ enum Handled {
 }
 
 async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled> {
+    app.resized(area);
     match event {
         Event::Paste(text) if app.tab == Tab::Chat && app.approval.is_none() => {
             app.input.insert(&text);
@@ -146,6 +149,7 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
             MouseEventKind::Down(MouseButton::Left)
                 if app.approval.is_none() && app.tab == Tab::Chat =>
             {
+                app.selection = None;
                 if let Some(index) = ui::suggestion_at(app, area, mouse.column, mouse.row) {
                     let execute = picker_title(app.input.text()).is_some()
                         && app.suggestions()[index].execute;
@@ -153,8 +157,24 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                     if execute && submit_draft(app).await? {
                         return Ok(Handled::Quit);
                     }
-                } else if let Some(index) = ui::tool_at(app, area, mouse.column, mouse.row) {
-                    ui::toggle_tool(app, area, index);
+                } else if let Some(point) = ui::point_at(app, area, mouse.column, mouse.row) {
+                    app.selection = Some(ui::Selection::at(point));
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if app.tab == Tab::Chat => {
+                let point = ui::point_at(app, area, mouse.column, mouse.row);
+                if let (Some(selection), Some(point)) = (app.selection.as_mut(), point) {
+                    selection.head = point;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) if app.tab == Tab::Chat => {
+                // A press and release on the same cell is a click, not a
+                // selection: toggle the tool row under it, if any.
+                if app.selection.is_some_and(|selection| selection.is_click()) {
+                    app.selection = None;
+                    if let Some(index) = ui::tool_at(app, area, mouse.column, mouse.row) {
+                        ui::toggle_tool(app, area, index);
+                    }
                 }
             }
             MouseEventKind::ScrollUp => {
@@ -177,7 +197,7 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
             }
             _ => return Ok(Handled::Ignored),
         },
-        Event::Resize(_, _) => {}
+        Event::Resize(width, height) => app.resized(Rect::new(0, 0, width, height)),
         _ => return Ok(Handled::Ignored),
     }
     Ok(Handled::Redraw)
@@ -194,7 +214,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, screen: Rect) -> Result<bool> 
     }
     if key.code == KeyCode::Char('p') && control {
         app.tab = if app.tab == Tab::Chat {
-            Tab::Runners
+            Tab::All
         } else {
             Tab::Chat
         };
@@ -229,7 +249,7 @@ fn handle_interrupt(app: &mut App) -> bool {
         app.decide("deny");
     } else if app.pending {
         app.cancel_run();
-    } else if let Some(result) = app.input.copy_selection() {
+    } else if let Some(result) = app.copy_selection().or_else(|| app.input.copy_selection()) {
         if let Err(notice) = result {
             app.notice = Some(notice);
         }
@@ -257,7 +277,18 @@ fn handle_approval_key(app: &mut App, key: KeyEvent) {
 
 async fn handle_browser_key(app: &mut App, key: KeyEvent) {
     match key.code {
+        KeyCode::Esc if !app.query.is_empty() => app.set_query(String::new()),
         KeyCode::Esc => app.tab = Tab::Chat,
+        KeyCode::Backspace => {
+            let mut query = app.query.clone();
+            query.pop();
+            app.set_query(query);
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let mut query = app.query.clone();
+            query.push(c);
+            app.set_query(query);
+        }
         KeyCode::Tab => app.tab = app.tab.next(),
         KeyCode::BackTab => app.tab = app.tab.previous(),
         KeyCode::F(5) => app.refresh().await,
@@ -315,6 +346,7 @@ async fn handle_chat_key(app: &mut App, key: KeyEvent, screen: Rect) -> Result<O
         KeyCode::Enter => return submit_draft(app).await.map(Some),
         KeyCode::Esc => {
             app.notice = None;
+            app.selection = None;
             app.jump_to_bottom();
         }
         KeyCode::End if app.input.is_empty() => app.jump_to_bottom(),
@@ -361,6 +393,165 @@ async fn submit_draft(app: &mut App) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use app::EntryKind;
+
+    #[tokio::test]
+    async fn typing_in_the_browser_filters_and_esc_clears_before_closing() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.actions = vec![serde_json::json!("git.status"), serde_json::json!("notes")];
+        app.tab = Tab::All;
+        let screen = Rect::new(0, 0, 80, 24);
+        for c in ['g', 'i'] {
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char(c)), screen)
+                .await
+                .unwrap();
+        }
+        assert_eq!(app.query, "gi");
+        assert_eq!(app.rows().len(), 1);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Backspace), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.query, "g");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.query, "");
+        assert_eq!(app.tab, Tab::All);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.tab, Tab::Chat);
+    }
+
+    #[tokio::test]
+    async fn a_new_query_resets_the_selection() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.actions = vec![serde_json::json!("a"), serde_json::json!("b")];
+        app.tab = Tab::All;
+        app.select_next();
+        assert_eq!(app.selected_index(), 1);
+        let screen = Rect::new(0, 0, 80, 24);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('b')), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.selected_index(), 0);
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    fn chat_with_tool() -> (App, Rect, u16, u16) {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push(EntryKind::User, "hello world");
+        app.push_tool("git.status", "one\ntwo");
+        let screen = Rect::new(0, 0, 60, 24);
+        let inner = ui::conversation_inner(ui::screen_rows(screen, &app)[1]);
+        (app, screen, inner.x, inner.y)
+    }
+
+    #[tokio::test]
+    async fn dragging_selects_text_and_ctrl_c_keeps_the_draft() {
+        let (mut app, screen, x, y) = chat_with_tool();
+        app.input.set("draft");
+        handle_event(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), x + 3, y),
+            screen,
+        )
+        .await
+        .unwrap();
+        handle_event(
+            &mut app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), x + 7, y),
+            screen,
+        )
+        .await
+        .unwrap();
+        handle_event(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), x + 7, y),
+            screen,
+        )
+        .await
+        .unwrap();
+        let selection = app.selection.expect("selection");
+        assert_eq!(selection.anchor, ui::Point { line: 0, col: 3 });
+        assert_eq!(selection.head, ui::Point { line: 0, col: 7 });
+        assert_eq!(app.selected_text().as_deref(), Some("hello"));
+
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!handle_key(&mut app, key, screen).await.unwrap());
+        assert_eq!(app.input.text(), "draft", "copy never clears the draft");
+        assert!(app.selection.is_none(), "copy releases the selection");
+    }
+
+    #[tokio::test]
+    async fn a_click_without_dragging_still_toggles_a_tool_row() {
+        let (mut app, screen, x, y) = chat_with_tool();
+        let header = y + 2;
+        handle_event(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), x + 4, header),
+            screen,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !app.entries[1].expanded,
+            "nothing happens until the button is released"
+        );
+        handle_event(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), x + 4, header),
+            screen,
+        )
+        .await
+        .unwrap();
+        assert!(app.entries[1].expanded);
+        assert!(app.selection.is_none());
+    }
+
+    #[tokio::test]
+    async fn esc_resize_and_a_new_chat_drop_the_selection() {
+        let (mut app, screen, x, y) = chat_with_tool();
+        let select = |app: &mut App| {
+            app.selection = Some(ui::Selection {
+                anchor: ui::Point { line: 0, col: 3 },
+                head: ui::Point { line: 0, col: 7 },
+            });
+        };
+        select(&mut app);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc), screen)
+            .await
+            .unwrap();
+        assert!(app.selection.is_none());
+        select(&mut app);
+        handle_event(&mut app, Event::Resize(80, 24), screen)
+            .await
+            .unwrap();
+        assert!(app.selection.is_none());
+        select(&mut app);
+        app.new_chat();
+        assert!(app.selection.is_none());
+        select(&mut app);
+        handle_event(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), x, y + 20),
+            screen,
+        )
+        .await
+        .unwrap();
+        assert!(
+            app.selection.is_none(),
+            "a click outside the conversation clears it"
+        );
+    }
 
     #[tokio::test]
     async fn ctrl_e_toggles_latest_tool_without_editing_draft() {
