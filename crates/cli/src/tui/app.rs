@@ -100,7 +100,7 @@ const HELP: &str = "\
 ## Editing
 - `Shift+arrows` select, `Ctrl+V` pastes, `Ctrl+X` cuts
 - `Alt+Backspace` and `Alt+Delete` remove words
-- `Ctrl+A`, `Ctrl+E`, `Ctrl+W`, `Ctrl+U`, `Ctrl+K` work as in a shell
+- `Ctrl+A`, `Ctrl+W`, `Ctrl+U`, `Ctrl+K` work as in a shell
 
 ## Approvals
 - `o` allows once, `f` allows always, `d` or `Esc` denies";
@@ -718,11 +718,11 @@ fn response_result(response: WsResponse) -> Result<Value> {
     if response.ok {
         Ok(response.result.unwrap_or(Value::Null))
     } else {
-        Err(anyhow!(
-            "{}: {}",
-            response.code.as_deref().unwrap_or("error"),
-            response.error.as_deref().unwrap_or("unknown error")
-        ))
+        let message = response.error.as_deref().unwrap_or("unknown error");
+        match response.tip.as_deref() {
+            Some(tip) => Err(anyhow!("{message}\n{tip}")),
+            None => Err(anyhow!("{message}")),
+        }
     }
 }
 
@@ -745,6 +745,24 @@ mod tests {
             tip: None,
             trace: None,
         }))
+    }
+
+    #[test]
+    fn failed_response_shows_message_and_tip_without_code() {
+        let response = WsResponse {
+            id: 1,
+            ok: false,
+            result: None,
+            error: Some("runner `ghost` not registered".into()),
+            code: Some("runner_not_found".into()),
+            tip: Some("Run `agentctl runner ls` to list runners".into()),
+            trace: None,
+        };
+        let error = response_result(response).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "runner `ghost` not registered\nRun `agentctl runner ls` to list runners"
+        );
     }
 
     #[test]
