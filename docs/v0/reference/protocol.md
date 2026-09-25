@@ -378,6 +378,7 @@ List background services with their current state.
 | `sessions_unavailable` | No session store is configured | — |
 | `unknown_skill` | Runner references a skill that is not registered | Run `agentctl skills ls` to list skills |
 | `no_provider` | The runner could not resolve a provider for its model | You can configure new providers in your `config.toml` |
+| `runner_turn_limit` | The runner used all `runtime.max_turns` turns without finishing. In a session, the work so far is kept | Send another message to let it continue, or raise `max_turns` under `[runtime]` in `config.toml` |
 | `provider_upstream` | AI provider returned an error | — |
 
 ---

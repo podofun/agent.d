@@ -57,7 +57,7 @@ Invokes the action named `name` with the given `args` table. The callee's `requi
 
 ### `ctx.run(name, prompt_or_opts)`
 
-Runs the named runner with a prompt and drives its full tool-use loop until `stop_reason` is reached or `runtime.max_turns` is hit (default 16). Returns a `RunResult`. The target runner needs an `ai:<provider>` grant. The same [history validation, deadlines, concurrency limits, and optional usage result](/v0/reference/protocol#runners-run) apply to Lua and WebSocket calls.
+Runs the named runner with a prompt and drives its full tool-use loop until the model gives a final answer. Returns a `RunResult`. If the loop reaches `runtime.max_turns` (default 16) first, the call fails with a `runner_turn_limit` error; in a session, the work so far is kept so the next message can pick up from there. The target runner needs an `ai:<provider>` grant. The same [history validation, deadlines, concurrency limits, and optional usage result](/v0/reference/protocol#runners-run) apply to Lua and WebSocket calls.
 
 | Field | Type | Description |
 |---|---|---|
@@ -134,7 +134,7 @@ schemas; see
 | `provider` | `string` | Provider prefix used for the call. |
 | `usage` | `table \| nil` | Cumulative provider-reported tokens when every turn reports usage; see [runner results](/v0/reference/protocol#runners-run). |
 | `model` | `string` | Exact model string used. |
-| `stop_reason` | `string \| nil` | Why the runner stopped (e.g. `"end_turn"`, `"max_turns"`). |
+| `stop_reason` | `string \| nil` | Why the runner stopped (e.g. `"end_turn"`, `"max_tokens"`). |
 
 ## Examples
 
