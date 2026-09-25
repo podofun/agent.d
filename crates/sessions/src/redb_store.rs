@@ -452,12 +452,18 @@ mod tests {
         let renamed = s.relabel(&a.id, Some("new".into())).unwrap();
         assert_eq!(renamed.label.as_deref(), Some("new"));
         assert!(s.find_by_label("interface:ws", "old").unwrap().is_none());
-        assert_eq!(s.find_by_label("interface:ws", "new").unwrap().unwrap().id, a.id);
+        assert_eq!(
+            s.find_by_label("interface:ws", "new").unwrap().unwrap().id,
+            a.id
+        );
         assert!(matches!(
             s.relabel(&a.id, Some("taken".into())),
             Err(SessionError::LabelTaken(_))
         ));
-        assert!(matches!(s.relabel("missing", None), Err(SessionError::NotFound(_))));
+        assert!(matches!(
+            s.relabel("missing", None),
+            Err(SessionError::NotFound(_))
+        ));
         s.relabel(&b.id, None).unwrap();
         assert!(s.find_by_label("interface:ws", "taken").unwrap().is_none());
         assert_eq!(s.get(&b.id).unwrap().unwrap().label, None);

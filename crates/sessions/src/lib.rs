@@ -435,12 +435,21 @@ mod tests {
             .unwrap();
         let renamed = s.relabel(&a.id, Some("work".into())).unwrap();
         assert_eq!(renamed.label.as_deref(), Some("work"));
-        assert_eq!(s.find_by_label("interface:web", "work").unwrap().unwrap().id, a.id);
+        assert_eq!(
+            s.find_by_label("interface:web", "work")
+                .unwrap()
+                .unwrap()
+                .id,
+            a.id
+        );
         assert!(matches!(
             s.relabel(&a.id, Some("taken".into())),
             Err(SessionError::LabelTaken(_))
         ));
-        assert!(matches!(s.relabel("missing", None), Err(SessionError::NotFound(_))));
+        assert!(matches!(
+            s.relabel("missing", None),
+            Err(SessionError::NotFound(_))
+        ));
         s.relabel(&b.id, None).unwrap();
         assert!(s.find_by_label("interface:web", "taken").unwrap().is_none());
     }
