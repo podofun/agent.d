@@ -8,6 +8,8 @@
 
 [Documentation](https://docs.podo.fun/agentd/v0/guide/what-is-agentd) · [Quick start](https://docs.podo.fun/agentd/v0/guide/quick-start) · [Recipes](https://docs.podo.fun/agentd/v0/recipes/) · [Releases](https://github.com/podofun/agent.d/releases)
 
+<img src="assets/agentctl_chat.gif" alt="agentctl chat running a runner that reads the repository with workspace tools" width="720" />
+
 </div>
 
 agent.d runs AI agents as a local service. You define tools, agent behavior, and long-running services in Lua. You define permissions in TOML. The Rust runtime loads those definitions, connects them to model providers, and enforces access to the host.
