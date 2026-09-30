@@ -9,10 +9,12 @@ use super::app::{App, Tab};
 mod approval;
 mod browser;
 mod conversation;
+mod logo;
 mod markdown;
 mod selection;
 
 pub(super) use conversation::{suggestion_at, toggle_tool, tool_at};
+pub(super) use logo::SPIN as LEAF_SPIN;
 pub(super) use selection::{Selection, point_at, selected_text};
 #[cfg(test)]
 pub(super) use {conversation::conversation_inner, selection::Point};
@@ -120,8 +122,31 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
+/// Where the welcome leaf sits on `screen`, or `None` when it is not shown.
+pub(super) fn leaf_area(app: &App, screen: Rect) -> Option<Rect> {
+    if app.tab != Tab::Chat || app.pending || !app.entries.is_empty() {
+        return None;
+    }
+    welcome_layout(screen_rows(screen, app)[1]).and_then(|(leaf, _)| leaf)
+}
+
+/// The leaf rectangle, when there is room for it, and the row the title
+/// goes on. `None` when not even the title and hints fit.
+fn welcome_layout(area: Rect) -> Option<(Option<Rect>, u16)> {
+    if area.width < logo::MIN_WIDTH || area.height < logo::TEXT_ROWS {
+        return None;
+    }
+    let Some(rows) = logo::tier(area.width, area.height) else {
+        let top = area.y + (area.height - logo::TEXT_ROWS) / 2;
+        return Some((None, top + 1));
+    };
+    let top = area.y + (area.height - rows - logo::TEXT_ROWS) / 2;
+    let leaf = Rect::new(area.x + (area.width - 2 * rows) / 2, top, 2 * rows, rows);
+    Some((Some(leaf), top + rows + 1))
+}
+
 fn draw_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    if area.height < 17 || area.width < 42 {
+    let Some((leaf, title_row)) = welcome_layout(area) else {
         frame.render_widget(
             Paragraph::new("What would you like to do?").style(Style::default().fg(MUTED)),
             Rect::new(
@@ -132,13 +157,13 @@ fn draw_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ),
         );
         return;
-    }
-    let top = area.y + area.height.saturating_sub(17) / 2;
-    let logo_x = area.x + area.width.saturating_sub(24) / 2;
-    for (index, line) in include_str!("../logo.txt").lines().enumerate() {
+    };
+    if let Some(leaf) = leaf {
+        let elapsed = app.leaf_elapsed();
+        let (angle, glow) = (logo::angle(elapsed), logo::glow(elapsed));
         frame.render_widget(
-            Paragraph::new(line).style(Style::default().fg(PRIMARY)),
-            Rect::new(logo_x, top + index as u16, 24.min(area.width), 1),
+            Paragraph::new(logo::render(leaf.height, angle, glow, app.truecolor)),
+            leaf,
         );
     }
     let title = "agent.d";
@@ -146,7 +171,7 @@ fn draw_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Paragraph::new(title).style(Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD)),
         Rect::new(
             area.x + area.width.saturating_sub(title.len() as u16) / 2,
-            top + 10,
+            title_row,
             title.len() as u16,
             1,
         ),
@@ -165,7 +190,7 @@ fn draw_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Paragraph::new(*hint)
                 .style(Style::default().fg(MUTED))
                 .alignment(Alignment::Center),
-            Rect::new(area.x, top + 12 + index as u16, area.width, 1),
+            Rect::new(area.x, title_row + 2 + index as u16, area.width, 1),
         );
     }
 }
@@ -303,27 +328,140 @@ mod tests {
     use ratatui::Terminal;
     use serde_json::json;
 
-    #[test]
-    fn welcome_uses_logo_and_terminal_background() {
+    fn welcome(app: &App, width: u16, height: u16) -> Vec<Vec<ratatui::buffer::Cell>> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].clone()).collect())
+            .collect()
+    }
+
+    fn leaf_cells(grid: &[Vec<ratatui::buffer::Cell>]) -> usize {
+        grid.iter()
+            .flatten()
+            .filter(|cell| matches!(cell.symbol(), "▀" | "▄"))
+            .count()
+    }
+
+    fn connected(truecolor: bool) -> App {
         let mut app = App::new("http://127.0.0.1:7777", 1000, None);
         app.connected = true;
-        let backend = ratatui::backend::TestBackend::new(100, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let rendered = buffer
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("no runner"));
-        assert!(rendered.contains("⣿"));
-        assert!(
-            buffer
-                .content()
+        app.truecolor = truecolor;
+        app
+    }
+
+    #[test]
+    fn welcome_leaf_grows_with_the_terminal() {
+        let app = connected(true);
+        let small = leaf_cells(&welcome(&app, 80, 33));
+        let large = leaf_cells(&welcome(&app, 120, 44));
+        assert!(small > 0, "a 33 row terminal shows the leaf");
+        assert!(large > small, "{small} cells at 80x33, {large} at 120x44");
+        let leaf = leaf_area(&app, Rect::new(0, 0, 200, 80)).unwrap();
+        assert_eq!(leaf.height, 12, "even a huge terminal gets a modest leaf");
+    }
+
+    #[test]
+    fn welcome_leaf_hides_when_there_is_no_room() {
+        let app = connected(true);
+        let text = |width, height| -> String {
+            welcome(&app, width, height)
                 .iter()
-                .all(|cell| matches!(cell.style().bg, None | Some(Color::Reset)))
+                .flatten()
+                .map(|cell| cell.symbol())
+                .collect()
+        };
+        for (width, height) in [(41, 40), (100, 12), (93, 25)] {
+            assert_eq!(
+                leaf_cells(&welcome(&app, width, height)),
+                0,
+                "{width}x{height}"
+            );
+        }
+        let medium = text(93, 25);
+        assert!(medium.contains("agent.d") && medium.contains("Type a message to start"));
+        assert!(!medium.contains("What would you like to do?"));
+        assert!(text(41, 40).contains("What would you like to do?"));
+        assert!(text(100, 12).contains("What would you like to do?"));
+    }
+
+    #[test]
+    fn welcome_title_and_hints_sit_below_the_leaf() {
+        let app = connected(true);
+        let grid = welcome(&app, 100, 40);
+        let rows: Vec<String> = grid
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let last_leaf = rows
+            .iter()
+            .rposition(|row| row.contains('▀') || row.contains('▄'))
+            .unwrap();
+        let title = rows.iter().position(|row| row.contains("agent.d")).unwrap();
+        let hint = rows
+            .iter()
+            .position(|row| row.contains("Type a message to start"))
+            .unwrap();
+        assert!(
+            last_leaf < title && title < hint,
+            "{last_leaf} {title} {hint}"
         );
+    }
+
+    #[test]
+    fn welcome_leaf_is_gray_at_rest_and_coloured_mid_turn() {
+        let mut app = connected(true);
+        let screen = Rect::new(0, 0, 100, 40);
+        let leaf = leaf_area(&app, screen).unwrap();
+        let coloured = |app: &App| -> usize {
+            let grid = welcome(app, 100, 40);
+            (leaf.y..leaf.bottom())
+                .flat_map(|y| (leaf.x..leaf.right()).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let style = grid[y as usize][x as usize].style();
+                    [style.fg, style.bg]
+                        .into_iter()
+                        .any(|c| matches!(c, Some(Color::Rgb(r, g, b)) if r != g || g != b))
+                })
+                .count()
+        };
+        assert_eq!(coloured(&app), 0);
+        // 15% in: still facing the viewer and already mostly coloured.
+        app.leaf_spin = Some(std::time::Instant::now() - LEAF_SPIN * 3 / 20);
+        assert!(
+            coloured(&app) > 20,
+            "the turning leaf shows the logo colours"
+        );
+    }
+
+    #[test]
+    fn welcome_keeps_the_terminal_background_around_the_leaf() {
+        let app = connected(true);
+        for cell in welcome(&app, 100, 40).iter().flatten() {
+            if cell.symbol() != "▀" {
+                assert!(matches!(cell.style().bg, None | Some(Color::Reset)));
+            }
+        }
+    }
+
+    #[test]
+    fn welcome_falls_back_to_braille_without_true_colour() {
+        let app = connected(false);
+        let grid = welcome(&app, 100, 40);
+        assert_eq!(leaf_cells(&grid), 0);
+        assert!(grid.iter().flatten().any(|cell| {
+            let c = cell.symbol().chars().next().unwrap_or(' ');
+            ('\u{2801}'..='\u{28FF}').contains(&c)
+        }));
+        let leaf = leaf_area(&app, Rect::new(0, 0, 100, 40)).unwrap();
+        for y in leaf.y..leaf.bottom() {
+            for x in leaf.x..leaf.right() {
+                let style = grid[y as usize][x as usize].style();
+                assert!(!matches!(style.fg, Some(Color::Rgb(..))), "({x}, {y})");
+            }
+        }
     }
 
     #[test]
