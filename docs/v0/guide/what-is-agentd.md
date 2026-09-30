@@ -1,54 +1,29 @@
 # What is agent.d?
 
-agent.d is a portable runtime for tool-using AI agents. It gives you one place to define what an agent can do — its tools, model, memory, external access, and approval rules — and then makes all of that available to any connected client under a default-deny permission engine.
+agent.d is a runtime for AI agents that do real work on a machine. You describe what an agent can do, which model it talks to, and what it is allowed to touch. It runs the agent as a small background service and gives you a terminal chat, a command line, and a WebSocket API to reach it from anywhere else.
 
-## The problem it solves
+It does not care what the agent is for. The same runtime can host a code reviewer that reads your Git diff, a support bot on Discord, a job that watches a webhook and files tickets, or a personal assistant that remembers your preferences across weeks.
 
-Most agent prototypes start simple: a prompt, a model, and a few tool calls. They get harder to operate once you need to answer questions like:
+## Why run agents this way
 
-- Which commands is this agent allowed to run?
-- Can this chat bot reuse the same tools as the CLI?
-- How do I stop one integration from getting access intended for another?
-- Where should operational state live?
-- How do I swap model providers without rewriting every tool?
+Getting a model to call a tool takes an afternoon. Trusting it with your machine is the hard part. You need to know which programs it can run, which files it can read, which hosts it can reach, and what happened while you were not looking. You also want to reuse the agent from more than one place without copying its tools into each one.
 
-These questions don't have clean answers when tool definitions, permission logic, and provider wiring live inside each frontend separately. Every new surface means duplicating and re-auditing the same code.
+This runtime is built around those questions.
 
-agent.d turns those concerns into runtime configuration instead of application glue. You write Lua to register components once. The daemon loads them, enforces policy, and serves any number of connected clients.
+**Nothing runs unless you allow it.** Every capability starts switched off: running a program, reading a file, reaching a host, reading a secret, calling a model. You switch them on in one file, `grants.toml`, kept apart from the code that uses them, so a tool can say what it needs but can never give itself access. When an agent asks for something you have not granted, you can approve it once or for good from the chat, instead of editing config and restarting.
 
-## Who it's for
+**Allowed commands still run in a sandbox.** Granting an agent `git` does not hand it your home directory. Every program it starts is confined to the folders and hosts you granted, on Linux, macOS, and Windows, and that confinement follows any program the command starts in turn.
 
-**Agent builders** writing tools, runners, and services in Lua who want a clean separation between capability definitions and the clients that call them.
+**Write a capability once, use it everywhere.** Tools, agents, and background services are short Lua files. Once the runtime loads them, the same agent answers in the terminal chat, from `agentctl`, from your own app, and from a bot running as a service, with the same permissions each time.
 
-**Operators** who need to control what an agent can do at runtime — granting permissions, approving requests interactively, and observing activity through structured traces — without touching application code.
-
-## How it helps
-
-- **Define tools once.** Expose actions such as `git.status` or `deploy.preview`, then call them from any connected client.
-- **Control access centrally.** `grants.toml` is the only source of grants. A component manifest can declare what it needs, but it can never grant itself access.
-- **Fail closed by default.** A tool cannot touch the local system, network, secrets, or models unless it has an explicit grant.
-- **Ask for approval when needed.** A privileged operator connected to the `/control` plane can approve a missing grant once or persist it for future runs.
-- **Keep agent behavior portable.** Frontends reuse the same component definitions instead of carrying their own copies.
-- **Keep operations visible.** The runtime writes structured trace events so tool calls and runner activity can be inspected later.
-- **Use different providers.** Built-in providers cover the Anthropic API, OpenAI-compatible APIs, local CLI backends, and Codex app-server — selected per runner with a `"<provider>/<model_id>"` string.
+**Pick any model and change your mind later.** An agent names its model as one string, such as `anthropic/claude-opus-4-7`, `openai/gpt-4.1`, or `ollama/qwen3:14b` for a model running on your own machine. Hosted APIs, local servers, Claude Code, and Codex all plug in the same way, so switching providers never means rewriting your tools.
 
 ## What you get
 
-Two binaries:
-
-- **`agentd`** — the runtime server. Loads your Lua components, enforces grants, and listens on `127.0.0.1:7777` by default.
-- **`agentctl`** — the console client. Lets you call actions, inspect runners, follow traces, and manage packages from the terminal.
-
-You write components in Lua and configure permissions in TOML. The daemon does the rest.
+Installing it gives you two programs. `agentd` is the runtime itself: it loads your Lua files, enforces your grants, and keeps running in the background. `agentctl` is how you talk to it, whether that is opening a chat with an agent, calling a single action, approving a request, or following the activity log.
 
 ## Next steps
 
-- [Installation](/v0/guide/installation) — build from source and put the binaries on your PATH.
-- [Quick start](/v0/guide/quick-start) — start the daemon with the bundled example and make your first call in five minutes.
-
-## See also
-
-- [How it works](/v0/guide/how-it-works)
-- [Concepts](/v0/concepts/)
-- [Permissions](/v0/concepts/permissions)
-- [Providers](/v0/providers/)
+- [Installation](/v0/guide/installation) gets both programs onto your machine.
+- [Quick start](/v0/guide/quick-start) has a working agent answering you in a few minutes.
+- [How it works](/v0/guide/how-it-works) explains what happens between your request and the result.

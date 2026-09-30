@@ -1,70 +1,39 @@
 # How it works
 
-This page explains the agent.d request lifecycle, the daemon's network surface, and the daemon-loads-once-serves-many model that lets multiple clients share the same runtime without duplicating component definitions.
+This page follows one request from the moment you ask for it to the moment the result comes back. It is the mental model the rest of the docs build on, so it is worth reading once before you write your first tool.
 
-## Daemon endpoints
+## Three files and a background service
 
-The daemon opens three endpoints on startup:
+A setup comes down to three files in a config folder:
 
-```text
-init.lua + packages + skills
-        |
-        v
-   daemon process
-        |
-        +-- GET /health    open liveness probe — returns "ok"
-        +-- /ws            client data plane (WebSocket, bearer-token auth)
-        +-- /control       privileged approval plane (WebSocket, separate admin token)
-```
+- **`init.lua`** describes what exists: the tools and their actions, the agents (called runners) with their models and instructions, and any background services such as a bot or a poller.
+- **`grants.toml`** decides what each of those is allowed to do. It is the only place access is ever given.
+- **`config.toml`** holds runtime settings such as the address to listen on and which model providers are available. Most setups barely touch it.
 
-`/health` requires no authentication and is safe to hit from a load-balancer probe or readiness check. `/ws` is where clients call actions and run runners. `/control` is where an operator connects to approve or deny pending requests — it carries a separate admin bearer token.
+When you start `agentd`, it reads `init.lua` once, registers everything it describes, and starts listening, by default on `127.0.0.1:7777`. From then on every client shares that one loaded setup: the terminal chat, `agentctl`, your own application, and the services running inside the runtime. Nothing is loaded per request and nothing is copied per client.
 
-The startup banner prints the Local, WS, and Control URLs and the counts of loaded actions, runners, services, and skills so you can confirm what was registered.
+While you are building, start it with `--watch`. It then reloads as soon as you save `init.lua`, anything it imports, a skill file, or `grants.toml`. Requests already running finish on the old version, and stored memory and a connected approver carry over.
 
-## Daemon-loads-once-serves-many
+## The life of a request
 
-The daemon evaluates your Lua entry file (typically `init.lua`) once at startup. Every `agentd.tool`, `agentd.action`, `agentd.runner`, `agentd.skill`, and `agentd.service` call during that evaluation registers a component in the runtime. Once loaded, those components are available to every client that connects — no per-client boot cost, no duplicated state.
+Say you open the chat and ask the code reviewer to look at your staged changes. The runner decides it needs the diff and asks for the `git.diff` action. Here is what happens next.
 
-In development mode (`--watch`), the daemon watches `init.lua`, every file pulled in via `import()`, loaded skill `.md` sources, and `grants.toml`. When any of them changes, the runtime rebuilds in place. In-flight requests drain on the old runtime via an executor swap; durable memory and a connected approval operator survive the reload.
+**The runtime finds who owns the action.** Every action belongs to a tool, so `git.diff` belongs to the `git` tool. An action nobody registered fails straight away.
 
-## The request lifecycle
+**Every layer has to say yes.** The runtime checks the call against the tool's grants, what the action declares it needs, what this runner is allowed to call, what the connecting client is allowed to call, and any global policy. Access is the overlap of all of them, so a single missing yes means no. The [permission model](/v0/concepts/permissions) walks through each layer.
 
-A client sends a method call over the `/ws` WebSocket (for example, `actions.call` with `name = "git.status"`). The runtime processes it in five steps:
+**A missing grant can become a question instead of an error.** If an approver is connected, for example you in the chat, the runtime pauses and asks. You can allow it once, allow it from now on (which writes the grant into `grants.toml` for you), or deny it. Nobody answering within two minutes counts as a no. Rules you mark as hard denials are never offered for approval. See [Interactive approvals](/v0/security/approvals).
 
-1. **Route to the owning tool.** The runtime looks up which registered tool owns the requested action. If no tool owns it, the call fails with `not_found`.
+**The handler runs with only what it was granted.** Your Lua handler receives the call's arguments and a `ctx` handle, which is how it reaches the outside world: running programs, reading files, making HTTP requests, reading secrets, storing memory, calling a model, or calling another action. Each of those is checked again at the moment it is used, and any program it starts runs inside the [shell sandbox](/v0/security/sandbox), confined to the folders and hosts you granted.
 
-2. **Run the five-layer permission engine.** Before the handler runs, the runtime evaluates:
+**The result goes back and the call is recorded.** Whatever the handler returns is sent back to the caller, here the runner, which reads the diff and writes its review. Every call also lands in a trace log you can follow live with `agentctl trace -f`, which is the first place to look when an agent does something you did not expect. See [Observability](/v0/operations/observability).
 
-   ```
-   tool/package grants
-     ∩ action.requires
-     ∩ runner.allow (if the caller is a runner)
-     ∩ interface.allow (if the caller is an interface)
-     ∩ policy
-   = Decision
-   ```
+## Who is asking
 
-   This is a default-deny intersection. Every layer must permit the call. `grants.toml` is the only source of grants — a component's `requires` declaration states what it needs but never self-grants.
+Every call carries the identity of whoever made it: the client that connected, the user it is acting for, the runner that asked, or the background service that is running. Grants can be written for any of them, so a Discord bot and your own terminal can share the same tools with different permissions. See [Interfaces and callers](/v0/concepts/interfaces-and-callers).
 
-   If the decision is **deny** and the action has `confirm = true` (or a required grant is missing and approvals are enabled), the runtime sends an approval request to any connected operator on `/control`. On timeout (default 120 seconds) the request fails closed.
+## Where to go next
 
-   Policy `deny_actions` and `deny_permissions` are hard denials and are never escalated to approval.
-
-3. **Deliver a `ctx` handle to the action handler.** If the call is allowed, the runtime invokes the Lua handler with `(args, ctx)`. The `ctx` handle exposes the approved capabilities for that invocation: shell, filesystem, HTTP, WebSocket, secrets, durable memory, ephemeral state, model calls, and cross-component calls. Each capability call is re-checked against grants at the point of use — the handle does not pre-authorize everything upfront.
-
-4. **Return the result to the client.** The handler's return value is serialized and sent back in the envelope `{ "id": …, "ok": true, "result": … }`. If the handler raises an error, the client receives `{ "ok": false, "code": "…", "error": "…" }`.
-
-5. **Write a trace event.** Every call is appended to the trace log (`$XDG_STATE_HOME/agentd/trace.jsonl` by default) so you can inspect activity with `agentctl trace -f` or ship the JSONL to your observability stack.
-
-## Caller identity
-
-Every connection gets a session id (`ws-<n>`). The `session` and `user` fields in a call's params override the identity carried into `ctx.caller`, which lets a gateway service forward per-user context without opening separate connections.
-
-Services running in the background share the same permission engine but identify as `{ service = "<name>" }` in `ctx.caller` and are governed by their own `[service.<name>]` grant section in `grants.toml`.
-
-## See also
-
-- [Concepts: runtime](/v0/concepts/runtime)
-- [Concepts: permissions](/v0/concepts/permissions)
-- [Security: grants](/v0/security/grants)
-- [Reference: protocol](/v0/reference/protocol)
+- [Quick start](/v0/guide/quick-start) puts this into practice with the bundled example.
+- [Concepts](/v0/concepts/) describes each building block in more depth.
+- [Protocol reference](/v0/reference/protocol) documents the WebSocket API, for when you connect your own application.
