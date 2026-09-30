@@ -94,7 +94,7 @@ pub(crate) async fn run(
     );
     let mut screen = Screen::open()?;
     let mut events = EventStream::new();
-    let mut spinner = tokio::time::interval(Duration::from_millis(100));
+    let mut spinner = tokio::time::interval(Duration::from_millis(60));
     let mut dirty = true;
     loop {
         if dirty {
@@ -121,7 +121,7 @@ pub(crate) async fn run(
                     Handled::Ignored => {}
                 }
             }
-            _ = spinner.tick(), if app.pending => dirty = true,
+            _ = spinner.tick(), if app.pending || app.animating() => dirty = true,
         }
     }
     Ok(())
@@ -159,6 +159,11 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                     }
                 } else if let Some(point) = ui::point_at(app, area, mouse.column, mouse.row) {
                     app.selection = Some(ui::Selection::at(point));
+                } else if ui::leaf_area(app, area).is_some_and(|leaf| {
+                    (leaf.x..leaf.right()).contains(&mouse.column)
+                        && (leaf.y..leaf.bottom()).contains(&mouse.row)
+                }) {
+                    app.spin_leaf();
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if app.tab == Tab::Chat => {
@@ -550,6 +555,40 @@ mod tests {
         assert!(
             app.selection.is_none(),
             "a click outside the conversation clears it"
+        );
+    }
+
+    #[tokio::test]
+    async fn clicking_the_leaf_turns_it_once() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.connected = true;
+        let screen = Rect::new(0, 0, 100, 40);
+        let leaf = ui::leaf_area(&app, screen).expect("leaf shown");
+        let (x, y) = (leaf.x + leaf.width / 2, leaf.y + leaf.height / 2);
+        assert!(!app.animating());
+        handle_event(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, y),
+            screen,
+        )
+        .await
+        .unwrap();
+        assert!(!app.animating(), "a click beside the leaf does nothing");
+        handle_event(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+            screen,
+        )
+        .await
+        .unwrap();
+        assert!(app.animating());
+        app.leaf_spin = Some(std::time::Instant::now() - ui::LEAF_SPIN);
+        assert!(!app.animating(), "one turn, then it rests");
+
+        app.push(EntryKind::User, "hi");
+        assert!(
+            ui::leaf_area(&app, screen).is_none(),
+            "no leaf once a chat starts"
         );
     }
 

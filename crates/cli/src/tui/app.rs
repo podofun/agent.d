@@ -132,6 +132,10 @@ pub(super) struct App {
     pub(super) selection: Option<Selection>,
     /// Terminal size from the last event, for selection math.
     pub(super) screen: Rect,
+    /// Whether the terminal renders 24-bit colour.
+    pub(super) truecolor: bool,
+    /// When the welcome leaf was last clicked into a turn.
+    pub(super) leaf_spin: Option<std::time::Instant>,
     unread: bool,
     pub(super) selected: [usize; 7],
     /// Browser search text, shared by every section.
@@ -174,6 +178,9 @@ impl App {
             scroll: 0,
             selection: None,
             screen: Rect::new(0, 0, 80, 24),
+            truecolor: std::env::var("COLORTERM")
+                .is_ok_and(|value| matches!(value.as_str(), "truecolor" | "24bit")),
+            leaf_spin: None,
             unread: false,
             selected: [0; 7],
             query: String::new(),
@@ -221,6 +228,25 @@ impl App {
         if self.scroll > 0 {
             self.unread = true;
         }
+    }
+
+    /// True while something on screen moves and needs regular redraws.
+    pub(super) fn animating(&self) -> bool {
+        self.leaf_elapsed().is_some()
+    }
+
+    /// Start one turn of the welcome leaf, unless it is already turning.
+    pub(super) fn spin_leaf(&mut self) {
+        if !self.animating() {
+            self.leaf_spin = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Time into the current leaf turn, or `None` when it is at rest.
+    pub(super) fn leaf_elapsed(&self) -> Option<std::time::Duration> {
+        self.leaf_spin
+            .map(|started| started.elapsed())
+            .filter(|elapsed| *elapsed < ui::LEAF_SPIN)
     }
 
     pub(super) fn has_unread(&self) -> bool {
