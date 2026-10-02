@@ -82,6 +82,8 @@ pub enum MailerError {
     Transport(String),
     #[error("the mail server refused to send the message ({0})")]
     Send(String),
+    #[error("`{host}` resolves only to addresses that are not allowed ({reason})")]
+    AddressRefused { host: String, reason: String },
 }
 
 /// Pooled async SMTP transport + default From mailbox. Clone is cheap
@@ -92,6 +94,9 @@ pub struct Mailer {
     transport: AsyncSmtpTransport<Tokio1Executor>,
     from: Mailbox,
     host: String,
+    /// The address every connection goes to, when the mailer was created with
+    /// [`Mailer::connect_checked`].
+    peer_ip: Option<std::net::IpAddr>,
 }
 
 fn parse_mailbox(s: &str) -> Result<Mailbox, MailerError> {
@@ -101,6 +106,57 @@ fn parse_mailbox(s: &str) -> Result<Mailbox, MailerError> {
 
 impl Mailer {
     pub fn connect(cfg: MailerConfig) -> Result<Self, MailerError> {
+        Self::connect_to(cfg, None)
+    }
+
+    /// Like [`Mailer::connect`], but the host is resolved now and the mailer
+    /// only ever connects to an address that passes `check`, so a host that
+    /// resolves only to refused addresses is refused here and never
+    /// contacted. TLS still verifies the server against the configured host
+    /// name.
+    pub fn connect_checked(
+        cfg: MailerConfig,
+        check: crate::http::AddressCheck,
+    ) -> Result<Self, MailerError> {
+        use std::net::ToSocketAddrs;
+        let port = cfg.port.unwrap_or(match cfg.security {
+            Security::Tls => lettre::transport::smtp::SUBMISSIONS_PORT,
+            Security::StartTls => lettre::transport::smtp::SUBMISSION_PORT,
+            Security::Plaintext => lettre::transport::smtp::SMTP_PORT,
+        });
+        let found = (cfg.host.as_str(), port).to_socket_addrs().map_err(|e| {
+            MailerError::Transport(format!("`{}` could not be resolved ({e})", cfg.host))
+        })?;
+        let mut last_reason = None;
+        let ip = found
+            .map(|a| a.ip().to_canonical())
+            .find(|ip| match check(*ip) {
+                Ok(()) => true,
+                Err(reason) => {
+                    last_reason = Some(reason);
+                    false
+                }
+            });
+        match ip {
+            Some(ip) => Self::connect_to(cfg, Some(ip)),
+            None => Err(match last_reason {
+                Some(reason) => MailerError::AddressRefused {
+                    host: cfg.host,
+                    reason,
+                },
+                None => {
+                    MailerError::Transport(format!("`{}` did not resolve to any address", cfg.host))
+                }
+            }),
+        }
+    }
+
+    /// Build the transport. With `peer_ip`, connections go to that address and
+    /// the configured host name is only used to verify TLS.
+    fn connect_to(
+        cfg: MailerConfig,
+        peer_ip: Option<std::net::IpAddr>,
+    ) -> Result<Self, MailerError> {
         if cfg.host.is_empty() {
             return Err(MailerError::Config("`host` is empty".into()));
         }
@@ -109,13 +165,36 @@ impl Mailer {
         }
         let from = parse_mailbox(&cfg.from)?;
 
-        let mut builder = match cfg.security {
-            Security::Tls => AsyncSmtpTransport::<Tokio1Executor>::relay(&cfg.host)
+        let mut builder = match (cfg.security, peer_ip) {
+            (Security::Tls, None) => AsyncSmtpTransport::<Tokio1Executor>::relay(&cfg.host)
                 .map_err(|e| MailerError::Config(e.to_string()))?,
-            Security::StartTls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.host)
-                .map_err(|e| MailerError::Config(e.to_string()))?,
-            Security::Plaintext => {
+            (Security::StartTls, None) => {
+                AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.host)
+                    .map_err(|e| MailerError::Config(e.to_string()))?
+            }
+            (Security::Plaintext, None) => {
                 AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&cfg.host)
+            }
+            (security, Some(ip)) => {
+                use lettre::transport::smtp::client::{Tls, TlsParameters};
+                let params = || {
+                    TlsParameters::new(cfg.host.clone())
+                        .map_err(|e| MailerError::Config(e.to_string()))
+                };
+                let (tls, port) = match security {
+                    Security::Tls => (
+                        Tls::Wrapper(params()?),
+                        lettre::transport::smtp::SUBMISSIONS_PORT,
+                    ),
+                    Security::StartTls => (
+                        Tls::Required(params()?),
+                        lettre::transport::smtp::SUBMISSION_PORT,
+                    ),
+                    Security::Plaintext => (Tls::None, lettre::transport::smtp::SMTP_PORT),
+                };
+                AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(ip.to_string())
+                    .port(port)
+                    .tls(tls)
             }
         };
 
@@ -133,7 +212,14 @@ impl Mailer {
             transport,
             from,
             host: cfg.host,
+            peer_ip,
         })
+    }
+
+    /// The address this mailer connects to, if it was created with
+    /// [`Mailer::connect_checked`].
+    pub fn peer_ip(&self) -> Option<std::net::IpAddr> {
+        self.peer_ip
     }
 
     /// The SMTP host this mailer connects to. The scripting layer derives the
@@ -600,5 +686,57 @@ mod tests {
         r2.unwrap();
         let caps = rx.await.unwrap();
         assert_eq!(caps.len(), 2);
+    }
+
+    fn localhost_cfg(port: u16) -> MailerConfig {
+        MailerConfig {
+            host: "localhost".into(),
+            port: Some(port),
+            from: "a@b.c".into(),
+            security: Security::Plaintext,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_resolving_only_to_refused_addresses_is_refused_at_creation() {
+        let refuse_loopback: crate::http::AddressCheck = std::sync::Arc::new(|ip| {
+            if ip.is_loopback() {
+                Err(format!("`net:{ip}` is denied"))
+            } else {
+                Ok(())
+            }
+        });
+        match Mailer::connect_checked(localhost_cfg(25), refuse_loopback) {
+            Err(MailerError::AddressRefused { host, reason }) => {
+                assert_eq!(host, "localhost");
+                assert!(reason.contains("denied"), "{reason}");
+            }
+            Err(other) => panic!("expected AddressRefused, got {other}"),
+            Ok(_) => panic!("expected AddressRefused, got a mailer"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_checked_mailer_sends_to_the_address_it_resolved() {
+        let (port, rx) = mock_smtp().await;
+        let only_ipv4: crate::http::AddressCheck = std::sync::Arc::new(|ip| {
+            if ip.is_ipv4() {
+                Ok(())
+            } else {
+                Err("not ipv4".into())
+            }
+        });
+        let m = Mailer::connect_checked(localhost_cfg(port), only_ipv4).unwrap();
+        assert_eq!(m.peer_ip(), Some("127.0.0.1".parse().unwrap()));
+        m.send(Mail {
+            to: vec!["x@y.z".into()],
+            subject: "hi".into(),
+            text: Some("body".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert!(rx.await.unwrap().data.contains("Subject: hi"));
     }
 }
