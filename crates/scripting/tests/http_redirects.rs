@@ -136,3 +136,33 @@ async fn redirect_to_another_granted_host_is_followed() {
         .unwrap();
     assert_eq!(res.value["body"], "landed");
 }
+
+/// Denies `net:localhost`, the host `/away` redirects to.
+struct DenyLocalhost;
+impl agentd_types::Denials for DenyLocalhost {
+    fn denies_permission(&self, p: &agentd_permissions::Permission) -> bool {
+        agentd_permissions::Permission::new("net:localhost").covers(p)
+    }
+    fn denies_action(&self, _name: &str) -> bool {
+        false
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn redirect_to_a_denied_host_is_refused_even_under_a_wildcard_grant() {
+    let (addr, seen) = spawn_redirect_server().await;
+    let (_dir, host) = host_with_get(addr, "/away");
+    host.set_denials(Arc::new(DenyLocalhost));
+    let err = host
+        .call(ctx(&["net:*"]), go())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("net:localhost"), "{err}");
+    assert!(err.contains("denied"), "{err}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["/away"],
+        "the denied host was never requested"
+    );
+}

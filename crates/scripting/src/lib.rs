@@ -2681,17 +2681,28 @@ fn do_http(lua: &Lua, req: HttpRequest) -> mlua::Result<Value> {
 
 /// The check every redirect of a `ctx.http` request must pass: the target's
 /// `net:<host>` must be in this execution's grants, exactly like the first
-/// URL. The request runs outside Lua, so it checks a snapshot of the grants
-/// taken when the call is made. Redirects are never put to an approver.
+/// URL, and must not be denied by the operator. The request runs outside Lua,
+/// so it checks a snapshot of the grants taken when the call is made.
+/// Redirects are never put to an approver.
 fn redirect_check(lua: &Lua) -> mlua::Result<RedirectCheck> {
     let active = lua
         .app_data_ref::<ActiveContext>()
         .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state. This is a bug in agentd, please report it"))?;
     let grants = active.effective_grants.clone();
+    drop(active);
+    let denied = denials(lua);
     Ok(Arc::new(move |url: &str| {
         let host = host_of(url).map_err(|e| e.to_string())?;
         let needed = Permission::new(format!("net:{host}"));
-        if grants.contains(&needed) {
+        if denied
+            .as_ref()
+            .is_some_and(|d| d.denies_permission(&needed))
+        {
+            Err(format!(
+                "`{}` is denied by the operator in grants.toml",
+                needed.as_str()
+            ))
+        } else if grants.contains(&needed) {
             Ok(())
         } else {
             Err(format!("it needs the `{}` grant", needed.as_str()))
