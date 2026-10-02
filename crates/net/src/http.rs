@@ -68,6 +68,60 @@ pub enum HttpError {
     Decode(String),
     #[error("the server redirected the request to `{url}`, which is not allowed ({reason})")]
     RedirectRefused { url: String, reason: String },
+    #[error("`{host}` resolves only to addresses that are not allowed ({reason})")]
+    AddressRefused { host: String, reason: String },
+}
+
+/// Decides whether the request may connect to one resolved address. Returns
+/// why it is refused, if it is.
+pub type AddressCheck = Arc<dyn Fn(std::net::IpAddr) -> Result<(), String> + Send + Sync>;
+
+/// What a checked request must pass besides its first URL: every redirect
+/// target, and every address a host name resolves to.
+pub struct Checks {
+    pub redirect: RedirectCheck,
+    pub address: AddressCheck,
+}
+
+/// Resolves host names with the system resolver and drops every address the
+/// check refuses, so the client can never connect to one. When nothing is
+/// left, the refusal is recorded for [`send_checked`] to report.
+struct FilteringResolver {
+    check: AddressCheck,
+    refused: Arc<Mutex<Option<(String, String)>>>,
+}
+
+impl reqwest::dns::Resolve for FilteringResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let check = self.check.clone();
+        let refused = self.refused.clone();
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let found: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            let mut last_reason = None;
+            let allowed: Vec<std::net::SocketAddr> = found
+                .into_iter()
+                .filter(|a| match check(a.ip().to_canonical()) {
+                    Ok(()) => true,
+                    Err(reason) => {
+                        last_reason = Some(reason);
+                        false
+                    }
+                })
+                .collect();
+            if allowed.is_empty()
+                && let Some(reason) = last_reason
+            {
+                *refused.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((host.clone(), reason.clone()));
+                return Err(
+                    format!("`{host}` resolves only to refused addresses ({reason})").into(),
+                );
+            }
+            Ok(Box::new(allowed.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 /// Decides whether a redirect may be followed. Receives the target URL and
@@ -126,12 +180,13 @@ pub async fn send_streaming(
 
 /// Build and dispatch the request, returning the live `reqwest::Response`.
 async fn begin(req: Request) -> Result<reqwest::Response, HttpError> {
-    begin_with(req, reqwest::redirect::Policy::default()).await
+    begin_with(req, reqwest::redirect::Policy::default(), None).await
 }
 
 async fn begin_with(
     req: Request,
     redirects: reqwest::redirect::Policy,
+    resolver: Option<FilteringResolver>,
 ) -> Result<reqwest::Response, HttpError> {
     let method = req.method.to_uppercase();
     let method = match method.as_str() {
@@ -146,9 +201,14 @@ async fn begin_with(
     };
 
     let timeout = Duration::from_millis(req.timeout_ms.unwrap_or(30_000));
-    let client = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(timeout)
-        .redirect(redirects)
+        .redirect(redirects);
+    if let Some(resolver) = resolver {
+        // A proxy would resolve the host itself, out of reach of the check.
+        builder = builder.no_proxy().dns_resolver(Arc::new(resolver));
+    }
+    let client = builder
         .build()
         .map_err(|e| HttpError::Build(e.to_string()))?;
 
@@ -171,12 +231,25 @@ pub async fn send(req: Request) -> Result<Response, HttpError> {
     read_response(begin(req).await?).await
 }
 
-/// Like [`send`], but every redirect target must pass `check` before it is
-/// requested. A refused hop ends the request with [`HttpError::RedirectRefused`];
-/// the refused URL is never fetched.
-pub async fn send_checked(req: Request, check: RedirectCheck) -> Result<Response, HttpError> {
+/// Like [`send`], but every redirect target must pass `checks.redirect`
+/// before it is requested, and every address a host name resolves to must
+/// pass `checks.address` before it is connected to. A refused hop ends the
+/// request with [`HttpError::RedirectRefused`] and a host with only refused
+/// addresses with [`HttpError::AddressRefused`]; neither is ever contacted.
+/// Environment proxies are not used. An IP literal in a URL is not resolved,
+/// so the caller checks it with the URL itself.
+pub async fn send_checked(req: Request, checks: Checks) -> Result<Response, HttpError> {
+    let Checks {
+        redirect: check,
+        address,
+    } = checks;
     let refused: Arc<Mutex<Option<(String, String)>>> = Arc::default();
     let slot = refused.clone();
+    let refused_address: Arc<Mutex<Option<(String, String)>>> = Arc::default();
+    let resolver = FilteringResolver {
+        check: address,
+        refused: refused_address.clone(),
+    };
     let policy = reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() >= MAX_REDIRECTS {
             return attempt.error("too many redirects");
@@ -190,7 +263,19 @@ pub async fn send_checked(req: Request, check: RedirectCheck) -> Result<Response
             }
         }
     });
-    let resp = begin_with(req, policy).await?;
+    let resp = match begin_with(req, policy, Some(resolver)).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            if let Some((host, reason)) = refused_address
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                return Err(HttpError::AddressRefused { host, reason });
+            }
+            return Err(e);
+        }
+    };
     if let Some((url, reason)) = refused.lock().unwrap_or_else(|e| e.into_inner()).take() {
         return Err(HttpError::RedirectRefused { url, reason });
     }
@@ -456,5 +541,59 @@ mod integration_tests {
         .await
         .unwrap_err();
         assert!(matches!(err, super::HttpError::Transport(_)));
+    }
+
+    fn checks(address: super::AddressCheck) -> super::Checks {
+        super::Checks {
+            redirect: Arc::new(|_| Ok(())),
+            address,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_resolving_only_to_refused_addresses_is_never_contacted() {
+        let (addr, log) = spawn_echo().await;
+        let refuse_loopback: super::AddressCheck = Arc::new(|ip: std::net::IpAddr| {
+            if ip.is_loopback() {
+                Err(format!("`net:{ip}` is denied"))
+            } else {
+                Ok(())
+            }
+        });
+        let err = super::send_checked(
+            Request {
+                url: format!("http://localhost:{}/x", addr.port()),
+                ..Default::default()
+            },
+            checks(refuse_loopback),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            super::HttpError::AddressRefused { host, reason } => {
+                assert_eq!(host, "localhost");
+                assert!(reason.contains("denied"), "{reason}");
+            }
+            other => panic!("expected AddressRefused, got {other:?}"),
+        }
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "the server was never contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_addresses_still_connect() {
+        let (addr, _log) = spawn_echo().await;
+        let res = super::send_checked(
+            Request {
+                url: format!("http://localhost:{}/x", addr.port()),
+                ..Default::default()
+            },
+            checks(Arc::new(|_| Ok(()))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.body, "got /x");
     }
 }

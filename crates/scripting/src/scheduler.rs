@@ -22,7 +22,8 @@
 
 use agentd_ai::{CompletionRequest, CompletionResponse, Provider};
 use agentd_net::http::{
-    RedirectCheck, Request as HttpRequest, Response as HttpResponse, send_checked as http_send,
+    Checks as HttpChecks, Request as HttpRequest, Response as HttpResponse,
+    send_checked as http_send,
 };
 use agentd_net::mailer::{Mail, Mailer, SendOutcome};
 use agentd_net::ws::{Connection as WsConnection, Frame as WsFrame};
@@ -60,7 +61,7 @@ impl<'a> Drop for AppDataGuard<'a> {
 /// wrapped like the http/ai bindings.
 pub(crate) enum Op {
     /// An HTTP request and the check every redirect it meets must pass.
-    Http(HttpRequest, RedirectCheck),
+    Http(HttpRequest, HttpChecks),
     Shell(ExecRequest),
     Ai {
         provider_name: String,
@@ -323,7 +324,7 @@ enum StepOutcome {
 
 async fn perform(op: Op) -> Result<serde_json::Value, String> {
     match op {
-        Op::Http(req, check) => match http_send(req, check).await {
+        Op::Http(req, checks) => match http_send(req, checks).await {
             Ok(resp) => Ok(http_response_to_json(resp)),
             Err(e) => Err(e.to_string()),
         },
