@@ -21,7 +21,9 @@
 //! blocking the calling thread.
 
 use agentd_ai::{CompletionRequest, CompletionResponse, Provider};
-use agentd_net::http::{Request as HttpRequest, Response as HttpResponse, send as http_send};
+use agentd_net::http::{
+    RedirectCheck, Request as HttpRequest, Response as HttpResponse, send_checked as http_send,
+};
 use agentd_net::mailer::{Mail, Mailer, SendOutcome};
 use agentd_net::ws::{Connection as WsConnection, Frame as WsFrame};
 use agentd_permissions::Caller;
@@ -57,7 +59,8 @@ impl<'a> Drop for AppDataGuard<'a> {
 /// the ws handle moves from userdata to a table so its methods can be Lua-
 /// wrapped like the http/ai bindings.
 pub(crate) enum Op {
-    Http(HttpRequest),
+    /// An HTTP request and the check every redirect it meets must pass.
+    Http(HttpRequest, RedirectCheck),
     Shell(ExecRequest),
     Ai {
         provider_name: String,
@@ -320,7 +323,7 @@ enum StepOutcome {
 
 async fn perform(op: Op) -> Result<serde_json::Value, String> {
     match op {
-        Op::Http(req) => match http_send(req).await {
+        Op::Http(req, check) => match http_send(req, check).await {
             Ok(resp) => Ok(http_response_to_json(resp)),
             Err(e) => Err(e.to_string()),
         },
