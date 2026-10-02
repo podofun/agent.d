@@ -63,6 +63,9 @@ jobs:
       - name: Test shell crate (sandbox backend)
         run: cargo test -p agentd-shell
 
+      - name: Test file crate (verified opens)
+        run: cargo test -p agentd-fs
+
   # Build the runtime image and boot it against the example userland so the
   # Dockerfile can't silently rot. The container marks itself healthy only
   # after /health answers 200.
