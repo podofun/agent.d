@@ -36,17 +36,6 @@ impl Denials for DenyAllShell {
     }
 }
 
-/// Denies every shell command with a bare `shell.exec` denial.
-struct DenyAllShell;
-impl Denials for DenyAllShell {
-    fn denies_permission(&self, p: &Permission) -> bool {
-        Permission::new("shell.exec").covers(p)
-    }
-    fn denies_action(&self, _name: &str) -> bool {
-        false
-    }
-}
-
 /// An approver that would allow anything, to prove denials never reach it.
 struct AllowAll;
 #[async_trait]
@@ -128,17 +117,6 @@ async fn granted_calls_that_no_denial_covers_still_work() {
              return ctx.call("x.inner", {}) end }"#,
     );
     assert_eq!(call(&host, &[], "x.outer").await.unwrap()["ok"], true);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_bare_shell_denial_refuses_every_program() {
-    let (_d, host) = host_with(
-        r#"agentd.action{ name = "s.go", handler = function(_, ctx)
-             return ctx.shell("ls", {}) end }"#,
-    );
-    host.set_denials(Arc::new(DenyAllShell));
-    let err = call(&host, &["shell.exec:ls"], "s.go").await.unwrap_err();
-    assert!(err.contains("denied"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
