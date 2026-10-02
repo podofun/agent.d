@@ -4,7 +4,7 @@
 //! [`CompletionRequest::mcp_endpoint`] the executor sets:
 //!
 //! 1. **Text-only fallback** (no `mcp_endpoint`): runs
-//!    `claude -p [--model M] [--append-system-prompt S]` w/ the prompt on
+//!    `claude -p <confinement> [--model M] [--append-system-prompt S]` w/ the prompt on
 //!    stdin and reads plain text from stdout. No tool use. This is the
 //!    historical behavior and what tests that don't have a `claude` binary
 //!    available exercise.
@@ -20,12 +20,20 @@
 //!      --verbose \
 //!      --mcp-config <tmpfile> \
 //!      --allowedTools "mcp__agentd__*" \
+//!      <confinement> \
 //!      [--model M] [--append-system-prompt S]
 //!    ```
 //!
 //!    The CLI runs its own agent loop, calling agentd's MCP server for
 //!    each tool, and emits a stream of JSONL events. We scan the stream
 //!    for the final `result` event and return its `result` text.
+//!
+//! `<confinement>` is `--tools "" --strict-mcp-config --setting-sources ""`
+//! on both paths: none of the CLI's own tools (Bash, Edit, WebFetch, Read, ...),
+//! none of the user's MCP servers, and none of the user's, project's, or local
+//! settings files, so a runner can only act through agentd actions and a
+//! settings file written into the working directory changes nothing. Login is
+//! unaffected; it does not come from those files.
 //!
 //! `LoopMode::ProviderOwned` always — the executor never sees individual
 //! tool_calls from this provider because the CLI swallows them.
@@ -132,6 +140,7 @@ impl ClaudeCliProvider {
         let mut cmd = agentd_process::command(&self.bin);
         cmd.kill_on_drop(true);
         cmd.arg("-p");
+        confine(&mut cmd);
         if let Some(model) = &req.model {
             cmd.arg("--model").arg(model);
         }
@@ -241,6 +250,7 @@ impl ClaudeCliProvider {
             .arg(&cfg_path)
             .arg("--allowedTools")
             .arg("mcp__agentd__*");
+        confine(&mut cmd);
         if let Some(model) = &req.model {
             cmd.arg("--model").arg(model);
         }
@@ -466,6 +476,17 @@ fn stringify_result(v: serde_json::Value) -> String {
         }
     }
     v.to_string()
+}
+
+/// Run the CLI with only what agentd hands it: no built-in tools, no MCP
+/// servers besides the one in `--mcp-config`, no settings files. Operator
+/// `extra_args` come later on the command line and can still override this.
+fn confine(cmd: &mut agentd_process::Command) {
+    cmd.arg("--tools")
+        .arg("")
+        .arg("--strict-mcp-config")
+        .arg("--setting-sources")
+        .arg("");
 }
 
 fn pluck_assistant_text(message: &serde_json::Value) -> Option<String> {
