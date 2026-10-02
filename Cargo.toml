@@ -65,7 +65,7 @@ daemon             = { path = "crates/daemon" }
 
 # Third-party used by >1 crate. Single-crate deps live in the crate's own Cargo.toml.
 anyhow             = "1.0.102"
-async-trait        = "0.1.89"
+async-trait        = "0.1.92"
 clap               = { version = "4.6.1", features = ["derive", "env"] }
 dirs               = "6.0.0"
 futures-util       = { version = "0.3.32", default-features = false }
