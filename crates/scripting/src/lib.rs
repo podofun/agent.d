@@ -2719,7 +2719,7 @@ fn redirect_check(lua: &Lua) -> mlua::Result<RedirectCheck> {
 /// The check every address a `ctx.http` host name resolves to must pass: it
 /// must not be denied by the operator. A name that resolves only to denied
 /// addresses is never contacted. Grants are checked on the name, as before.
-fn address_check(lua: &Lua) -> AddressCheck {
+pub(crate) fn address_check(lua: &Lua) -> AddressCheck {
     let denied = denials(lua);
     Arc::new(move |ip: std::net::IpAddr| {
         let needed = Permission::new(format!("net:{ip}"));
@@ -3793,7 +3793,7 @@ fn hard_denial(what: &str) -> mlua::Error {
     ))
 }
 
-fn refuse_if_denied(lua: &Lua, req: &Permission) -> mlua::Result<()> {
+pub(crate) fn refuse_if_denied(lua: &Lua, req: &Permission) -> mlua::Result<()> {
     match denials(lua) {
         Some(d) if d.denies_permission(req) => Err(hard_denial(&format!("`{}`", req.as_str()))),
         _ => Ok(()),

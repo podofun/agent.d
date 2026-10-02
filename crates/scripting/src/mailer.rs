@@ -11,12 +11,22 @@ use std::sync::Arc;
 use agentd_net::mailer::{Attachment, Mail, Mailer, MailerConfig, Security};
 use agentd_permissions::Permission;
 
-use crate::{block_on, check_permission_inline, scheduler};
+use crate::{address_check, block_on, check_permission_inline, refuse_if_denied, scheduler};
 
 /// Raw userdata wrapping a connected mailer. No methods — `:send` lives on the
 /// Lua-side table built in [`build_mailer_table`].
 struct MailerHandle {
     mailer: Arc<Mailer>,
+}
+
+/// Refuse to send through a mailer whose host, or the address it connects
+/// to, the operator has denied since it was created.
+fn refuse_denied_mailer(lua: &mlua::Lua, mailer: &Mailer) -> mlua::Result<()> {
+    refuse_if_denied(lua, &Permission::new(format!("net:{}", mailer.host())))?;
+    if let Some(ip) = mailer.peer_ip() {
+        refuse_if_denied(lua, &Permission::new(format!("net:{ip}")))?;
+    }
+    Ok(())
 }
 
 impl mlua::UserData for MailerHandle {}
@@ -74,7 +84,8 @@ fn mailer_create_internal(lua: &mlua::Lua, opts: mlua::Table) -> mlua::Result<ml
         security,
         timeout_ms,
     };
-    let mailer = Mailer::connect(cfg).map_err(|e| mlua::Error::external(e.to_string()))?;
+    let mailer = Mailer::connect_checked(cfg, address_check(lua))
+        .map_err(|e| mlua::Error::external(e.to_string()))?;
     lua.create_userdata(MailerHandle {
         mailer: Arc::new(mailer),
     })
@@ -88,6 +99,7 @@ fn mailer_send_internal(
     (ud, mail_table): (mlua::AnyUserData, mlua::Table),
 ) -> mlua::Result<mlua::Value> {
     let mailer = ud.borrow::<MailerHandle>()?.mailer.clone();
+    refuse_denied_mailer(lua, &mailer)?;
 
     let to: Vec<String> = mail_table
         .get::<Option<Vec<String>>>("to")?

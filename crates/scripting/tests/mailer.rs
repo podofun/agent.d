@@ -313,3 +313,57 @@ async fn concurrent_sends() {
     assert!(subjects.contains("subj-a"), "captures: {subjects}");
     assert!(subjects.contains("subj-b"), "captures: {subjects}");
 }
+
+/// Denies `net:127.0.0.1`, but only from `from` on, so a mailer can be
+/// created first and then see the denial arrive.
+struct DenyLoopbackFrom {
+    from: std::time::Instant,
+}
+impl agentd_types::Denials for DenyLoopbackFrom {
+    fn denies_permission(&self, p: &agentd_permissions::Permission) -> bool {
+        std::time::Instant::now() >= self.from
+            && agentd_permissions::Permission::new("net:127.0.0.1").covers(p)
+    }
+    fn denies_action(&self, _name: &str) -> bool {
+        false
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn send_is_refused_once_the_mail_host_is_denied() {
+    let dir = write_tools(&[(
+        "t.lua",
+        r#"
+        agentd.action{
+          name = "mail.later",
+          handler = function(_, ctx)
+            local m = ctx.mailer.create{
+              host = "127.0.0.1", port = 25,
+              from = "a@b.c", security = "plaintext",
+            }
+            sleep(1500)
+            return m:send{ to = { "x@y.z" }, subject = "s", text = "t" }
+          end,
+        }
+        "#,
+    )]);
+    let host = LuaHost::new().unwrap();
+    host.start_async_runtime(tokio::runtime::Handle::current());
+    host.load_dir(dir.path()).unwrap();
+    host.set_denials(std::sync::Arc::new(DenyLoopbackFrom {
+        from: std::time::Instant::now() + std::time::Duration::from_millis(500),
+    }));
+    let err = host
+        .call(
+            ctx(&["net:127.0.0.1"]),
+            ActionCall {
+                action: "mail.later".into(),
+                args: serde_json::Value::Null,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("net:127.0.0.1"), "{err}");
+    assert!(err.contains("denied"), "{err}");
+}
