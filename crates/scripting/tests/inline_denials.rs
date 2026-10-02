@@ -166,6 +166,49 @@ async fn a_file_denial_written_through_a_symlink_still_applies() {
     assert!(err.contains("denied"), "{err}");
 }
 
+/// Answers every request and declares tools of its own, like the Codex
+/// providers.
+struct OwnTools;
+#[async_trait]
+impl agentd_ai::Provider for OwnTools {
+    fn name(&self) -> &str {
+        "own"
+    }
+    fn has_own_tools(&self) -> bool {
+        true
+    }
+    async fn complete(
+        &self,
+        _req: agentd_ai::CompletionRequest,
+    ) -> Result<agentd_ai::CompletionResponse, agentd_ai::ProviderError> {
+        Ok(agentd_ai::MockProvider::text_only("done"))
+    }
+}
+
+/// `ctx.ai` refuses a provider with its own tools while a host is denied,
+/// and still runs a provider whose tool loop agent.d drives.
+#[tokio::test(flavor = "multi_thread")]
+async fn ctx_ai_refuses_a_provider_with_its_own_tools_under_a_host_denial() {
+    let (_d, host) = host_with(
+        r#"agentd.action{ name = "a.own", handler = function(_, ctx)
+             return ctx.ai.ask("hi", { model = "own/m" }) end }
+           agentd.action{ name = "a.plain", handler = function(_, ctx)
+             return ctx.ai.ask("hi", { model = "plain/m" }).text end }"#,
+    );
+    host.set_ai_provider("own", Arc::new(OwnTools));
+    host.set_ai_provider(
+        "plain",
+        Arc::new(agentd_ai::MockProvider::new().with_reply("ok")),
+    );
+    let err = call(&host, &["ai:own"], "a.own").await.unwrap_err();
+    assert!(err.contains("own tools"), "{err}");
+    assert!(err.contains("net:denied.example"), "{err}");
+    assert_eq!(
+        call(&host, &["ai:plain"], "a.plain").await.unwrap(),
+        serde_json::json!("ok")
+    );
+}
+
 /// Denies one program, written as `name` in grants.toml.
 struct DenyProgram(&'static str);
 impl Denials for DenyProgram {

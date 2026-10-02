@@ -68,6 +68,11 @@ impl Provider for CodexCliProvider {
         LoopMode::ProviderOwned
     }
 
+    /// Codex reads files and runs commands in its own sandbox.
+    fn has_own_tools(&self) -> bool {
+        true
+    }
+
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
         if req.mcp_endpoint.is_some() {
             return Err(ProviderError::Config(

@@ -1432,6 +1432,34 @@ impl Executor {
         Ok(out)
     }
 
+    /// A provider with tools of its own reaches files and hosts outside the
+    /// checks that enforce the operator's denials, so it may not run while
+    /// any file or host is denied.
+    fn refuse_own_tools_under_denials(
+        &self,
+        provider_name: &str,
+        provider: &dyn agentd_ai::Provider,
+    ) -> Result<(), RunnerError> {
+        if !provider.has_own_tools() {
+            return Ok(());
+        }
+        let engine = self.engine.load();
+        let denied = engine
+            .grants()
+            .policy()
+            .deny_permissions
+            .iter()
+            .find(|p| matches!(p.parts().0, "fs.read" | "fs.write" | "net"))
+            .cloned();
+        match denied {
+            Some(p) => Err(RunnerError::Denied(format!(
+                "the `{provider_name}` provider runs its own tools, which reach files and hosts outside agent.d's checks, so it cannot run while grants.toml denies `{}`. Use a provider whose tool loop agent.d drives, such as `anthropic` or `openai`",
+                p.as_str()
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// Summarize the oldest turns of `history` per `policy`. Returns `None`
     /// when there is nothing safe to drop (too few turns, or no clean
     /// user-turn boundary outside the tool-call groups).
@@ -1460,6 +1488,7 @@ impl Executor {
         {
             return Err(RunnerError::Denied(reason));
         }
+        self.refuse_own_tools_under_denials(&provider_name, provider.as_ref())?;
         let mut req = agentd_ai::CompletionRequest::default();
         if !composition.system.is_empty() {
             req.system = Some(composition.system.clone());
@@ -1580,6 +1609,7 @@ impl Executor {
         {
             return Err(RunnerError::Denied(reason));
         }
+        self.refuse_own_tools_under_denials(&provider_name, provider.as_ref())?;
         let tools = self.build_tool_catalog(&composition.allowed_actions);
 
         let mut composed_system = composition.system.clone();
