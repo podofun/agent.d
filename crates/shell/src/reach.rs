@@ -605,7 +605,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn on_windows_a_loopback_denial_overlaps_any_network() {
-        let reach = net(&["net:api.example.com"]);
+        // An address grant, so the host-name rule does not decide it first.
+        let reach = net(&["net:198.51.100.1"]);
         assert!(matches!(
             reach.net_overlap(&host("net:127.0.0.1")),
             Some(Overlap::System(_))
