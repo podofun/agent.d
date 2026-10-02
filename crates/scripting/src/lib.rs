@@ -3870,7 +3870,9 @@ fn refuse_if_program_denied(lua: &Lua, program: &str, cwd: Option<&Path>) -> mlu
 /// The sandbox cannot carve a denied file out of a folder it opens, nor tell
 /// a denied host apart from the hosts it lets a child reach. So a host grant
 /// a denial fully covers is dropped, and a shell call is then refused when
-/// anything its child could still reach overlaps a file or host denial.
+/// anything its child could still reach overlaps a file or host denial. The
+/// denied files also go to the sandbox, which on Windows checks them again
+/// against the real access lists it stamps.
 fn refuse_if_reach_denied(lua: &Lua, policy: &mut SandboxPolicy) -> mlua::Result<()> {
     let Some(denials) = denials(lua) else {
         return Ok(());
@@ -3899,6 +3901,11 @@ fn refuse_if_reach_denied(lua: &Lua, policy: &mut SandboxPolicy) -> mlua::Result
                 "this shell command could {verb} what `{}` denies in grants.toml, because {how}. {fix}",
                 denied.as_str()
             )));
+        }
+        match denied.parts().0 {
+            "fs.read" => policy.denied_reads.push(target()),
+            "fs.write" => policy.denied_writes.push(target()),
+            _ => {}
         }
     }
     Ok(())

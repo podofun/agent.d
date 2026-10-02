@@ -88,6 +88,9 @@ pub enum ShellError {
     NetSandboxUnavailable,
     #[error("the shell sandbox could not be set up ({0})")]
     Sandbox(String),
+    /// The child could reach a path the operator denies, so it was not started.
+    #[error("{0}")]
+    DeniedReach(String),
 }
 
 /// Run a command. The caller is responsible for permission checks BEFORE

@@ -32,6 +32,7 @@ fn marker_req(marker: &std::path::Path) -> ExecRequest {
             allow_net: true,
             net_hosts: vec![Permission::new("net:203.0.113.77")],
             unrestricted: false,
+            ..Default::default()
         }),
     }
 }

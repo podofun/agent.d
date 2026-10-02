@@ -215,7 +215,7 @@ fn fixed_reads() -> Vec<PathBuf> {
 
 /// `path` with every symlink in its existing part resolved, the way the
 /// kernel sees it. A missing tail is kept as written.
-fn real(path: &Path) -> PathBuf {
+pub(crate) fn real(path: &Path) -> PathBuf {
     let mut existing = path;
     let mut tail = Vec::new();
     loop {
@@ -249,7 +249,7 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
 
 /// Whether either path contains the other, without regard to letter case
 /// where the platform's file names ignore it.
-fn nested(a: &Path, b: &Path) -> bool {
+pub(crate) fn nested(a: &Path, b: &Path) -> bool {
     let (a, b) = (fold(a), fold(b));
     a.starts_with(&b) || b.starts_with(&a)
 }

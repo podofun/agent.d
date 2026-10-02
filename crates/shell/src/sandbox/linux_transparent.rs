@@ -437,6 +437,7 @@ mod supervisor {
             allow_net: true,
             net_hosts: vec![],
             unrestricted: false,
+            ..Default::default()
         };
         if let Err(e) = crate::sandbox::apply(&policy) {
             report(

@@ -108,6 +108,13 @@ pub struct SandboxPolicy {
     pub net_hosts: Vec<Permission>,
     /// `shell.unrestricted` escape hatch. When true the sandbox is not applied.
     pub unrestricted: bool,
+    /// Paths the child must never read, from the operator's denials. The
+    /// caller refuses a policy whose reach overlaps them before launch. A
+    /// backend that opens files by stamping access lists (Windows) checks
+    /// them again against the real lists, before and after stamping.
+    pub denied_reads: Vec<PathBuf>,
+    /// Paths the child must never write, checked the same way.
+    pub denied_writes: Vec<PathBuf>,
 }
 
 /// Outcome of trying to apply a sandbox policy to a process.
