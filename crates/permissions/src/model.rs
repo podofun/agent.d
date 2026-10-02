@@ -4,13 +4,25 @@ use serde::{Deserialize, Serialize};
 
 /// Flat slug like `net:googleapis.com`. Holder-side slugs may use `*` / `**`
 /// wildcards in the specifier.
+///
+/// A `net:` host is stored in one canonical form (lowercase, international
+/// names in their ASCII form, no trailing dot), so a grant, a denial, and a
+/// request for the same host always compare equal however each was written.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Permission(pub String);
+pub struct Permission(#[serde(deserialize_with = "deserialize_slug")] pub String);
+
+fn deserialize_slug<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    String::deserialize(d).map(|s| Permission::new(s).0)
+}
 
 impl Permission {
     pub fn new(s: impl Into<String>) -> Self {
-        Self(s.into())
+        let s = s.into();
+        match s.split_once(':') {
+            Some(("net", host)) => Self(format!("net:{}", canonical_host(host))),
+            _ => Self(s),
+        }
     }
 
     pub fn as_str(&self) -> &str {
@@ -38,6 +50,19 @@ impl Permission {
             (Some(h), Some(r)) => match_spec(h, r),
         }
     }
+}
+
+/// Lowercase, IDNA to ASCII, trailing dot removed. A specifier that is not a
+/// plain host name (a wildcard pattern, an address) is only lowercased.
+fn canonical_host(host: &str) -> String {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if !host.is_ascii()
+        && !host.contains('*')
+        && let Ok(url::Host::Domain(ascii)) = url::Host::parse(host)
+    {
+        return ascii;
+    }
+    host.to_ascii_lowercase()
 }
 
 fn match_spec(holder: &str, required: &str) -> bool {
@@ -250,6 +275,49 @@ impl Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn net_hosts_are_stored_in_one_canonical_form() {
+        let same = |a: &str, b: &str| assert_eq!(Permission::new(a).as_str(), b, "{a}");
+        same("net:Tracker.Example.COM", "net:tracker.example.com");
+        same("net:tracker.example.com.", "net:tracker.example.com");
+        same("net:bücher.example", "net:xn--bcher-kva.example");
+        same("net:API.Example.*", "net:api.example.*");
+        same("net:127.0.0.1", "net:127.0.0.1");
+        same("net:*", "net:*");
+        same("net", "net");
+    }
+
+    #[test]
+    fn only_net_specifiers_are_normalized() {
+        for slug in [
+            "fs.read:/Proj/X.txt",
+            "shell.exec:Git",
+            "secret:API_KEY",
+            "ai:Anthropic",
+        ] {
+            assert_eq!(Permission::new(slug).as_str(), slug);
+        }
+    }
+
+    #[test]
+    fn a_differently_written_host_is_still_covered() {
+        let grant = Permission::new("net:Tracker.Example.com.");
+        assert!(grant.covers(&Permission::new("net:tracker.example.com")));
+        assert!(
+            Permission::new("net:tracker.example.com")
+                .covers(&Permission::new("net:TRACKER.example.com."))
+        );
+    }
+
+    #[test]
+    fn deserialized_permissions_are_normalized_too() {
+        let set: PermissionSet = serde_json::from_str(r#"["net:Tracker.Example.com."]"#).unwrap();
+        assert_eq!(
+            set.iter().next().unwrap().as_str(),
+            "net:tracker.example.com"
+        );
+    }
 
     #[test]
     fn permission_covers_exact() {

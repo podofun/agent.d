@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use agentd_ai::{CompletionRequest, Message, Provider, Role};
 use agentd_fs as fs;
 use agentd_memory::MemoryStore;
-use agentd_net::http::{Request as HttpRequest, host_of, send as http_send};
+use agentd_net::http::{RedirectCheck, Request as HttpRequest, host_of, send_checked as http_send};
 use agentd_net::ws::{Connection as WsConnection, Frame as WsFrame, host_of as ws_host_of};
 use agentd_permissions::{Permission, PermissionSet};
 use agentd_runners::{CompactPolicy, RunnerDef, RunnerRegistry};
@@ -2658,14 +2658,16 @@ fn parse_http_opts(lua: &Lua, opts: Option<Value>) -> mlua::Result<HttpRequest> 
 fn do_http(lua: &Lua, req: HttpRequest) -> mlua::Result<Value> {
     let host = host_of(&req.url).map_err(|e| mlua::Error::external(e.to_string()))?;
     check_permission_inline(lua, &Permission::new(format!("net:{host}")))?;
+    let check = redirect_check(lua)?;
     if scheduler::is_in_coroutine(lua) {
         // Yield to the scheduler so other coroutines / async tasks can make
         // progress while reqwest does its thing.
-        return scheduler::build_marker(lua, scheduler::Op::Http(req));
+        return scheduler::build_marker(lua, scheduler::Op::Http(req, check));
     }
     // Top-level call (e.g. from init.lua) — no coroutine to yield from, so
     // block the current thread.
-    let resp = block_on(http_send(req))?.map_err(|e| mlua::Error::external(e.to_string()))?;
+    let resp =
+        block_on(http_send(req, check))?.map_err(|e| mlua::Error::external(e.to_string()))?;
     let t = lua.create_table()?;
     t.set("status", resp.status)?;
     t.set("body", resp.body)?;
@@ -2675,6 +2677,26 @@ fn do_http(lua: &Lua, req: HttpRequest) -> mlua::Result<Value> {
     }
     t.set("headers", h)?;
     Ok(Value::Table(t))
+}
+
+/// The check every redirect of a `ctx.http` request must pass: the target's
+/// `net:<host>` must be in this execution's grants, exactly like the first
+/// URL. The request runs outside Lua, so it checks a snapshot of the grants
+/// taken when the call is made. Redirects are never put to an approver.
+fn redirect_check(lua: &Lua) -> mlua::Result<RedirectCheck> {
+    let active = lua
+        .app_data_ref::<ActiveContext>()
+        .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state. This is a bug in agentd, please report it"))?;
+    let grants = active.effective_grants.clone();
+    Ok(Arc::new(move |url: &str| {
+        let host = host_of(url).map_err(|e| e.to_string())?;
+        let needed = Permission::new(format!("net:{host}"));
+        if grants.contains(&needed) {
+            Ok(())
+        } else {
+            Err(format!("it needs the `{}` grant", needed.as_str()))
+        }
+    }))
 }
 
 // ---------- ctx.secret ----------
