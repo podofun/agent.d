@@ -312,12 +312,7 @@ fn commit(path: &Path, image: &mut Image) -> Result<Vec<PathBuf>, FsError> {
     }
     let result = (|| -> Result<(), FsError> {
         fs::create_dir_all(parent)?;
-        let mut builder = tempfile::Builder::new();
-        #[cfg(unix)]
-        if image.permissions.is_none() {
-            use std::os::unix::fs::PermissionsExt;
-            builder.permissions(Permissions::from_mode(0o666));
-        }
+        let builder = new_file_builder(image.permissions.is_none());
         let mut file = builder.tempfile_in(parent)?;
         file.write_all(bytes)?;
         if let Some(permissions) = &image.permissions {
@@ -334,6 +329,25 @@ fn commit(path: &Path, image: &mut Image) -> Result<Vec<PathBuf>, FsError> {
     }
     result?;
     Ok(created_dirs)
+}
+
+/// The temporary-file builder for a write. A brand-new file on Unix starts
+/// from mode 0o666 (narrowed by the umask), like a plain `File::create`.
+fn new_file_builder(new_file: bool) -> tempfile::Builder<'static, 'static> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut builder = tempfile::Builder::new();
+        if new_file {
+            builder.permissions(Permissions::from_mode(0o666));
+        }
+        builder
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = new_file;
+        tempfile::Builder::new()
+    }
 }
 
 impl History {
