@@ -320,9 +320,12 @@ struct DenyLoopbackFrom {
     from: std::time::Instant,
 }
 impl agentd_types::Denials for DenyLoopbackFrom {
-    fn denies_permission(&self, p: &agentd_permissions::Permission) -> bool {
-        std::time::Instant::now() >= self.from
-            && agentd_permissions::Permission::new("net:127.0.0.1").covers(p)
+    fn denied_permissions(&self) -> PermissionSet {
+        if std::time::Instant::now() >= self.from {
+            PermissionSet::from_iter(["net:127.0.0.1"])
+        } else {
+            PermissionSet::empty()
+        }
     }
     fn denies_action(&self, _name: &str) -> bool {
         false

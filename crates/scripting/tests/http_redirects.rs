@@ -140,8 +140,8 @@ async fn redirect_to_another_granted_host_is_followed() {
 /// Denies `net:localhost`, the host `/away` redirects to.
 struct DenyLocalhost;
 impl agentd_types::Denials for DenyLocalhost {
-    fn denies_permission(&self, p: &agentd_permissions::Permission) -> bool {
-        agentd_permissions::Permission::new("net:localhost").covers(p)
+    fn denied_permissions(&self) -> PermissionSet {
+        PermissionSet::from_iter(["net:localhost"])
     }
     fn denies_action(&self, _name: &str) -> bool {
         false

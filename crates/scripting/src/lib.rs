@@ -2702,7 +2702,7 @@ fn redirect_check(lua: &Lua) -> mlua::Result<RedirectCheck> {
         let needed = Permission::new(format!("net:{host}"));
         if denied
             .as_ref()
-            .is_some_and(|d| d.denies_permission(&needed))
+            .is_some_and(|d| is_denied(d.as_ref(), &needed))
         {
             Err(format!(
                 "`{}` is denied by the operator in grants.toml",
@@ -2725,7 +2725,7 @@ pub(crate) fn address_check(lua: &Lua) -> AddressCheck {
         let needed = Permission::new(format!("net:{ip}"));
         if denied
             .as_ref()
-            .is_some_and(|d| d.denies_permission(&needed))
+            .is_some_and(|d| is_denied(d.as_ref(), &needed))
         {
             Err(format!(
                 "`{}` is denied by the operator in grants.toml",
@@ -3785,6 +3785,13 @@ fn denials(lua: &Lua) -> Option<Arc<dyn agentd_types::Denials>> {
     lua.app_data_ref::<DenialsHandle>().map(|h| h.0.clone())
 }
 
+/// Whether the operator denied `req`. Path denials get the same canonical
+/// twins grants get, so a denial written through a symlink still covers the
+/// resolved path a `ctx.fs` call checks.
+fn is_denied(denials: &dyn agentd_types::Denials, req: &Permission) -> bool {
+    normalize_path_grants(&denials.denied_permissions()).contains(req)
+}
+
 /// A refusal for something the operator denied outright. It is never put to
 /// an approver, so it is not marked for escalation.
 fn hard_denial(what: &str) -> mlua::Error {
@@ -3795,7 +3802,7 @@ fn hard_denial(what: &str) -> mlua::Error {
 
 pub(crate) fn refuse_if_denied(lua: &Lua, req: &Permission) -> mlua::Result<()> {
     match denials(lua) {
-        Some(d) if d.denies_permission(req) => Err(hard_denial(&format!("`{}`", req.as_str()))),
+        Some(d) if is_denied(d.as_ref(), req) => Err(hard_denial(&format!("`{}`", req.as_str()))),
         _ => Ok(()),
     }
 }

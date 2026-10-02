@@ -135,6 +135,7 @@ async fn denials_come_from_the_current_grants() {
     let denials: &dyn Denials = exec.as_ref();
     assert!(denials.denies_action("pkg.publish"));
     assert!(!denials.denies_action("pkg.build"));
-    assert!(denials.denies_permission(&Permission::new("net:tracker.example.com")));
-    assert!(!denials.denies_permission(&Permission::new("net:api.example.com")));
+    let denied = denials.denied_permissions();
+    assert!(denied.contains(&Permission::new("net:tracker.example.com")));
+    assert!(!denied.contains(&Permission::new("net:api.example.com")));
 }
