@@ -89,8 +89,12 @@ impl Image {
                 return Err(FsError::Unsupported(path.into()));
             }
         }
+        // Read through a handle confirmed to be this file, so a swap between
+        // the metadata check above and the read cannot redirect it.
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut crate::open_verified(path)?, &mut bytes)?;
         Ok(Self {
-            bytes: Some(fs::read(path)?),
+            bytes: Some(bytes),
             permissions: Some(metadata.permissions()),
         })
     }
