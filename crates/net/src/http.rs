@@ -5,6 +5,7 @@
 // shape so Lua doesn't have to think about builders.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -65,7 +66,16 @@ pub enum HttpError {
     Transport(String),
     #[error("could not decode the response body ({0})")]
     Decode(String),
+    #[error("the server redirected the request to `{url}`, which is not allowed ({reason})")]
+    RedirectRefused { url: String, reason: String },
 }
+
+/// Decides whether a redirect may be followed. Receives the target URL and
+/// returns why it is refused, if it is.
+pub type RedirectCheck = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+/// Most redirects followed for one request, matching the client's default.
+const MAX_REDIRECTS: usize = 10;
 
 /// Parse the host out of a URL. Used to derive the `net:<host>` permission slug.
 pub fn host_of(url: &str) -> Result<String, HttpError> {
@@ -116,6 +126,13 @@ pub async fn send_streaming(
 
 /// Build and dispatch the request, returning the live `reqwest::Response`.
 async fn begin(req: Request) -> Result<reqwest::Response, HttpError> {
+    begin_with(req, reqwest::redirect::Policy::default()).await
+}
+
+async fn begin_with(
+    req: Request,
+    redirects: reqwest::redirect::Policy,
+) -> Result<reqwest::Response, HttpError> {
     let method = req.method.to_uppercase();
     let method = match method.as_str() {
         "GET" => reqwest::Method::GET,
@@ -131,6 +148,7 @@ async fn begin(req: Request) -> Result<reqwest::Response, HttpError> {
     let timeout = Duration::from_millis(req.timeout_ms.unwrap_or(30_000));
     let client = reqwest::Client::builder()
         .timeout(timeout)
+        .redirect(redirects)
         .build()
         .map_err(|e| HttpError::Build(e.to_string()))?;
 
@@ -150,7 +168,36 @@ async fn begin(req: Request) -> Result<reqwest::Response, HttpError> {
 }
 
 pub async fn send(req: Request) -> Result<Response, HttpError> {
-    let resp = begin(req).await?;
+    read_response(begin(req).await?).await
+}
+
+/// Like [`send`], but every redirect target must pass `check` before it is
+/// requested. A refused hop ends the request with [`HttpError::RedirectRefused`];
+/// the refused URL is never fetched.
+pub async fn send_checked(req: Request, check: RedirectCheck) -> Result<Response, HttpError> {
+    let refused: Arc<Mutex<Option<(String, String)>>> = Arc::default();
+    let slot = refused.clone();
+    let policy = reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        let url = attempt.url().to_string();
+        match check(&url) {
+            Ok(()) => attempt.follow(),
+            Err(reason) => {
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((url, reason));
+                attempt.stop()
+            }
+        }
+    });
+    let resp = begin_with(req, policy).await?;
+    if let Some((url, reason)) = refused.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        return Err(HttpError::RedirectRefused { url, reason });
+    }
+    read_response(resp).await
+}
+
+async fn read_response(resp: reqwest::Response) -> Result<Response, HttpError> {
     let status = resp.status().as_u16();
     let mut headers = BTreeMap::new();
     for (k, v) in resp.headers() {
