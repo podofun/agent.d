@@ -2114,13 +2114,13 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
     refuse_if_program_denied(lua, &req.bin, cwd.as_deref())?;
     // Confine the child to the execution's effective filesystem/network grants,
     // after refusing a reach that overlaps a denial and before asking anything.
-    let policy = {
+    let mut policy = {
         let active = lua
             .app_data_ref::<ActiveContext>()
             .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
         build_sandbox_policy(&active.effective_grants)
     };
-    refuse_if_reach_denied(lua, &policy)?;
+    refuse_if_reach_denied(lua, &mut policy)?;
     let allowed = {
         let active = lua
             .app_data_ref::<ActiveContext>()
@@ -3867,39 +3867,46 @@ fn refuse_if_program_denied(lua: &Lua, program: &str, cwd: Option<&Path>) -> mlu
     }
 }
 
-/// The sandbox cannot carve a denied file out of a folder it opens, so a
-/// shell call is refused when anything its child could reach overlaps a file
-/// denial, or when it runs unrestricted while any file or host is denied.
-fn refuse_if_reach_denied(lua: &Lua, policy: &SandboxPolicy) -> mlua::Result<()> {
+/// The sandbox cannot carve a denied file out of a folder it opens, nor tell
+/// a denied host apart from the hosts it lets a child reach. So a host grant
+/// a denial fully covers is dropped, and a shell call is then refused when
+/// anything its child could still reach overlaps a file or host denial.
+fn refuse_if_reach_denied(lua: &Lua, policy: &mut SandboxPolicy) -> mlua::Result<()> {
     let Some(denials) = denials(lua) else {
         return Ok(());
     };
+    let denied = normalize_path_grants(&denials.denied_permissions());
+    policy.net_hosts.retain(|grant| {
+        !denied
+            .iter()
+            .any(|d| d.parts().0 == "net" && (d.parts().1.is_none() || d.covers(grant)))
+    });
+    policy.allow_net = !policy.net_hosts.is_empty();
     let reach = agentd_shell::Reach::of(policy);
-    for denied in normalize_path_grants(&denials.denied_permissions()).iter() {
-        let (verb, write) = match denied.parts().0 {
-            "fs.read" => ("read", false),
-            "fs.write" => ("write", true),
-            "net" if policy.unrestricted => ("connect to", false),
-            _ => continue,
-        };
-        let target = match denied.parts().1 {
+    for denied in denied.iter() {
+        let target = || match denied.parts().1 {
             Some(spec) => concrete_ancestor(spec),
             None => PathBuf::from(std::path::MAIN_SEPARATOR_STR),
         };
-        let how = if denied.parts().0 == "net" {
-            Some(agentd_shell::Overlap::Unrestricted)
-        } else {
-            reach.overlap(&target, write)
+        let (verb, how, fix) = match denied.parts().0 {
+            "fs.read" => ("read", reach.overlap(&target(), false), FOLDER_FIX),
+            "fs.write" => ("write", reach.overlap(&target(), true), FOLDER_FIX),
+            "net" => ("connect to", reach.net_overlap(denied), HOST_FIX),
+            _ => continue,
         };
         if let Some(how) = how {
             return Err(mlua::Error::external(format!(
-                "this shell command could {verb} what `{}` denies in grants.toml, because {how}. A sandbox cannot carve a denied path out of a folder it opens, so the command is refused before anything is asked. Keep denied files outside the folders shell commands are granted, or grant narrower folders",
+                "this shell command could {verb} what `{}` denies in grants.toml, because {how}. {fix}",
                 denied.as_str()
             )));
         }
     }
     Ok(())
 }
+
+const FOLDER_FIX: &str = "A sandbox cannot carve a denied path out of a folder it opens, so the command is refused before anything is asked. Keep denied files outside the folders shell commands are granted, or grant narrower folders";
+
+const HOST_FIX: &str = "A sandbox cannot tell a denied host apart from the hosts it lets a command reach, so the command is refused before anything is asked. Grant shell commands only the exact hosts they need";
 
 pub(crate) fn refuse_if_denied(lua: &Lua, req: &Permission) -> mlua::Result<()> {
     match denials(lua) {

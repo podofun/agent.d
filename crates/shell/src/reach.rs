@@ -1,5 +1,5 @@
-//! What a sandboxed child can reach, so a caller can tell whether a path it
-//! must keep away from the child is within that reach.
+//! What a sandboxed child can reach, so a caller can tell whether a path or
+//! host it must keep away from the child is within that reach.
 //!
 //! The sandbox can only allow: it cannot carve one file out of a folder it
 //! opens, against a child that can rename folders or create links. So reach
@@ -8,7 +8,10 @@
 //! through a hard link to the same file.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+
+use agentd_permissions::Permission;
 
 use crate::policy::{SandboxPolicy, WRITE_SCRATCH};
 
@@ -24,6 +27,15 @@ pub enum Overlap {
     /// The path is a file with more than one hard link, and the sandbox opens
     /// this folder on the same device, where another link may live.
     HardLink(PathBuf),
+    /// The sandbox lets the child connect to this host, and it and the
+    /// denied host cover one another.
+    Host(Permission),
+    /// The sandbox lets the child connect to this host name, which may lead
+    /// to a denied address.
+    HostName(Permission),
+    /// On Windows a child with network also reaches loopback services and
+    /// the machine's DNS servers, this address among them.
+    System(IpAddr),
 }
 
 impl fmt::Display for Overlap {
@@ -48,6 +60,22 @@ impl fmt::Display for Overlap {
                 "it is a file with more than one hard link, and its sandbox opens `{}` on the same device",
                 folder.display()
             ),
+            Overlap::Host(grant) => match grant.parts().1 {
+                Some(host) => write!(
+                    f,
+                    "its sandbox lets it connect to `{host}`, which overlaps it"
+                ),
+                None => write!(f, "its sandbox lets it connect to any host"),
+            },
+            Overlap::HostName(grant) => write!(
+                f,
+                "its sandbox lets it connect to `{}`, a name that may lead to a denied address",
+                grant.parts().1.unwrap_or_default()
+            ),
+            Overlap::System(ip) => write!(
+                f,
+                "on Windows its sandbox also lets it reach `{ip}` for name lookups and local services"
+            ),
         }
     }
 }
@@ -59,6 +87,8 @@ pub struct Reach {
     unrestricted: bool,
     read: Vec<PathBuf>,
     write: Vec<PathBuf>,
+    /// The hosts the child may connect to, or `None` without network.
+    net: Option<Vec<Permission>>,
 }
 
 impl Reach {
@@ -80,6 +110,7 @@ impl Reach {
             unrestricted: policy.unrestricted,
             read,
             write,
+            net: policy.allow_net.then(|| policy.net_hosts.clone()),
         }
     }
 
@@ -96,6 +127,79 @@ impl Reach {
         let mounts = mounts::table();
         mounts::overlap(&mounts, folders, &target).or_else(|| hard_link(folders, &target, &mounts))
     }
+}
+
+impl Reach {
+    /// How a child could connect to what the `net` permission `denied`
+    /// names, if it can. Host names and addresses are not tied together, so
+    /// while an address is denied every host-name grant overlaps it.
+    pub fn net_overlap(&self, denied: &Permission) -> Option<Overlap> {
+        if self.unrestricted {
+            return Some(Overlap::Unrestricted);
+        }
+        let grants = self.net.as_ref()?;
+        let denied_host = denied.parts().1;
+        if let Some(grant) = grants.iter().find(|g| match (g.parts().1, denied_host) {
+            (None, _) | (_, None) => true,
+            _ => g.covers(denied) || denied.covers(g),
+        }) {
+            return Some(Overlap::Host(grant.clone()));
+        }
+        if denied_host.is_some_and(is_address)
+            && let Some(grant) = grants
+                .iter()
+                .find(|g| g.parts().1.is_some_and(|h| !is_address(h)))
+        {
+            return Some(Overlap::HostName(grant.clone()));
+        }
+        system_overlap(denied)
+    }
+}
+
+/// Whether a `net` spec names addresses rather than host names: an IP
+/// address, or a prefix of one (`169.254.*`, `2001:db8:*`). Host names never
+/// hold a `:`.
+fn is_address(spec: &str) -> bool {
+    let bare = spec.trim_start_matches('[').trim_end_matches(']');
+    if bare.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    bare.strip_suffix('*').is_some_and(|prefix| {
+        !prefix.is_empty()
+            && (prefix.contains(':') || prefix.chars().all(|c| c.is_ascii_digit() || c == '.'))
+    })
+}
+
+/// A Windows child with network reaches loopback and the machine's DNS
+/// servers whatever its grants, so a denial of any of these overlaps.
+#[cfg(windows)]
+fn system_overlap(denied: &Permission) -> Option<Overlap> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    let spec = denied.parts().1?;
+    if spec.eq_ignore_ascii_case("localhost") {
+        return Some(Overlap::System(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    }
+    if let Ok(ip) = spec
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        && ip.to_canonical().is_loopback()
+    {
+        return Some(Overlap::System(ip));
+    }
+    [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ]
+    .into_iter()
+    .chain(crate::sandbox::windows_wfp::system_dns_servers())
+    .find(|ip| denied.covers(&Permission::new(format!("net:{ip}"))))
+    .map(Overlap::System)
+}
+
+#[cfg(not(windows))]
+fn system_overlap(_denied: &Permission) -> Option<Overlap> {
+    None
 }
 
 /// The folders every sandboxed child may read, whatever its grants.
@@ -426,6 +530,90 @@ mod tests {
         assert!(matches!(
             reach.overlap(&secret.join(".env"), false),
             Some(Overlap::Folder(_))
+        ));
+    }
+
+    fn net(grants: &[&str]) -> Reach {
+        Reach::of(&SandboxPolicy {
+            allow_net: !grants.is_empty(),
+            net_hosts: grants.iter().map(|g| Permission::new(*g)).collect(),
+            ..Default::default()
+        })
+    }
+
+    fn host(slug: &str) -> Permission {
+        Permission::new(slug)
+    }
+
+    #[test]
+    fn a_host_grant_and_a_denial_overlap_when_either_covers_the_other() {
+        let reach = net(&["net:api.example.*"]);
+        assert_eq!(
+            reach.net_overlap(&host("net:api.example.com")),
+            Some(Overlap::Host(host("net:api.example.*")))
+        );
+        assert!(
+            net(&["net:api.example.com"])
+                .net_overlap(&host("net:api.*"))
+                .is_some()
+        );
+        assert_eq!(
+            net(&["net:api.example.com"]).net_overlap(&host("net:other.example")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_bare_grant_or_denial_overlaps_any_host() {
+        assert!(net(&["net"]).net_overlap(&host("net:x.example")).is_some());
+        assert!(net(&["net:x.example"]).net_overlap(&host("net")).is_some());
+    }
+
+    #[test]
+    fn an_address_denial_overlaps_every_host_name_grant() {
+        assert_eq!(
+            net(&["net:api.example.com"]).net_overlap(&host("net:203.0.113.7")),
+            Some(Overlap::HostName(host("net:api.example.com")))
+        );
+        assert!(
+            net(&["net:api.example.com"])
+                .net_overlap(&host("net:169.254.*"))
+                .is_some()
+        );
+        assert_eq!(
+            net(&["net:198.51.100.1"]).net_overlap(&host("net:203.0.113.7")),
+            None
+        );
+    }
+
+    #[test]
+    fn without_network_no_host_is_reached() {
+        assert_eq!(net(&[]).net_overlap(&host("net:x.example")), None);
+        assert_eq!(net(&[]).net_overlap(&host("net")), None);
+    }
+
+    #[test]
+    fn addresses_and_host_names_are_told_apart() {
+        for a in ["1.2.3.4", "::1", "[::1]", "169.254.*", "2001:db8:*", "10.*"] {
+            assert!(is_address(a), "{a}");
+        }
+        for h in ["example.com", "api.*", "*", "localhost", "10x.example"] {
+            assert!(!is_address(h), "{h}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_loopback_denial_overlaps_any_network() {
+        // An address grant, so the host-name rule does not decide it first.
+        let reach = net(&["net:198.51.100.1"]);
+        assert!(matches!(
+            reach.net_overlap(&host("net:127.0.0.1")),
+            Some(Overlap::System(_))
+        ));
+        assert!(matches!(
+            reach.net_overlap(&host("net:localhost")),
+            Some(Overlap::System(_))
         ));
     }
 

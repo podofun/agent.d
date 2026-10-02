@@ -298,3 +298,45 @@ async fn an_unrestricted_shell_call_is_refused_while_a_host_is_denied() {
     assert!(err.contains("net:denied.example"), "{err}");
     assert!(err.contains("unrestricted"), "{err}");
 }
+
+/// Denies one host or address.
+struct DenyHost(&'static str);
+impl Denials for DenyHost {
+    fn denied_permissions(&self) -> PermissionSet {
+        PermissionSet::from_iter([format!("net:{}", self.0)])
+    }
+    fn denies_action(&self, _name: &str) -> bool {
+        false
+    }
+}
+
+/// A host grant that covers a denied host is refused; one the denial fully
+/// covers is dropped, so the command runs without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shell_call_whose_host_grant_covers_a_denied_host_is_refused() {
+    let (_d, host) = host_with(RUN_TRUE);
+    let err = call(&host, &["shell.exec", "net:*"], "s.go")
+        .await
+        .unwrap_err();
+    assert!(err.contains("net:denied.example"), "{err}");
+    assert!(err.contains("connect to"), "{err}");
+
+    let res = call(&host, &["shell.exec", "net:denied.example"], "s.go").await;
+    assert!(
+        !res.as_ref().is_err_and(|e| e.contains("connect to")),
+        "a grant the denial fully covers is dropped, not refused: {res:?}"
+    );
+}
+
+/// A host name may lead to any address, so an address denial refuses a
+/// shell call granted a host name.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_address_denial_refuses_a_shell_call_granted_a_host_name() {
+    let (_d, host) = host_with(RUN_TRUE);
+    host.set_denials(Arc::new(DenyHost("203.0.113.7")));
+    let err = call(&host, &["shell.exec", "net:api.example.com"], "s.go")
+        .await
+        .unwrap_err();
+    assert!(err.contains("net:203.0.113.7"), "{err}");
+    assert!(err.contains("api.example.com"), "{err}");
+}
