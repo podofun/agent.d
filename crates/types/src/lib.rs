@@ -5,7 +5,8 @@ use thiserror::Error;
 
 mod approval;
 pub use approval::{
-    ApprovalBroker, ApprovalKind, ApprovalRequest, InlineApprovalRequest, InlineApprovals, Verdict,
+    ApprovalBroker, ApprovalKind, ApprovalRequest, Denials, InlineApprovalRequest, InlineApprovals,
+    Verdict,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

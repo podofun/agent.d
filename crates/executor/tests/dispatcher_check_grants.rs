@@ -120,3 +120,21 @@ async fn check_grants_allows_wildcard_grant() {
     let decision = exec.check_grants(caller, "codex.shell", required).await;
     assert!(decision.is_allow(), "wildcard should permit any bin");
 }
+
+#[tokio::test]
+async fn denials_come_from_the_current_grants() {
+    use agentd_permissions::Permission;
+    use agentd_types::Denials;
+
+    let mut file = GrantsFile::default();
+    file.policy.deny_actions.insert("pkg.publish".into());
+    file.policy
+        .deny_permissions
+        .insert(Permission::new("net:tracker.example.com"));
+    let exec = build_executor(file);
+    let denials: &dyn Denials = exec.as_ref();
+    assert!(denials.denies_action("pkg.publish"));
+    assert!(!denials.denies_action("pkg.build"));
+    assert!(denials.denies_permission(&Permission::new("net:tracker.example.com")));
+    assert!(!denials.denies_permission(&Permission::new("net:api.example.com")));
+}

@@ -8,7 +8,7 @@
 //! [`Verdict`]. No client is privileged by *being* a particular binary — the
 //! trust boundary is the control channel the broker is wired to.
 
-use agentd_permissions::Caller;
+use agentd_permissions::{Caller, Permission};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -89,6 +89,15 @@ pub trait InlineApprovals: Send + Sync {
     /// Escalate an inline capability denial. Returns [`Verdict::Deny`] when no
     /// broker/approver is available or the operator rejects (fail closed).
     async fn request_inline(&self, req: InlineApprovalRequest) -> Verdict;
+}
+
+/// The operator's hard denials (`[policy].deny_actions` and
+/// `deny_permissions`), read at the moment of each call so a reload applies
+/// at once. A denied call is refused even when a grant covers it, and is never
+/// offered for approval. Implemented by the executor.
+pub trait Denials: Send + Sync {
+    fn denies_permission(&self, p: &Permission) -> bool;
+    fn denies_action(&self, name: &str) -> bool;
 }
 
 #[cfg(test)]

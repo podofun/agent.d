@@ -1165,6 +1165,19 @@ impl ExecutorHandle {
 /// Bridge for inline (mid-handler) permission escalations from the scripting
 /// scheduler. Reuses the same broker, trace kind, and grants persistence the
 /// dispatch-time escalation path uses, so the operator experience is one flow.
+/// Denials are read from the engine at the moment of each check, so a reload
+/// (a `--watch` rebuild, or the reload after an "allow forever") applies to
+/// the very next call.
+impl agentd_types::Denials for Executor {
+    fn denies_permission(&self, p: &agentd_permissions::Permission) -> bool {
+        self.engine.load().grants().policy().denies_permission(p)
+    }
+
+    fn denies_action(&self, name: &str) -> bool {
+        self.engine.load().grants().policy().denies_action(name)
+    }
+}
+
 #[async_trait]
 impl agentd_types::InlineApprovals for Executor {
     async fn request_inline(

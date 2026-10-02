@@ -432,6 +432,20 @@ impl LuaHost {
         lua.set_app_data(InlineApprovalsHandle(hook));
     }
 
+    /// Wire the operator's hard denials. Inline capability checks and nested
+    /// `ctx.call` consult them before anything else.
+    pub fn set_denials(&self, denials: Arc<dyn agentd_types::Denials>) {
+        let lua = self.lua.lock().unwrap();
+        lua.set_app_data(DenialsHandle(denials));
+    }
+
+    /// Drop the denials hook, for the same reason as
+    /// [`LuaHost::clear_inline_approvals`].
+    pub fn clear_denials(&self) {
+        let lua = self.lua.lock().unwrap();
+        lua.remove_app_data::<DenialsHandle>();
+    }
+
     /// Drop the inline-approval hook. Counterpart of
     /// [`LuaHost::clear_runner_dispatcher`]: the hook parks an `Arc<Executor>`
     /// in the Lua app-data, which would otherwise keep the old runtime alive
@@ -2086,6 +2100,10 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
     // `shell.exec` grants keep working unchanged.
     let bin_perm = Permission::new(format!("shell.exec:{}", req.bin));
     let bare_perm = Permission::new("shell.exec");
+    // A bare `shell.exec` denial forbids every program; a scoped one forbids
+    // just that binary. Check both, since a bare slug does not cover a scoped one.
+    refuse_if_denied(lua, &bare_perm)?;
+    refuse_if_denied(lua, &bin_perm)?;
     let allowed = {
         let active = lua
             .app_data_ref::<ActiveContext>()
@@ -2663,17 +2681,28 @@ fn do_http(lua: &Lua, req: HttpRequest) -> mlua::Result<Value> {
 
 /// The check every redirect of a `ctx.http` request must pass: the target's
 /// `net:<host>` must be in this execution's grants, exactly like the first
-/// URL. The request runs outside Lua, so it checks a snapshot of the grants
-/// taken when the call is made. Redirects are never put to an approver.
+/// URL, and must not be denied by the operator. The request runs outside Lua,
+/// so it checks a snapshot of the grants taken when the call is made.
+/// Redirects are never put to an approver.
 fn redirect_check(lua: &Lua) -> mlua::Result<RedirectCheck> {
     let active = lua
         .app_data_ref::<ActiveContext>()
         .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state. This is a bug in agentd, please report it"))?;
     let grants = active.effective_grants.clone();
+    drop(active);
+    let denied = denials(lua);
     Ok(Arc::new(move |url: &str| {
         let host = host_of(url).map_err(|e| e.to_string())?;
         let needed = Permission::new(format!("net:{host}"));
-        if grants.contains(&needed) {
+        if denied
+            .as_ref()
+            .is_some_and(|d| d.denies_permission(&needed))
+        {
+            Err(format!(
+                "`{}` is denied by the operator in grants.toml",
+                needed.as_str()
+            ))
+        } else if grants.contains(&needed) {
             Ok(())
         } else {
             Err(format!("it needs the `{}` grant", needed.as_str()))
@@ -3513,6 +3542,12 @@ fn tools_resolve_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Function> 
         (func, inner)
     };
 
+    if denials(lua).is_some_and(|d| d.denies_action(&name)) {
+        return Err(hard_denial(&format!("the action `{name}`")));
+    }
+    for req in &action_meta.requires {
+        refuse_if_denied(lua, &Permission::new(req))?;
+    }
     {
         let active = lua
             .app_data_ref::<ActiveContext>()
@@ -3691,7 +3726,32 @@ const ESCALATE_MARK: &str = "\u{1}agentd:escalate\u{1}";
 #[derive(Clone)]
 pub(crate) struct InlineApprovalsHandle(pub(crate) Arc<dyn agentd_types::InlineApprovals>);
 
+/// Lua app-data holding the operator's hard denials (see
+/// [`LuaHost::set_denials`]).
+#[derive(Clone)]
+pub(crate) struct DenialsHandle(pub(crate) Arc<dyn agentd_types::Denials>);
+
+fn denials(lua: &Lua) -> Option<Arc<dyn agentd_types::Denials>> {
+    lua.app_data_ref::<DenialsHandle>().map(|h| h.0.clone())
+}
+
+/// A refusal for something the operator denied outright. It is never put to
+/// an approver, so it is not marked for escalation.
+fn hard_denial(what: &str) -> mlua::Error {
+    mlua::Error::external(format!(
+        "{what} is denied by the operator in grants.toml, so it is refused and never offered for approval"
+    ))
+}
+
+fn refuse_if_denied(lua: &Lua, req: &Permission) -> mlua::Result<()> {
+    match denials(lua) {
+        Some(d) if d.denies_permission(req) => Err(hard_denial(&format!("`{}`", req.as_str()))),
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn check_permission_inline(lua: &Lua, req: &Permission) -> mlua::Result<()> {
+    refuse_if_denied(lua, req)?;
     let active = lua
         .app_data_ref::<ActiveContext>()
         .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
