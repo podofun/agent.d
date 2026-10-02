@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 /// wildcards in the specifier.
 ///
 /// A `net:` host is stored in one canonical form (lowercase, international
-/// names in their ASCII form, no trailing dot), so a grant, a denial, and a
+/// names in their ASCII form, no trailing dot, IP addresses unbracketed with
+/// IPv4 never written as IPv6), so a grant, a denial, and a
 /// request for the same host always compare equal however each was written.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -52,9 +53,18 @@ impl Permission {
     }
 }
 
-/// Lowercase, IDNA to ASCII, trailing dot removed. A specifier that is not a
-/// plain host name (a wildcard pattern, an address) is only lowercased.
+/// Lowercase, IDNA to ASCII, trailing dot removed. An IP address loses its
+/// URL brackets, and an IPv4 address written as IPv6 (`::ffff:a.b.c.d`)
+/// becomes plain IPv4, so an address matches however it was written. A
+/// wildcard pattern is only lowercased.
 fn canonical_host(host: &str) -> String {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return ip.to_canonical().to_string();
+    }
     let host = host.strip_suffix('.').unwrap_or(host);
     if !host.is_ascii()
         && !host.contains('*')
@@ -286,6 +296,24 @@ mod tests {
         same("net:127.0.0.1", "net:127.0.0.1");
         same("net:*", "net:*");
         same("net", "net");
+    }
+
+    #[test]
+    fn ip_addresses_are_stored_in_one_canonical_form() {
+        let same = |a: &str, b: &str| assert_eq!(Permission::new(a).as_str(), b, "{a}");
+        same("net:[::ffff:a9fe:a9fe]", "net:169.254.169.254");
+        same("net:::ffff:169.254.169.254", "net:169.254.169.254");
+        same("net:[2001:DB8:0:0::1]", "net:2001:db8::1");
+        same("net:[::1]", "net:::1");
+        same("net:169.254.169.254", "net:169.254.169.254");
+        same("net:169.254.*", "net:169.254.*");
+    }
+
+    #[test]
+    fn an_ipv4_denial_covers_the_same_address_written_as_ipv6() {
+        let deny = Permission::new("net:169.254.*");
+        assert!(deny.covers(&Permission::new("net:[::ffff:a9fe:a9fe]")));
+        assert!(Permission::new("net:127.0.0.1").covers(&Permission::new("net:[::ffff:7f00:1]")));
     }
 
     #[test]
