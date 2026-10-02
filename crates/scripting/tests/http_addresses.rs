@@ -6,7 +6,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use agentd_permissions::{Caller, Permission, PermissionSet};
+use agentd_permissions::{Caller, PermissionSet};
 use agentd_scripting::LuaHost;
 use agentd_types::{ActionCall, CallContext, Denials, Registry};
 use http_body_util::Full;
@@ -17,10 +17,8 @@ use hyper_util::rt::TokioIo;
 /// Denies both loopback addresses, which is everything `localhost` resolves to.
 struct DenyLoopback;
 impl Denials for DenyLoopback {
-    fn denies_permission(&self, p: &Permission) -> bool {
-        ["net:127.0.0.1", "net:::1"]
-            .iter()
-            .any(|d| Permission::new(*d).covers(p))
+    fn denied_permissions(&self) -> PermissionSet {
+        PermissionSet::from_iter(["net:127.0.0.1", "net:::1"])
     }
     fn denies_action(&self, _name: &str) -> bool {
         false

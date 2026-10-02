@@ -5,7 +5,7 @@
 use std::io::Write;
 use std::sync::Arc;
 
-use agentd_permissions::{Caller, Permission, PermissionSet};
+use agentd_permissions::{Caller, PermissionSet};
 use agentd_scripting::LuaHost;
 use agentd_types::{
     ActionCall, CallContext, Denials, InlineApprovalRequest, InlineApprovals, Registry, Verdict,
@@ -15,10 +15,8 @@ use async_trait::async_trait;
 /// Denies `net:denied.example` and `shell.exec:rm`, and the action `x.secret`.
 struct Deny;
 impl Denials for Deny {
-    fn denies_permission(&self, p: &Permission) -> bool {
-        ["net:denied.example", "shell.exec:rm"]
-            .iter()
-            .any(|d| Permission::new(*d).covers(p))
+    fn denied_permissions(&self) -> PermissionSet {
+        PermissionSet::from_iter(["net:denied.example", "shell.exec:rm"])
     }
     fn denies_action(&self, name: &str) -> bool {
         name == "x.secret"
@@ -28,8 +26,8 @@ impl Denials for Deny {
 /// Denies every shell command with a bare `shell.exec` denial.
 struct DenyAllShell;
 impl Denials for DenyAllShell {
-    fn denies_permission(&self, p: &Permission) -> bool {
-        Permission::new("shell.exec").covers(p)
+    fn denied_permissions(&self) -> PermissionSet {
+        PermissionSet::from_iter(["shell.exec"])
     }
     fn denies_action(&self, _name: &str) -> bool {
         false
@@ -127,5 +125,43 @@ async fn a_bare_shell_denial_refuses_every_program() {
     );
     host.set_denials(Arc::new(DenyAllShell));
     let err = call(&host, &["shell.exec:ls"], "s.go").await.unwrap_err();
+    assert!(err.contains("denied"), "{err}");
+}
+
+/// Denies one file, named through a symlinked folder.
+struct DenyThroughLink(String);
+impl Denials for DenyThroughLink {
+    fn denied_permissions(&self) -> PermissionSet {
+        PermissionSet::from_iter([format!("fs.read:{}", self.0)])
+    }
+    fn denies_action(&self, _name: &str) -> bool {
+        false
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_denial_written_through_a_symlink_still_applies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(real.join("secret.txt"), "s").unwrap();
+    std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+    let real_file = real
+        .join("secret.txt")
+        .to_string_lossy()
+        .replace('\\', "\\\\");
+    let (_d, host) = host_with(&format!(
+        r#"agentd.action{{ name = "f.go", handler = function(_, ctx)
+             return {{ s = ctx.fs.read("{real_file}") }} end }}"#
+    ));
+    host.set_denials(Arc::new(DenyThroughLink(
+        tmp.path()
+            .join("link/secret.txt")
+            .to_string_lossy()
+            .into_owned(),
+    )));
+    let grant = format!("fs.read:{}/**", tmp.path().display());
+    let err = call(&host, &[&grant], "f.go").await.unwrap_err();
     assert!(err.contains("denied"), "{err}");
 }
