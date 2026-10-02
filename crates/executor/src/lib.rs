@@ -1169,8 +1169,13 @@ impl ExecutorHandle {
 /// (a `--watch` rebuild, or the reload after an "allow forever") applies to
 /// the very next call.
 impl agentd_types::Denials for Executor {
-    fn denies_permission(&self, p: &agentd_permissions::Permission) -> bool {
-        self.engine.load().grants().policy().denies_permission(p)
+    fn denied_permissions(&self) -> agentd_permissions::PermissionSet {
+        self.engine
+            .load()
+            .grants()
+            .policy()
+            .deny_permissions
+            .clone()
     }
 
     fn denies_action(&self, name: &str) -> bool {
