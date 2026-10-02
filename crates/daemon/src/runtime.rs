@@ -140,6 +140,9 @@ pub fn build_runtime(cfg: &Config, shared: &Shared) -> Result<BuiltRuntime> {
     // And as the inline-approval hook, so a `ctx.*` permission denial inside a
     // running handler escalates to the same broker instead of failing fast.
     host.set_inline_approvals(executor.clone());
+    // And as the source of hard denials, consulted first by every inline
+    // capability check and nested `ctx.call`.
+    host.set_denials(executor.clone());
 
     let service_handles = executor.start_services();
     let used_paths = used_paths(&host, &cfg.grants_file);
@@ -200,6 +203,7 @@ pub fn teardown(built: BuiltRuntime) {
     }
     built.host.clear_runner_dispatcher();
     built.host.clear_inline_approvals();
+    built.host.clear_denials();
     built.host.shutdown_async_runtime();
     // `built` drops here; in-flight callers holding `Arc<Executor>` clones
     // finish on the old runtime, then the host and Lua VM drop.
