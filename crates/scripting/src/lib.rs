@@ -11,7 +11,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use agentd_ai::{CompletionRequest, Message, Provider, Role};
 use agentd_fs as fs;
 use agentd_memory::MemoryStore;
-use agentd_net::http::{RedirectCheck, Request as HttpRequest, host_of, send_checked as http_send};
+use agentd_net::http::{
+    AddressCheck, Checks as HttpChecks, RedirectCheck, Request as HttpRequest, host_of,
+    send_checked as http_send,
+};
 use agentd_net::ws::{Connection as WsConnection, Frame as WsFrame, host_of as ws_host_of};
 use agentd_permissions::{Permission, PermissionSet};
 use agentd_runners::{CompactPolicy, RunnerDef, RunnerRegistry};
@@ -2658,7 +2661,10 @@ fn parse_http_opts(lua: &Lua, opts: Option<Value>) -> mlua::Result<HttpRequest> 
 fn do_http(lua: &Lua, req: HttpRequest) -> mlua::Result<Value> {
     let host = host_of(&req.url).map_err(|e| mlua::Error::external(e.to_string()))?;
     check_permission_inline(lua, &Permission::new(format!("net:{host}")))?;
-    let check = redirect_check(lua)?;
+    let check = HttpChecks {
+        redirect: redirect_check(lua)?,
+        address: address_check(lua),
+    };
     if scheduler::is_in_coroutine(lua) {
         // Yield to the scheduler so other coroutines / async tasks can make
         // progress while reqwest does its thing.
@@ -2708,6 +2714,27 @@ fn redirect_check(lua: &Lua) -> mlua::Result<RedirectCheck> {
             Err(format!("it needs the `{}` grant", needed.as_str()))
         }
     }))
+}
+
+/// The check every address a `ctx.http` host name resolves to must pass: it
+/// must not be denied by the operator. A name that resolves only to denied
+/// addresses is never contacted. Grants are checked on the name, as before.
+fn address_check(lua: &Lua) -> AddressCheck {
+    let denied = denials(lua);
+    Arc::new(move |ip: std::net::IpAddr| {
+        let needed = Permission::new(format!("net:{ip}"));
+        if denied
+            .as_ref()
+            .is_some_and(|d| d.denies_permission(&needed))
+        {
+            Err(format!(
+                "`{}` is denied by the operator in grants.toml",
+                needed.as_str()
+            ))
+        } else {
+            Ok(())
+        }
+    })
 }
 
 // ---------- ctx.secret ----------
