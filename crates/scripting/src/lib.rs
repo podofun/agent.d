@@ -2112,6 +2112,15 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
             .and_then(|active| active.cwd.clone())
     });
     refuse_if_program_denied(lua, &req.bin, cwd.as_deref())?;
+    // Confine the child to the execution's effective filesystem/network grants,
+    // after refusing a reach that overlaps a denial and before asking anything.
+    let policy = {
+        let active = lua
+            .app_data_ref::<ActiveContext>()
+            .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
+        build_sandbox_policy(&active.effective_grants)
+    };
+    refuse_if_reach_denied(lua, &policy)?;
     let allowed = {
         let active = lua
             .app_data_ref::<ActiveContext>()
@@ -2133,15 +2142,9 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
         )));
     }
 
-    // Confine the child to the execution's effective filesystem/network grants.
     // Must be attached before the request is wrapped into Op::Shell so the
     // scheduler carries the policy through to agentd_shell::exec.
-    {
-        let active = lua
-            .app_data_ref::<ActiveContext>()
-            .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
-        req.sandbox = Some(build_sandbox_policy(&active.effective_grants));
-    }
+    req.sandbox = Some(policy);
 
     if scheduler::is_in_coroutine(lua) {
         return scheduler::build_marker(lua, scheduler::Op::Shell(req));
@@ -3834,6 +3837,40 @@ fn refuse_if_program_denied(lua: &Lua, program: &str, cwd: Option<&Path>) -> mlu
     } else {
         Ok(())
     }
+}
+
+/// The sandbox cannot carve a denied file out of a folder it opens, so a
+/// shell call is refused when anything its child could reach overlaps a file
+/// denial, or when it runs unrestricted while any file or host is denied.
+fn refuse_if_reach_denied(lua: &Lua, policy: &SandboxPolicy) -> mlua::Result<()> {
+    let Some(denials) = denials(lua) else {
+        return Ok(());
+    };
+    let reach = agentd_shell::Reach::of(policy);
+    for denied in normalize_path_grants(&denials.denied_permissions()).iter() {
+        let (verb, write) = match denied.parts().0 {
+            "fs.read" => ("read", false),
+            "fs.write" => ("write", true),
+            "net" if policy.unrestricted => ("connect to", false),
+            _ => continue,
+        };
+        let target = match denied.parts().1 {
+            Some(spec) => concrete_ancestor(spec),
+            None => PathBuf::from(std::path::MAIN_SEPARATOR_STR),
+        };
+        let how = if denied.parts().0 == "net" {
+            Some(agentd_shell::Overlap::Unrestricted)
+        } else {
+            reach.overlap(&target, write)
+        };
+        if let Some(how) = how {
+            return Err(mlua::Error::external(format!(
+                "this shell command could {verb} what `{}` denies in grants.toml, because {how}. A sandbox cannot carve a denied path out of a folder it opens, so the command is refused before anything is asked. Keep denied files outside the folders shell commands are granted, or grant narrower folders",
+                denied.as_str()
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn refuse_if_denied(lua: &Lua, req: &Permission) -> mlua::Result<()> {

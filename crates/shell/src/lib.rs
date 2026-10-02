@@ -20,9 +20,11 @@ pub mod netbroker;
 pub mod netfilter;
 pub mod policy;
 mod program;
+mod reach;
 pub mod sandbox;
 pub use policy::{SandboxError, SandboxPolicy};
 pub use program::resolve_program;
+pub use reach::{Overlap, Reach};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecRequest {
