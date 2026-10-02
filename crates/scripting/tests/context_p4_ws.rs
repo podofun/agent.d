@@ -249,3 +249,92 @@ async fn ws_handle_is_closed_after_close() {
         Some(true)
     );
 }
+
+/// Denies loopback, either at once or only after `after` has passed, so a
+/// test can open a connection first and then see a denial arrive.
+struct DenyLoopbackAfter {
+    from: std::time::Instant,
+}
+impl agentd_types::Denials for DenyLoopbackAfter {
+    fn denies_permission(&self, p: &agentd_permissions::Permission) -> bool {
+        std::time::Instant::now() >= self.from
+            && ["net:127.0.0.1", "net:::1"]
+                .iter()
+                .any(|d| agentd_permissions::Permission::new(*d).covers(p))
+    }
+    fn denies_action(&self, _name: &str) -> bool {
+        false
+    }
+}
+
+async fn run_ws(
+    lua_body: &str,
+    grant: &str,
+    deny_from: std::time::Instant,
+) -> Result<serde_json::Value, String> {
+    let dir = write_tools(&[(
+        "t.lua",
+        &format!(
+            r#"
+            agentd.action{{
+              name = "ws.go",
+              handler = function(_, ctx)
+                {lua_body}
+              end,
+            }}
+            "#
+        ),
+    )]);
+    let host = LuaHost::new().unwrap();
+    host.load_dir(dir.path()).unwrap();
+    host.set_denials(std::sync::Arc::new(DenyLoopbackAfter { from: deny_from }));
+    host.call(
+        ctx(&[grant]),
+        ActionCall {
+            action: "ws.go".into(),
+            args: serde_json::Value::Null,
+        },
+    )
+    .await
+    .map(|r| r.value)
+    .map_err(|e| e.to_string())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_refuses_a_granted_name_that_resolves_only_to_denied_addresses() {
+    let addr = spawn_echo().await;
+    let now = std::time::Instant::now();
+    let err = run_ws(
+        &format!(
+            r#"local h = ctx.ws.connect("ws://localhost:{}/") return {{ ok = true }}"#,
+            addr.port()
+        ),
+        "net:*",
+        now,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("denied"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_send_is_refused_once_the_host_is_denied() {
+    let addr = spawn_echo().await;
+    let deny_from = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let err = run_ws(
+        &format!(
+            r#"local h = ctx.ws.connect("ws://127.0.0.1:{}/")
+               h:send("before")
+               sleep(1500)
+               h:send("after")
+               return {{ ok = true }}"#,
+            addr.port()
+        ),
+        &format!("net:{}", addr.ip()),
+        deny_from,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("net:127.0.0.1"), "{err}");
+    assert!(err.contains("denied"), "{err}");
+}

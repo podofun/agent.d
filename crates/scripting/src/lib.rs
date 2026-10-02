@@ -3314,6 +3314,19 @@ fn do_ai(lua: &Lua, (req, provider_name): (CompletionRequest, String)) -> mlua::
 /// the Lua-side table built in `build_ws_table`.
 struct WsHandle {
     conn: Arc<WsConnection>,
+    /// The `net:` host the connection was granted for, re-checked against the
+    /// operator's denials before every send.
+    host: String,
+}
+
+/// Refuse to send on a connection whose host, or the address it reached, the
+/// operator has denied since it was opened.
+fn refuse_denied_ws(lua: &Lua, handle: &WsHandle) -> mlua::Result<()> {
+    refuse_if_denied(lua, &Permission::new(format!("net:{}", handle.host)))?;
+    if let Some(ip) = handle.conn.peer_ip() {
+        refuse_if_denied(lua, &Permission::new(format!("net:{ip}")))?;
+    }
+    Ok(())
 }
 
 impl mlua::UserData for WsHandle {}
@@ -3401,10 +3414,12 @@ fn build_ws_table(lua: &Lua) -> mlua::Result<Table> {
 fn ws_connect_internal(lua: &Lua, url: String) -> mlua::Result<mlua::AnyUserData> {
     let host = ws_host_of(&url).map_err(|e| mlua::Error::external(e.to_string()))?;
     check_permission_inline(lua, &Permission::new(format!("net:{host}")))?;
-    let conn = block_on(async move { WsConnection::connect(&url).await })?
+    let check = address_check(lua);
+    let conn = block_on(async move { WsConnection::connect_checked(&url, check).await })?
         .map_err(|e| mlua::Error::external(e.to_string()))?;
     lua.create_userdata(WsHandle {
         conn: Arc::new(conn),
+        host,
     })
 }
 
@@ -3420,7 +3435,11 @@ fn ws_send_internal(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
             "`ws.send` is missing the message — pass the text to send as the second argument",
         )
     })?)?;
-    let conn = ud.borrow::<WsHandle>()?.conn.clone();
+    let conn = {
+        let handle = ud.borrow::<WsHandle>()?;
+        refuse_denied_ws(lua, &handle)?;
+        handle.conn.clone()
+    };
     if scheduler::is_in_coroutine(lua) {
         return scheduler::build_marker(lua, scheduler::Op::WsSendText { conn, msg });
     }
@@ -3441,7 +3460,11 @@ fn ws_send_binary_internal(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
         )
     })?)?;
     let bytes_vec: Vec<u8> = bytes.as_bytes().to_vec();
-    let conn = ud.borrow::<WsHandle>()?.conn.clone();
+    let conn = {
+        let handle = ud.borrow::<WsHandle>()?;
+        refuse_denied_ws(lua, &handle)?;
+        handle.conn.clone()
+    };
     if scheduler::is_in_coroutine(lua) {
         return scheduler::build_marker(
             lua,

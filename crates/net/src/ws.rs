@@ -29,6 +29,8 @@ pub enum WsError {
     Closed,
     #[error("the WebSocket operation timed out after {}ms", .0.as_millis())]
     Timeout(Duration),
+    #[error("`{host}` resolves only to addresses that are not allowed ({reason})")]
+    AddressRefused { host: String, reason: String },
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +51,9 @@ pub enum Frame {
 pub struct Connection {
     inner: Mutex<Inner>,
     url: String,
+    /// The address the connection reached, when it was opened with
+    /// [`Connection::connect_checked`].
+    peer_ip: Option<std::net::IpAddr>,
 }
 
 type Stream =
@@ -68,7 +73,68 @@ impl Connection {
                 stream: Some(stream),
             }),
             url: url.to_string(),
+            peer_ip: None,
         })
+    }
+
+    /// Like [`Connection::connect`], but the host name is resolved here and
+    /// every address must pass `check` before a TCP connection is opened to
+    /// it, so a name that resolves only to refused addresses is never
+    /// contacted. The handshake (and TLS, for `wss://`) then runs over that
+    /// connection with the URL's own host name. An IP literal in the URL is
+    /// not resolved, so the caller checks it with the URL itself.
+    pub async fn connect_checked(
+        url: &str,
+        check: crate::http::AddressCheck,
+    ) -> Result<Self, WsError> {
+        let parsed =
+            url::Url::parse(url).map_err(|e| WsError::InvalidUrl(url.into(), e.to_string()))?;
+        let host = host_of(url)?;
+        let port = parsed
+            .port_or_known_default()
+            .ok_or_else(|| WsError::InvalidUrl(url.into(), "no port".into()))?;
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        let found: Vec<std::net::SocketAddr> = tokio::net::lookup_host((bare, port))
+            .await
+            .map_err(|e| WsError::Handshake(e.to_string()))?
+            .collect();
+        let mut last_reason = None;
+        let allowed: Vec<std::net::SocketAddr> = found
+            .into_iter()
+            .filter(|a| match check(a.ip().to_canonical()) {
+                Ok(()) => true,
+                Err(reason) => {
+                    last_reason = Some(reason);
+                    false
+                }
+            })
+            .collect();
+        if allowed.is_empty() {
+            return Err(match last_reason {
+                Some(reason) => WsError::AddressRefused { host, reason },
+                None => WsError::Handshake(format!("`{host}` did not resolve to any address")),
+            });
+        }
+        let tcp = tokio::net::TcpStream::connect(allowed.as_slice())
+            .await
+            .map_err(|e| WsError::Handshake(e.to_string()))?;
+        let peer_ip = tcp.peer_addr().ok().map(|a| a.ip().to_canonical());
+        let (stream, _resp) = tokio_tungstenite::client_async_tls(url, tcp)
+            .await
+            .map_err(|e| WsError::Handshake(e.to_string()))?;
+        Ok(Self {
+            inner: Mutex::new(Inner {
+                stream: Some(stream),
+            }),
+            url: url.to_string(),
+            peer_ip,
+        })
+    }
+
+    /// The address this connection reached, if it was opened with
+    /// [`Connection::connect_checked`].
+    pub fn peer_ip(&self) -> Option<std::net::IpAddr> {
+        self.peer_ip
     }
 
     pub fn url(&self) -> &str {
@@ -252,6 +318,44 @@ mod tests {
         assert!(
             matches!(err, WsError::Handshake(_) | WsError::Io(_)),
             "got {err:?}"
+        );
+    }
+
+    fn refuse_loopback() -> crate::http::AddressCheck {
+        std::sync::Arc::new(|ip: std::net::IpAddr| {
+            if ip.is_loopback() {
+                Err(format!("`net:{ip}` is denied"))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_name_resolving_only_to_refused_addresses_is_never_connected() {
+        let addr = spawn_echo().await;
+        let url = format!("ws://localhost:{}/", addr.port());
+        match Connection::connect_checked(&url, refuse_loopback()).await {
+            Err(WsError::AddressRefused { host, reason }) => {
+                assert_eq!(host, "localhost");
+                assert!(reason.contains("denied"), "{reason}");
+            }
+            Err(other) => panic!("expected AddressRefused, got {other}"),
+            Ok(_) => panic!("expected AddressRefused, got a connection"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_checked_connection_records_the_address_it_reached() {
+        let addr = spawn_echo().await;
+        let url = format!("ws://localhost:{}/", addr.port());
+        let c = Connection::connect_checked(&url, std::sync::Arc::new(|_| Ok(())))
+            .await
+            .unwrap();
+        assert_eq!(c.peer_ip(), Some(addr.ip()));
+        c.send_text("hi").await.unwrap();
+        assert!(
+            matches!(c.recv(Some(Duration::from_secs(5))).await.unwrap(), Frame::Text(t) if t == "hi")
         );
     }
 }
