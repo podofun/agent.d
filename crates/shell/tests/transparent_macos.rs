@@ -23,6 +23,7 @@ fn policy(net_hosts: Vec<&str>) -> SandboxPolicy {
         allow_net: true,
         net_hosts: net_hosts.into_iter().map(Permission::new).collect(),
         unrestricted: false,
+        ..Default::default()
     }
 }
 

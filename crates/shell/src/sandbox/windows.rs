@@ -867,12 +867,25 @@ mod imp {
         })
     }
 
-    /// Whether a file already grants access to `sid`. This is used only for the
-    /// resolved executable file: unlike an ancestor directory, any allow ACE for
-    /// ALL_APPLICATION_PACKAGES here is sufficient evidence that Windows can map
-    /// the image without an agent.d-specific grant.
-    fn dacl_contains_sid(path: &str, sid: PSID) -> bool {
-        use windows::Win32::Security::{ACCESS_ALLOWED_ACE, ACE_HEADER, EqualSid, GetAce};
+    /// One allow entry of an access list.
+    struct AllowEntry {
+        sid: Vec<u8>,
+        mask: u32,
+        flags: u8,
+    }
+
+    /// What an object's access list allows.
+    enum Dacl {
+        /// The list could not be read.
+        Unreadable,
+        /// No list at all, which allows everyone everything.
+        Null,
+        Entries(Vec<AllowEntry>),
+    }
+
+    /// The allow entries of `path`'s access list.
+    fn dacl_allow_entries(path: &str) -> Dacl {
+        use windows::Win32::Security::{ACCESS_ALLOWED_ACE, ACE_HEADER, GetAce};
         const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
         let wide = to_wide(path);
         unsafe {
@@ -890,31 +903,132 @@ mod imp {
             )
             .is_err()
             {
-                return false;
+                return Dacl::Unreadable;
             }
-            let mut found = false;
-            if !dacl.is_null() {
+            let out = if dacl.is_null() {
+                Dacl::Null
+            } else {
+                let mut entries = Vec::new();
                 for i in 0..(*dacl).AceCount {
                     let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
                     if GetAce(dacl, i as u32, &mut ace).is_ok() && !ace.is_null() {
                         let header = &*(ace as *const ACE_HEADER);
                         if header.AceType == ACCESS_ALLOWED_ACE_TYPE {
                             let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
-                            let ace_sid =
+                            let sid =
                                 PSID(&allowed.SidStart as *const u32 as *mut core::ffi::c_void);
-                            if EqualSid(ace_sid, sid).is_ok() {
-                                found = true;
-                                break;
-                            }
+                            entries.push(AllowEntry {
+                                sid: sid_to_bytes(sid),
+                                mask: allowed.Mask,
+                                flags: header.AceFlags,
+                            });
                         }
                     }
                 }
-            }
+                Dacl::Entries(entries)
+            };
             if !psd.0.is_null() {
                 let _ = LocalFree(HLOCAL(psd.0));
             }
-            found
+            out
         }
+    }
+
+    /// Whether a file already grants access to `sid`. This is used only for the
+    /// resolved executable file: unlike an ancestor directory, any allow ACE for
+    /// ALL_APPLICATION_PACKAGES here is sufficient evidence that Windows can map
+    /// the image without an agent.d-specific grant.
+    fn dacl_contains_sid(path: &str, sid: PSID) -> bool {
+        let sid = sid_to_bytes(sid);
+        match dacl_allow_entries(path) {
+            Dacl::Entries(entries) => entries.iter().any(|e| e.sid == sid),
+            Dacl::Unreadable | Dacl::Null => false,
+        }
+    }
+
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const FILE_READ_DATA: u32 = 0x1;
+    const FILE_WRITE_DATA: u32 = 0x2;
+    const FILE_APPEND_DATA: u32 = 0x4;
+    const OBJECT_INHERIT_ACE: u8 = 0x1;
+    const CONTAINER_INHERIT_ACE: u8 = 0x2;
+    const INHERIT_ONLY_ACE: u8 = 0x8;
+
+    /// Whether one of `sids` may read (or write) `path` by its access list. A
+    /// missing path is judged by the inheritable entries of its nearest
+    /// existing folder, which it would receive when created. Metadata and
+    /// traverse entries on ancestors (see `set_meta_ace`) give no contents
+    /// and are skipped; deny entries are ignored, so this errs toward reach.
+    fn acl_reaches(path: &std::path::Path, sids: &[Vec<u8>], write: bool) -> bool {
+        let mut target = path;
+        let mut missing = false;
+        while !target.exists() {
+            match target.parent() {
+                Some(parent) => {
+                    target = parent;
+                    missing = true;
+                }
+                None => return false,
+            }
+        }
+        let Some(text) = target.to_str() else {
+            return false;
+        };
+        let wanted = if write {
+            GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA
+        } else {
+            GENERIC_READ | GENERIC_ALL | FILE_READ_DATA
+        };
+        match dacl_allow_entries(text) {
+            Dacl::Unreadable => false,
+            Dacl::Null => true,
+            Dacl::Entries(entries) => entries.iter().any(|e| {
+                let applies = if missing {
+                    e.flags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) != 0
+                } else {
+                    e.flags & INHERIT_ONLY_ACE == 0
+                };
+                applies
+                    && e.mask & !TRAVERSE_META != 0
+                    && e.mask & wanted != 0
+                    && sids.contains(&e.sid)
+            }),
+        }
+    }
+
+    /// Refuse when the child could reach a denied path: through its real
+    /// access list (entries left by an earlier command, or set outside
+    /// agent.d), or through `program_dir`, which this call opens beyond its
+    /// grants.
+    fn refuse_denied_reach(
+        policy: &SandboxPolicy,
+        sids: &[Vec<u8>],
+        program_dir: Option<&std::path::Path>,
+    ) -> Result<(), ShellError> {
+        let denied = policy
+            .denied_reads
+            .iter()
+            .map(|p| (p, false))
+            .chain(policy.denied_writes.iter().map(|p| (p, true)));
+        for (path, write) in denied {
+            let verb = if write { "write" } else { "read" };
+            let path = crate::reach::real(path);
+            let how = match program_dir {
+                Some(dir) if !write && crate::reach::nested(dir, &path) => format!(
+                    "the folder of the program it runs, `{}`, is opened to it",
+                    dir.display()
+                ),
+                _ if acl_reaches(&path, sids, write) => format!(
+                    "the path's access list lets sandboxed commands {verb} it, from an earlier command or a link to a granted file"
+                ),
+                _ => continue,
+            };
+            return Err(ShellError::DeniedReach(format!(
+                "this shell command could {verb} `{}`, which the operator denies, because {how}, so it was not started. Keep denied files out of the folders shell commands are granted and the folders of the programs they run",
+                path.display()
+            )));
+        }
+        Ok(())
     }
 
     fn all_application_packages_sid() -> Result<PSID, ShellError> {
@@ -1015,6 +1129,23 @@ mod imp {
             ))
         })?;
 
+        // A denied path must stay out of the child's reach. Access left by an
+        // earlier command shows in the path's real access list, and the
+        // program's folder is opened beyond the grants when Windows cannot
+        // already load the program from where it is.
+        let aap_sid = all_application_packages_sid()?;
+        let aap_can_load = bin_path
+            .to_str()
+            .is_some_and(|path| dacl_contains_sid(path, aap_sid));
+        let reach_sids = [sid_to_bytes(sid), sid_to_bytes(aap_sid)];
+        unsafe { LocalFree(HLOCAL(aap_sid.0)) };
+        let program_dir = (!aap_can_load).then(|| bin_path.parent()).flatten();
+        if let Err(e) = refuse_denied_reach(policy, &reach_sids, program_dir) {
+            unsafe { FreeSid(sid) };
+            return Err(e);
+        }
+        let mut stamped: Vec<String> = Vec::new();
+
         // Grant the AppContainer access to exactly the policy's paths. Without an
         // ACE for the package SID a lowbox child cannot touch user files at all.
         // Grants include GENERIC_EXECUTE (FILE_TRAVERSE for directories): a
@@ -1032,6 +1163,7 @@ mod imp {
                 )
             {
                 record_stamp('I', s);
+                stamped.push(s.to_string());
             }
         }
         for p in &policy.read_paths {
@@ -1039,6 +1171,7 @@ mod imp {
                 && stamp_ace(s, sid, GENERIC_READ | GENERIC_EXECUTE)
             {
                 record_stamp('I', s);
+                stamped.push(s.to_string());
             }
         }
 
@@ -1086,16 +1219,12 @@ mod imp {
         // the ancestor pass may already have put this SID on the directory with
         // metadata-only rights, which is not enough for an npm grandchild to
         // reopen node.exe.
-        let aap_sid = all_application_packages_sid()?;
-        let aap_can_load = bin_path
-            .to_str()
-            .is_some_and(|path| dacl_contains_sid(path, aap_sid));
-        unsafe { LocalFree(HLOCAL(aap_sid.0)) };
         if !aap_can_load {
             if let Some(bin_dir) = bin_path.parent().and_then(|p| p.to_str())
                 && stamp_ace(bin_dir, sid, GENERIC_READ | GENERIC_EXECUTE)
             {
                 record_stamp('I', bin_dir);
+                stamped.push(bin_dir.to_string());
             }
             // Existing files do not reliably receive a newly inheritable
             // directory ACE. Stamp the image itself so a lowbox grandchild can
@@ -1104,7 +1233,19 @@ mod imp {
                 && stamp_ace(bin, sid, GENERIC_READ | GENERIC_EXECUTE)
             {
                 record_stamp('I', bin);
+                stamped.push(bin.to_string());
             }
+        }
+
+        // A stamp reaches every link of a file, so a hard link inside a
+        // granted folder can open a denied file. Check again before launch,
+        // and take this call's stamps back if so.
+        if let Err(e) = refuse_denied_reach(policy, &reach_sids, None) {
+            for path in &stamped {
+                revoke_sid(path, sid, true);
+            }
+            unsafe { FreeSid(sid) };
+            return Err(e);
         }
 
         // Network child: ask the broker to provision the WFP allowlist scoped to

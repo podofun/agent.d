@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agentd_executor::Executor;
-use agentd_types::Registry;
+use agentd_types::{Denials, Registry};
 use notify::{RecursiveMode, Watcher};
 
 use crate::config::Config;
@@ -110,6 +110,13 @@ async fn watch_loop(
                 *used.lock().unwrap() = canon_set(&new.used_paths);
                 arm(&mut watcher, &mut watched, &new.used_paths);
 
+                // Access stamped onto files for earlier sandboxed commands
+                // (Windows) was judged against the old denials, so clear it
+                // before the new runtime serves when they change.
+                if current.executor.denied_permissions() != new.executor.denied_permissions() {
+                    let _ =
+                        tokio::task::spawn_blocking(agentd_shell::sandbox::revoke_all_stamps).await;
+                }
                 executor.store(new.executor.clone());
                 regen_types(&cfg, &new);
 

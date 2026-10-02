@@ -15,7 +15,7 @@
 
 use agentd_permissions::Permission;
 use agentd_shell::sandbox::is_supported;
-use agentd_shell::{ExecRequest, SandboxPolicy, exec};
+use agentd_shell::{ExecRequest, SandboxPolicy, ShellError, exec};
 
 const STATUS_DLL_INIT_FAILED: i32 = -1073741502; // 0xC0000142
 
@@ -32,6 +32,7 @@ fn policy(write: &std::path::Path) -> SandboxPolicy {
         allow_net: false,
         net_hosts: vec![],
         unrestricted: false,
+        ..Default::default()
     }
 }
 
@@ -46,6 +47,7 @@ fn net_policy(write: &std::path::Path, hosts: &[&str]) -> SandboxPolicy {
             .map(|h| Permission::new(format!("net:{h}")))
             .collect(),
         unrestricted: false,
+        ..Default::default()
     }
 }
 
@@ -547,6 +549,7 @@ fn policy_reads(reads: &[&std::path::Path], write: &std::path::Path) -> SandboxP
         allow_net: false,
         net_hosts: vec![],
         unrestricted: false,
+        ..Default::default()
     }
 }
 
@@ -639,4 +642,96 @@ async fn grandchild_inherits_filesystem_confinement() {
     .unwrap();
     assert!(!target.exists(), "grandchild escaped fs confinement");
     let _ = res;
+}
+
+fn ps(command: String) -> Vec<String> {
+    vec![
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-Command".into(),
+        command,
+    ]
+}
+
+/// Access stamped for an earlier command stays on a folder's files. A later
+/// command that is denied one of them is refused before it starts, rather
+/// than reaching it through that leftover access.
+#[tokio::test]
+async fn a_denied_file_left_readable_by_an_earlier_command_is_refused() {
+    let _serial = SANDBOX_SERIAL.lock().await;
+    assert!(is_supported(), "windows sandbox must be supported");
+
+    let earlier = tempfile::tempdir().unwrap();
+    let secret = earlier.path().join("secret.txt");
+    std::fs::write(&secret, "TOPSECRET").unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let res = exec(req(
+        powershell(),
+        ps("exit 0".into()),
+        policy_reads(&[earlier.path()], scratch.path()),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(res.exit_code, 0, "earlier command failed: {}", res.stderr);
+
+    let mut later = policy(scratch.path());
+    later.denied_reads = vec![secret.clone()];
+    let err = exec(req(
+        powershell(),
+        ps(format!("Get-Content -LiteralPath '{}'", secret.display())),
+        later,
+    ))
+    .await
+    .unwrap_err();
+    assert!(matches!(err, ShellError::DeniedReach(_)), "{err}");
+    assert!(err.to_string().contains("access list"), "{err}");
+}
+
+/// A program outside the system folders runs with its own folder opened to
+/// it, so a denied file beside it refuses the call.
+#[tokio::test]
+async fn a_denied_file_beside_the_program_is_refused() {
+    let _serial = SANDBOX_SERIAL.lock().await;
+    assert!(is_supported(), "windows sandbox must be supported");
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let program = dir.path().join("whoami.exe");
+    std::fs::copy(format!(r"{root}\System32\whoami.exe"), &program).unwrap();
+    let secret = dir.path().join("secret.txt");
+    std::fs::write(&secret, "TOPSECRET").unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let mut denied = policy(scratch.path());
+    denied.denied_reads = vec![secret];
+    let err = exec(req(program.to_string_lossy().into_owned(), vec![], denied))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ShellError::DeniedReach(_)), "{err}");
+    assert!(err.to_string().contains("folder of the program"), "{err}");
+}
+
+/// Access stamped on a granted folder reaches every link of its files, so a
+/// hard link there to a denied file is caught after stamping, before launch.
+#[tokio::test]
+async fn a_hard_link_in_a_granted_folder_to_a_denied_file_is_refused() {
+    let _serial = SANDBOX_SERIAL.lock().await;
+    assert!(is_supported(), "windows sandbox must be supported");
+
+    let granted = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let secret = elsewhere.path().join("secret.txt");
+    std::fs::write(&secret, "TOPSECRET").unwrap();
+    let link = granted.path().join("link.txt");
+    std::fs::hard_link(&secret, &link).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let mut linked = policy_reads(&[granted.path()], scratch.path());
+    linked.denied_reads = vec![secret];
+    let err = exec(req(
+        powershell(),
+        ps(format!("Get-Content -LiteralPath '{}'", link.display())),
+        linked,
+    ))
+    .await
+    .unwrap_err();
+    assert!(matches!(err, ShellError::DeniedReach(_)), "{err}");
 }

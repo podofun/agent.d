@@ -12,6 +12,7 @@ fn policy_writing_only(dir: &std::path::Path) -> SandboxPolicy {
         allow_net: false,
         net_hosts: vec![],
         unrestricted: false,
+        ..Default::default()
     }
 }
 
