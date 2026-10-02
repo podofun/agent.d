@@ -54,10 +54,35 @@ pub struct FileDiff {
     pub added: Vec<u8>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct Stamp {
     digest: [u8; 32],
     permissions: Permissions,
+}
+
+/// Two stamps match when the contents and the permissions a user sets are
+/// the same. Only the permission bits count: on Unix the mode bits, on
+/// Windows the read-only flag. Windows `Permissions` also carry every file
+/// attribute (archive, temporary, ...), which the write path itself changes,
+/// so comparing them would report every write as an outside edit.
+impl PartialEq for Stamp {
+    fn eq(&self, other: &Self) -> bool {
+        self.digest == other.digest && same_permissions(&self.permissions, &other.permissions)
+    }
+}
+
+impl Eq for Stamp {}
+
+fn same_permissions(a: &Permissions, b: &Permissions) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        a.mode() & 0o7777 == b.mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        a.readonly() == b.readonly()
+    }
 }
 
 struct Image {
