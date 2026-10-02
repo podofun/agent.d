@@ -39,7 +39,15 @@ impl Permission {
     }
 
     /// Does this holder permission satisfy the given required permission?
+    /// File paths compare without regard to letter case on macOS and
+    /// Windows, whose default file systems ignore case, so a grant or a
+    /// denial covers the same file however its case is written.
     pub fn covers(&self, required: &Permission) -> bool {
+        self.covers_with_case(required, FILE_PATHS_IGNORE_CASE)
+    }
+
+    /// [`Permission::covers`] with the file-path case rule given explicitly.
+    pub fn covers_with_case(&self, required: &Permission, file_paths_ignore_case: bool) -> bool {
         let (hd, hs) = self.parts();
         let (rd, rs) = required.parts();
         if hd != rd {
@@ -48,10 +56,17 @@ impl Permission {
         match (hs, rs) {
             (None, None) => true,
             (None, Some(_)) | (Some(_), None) => false,
+            (Some(h), Some(r)) if file_paths_ignore_case && hd.starts_with("fs.") => {
+                match_spec(&h.to_lowercase(), &r.to_lowercase())
+            }
             (Some(h), Some(r)) => match_spec(h, r),
         }
     }
 }
+
+/// Whether this platform's default file systems ignore letter case in paths
+/// (APFS on macOS, NTFS on Windows). Linux file systems do not.
+const FILE_PATHS_IGNORE_CASE: bool = cfg!(any(target_os = "macos", windows));
 
 /// Lowercase, IDNA to ASCII, trailing dot removed. An IP address loses its
 /// URL brackets, and an IPv4 address written as IPv6 (`::ffff:a.b.c.d`)
@@ -314,6 +329,34 @@ mod tests {
         let deny = Permission::new("net:169.254.*");
         assert!(deny.covers(&Permission::new("net:[::ffff:a9fe:a9fe]")));
         assert!(Permission::new("net:127.0.0.1").covers(&Permission::new("net:[::ffff:7f00:1]")));
+    }
+
+    #[test]
+    fn file_paths_match_regardless_of_case_where_the_disk_ignores_case() {
+        let deny = Permission::new("fs.read:/Proj/.env");
+        let asked = Permission::new("fs.read:/proj/.ENV");
+        assert!(deny.covers_with_case(&asked, true));
+        assert!(!deny.covers_with_case(&asked, false));
+        let grant = Permission::new("fs.write:/Proj/**");
+        assert!(grant.covers_with_case(&Permission::new("fs.write:/proj/src/a.rs"), true));
+    }
+
+    #[test]
+    fn only_file_paths_ignore_case() {
+        assert!(
+            !Permission::new("shell.exec:Git")
+                .covers_with_case(&Permission::new("shell.exec:git"), true)
+        );
+        assert!(
+            !Permission::new("secret:API").covers_with_case(&Permission::new("secret:api"), true)
+        );
+    }
+
+    #[test]
+    fn case_rule_follows_the_platform() {
+        let deny = Permission::new("fs.read:/Proj/.env");
+        let asked = Permission::new("fs.read:/proj/.ENV");
+        assert_eq!(deny.covers(&asked), cfg!(any(target_os = "macos", windows)));
     }
 
     #[test]
