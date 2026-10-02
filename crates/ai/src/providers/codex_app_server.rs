@@ -124,6 +124,11 @@ impl Provider for CodexAppServerProvider {
         LoopMode::ProviderOwned
     }
 
+    /// Codex reads files and runs commands in its own sandbox.
+    fn has_own_tools(&self) -> bool {
+        true
+    }
+
     fn preferred_mcp_token(&self) -> Option<String> {
         Some(self.mcp_token.clone())
     }

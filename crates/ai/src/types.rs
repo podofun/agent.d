@@ -356,6 +356,14 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// Whether this provider runs tools of its own (a shell, file reads)
+    /// that reach the host without going through agentd's checks. Such a
+    /// provider cannot honour an operator's file or host denials, so the
+    /// executor refuses to run it while any exist.
+    fn has_own_tools(&self) -> bool {
+        false
+    }
+
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError>;
 
     /// Like [`Provider::complete`], additionally pushing [`StreamEvent`]s into

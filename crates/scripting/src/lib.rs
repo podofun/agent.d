@@ -3279,6 +3279,7 @@ fn do_ai(lua: &Lua, (req, provider_name): (CompletionRequest, String)) -> mlua::
         }
     };
     check_permission_inline(lua, &Permission::new(format!("ai:{provider_name}")))?;
+    refuse_own_tools_under_denials(lua, &provider_name, provider.as_ref())?;
     if scheduler::is_in_coroutine(lua) {
         return scheduler::build_marker(
             lua,
@@ -3800,6 +3801,33 @@ fn hard_denial(what: &str) -> mlua::Error {
     mlua::Error::external(format!(
         "{what} is denied by the operator in grants.toml, so it is refused and never offered for approval"
     ))
+}
+
+/// A provider with tools of its own (see `Provider::has_own_tools`) reaches
+/// files and hosts outside these checks, so `ctx.ai` refuses it while the
+/// operator denies any file or host, as the executor does for runs.
+fn refuse_own_tools_under_denials(
+    lua: &Lua,
+    provider_name: &str,
+    provider: &dyn Provider,
+) -> mlua::Result<()> {
+    if !provider.has_own_tools() {
+        return Ok(());
+    }
+    let Some(denials) = denials(lua) else {
+        return Ok(());
+    };
+    let denied = denials.denied_permissions();
+    match denied
+        .iter()
+        .find(|p| matches!(p.parts().0, "fs.read" | "fs.write" | "net"))
+    {
+        Some(p) => Err(mlua::Error::external(format!(
+            "the `{provider_name}` provider runs its own tools, which reach files and hosts outside agent.d's checks, so it cannot run while grants.toml denies `{}`. Use a provider whose tool loop agent.d drives, such as `anthropic` or `openai`",
+            p.as_str()
+        ))),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn refuse_if_denied(lua: &Lua, req: &Permission) -> mlua::Result<()> {
