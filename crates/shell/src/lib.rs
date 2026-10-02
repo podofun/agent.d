@@ -19,8 +19,10 @@ pub mod gateway;
 pub mod netbroker;
 pub mod netfilter;
 pub mod policy;
+mod program;
 pub mod sandbox;
 pub use policy::{SandboxError, SandboxPolicy};
+pub use program::resolve_program;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecRequest {

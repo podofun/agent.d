@@ -208,3 +208,40 @@ async fn ctx_ai_refuses_a_provider_with_its_own_tools_under_a_host_denial() {
         serde_json::json!("ok")
     );
 }
+
+/// Denies one program, written as `name` in grants.toml.
+struct DenyProgram(&'static str);
+impl Denials for DenyProgram {
+    fn denied_permissions(&self) -> PermissionSet {
+        PermissionSet::from_iter([format!("shell.exec:{}", self.0)])
+    }
+    fn denies_action(&self, _name: &str) -> bool {
+        false
+    }
+}
+
+/// A denial written as a bare name stops the same program asked for by path.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_program_denied_by_name_is_refused_when_asked_for_by_path() {
+    let (_d, host) = host_with(
+        r#"agentd.action{ name = "s.go", handler = function(_, ctx)
+             return ctx.shell("/bin/sh", { "-c", "true" }) end }"#,
+    );
+    host.set_denials(Arc::new(DenyProgram("sh")));
+    let err = call(&host, &["shell.exec"], "s.go").await.unwrap_err();
+    assert!(err.contains("denied"), "{err}");
+}
+
+/// A denial written as a path stops the same program asked for by name.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_program_denied_by_path_is_refused_when_asked_for_by_name() {
+    let (_d, host) = host_with(
+        r#"agentd.action{ name = "s.go", handler = function(_, ctx)
+             return ctx.shell("sh", { "-c", "true" }) end }"#,
+    );
+    host.set_denials(Arc::new(DenyProgram("/bin/sh")));
+    let err = call(&host, &["shell.exec"], "s.go").await.unwrap_err();
+    assert!(err.contains("denied"), "{err}");
+}

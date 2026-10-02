@@ -2107,6 +2107,11 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
     // just that binary. Check both, since a bare slug does not cover a scoped one.
     refuse_if_denied(lua, &bare_perm)?;
     refuse_if_denied(lua, &bin_perm)?;
+    let cwd = req.cwd.clone().or_else(|| {
+        lua.app_data_ref::<ActiveContext>()
+            .and_then(|active| active.cwd.clone())
+    });
+    refuse_if_program_denied(lua, &req.bin, cwd.as_deref())?;
     let allowed = {
         let active = lua
             .app_data_ref::<ActiveContext>()
@@ -3827,6 +3832,35 @@ fn refuse_own_tools_under_denials(
             p.as_str()
         ))),
         None => Ok(()),
+    }
+}
+
+/// A `shell.exec` denial may name a program by name or by path. Resolve the
+/// requested program and every such denial to the executable they name, so
+/// `shell.exec:python3` stops `/usr/bin/python3` and the reverse, through
+/// symlinks too.
+fn refuse_if_program_denied(lua: &Lua, program: &str, cwd: Option<&Path>) -> mlua::Result<()> {
+    let Some(denials) = denials(lua) else {
+        return Ok(());
+    };
+    let Some(target) = agentd_shell::resolve_program(program, cwd) else {
+        return Ok(());
+    };
+    let denied = normalize_path_grants(&denials.denied_permissions());
+    let hit = denied.contains(&Permission::new(format!("shell.exec:{}", target.display())))
+        || denied.iter().any(|p| match p.parts() {
+            ("shell.exec", Some(spec)) if !spec.contains('*') => {
+                agentd_shell::resolve_program(spec, None).as_deref() == Some(target.as_path())
+            }
+            _ => false,
+        });
+    if hit {
+        Err(hard_denial(&format!(
+            "the program `{program}` (`{}`)",
+            target.display()
+        )))
+    } else {
+        Ok(())
     }
 }
 
