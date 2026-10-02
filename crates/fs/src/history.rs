@@ -54,10 +54,35 @@ pub struct FileDiff {
     pub added: Vec<u8>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct Stamp {
     digest: [u8; 32],
     permissions: Permissions,
+}
+
+/// Two stamps match when the contents and the permissions a user sets are
+/// the same. Only the permission bits count: on Unix the mode bits, on
+/// Windows the read-only flag. Windows `Permissions` also carry every file
+/// attribute (archive, temporary, ...), which the write path itself changes,
+/// so comparing them would report every write as an outside edit.
+impl PartialEq for Stamp {
+    fn eq(&self, other: &Self) -> bool {
+        self.digest == other.digest && same_permissions(&self.permissions, &other.permissions)
+    }
+}
+
+impl Eq for Stamp {}
+
+fn same_permissions(a: &Permissions, b: &Permissions) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        a.mode() & 0o7777 == b.mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        a.readonly() == b.readonly()
+    }
 }
 
 struct Image {
@@ -89,8 +114,12 @@ impl Image {
                 return Err(FsError::Unsupported(path.into()));
             }
         }
+        // Read through a handle confirmed to be this file, so a swap between
+        // the metadata check above and the read cannot redirect it.
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut crate::open_verified(path)?, &mut bytes)?;
         Ok(Self {
-            bytes: Some(fs::read(path)?),
+            bytes: Some(bytes),
             permissions: Some(metadata.permissions()),
         })
     }
@@ -312,12 +341,7 @@ fn commit(path: &Path, image: &mut Image) -> Result<Vec<PathBuf>, FsError> {
     }
     let result = (|| -> Result<(), FsError> {
         fs::create_dir_all(parent)?;
-        let mut builder = tempfile::Builder::new();
-        #[cfg(unix)]
-        if image.permissions.is_none() {
-            use std::os::unix::fs::PermissionsExt;
-            builder.permissions(Permissions::from_mode(0o666));
-        }
+        let builder = new_file_builder(image.permissions.is_none());
         let mut file = builder.tempfile_in(parent)?;
         file.write_all(bytes)?;
         if let Some(permissions) = &image.permissions {
@@ -334,6 +358,25 @@ fn commit(path: &Path, image: &mut Image) -> Result<Vec<PathBuf>, FsError> {
     }
     result?;
     Ok(created_dirs)
+}
+
+/// The temporary-file builder for a write. A brand-new file on Unix starts
+/// from mode 0o666 (narrowed by the umask), like a plain `File::create`.
+fn new_file_builder(new_file: bool) -> tempfile::Builder<'static, 'static> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut builder = tempfile::Builder::new();
+        if new_file {
+            builder.permissions(Permissions::from_mode(0o666));
+        }
+        builder
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = new_file;
+        tempfile::Builder::new()
+    }
 }
 
 impl History {

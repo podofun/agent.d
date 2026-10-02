@@ -7,8 +7,10 @@
 //! relative inputs first.
 
 mod history;
+mod verified;
 
 pub use history::{FileDiff, FileHistory, History, Operation, Revision};
+pub use verified::{open_verified, read_bytes_verified, real_path};
 
 use std::path::{Path, PathBuf};
 
@@ -37,6 +39,12 @@ pub enum FsError {
     Io(#[from] std::io::Error),
     #[error("invalid utf-8 in `{0}`")]
     InvalidUtf8(PathBuf),
+    #[error(
+        "`{}` changed while it was being opened and now leads to `{}`, so it was not read",
+        path.display(),
+        actual.display()
+    )]
+    Changed { path: PathBuf, actual: PathBuf },
 }
 
 #[derive(Debug, Clone, Serialize)]

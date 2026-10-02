@@ -2388,7 +2388,9 @@ fn fs_chdir_binding(lua: &Lua, path: String) -> mlua::Result<String> {
 fn fs_read_binding(lua: &Lua, path: String) -> mlua::Result<mlua::String> {
     let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.read:{}", p.display())))?;
-    let bytes = block_on(fs::read_bytes(&p))?.map_err(mlua::Error::external)?;
+    // Read through a handle confirmed to be the checked file, so a symlink
+    // swapped in after the check cannot redirect the read.
+    let bytes = block_on(fs::read_bytes_verified(&p))?.map_err(mlua::Error::external)?;
     lua.create_string(bytes)
 }
 

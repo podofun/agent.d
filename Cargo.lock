@@ -153,11 +153,13 @@ dependencies = [
 name = "agentd-fs"
 version = "0.10.0-alpha"
 dependencies = [
+ "libc",
  "serde",
  "sha2",
  "tempfile",
  "thiserror",
  "tokio",
+ "windows",
 ]
 
 [[package]]
