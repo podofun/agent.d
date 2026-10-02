@@ -160,3 +160,32 @@ async fn grandchild_inherits_filesystem_confinement() {
     assert!(!target.exists(), "grandchild escaped fs confinement");
     let _ = res;
 }
+
+/// `/System` is always readable, and every file on the data volume also has a
+/// path under `/System/Volumes/Data`. Seatbelt judges the file itself, not
+/// the path used, so an ungranted file stays unreadable that way too.
+#[tokio::test]
+async fn read_through_the_data_volume_path_is_denied() {
+    if skip() {
+        return;
+    }
+    let granted = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let secret = outside.path().canonicalize().unwrap().join("secret");
+    std::fs::write(&secret, "top-secret").unwrap();
+    let via_data = format!("/System/Volumes/Data{}", secret.display());
+    assert!(
+        std::path::Path::new(&via_data).exists(),
+        "{via_data} should name the same file"
+    );
+    let res = exec(sh(
+        format!("cat '{via_data}'"),
+        write_policy(granted.path()),
+    ))
+    .await
+    .unwrap();
+    assert!(
+        !res.stdout.contains("top-secret"),
+        "data-volume read must be blocked: {res:?}"
+    );
+}

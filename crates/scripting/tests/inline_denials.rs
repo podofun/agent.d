@@ -245,3 +245,56 @@ async fn a_program_denied_by_path_is_refused_when_asked_for_by_name() {
     let err = call(&host, &["shell.exec"], "s.go").await.unwrap_err();
     assert!(err.contains("denied"), "{err}");
 }
+
+/// Denies reading one file.
+struct DenyRead(String);
+impl Denials for DenyRead {
+    fn denied_permissions(&self) -> PermissionSet {
+        PermissionSet::from_iter([format!("fs.read:{}", self.0)])
+    }
+    fn denies_action(&self, _name: &str) -> bool {
+        false
+    }
+}
+
+const RUN_TRUE: &str = r#"agentd.action{ name = "s.go", handler = function(_, ctx)
+     return ctx.shell("true") end }"#;
+
+/// A shell call whose granted folder holds a denied file is refused before
+/// anything is asked, since its sandbox would let the child read the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shell_call_whose_folder_holds_a_denied_file_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("open")).unwrap();
+    std::fs::write(root.join(".env"), "k").unwrap();
+    let (_d, host) = host_with(RUN_TRUE);
+    host.set_denials(Arc::new(DenyRead(
+        root.join(".env").to_string_lossy().into_owned(),
+    )));
+
+    let wide = format!("fs.read:{}/**", root.display());
+    let err = call(&host, &["shell.exec", &wide], "s.go")
+        .await
+        .unwrap_err();
+    assert!(err.contains(".env"), "names the denial: {err}");
+    assert!(err.contains("sandbox opens"), "says how: {err}");
+
+    let narrow = format!("fs.read:{}/**", root.join("open").display());
+    let res = call(&host, &["shell.exec", &narrow], "s.go").await;
+    assert!(
+        !res.as_ref().is_err_and(|e| e.contains("sandbox opens")),
+        "a folder apart from the denied file is not refused for it: {res:?}"
+    );
+}
+
+/// An unrestricted shell call reaches every host, so a host denial refuses it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unrestricted_shell_call_is_refused_while_a_host_is_denied() {
+    let (_d, host) = host_with(RUN_TRUE);
+    let err = call(&host, &["shell.exec", "shell.unrestricted"], "s.go")
+        .await
+        .unwrap_err();
+    assert!(err.contains("net:denied.example"), "{err}");
+    assert!(err.contains("unrestricted"), "{err}");
+}

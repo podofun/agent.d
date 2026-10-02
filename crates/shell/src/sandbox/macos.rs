@@ -7,7 +7,7 @@
 //! that *allows* outbound ([`sbpl_net_for_broker`]) while `pf` — scoped to the
 //! broker-leased uid — redirects its traffic to the daemon's policy relay.
 
-use crate::policy::{READ_BASELINE, SandboxError, SandboxPolicy, WRITE_SCRATCH};
+use crate::policy::{MACOS_READ_EXTRA, READ_BASELINE, SandboxError, SandboxPolicy, WRITE_SCRATCH};
 
 pub fn is_supported() -> bool {
     std::path::Path::new("/usr/bin/sandbox-exec").exists()
@@ -24,20 +24,6 @@ pub fn apply(_policy: &SandboxPolicy) -> Result<(), SandboxError> {
         "macos uses argv wrapping; call wrap_argv".into(),
     ))
 }
-
-/// macOS-only read baseline on top of [`READ_BASELINE`]: dyld needs to stat
-/// `/` itself (literal, not subpath — grants nothing below it) and read the
-/// shared cache + system frameworks, or every child dies with SIGABRT before
-/// `main`. Verified minimal on macOS 26: without the `/` literal, even
-/// `/bin/echo` aborts.
-const MACOS_READ_EXTRA: &[&str] = &[
-    "/System",
-    "/private/var/db",
-    "/private/var/select", // `/bin/sh` reads its implementation through here
-    "/dev/urandom",
-    "/dev/random",
-    "/dev/zero",
-];
 
 /// Seatbelt matches on RESOLVED paths, but grants often come in via symlinks
 /// (`/var` -> `/private/var`, `/tmp` -> `/private/tmp` — every macOS tempdir).

@@ -26,6 +26,21 @@ pub const READ_BASELINE: &[&str] = &[
     "/dev/random",
 ];
 
+/// macOS-only read baseline on top of [`READ_BASELINE`]: dyld needs to stat
+/// `/` itself (literal, not subpath, so nothing below it) and read the
+/// shared cache + system frameworks, or every child dies with SIGABRT before
+/// `main`. Verified minimal on macOS 26: without the `/` literal, even
+/// `/bin/echo` aborts.
+#[cfg(target_os = "macos")]
+pub const MACOS_READ_EXTRA: &[&str] = &[
+    "/System",
+    "/private/var/db",
+    "/private/var/select", // `/bin/sh` reads its implementation through here
+    "/dev/urandom",
+    "/dev/random",
+    "/dev/zero",
+];
+
 /// Per-user read-only config a sandboxed child needs beyond the system dirs.
 /// CLI tools read their global config on every invocation (`git`, `gh`, `npm`,
 /// …), so without these a sandboxed tool warns `Permission denied` on its own
