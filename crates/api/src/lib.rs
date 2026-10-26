@@ -352,13 +352,20 @@ fn token_eq(a: &str, b: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Which interface a `/ws` handshake is. The public token (or `--no-auth`)
-/// means `ws`; an interface token names its interface; anything else is refused.
-fn resolve_interface(state: &AppState, headers: &axum::http::HeaderMap) -> Option<String> {
+/// Which interface a `/ws` handshake is, and whether it is admin. The admin
+/// token means admin `ws`; the public token means `ws`; an interface token
+/// names its interface; anything else is refused. With `--no-auth` there is
+/// no admin token and every `ws` connection is admin.
+fn resolve_interface(state: &AppState, headers: &axum::http::HeaderMap) -> Option<(String, bool)> {
     let presented = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
+    if let (Some(p), Some(admin)) = (presented, &state.admin_token)
+        && token_eq(p, admin)
+    {
+        return Some(("ws".to_string(), true));
+    }
     if let Some(p) = presented {
         // Scan every entry so timing does not reveal which token matched.
         let mut hit: Option<&String> = None;
@@ -368,14 +375,17 @@ fn resolve_interface(state: &AppState, headers: &axum::http::HeaderMap) -> Optio
             }
         }
         if let Some(name) = hit {
-            return Some(name.clone());
+            return Some((name.clone(), false));
         }
     }
+    // `--no-auth` turns off both tokens; only then is a plain `ws`
+    // connection admin.
+    let admin = state.admin_token.is_none() && state.auth_token.is_none();
     match &state.auth_token {
-        None => Some("ws".to_string()),
+        None => Some(("ws".to_string(), admin)),
         Some(token) => presented
             .filter(|p| token_eq(p, token))
-            .map(|_| "ws".to_string()),
+            .map(|_| ("ws".to_string(), admin)),
     }
 }
 
@@ -384,12 +394,12 @@ async fn ws_upgrade(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let Some(interface) = resolve_interface(&state, &headers) else {
+    let Some((interface, admin)) = resolve_interface(&state, &headers) else {
         return (axum::http::StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     };
     ws.max_message_size(1_100_000)
         .max_frame_size(1_100_000)
-        .on_upgrade(move |socket| handle_socket(socket, state, interface))
+        .on_upgrade(move |socket| handle_socket(socket, state, interface, admin))
 }
 
 /// `/control` handshake. Gated by the **admin** token (separate from the public
@@ -463,11 +473,15 @@ struct Outbound {
     finished: Option<u64>,
 }
 
-async fn handle_socket(mut socket: WebSocket, state: AppState, interface: String) {
+async fn handle_socket(mut socket: WebSocket, state: AppState, interface: String, admin: bool) {
     let _connection = state.lifecycle.enter();
     let mut draining = state.lifecycle.is_draining();
     let session = format!("ws-{}", WS_CONN_SEQ.fetch_add(1, Ordering::Relaxed));
-    let conn = Arc::new(ConnIdentity { interface, session });
+    let conn = Arc::new(ConnIdentity {
+        interface,
+        session,
+        admin,
+    });
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(64);
     let mut tasks = FuturesUnordered::<BoxFuture<'static, ()>>::new();
     let mut active = HashMap::<u64, Option<tokio::sync::oneshot::Sender<()>>>::new();
@@ -567,7 +581,9 @@ async fn handle_run(
     let executor = state.executor.load_full();
     let caller = ws_caller(conn, p.session, p.user).with_runner(p.name.clone());
     let (tx, mut rx) = agentd_ai::types::stream_channel();
-    let run = executor.run_runner_with_options(caller, &p.name, p.options, p.stream.then_some(tx));
+    let mut options = p.options;
+    options.admin = conn.admin;
+    let run = executor.run_runner_with_options(caller, &p.name, options, p.stream.then_some(tx));
     tokio::pin!(run);
     loop {
         tokio::select! {
@@ -685,6 +701,20 @@ struct ConnIdentity {
     interface: String,
     /// Auto-minted `ws-<n>` connection id.
     session: String,
+    /// The handshake presented the admin token (or `--no-auth` on `ws`).
+    /// Never part of the caller identity: it only scopes sessions and
+    /// starts runs.
+    admin: bool,
+}
+
+/// The session scope for one request: admin connections own `admin:ws`
+/// sessions, everyone else their interface's.
+fn conn_scope(conn: &ConnIdentity, caller: &Caller) -> agentd_sessions::Scope {
+    if conn.admin {
+        agentd_sessions::Scope::admin(caller.user.as_ref().map(|u| u.as_str()))
+    } else {
+        scope_of(caller)
+    }
 }
 
 /// Build the `Caller` for one request: the interface comes from the handshake
@@ -760,8 +790,10 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
         "runners.run" => match serde_json::from_value::<RunParams>(req.params) {
             Ok(p) => {
                 let caller = ws_caller(conn, p.session, p.user).with_runner(p.name.clone());
+                let mut options = p.options;
+                options.admin = conn.admin;
                 match executor
-                    .run_runner_with_options(caller, &p.name, p.options, None)
+                    .run_runner_with_options(caller, &p.name, options, None)
                     .await
                 {
                     Ok(out) => ok_ser(id, &out),
@@ -803,7 +835,7 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
             match serde_json::from_value::<CreateSessionParams>(req.params) {
                 Ok(p) => {
                     let caller = ws_caller(conn, p.session, p.user);
-                    let new = agentd_sessions::NewSession::in_scope(&scope_of(&caller))
+                    let new = agentd_sessions::NewSession::in_scope(&conn_scope(conn, &caller))
                         .label(p.label)
                         .runner(p.runner);
                     match store.create(new) {
@@ -822,7 +854,7 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
                 Ok(p) => p,
                 Err(e) => return bad_params(id, e),
             };
-            let scope = scope_of(&ws_caller(conn, p.session.clone(), p.user.clone()));
+            let scope = conn_scope(conn, &ws_caller(conn, p.session.clone(), p.user.clone()));
             let meta = match (&p.id, &p.label) {
                 (Some(i), _) => store.get_in(&scope, i),
                 (None, Some(l)) => store.find_in(&scope, l),
@@ -861,7 +893,7 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
             };
             match serde_json::from_value::<LimitParam>(params) {
                 Ok(p) => match store.list(
-                    &scope_of(&ws_caller(conn, p.session, p.user)),
+                    &conn_scope(conn, &ws_caller(conn, p.session, p.user)),
                     p.limit.unwrap_or(50).min(500),
                 ) {
                     Ok(v) => ok_ser(id, &v),
@@ -876,7 +908,7 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
             };
             match serde_json::from_value::<RenameParams>(req.params) {
                 Ok(p) => {
-                    let scope = scope_of(&ws_caller(conn, p.session, p.user));
+                    let scope = conn_scope(conn, &ws_caller(conn, p.session, p.user));
                     match store.get_in(&scope, &p.id) {
                         Ok(Some(_)) => {}
                         Ok(None) => {
@@ -902,7 +934,7 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
             };
             match serde_json::from_value::<IdParam>(req.params) {
                 Ok(p) => {
-                    let scope = scope_of(&ws_caller(conn, p.session, p.user));
+                    let scope = conn_scope(conn, &ws_caller(conn, p.session, p.user));
                     // Out-of-scope ids delete nothing and say so like a missing id would.
                     let visible = match store.get_in(&scope, &p.id) {
                         Ok(v) => v.is_some(),

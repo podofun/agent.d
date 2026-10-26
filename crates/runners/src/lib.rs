@@ -160,6 +160,11 @@ pub struct RunOptions {
     pub model: Option<String>,
     pub max_tokens: Option<u32>,
     pub timeout_ms: Option<u64>,
+    /// The run was started over an admin connection. Set by the transport,
+    /// never read from the wire, and never passed on to nested runs. It
+    /// scopes the run's session to admin sessions.
+    #[serde(skip)]
+    pub admin: bool,
 }
 
 impl RunOptions {

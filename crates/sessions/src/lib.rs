@@ -34,11 +34,14 @@ pub enum SessionError {
 
 pub type Result<T> = std::result::Result<T, SessionError>;
 
+/// Session owner for admin connections.
+pub const ADMIN_OWNER: &str = "admin:ws";
+
 /// Who a caller is, for session visibility. Built from the `Caller` at every
 /// entry point (WebSocket, Lua), never from request parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scope {
-    /// `interface:<id>` or `service:<name>`.
+    /// `interface:<id>`, `service:<name>`, or `admin:ws`.
     pub owner: String,
     /// The caller's declared end-user, if any.
     pub user: Option<String>,
@@ -55,6 +58,16 @@ impl Scope {
         };
         Self {
             owner,
+            user: user.map(str::to_string),
+        }
+    }
+
+    /// The scope of an admin connection. Its owner, `admin:ws`, is a
+    /// namespace no interface token maps to, so only admin connections can
+    /// see, use, change, or delete these sessions.
+    pub fn admin(user: Option<&str>) -> Self {
+        Self {
+            owner: ADMIN_OWNER.to_string(),
             user: user.map(str::to_string),
         }
     }

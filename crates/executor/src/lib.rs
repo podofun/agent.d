@@ -1380,7 +1380,11 @@ impl Executor {
         })?;
         // A session outside the caller's scope reads as missing: no oracle for
         // other tenants' ids.
-        let scope = scope_of(&caller);
+        let scope = if options.admin {
+            Scope::admin(caller.user.as_ref().map(|u| u.as_str()))
+        } else {
+            scope_of(&caller)
+        };
         let meta = store
             .get_in(&scope, &session_id)
             .map_err(|e| RunnerError::Session(e.to_string()))?
