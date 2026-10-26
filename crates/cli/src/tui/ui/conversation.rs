@@ -3,18 +3,20 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::super::app::{App, Entry, EntryKind, ToolRow};
 use super::super::commands;
+use super::super::presentation;
 use super::{
     ERROR, MUTED, PRIMARY, SECONDARY, SUCCESS, WARNING, markdown, palette, screen_rows, selection,
     spinner_frame,
 };
 
 pub(super) fn draw_conversation(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    if app.entries.is_empty() && !app.pending {
+    if app.entries.is_empty() && app.queue.is_empty() && !app.pending {
         super::draw_welcome(frame, app, area);
         return;
     }
@@ -161,15 +163,17 @@ fn conversation_lines(app: &App, width: usize) -> Conversation {
     for queued in &app.queue {
         lines.push(Line::raw(""));
         selectable.push(0..0);
-        let mut body = markdown::wrap_plain(queued, body_width);
+        let mut body = emphasized(markdown::wrap_plain(queued, body_width));
         if let Some(last) = body.last_mut() {
-            last.spans.push(Span::raw("  queued"));
+            let tag = if app.queue_held {
+                "  not sent"
+            } else {
+                "  queued"
+            };
+            last.spans
+                .push(Span::styled(tag, Style::default().fg(MUTED)));
         }
-        let body: Vec<Line<'static>> = body
-            .into_iter()
-            .map(|line| line.patch_style(Style::default().fg(MUTED)))
-            .collect();
-        let queued = with_gutter("›", MUTED, body);
+        let queued = with_gutter("›", SECONDARY, body);
         selectable.extend(queued.iter().map(|_| 0..0));
         lines.extend(queued);
     }
@@ -246,8 +250,21 @@ fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
         EntryKind::User => with_gutter("›", SECONDARY, emphasized(body)),
         EntryKind::Agent => with_gutter("◆", PRIMARY, body),
         EntryKind::Info => with_gutter("i", SUCCESS, body),
-        EntryKind::Error => with_gutter("!", ERROR, body),
+        EntryKind::Error => with_gutter(
+            "!",
+            ERROR,
+            body.into_iter()
+                .map(|line| line.patch_style(Style::default().fg(ERROR)))
+                .collect(),
+        ),
         EntryKind::Tool => tool_lines(entry, width),
+        EntryKind::Setting => with_gutter(
+            "•",
+            SECONDARY,
+            body.into_iter()
+                .map(|line| line.patch_style(Style::default().fg(MUTED)))
+                .collect(),
+        ),
     }
 }
 
@@ -258,31 +275,134 @@ fn emphasized(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// A call's row: its name, then each short argument (paths, patterns,
+/// commands) in full. Collapsed, it previews the first lines of the long
+/// argument it carries (such as content being written), or else of its
+/// output. Expanded, it shows every long argument and the whole output.
 fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
-    let count = entry.body.lines().count();
-    let summary = if !entry.is_expandable_tool() {
-        String::new()
-    } else if entry.expanded {
-        "▾".to_owned()
-    } else {
-        format!("▸ {count} line{}", if count == 1 { "" } else { "s" })
+    let (short, long) = split_input(entry.input.as_ref());
+    let marker = match (entry.is_expandable_tool(), entry.expanded) {
+        (false, _) => "",
+        (true, true) => " ▾",
+        (true, false) => " ▸",
     };
-    let title_width = width.saturating_sub(summary.width() + 1);
-    let mut title: String = entry.text.graphemes(true).take(title_width).collect();
-    title.push_str(&" ".repeat(title_width.saturating_sub(title.width()) + 1));
-    let mut lines = vec![Line::from(vec![
-        gutter("✦", WARNING),
-        Span::styled(title, Style::default().fg(SECONDARY)),
-        Span::styled(summary, Style::default().fg(MUTED)),
-    ])];
-    if entry.expanded {
-        for mut part in markdown::wrap_plain(&entry.body, width.saturating_sub(2)) {
+    let mut spans = vec![
+        Span::styled(entry.text.clone(), Style::default().fg(SECONDARY)),
+        Span::styled(marker, Style::default().fg(MUTED)),
+    ];
+    for (key, value) in short {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(format!("{key} "), Style::default().fg(MUTED)));
+        spans.push(Span::raw(value));
+    }
+    let mut lines = with_gutter("✦", WARNING, markdown::wrap_spans(spans, width));
+    let inner = width.saturating_sub(2);
+    if !entry.expanded {
+        let preview = long.first().map_or(entry.body.as_str(), |(_, text)| text);
+        lines.extend(output_preview(preview, inner));
+        return lines;
+    }
+    let block = |lines: &mut Vec<Line<'static>>, label: &str, text: &str, bar: Color| {
+        if !label.is_empty() {
+            lines.push(indented(Line::styled(
+                format!("  {label}"),
+                Style::default().fg(MUTED),
+            )));
+        }
+        for mut part in markdown::wrap_plain(text, inner) {
             part.spans
-                .insert(0, Span::styled("│ ", Style::default().fg(WARNING)));
+                .insert(0, Span::styled("│ ", Style::default().fg(bar)));
             lines.push(indented(part));
         }
+    };
+    for (key, text) in &long {
+        block(&mut lines, key, text, MUTED);
+    }
+    if !entry.body.is_empty() {
+        let label = if long.is_empty() { "" } else { "result" };
+        block(&mut lines, label, &entry.body, WARNING);
     }
     lines
+}
+
+/// Named argument values, in the order the call gave them.
+type Fields = Vec<(String, String)>;
+
+/// A call's arguments, split into short ones that fit on its row and long
+/// ones (multi-line text, nested values) shown as blocks.
+fn split_input(input: Option<&Value>) -> (Fields, Fields) {
+    const SHORT: usize = 200;
+    let (mut short, mut long) = (Vec::new(), Vec::new());
+    let Some(input) = input else {
+        return (short, long);
+    };
+    let Value::Object(fields) = input else {
+        long.push(("input".to_owned(), presentation::value(input)));
+        return (short, long);
+    };
+    let scalar = |value: &Value| match value {
+        Value::String(text) if !text.contains('\n') && text.chars().count() <= SHORT => {
+            Some(text.clone())
+        }
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    };
+    for (key, value) in fields {
+        let fitted = match value {
+            Value::Array(items) => items
+                .iter()
+                .map(scalar)
+                .collect::<Option<Vec<_>>>()
+                .map(|items| items.join(" "))
+                .filter(|joined| joined.chars().count() <= SHORT),
+            Value::Null => continue,
+            other => scalar(other),
+        };
+        match fitted {
+            Some(text) => short.push((key.clone(), text)),
+            None => long.push((
+                key.clone(),
+                value
+                    .as_str()
+                    .map_or_else(|| presentation::value(value), str::to_owned),
+            )),
+        }
+    }
+    (short, long)
+}
+
+/// The first lines of a collapsed call's text, muted and cut to one row each.
+fn output_preview(body: &str, width: usize) -> Vec<Line<'static>> {
+    const ROWS: usize = 3;
+    body.lines()
+        .map(str::trim_end)
+        .skip_while(|line| line.trim().is_empty())
+        .take(ROWS)
+        .map(|line| {
+            let mut text: String = line.graphemes(true).take(width).collect();
+            if text.width() < line.width() {
+                text = text
+                    .graphemes(true)
+                    .take(width.saturating_sub(1))
+                    .collect::<String>()
+                    + "…";
+            }
+            indented(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(text, Style::default().fg(MUTED)),
+            ]))
+        })
+        .collect()
+}
+
+/// How far the conversation can scroll up on `screen`.
+pub(in crate::tui) fn max_scroll(app: &App, screen: Rect) -> usize {
+    let inner = conversation_inner(screen_rows(screen, app)[1]);
+    conversation_lines(app, inner.width.saturating_sub(1).max(1) as usize)
+        .lines
+        .len()
+        .saturating_sub(inner.height as usize)
 }
 
 pub(in crate::tui) fn tool_at(app: &App, screen: Rect, x: u16, y: u16) -> Option<ToolRow> {
@@ -300,6 +420,9 @@ pub(in crate::tui) fn tool_at(app: &App, screen: Rect, x: u16, y: u16) -> Option
 
 /// Open or close a tool row, or a run of them, and keep it in view.
 pub(in crate::tui) fn toggle_tool(app: &mut App, screen: Rect, row: ToolRow) {
+    let inner = conversation_inner(screen_rows(screen, app)[1]);
+    let width = inner.width.saturating_sub(1).max(1) as usize;
+    let before = conversation_lines(app, width).offset(inner.height, app.scroll);
     match row {
         ToolRow::Entry(index) => {
             if !app
@@ -320,19 +443,21 @@ pub(in crate::tui) fn toggle_tool(app: &mut App, screen: Rect, row: ToolRow) {
         }
     }
     app.selection = None;
-    let inner = conversation_inner(screen_rows(screen, app)[1]);
-    let conversation = conversation_lines(app, inner.width.saturating_sub(1).max(1) as usize);
-    if let Some((header, _)) = conversation
-        .tool_headers
-        .iter()
-        .find(|(_, target)| *target == row)
-    {
-        app.scroll = conversation
-            .lines
-            .len()
-            .saturating_sub(inner.height as usize)
-            .saturating_sub(*header);
-    }
+    let after = conversation_lines(app, width);
+    let Some(&(header, _)) = after.tool_headers.iter().find(|(_, target)| *target == row) else {
+        return;
+    };
+    // Keep the row where it was on screen; a row out of view moves to the top.
+    let height = inner.height as usize;
+    let row_on_screen = header
+        .checked_sub(before)
+        .filter(|row| *row < height)
+        .unwrap_or(0);
+    app.scroll = after
+        .lines
+        .len()
+        .saturating_sub(height)
+        .saturating_sub(header - row_on_screen);
 }
 
 pub(super) fn draw_suggestions(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -457,9 +582,10 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("✦  git.status"));
-        assert!(rendered.contains("3 lines"));
-        assert!(!rendered.contains("modified: README.md"));
+        assert!(rendered.contains("✦  git.status ▸"));
+        // Collapsed output shows as a short preview, not as the quoted body.
+        assert!(rendered.contains("modified: README.md"));
+        assert!(!rendered.contains("│ modified"));
 
         let inner = conversation_inner(screen_rows(screen, &app)[1]);
         let conversation = conversation_lines(&app, inner.width.saturating_sub(1) as usize);
@@ -478,6 +604,63 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("│ modified: README.md"));
+    }
+
+    #[test]
+    fn opening_a_call_keeps_its_row_in_place() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        for turn in 0..10 {
+            app.push(EntryKind::User, format!("question {turn}"));
+        }
+        app.push_tool("git.diff", "line\n".repeat(30));
+        app.push(EntryKind::Agent, "done");
+        let screen = Rect::new(0, 0, 80, 20);
+        let inner = conversation_inner(screen_rows(screen, &app)[1]);
+        let width = inner.width.saturating_sub(1) as usize;
+        let row_of = |app: &App| {
+            let conversation = conversation_lines(app, width);
+            conversation.tool_headers[0].0 - conversation.offset(inner.height, app.scroll)
+        };
+        let before = row_of(&app);
+        toggle_tool(&mut app, screen, ToolRow::Entry(10));
+        assert!(app.entries[10].expanded);
+        assert_eq!(row_of(&app), before);
+    }
+
+    #[test]
+    fn a_call_shows_full_paths_and_what_it_writes() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push_tool("fs.write", "Done");
+        app.entries[0].input = Some(serde_json::json!({
+            "path": "/home/me/project/crates/cli/src/tui/ui/conversation.rs",
+            "content": "fn main() {\n    run();\n}"
+        }));
+        let text = rendered(&app, 50, 20);
+        // The path wraps in full instead of being cut.
+        assert!(text.contains("path"), "{text}");
+        assert!(text.contains("/home/me/project/crates"), "{text}");
+        assert!(text.contains("versation.rs"), "{text}");
+        assert!(
+            text.contains("fn main() {"),
+            "collapsed shows what is written"
+        );
+        assert!(!text.contains("result"));
+
+        app.entries[0].set_expanded(true);
+        let text = rendered(&app, 50, 20);
+        assert!(text.contains("content"));
+        assert!(text.contains("│ }"));
+        assert!(text.contains("result"));
+        assert!(text.contains("│ Done"));
+    }
+
+    #[test]
+    fn long_preview_lines_are_cut_with_an_ellipsis() {
+        let lines = output_preview(&format!("\n{}\nb\nc\nd", "x".repeat(50)), 10);
+        let text: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        assert_eq!(text.len(), 3);
+        assert!(text[0].ends_with("xxxxxxxxx…"), "{}", text[0]);
+        assert!(text[2].ends_with('c'));
     }
 
     fn rendered(app: &App, width: u16, height: u16) -> String {
@@ -503,8 +686,7 @@ mod tests {
         assert!(text.contains("›  hello **there**"));
         assert!(text.contains("◆  Hi friend"));
         assert!(text.contains("• item"));
-        assert!(text.contains("✦  git.status"));
-        assert!(text.contains("3 lines"));
+        assert!(text.contains("✦  git.status ▸"));
         assert!(!text.contains("you"));
         assert!(!text.contains("agent "));
     }

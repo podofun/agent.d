@@ -281,7 +281,33 @@ impl Editor {
         let mut row = 0;
         let mut column = 0;
         let mut boundaries = Vec::new();
-        for (index, grapheme) in self.text.grapheme_indices(true) {
+        let graphemes: Vec<(usize, &str)> = self.text.grapheme_indices(true).collect();
+        let cells_of = |grapheme: &str| {
+            if grapheme == "\t" {
+                4
+            } else {
+                grapheme.width().max(1)
+            }
+        };
+        let blank = |grapheme: &str| grapheme.chars().all(char::is_whitespace);
+        for (position, &(index, grapheme)) in graphemes.iter().enumerate() {
+            // Wrap at words: a word that does not fit the rest of the row
+            // starts the next one. Only a word wider than the row breaks.
+            let word_start =
+                !blank(grapheme) && (position == 0 || blank(graphemes[position - 1].1));
+            if word_start && column > 0 {
+                let word: usize = graphemes[position..]
+                    .iter()
+                    .take_while(|(_, next)| !blank(next))
+                    .map(|(_, next)| cells_of(next))
+                    .sum();
+                if column + word > width {
+                    lines.push(String::new());
+                    segments.push(Vec::new());
+                    row += 1;
+                    column = 0;
+                }
+            }
             if grapheme == "\n" {
                 boundaries.push((index, row, column));
                 lines.push(String::new());
@@ -291,7 +317,7 @@ impl Editor {
                 continue;
             }
             let displayed = if grapheme == "\t" { "    " } else { grapheme };
-            let cells = displayed.width().max(1);
+            let cells = cells_of(grapheme);
             if column + cells > width && column > 0 {
                 lines.push(String::new());
                 segments.push(Vec::new());
@@ -455,6 +481,17 @@ mod tests {
         assert_eq!(editor.text(), "first\nsecond[31m");
         editor.up(20);
         assert_eq!(editor.layout(20).cursor_row, 0);
+    }
+
+    #[test]
+    fn wraps_at_words_and_breaks_only_long_ones() {
+        let mut editor = Editor::default();
+        editor.set("are there any holes?");
+        assert_eq!(editor.layout(12).lines, vec!["are there ", "any holes?"]);
+        editor.set("abcdefghij xy");
+        assert_eq!(editor.layout(4).lines, vec!["abcd", "efgh", "ij ", "xy"]);
+        let layout = editor.layout(12);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (1, 2));
     }
 
     #[test]

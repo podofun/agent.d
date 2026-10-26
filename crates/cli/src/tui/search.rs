@@ -96,10 +96,7 @@ pub(super) fn label(section: Tab, value: &Value) -> String {
         ),
         Tab::Sessions => format!(
             "{}  ·  {} turns",
-            value["label"]
-                .as_str()
-                .or_else(|| value["id"].as_str())
-                .unwrap_or("?"),
+            value["label"].as_str().unwrap_or("untitled"),
             value["turn_count"].as_u64().unwrap_or(0)
         ),
         Tab::Actions => value.as_str().unwrap_or("?").to_owned(),

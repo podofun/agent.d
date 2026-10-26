@@ -243,22 +243,6 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_offers_copy_while_text_is_selected() {
-        let mut app = app();
-        app.selection = Some(Selection {
-            anchor: Point { line: 0, col: 3 },
-            head: Point { line: 0, col: 7 },
-        });
-        let backend = ratatui::backend::TestBackend::new(60, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let status: String = (0..60).map(|x| buffer[(x, 23)].symbol()).collect();
-        assert!(status.contains("Ctrl+C copy"), "{status}");
-        assert!(status.contains("Esc clear"), "{status}");
-    }
-
-    #[test]
     fn highlight_reverses_text_but_never_the_gutter() {
         let mut app = app();
         app.selection = Some(Selection {

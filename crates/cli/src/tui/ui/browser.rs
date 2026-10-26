@@ -4,6 +4,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 
+use unicode_width::UnicodeWidthStr;
+
 use super::super::app::{App, Tab};
 use super::super::presentation;
 use super::super::search::Row;
@@ -80,7 +82,7 @@ pub(super) fn draw_browser(frame: &mut Frame<'_>, app: &App) {
         ),
         None => {
             let message = if app.query.is_empty() {
-                app.notice
+                app.load_error
                     .clone()
                     .unwrap_or_else(|| "Nothing here yet. Press F5 to refresh.".into())
             } else {
@@ -100,11 +102,28 @@ pub(super) fn draw_browser(frame: &mut Frame<'_>, app: &App) {
             );
         }
     }
+    // Drop hints from the end until the rest fits.
+    let hints = [
+        "type to search",
+        "↑/↓ select",
+        "Enter open",
+        "Tab switch",
+        "Esc close",
+    ];
+    let mut footer = String::new();
+    for hint in hints {
+        let next = if footer.is_empty() {
+            format!(" {hint}")
+        } else {
+            format!("{footer}  ·  {hint}")
+        };
+        if next.width() + 1 > rows[2].width as usize {
+            break;
+        }
+        footer = next;
+    }
     frame.render_widget(
-        Paragraph::new(
-            " type to search  ·  ↑/↓ select  ·  Enter open  ·  Tab switch  ·  Esc close ",
-        )
-        .style(Style::default().fg(MUTED)),
+        Paragraph::new(footer).style(Style::default().fg(MUTED)),
         rows[2],
     );
 }
@@ -225,7 +244,7 @@ mod tests {
         let leading = inner.len() - inner.trim_start().len();
         let trailing = inner.len() - inner.trim_end().len();
         assert!(leading.abs_diff(trailing) <= 1, "{line}");
-        app.notice = Some("sessions.list: daemon has no session store".into());
+        app.load_error = Some("sessions.list: daemon has no session store".into());
         let text = rows(&app, 100, 30).join("\n");
         assert!(text.contains("daemon has no session store"));
         assert!(!text.contains("Nothing here yet"));
