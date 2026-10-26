@@ -119,7 +119,21 @@ impl Runs {
         run_id: Option<&str>,
         detail: &serde_json::Value,
     ) -> serde_json::Value {
-        let secrets = run_id
+        redact_value(detail, &self.secrets(run_id), true)
+    }
+
+    /// `value` with every secret the run read replaced by its name, and
+    /// nothing shortened. For tool inputs and outputs shown to the caller.
+    pub(crate) fn redact_secrets(
+        &self,
+        run_id: Option<&str>,
+        value: &serde_json::Value,
+    ) -> serde_json::Value {
+        redact_value(value, &self.secrets(run_id), false)
+    }
+
+    fn secrets(&self, run_id: Option<&str>) -> Vec<(String, String)> {
+        run_id
             .and_then(|id| {
                 self.records
                     .lock()
@@ -127,8 +141,7 @@ impl Runs {
                     .get(id)
                     .map(|r| r.secrets.lock().unwrap().clone())
             })
-            .unwrap_or_default();
-        redact_value(detail, &secrets)
+            .unwrap_or_default()
     }
 
     /// Ask a question once per run, kind, and unredacted request: identical
@@ -166,42 +179,51 @@ fn covers_rest_of_run(permission: &str) -> bool {
         .any(|p| permission.starts_with(p))
 }
 
-fn redact_value(v: &serde_json::Value, secrets: &[(String, String)]) -> serde_json::Value {
+/// Secrets replaced by their names. With `capped`, long strings, lists, and
+/// objects are also shortened.
+fn redact_value(
+    v: &serde_json::Value,
+    secrets: &[(String, String)],
+    capped: bool,
+) -> serde_json::Value {
     use serde_json::Value;
+    let limit = if capped { MAX_DETAIL_ITEMS } else { usize::MAX };
     match v {
-        Value::String(s) => Value::String(redact_str(s, secrets)),
+        Value::String(s) => Value::String(redact_str(s, secrets, capped)),
         Value::Array(items) => {
             let mut out: Vec<Value> = items
                 .iter()
-                .take(MAX_DETAIL_ITEMS)
-                .map(|i| redact_value(i, secrets))
+                .take(limit)
+                .map(|i| redact_value(i, secrets, capped))
                 .collect();
-            if items.len() > MAX_DETAIL_ITEMS {
-                out.push(Value::String(format!(
-                    "... {} more",
-                    items.len() - MAX_DETAIL_ITEMS
-                )));
+            if items.len() > limit {
+                out.push(Value::String(format!("... {} more", items.len() - limit)));
             }
             Value::Array(out)
         }
         Value::Object(map) => Value::Object(
             map.iter()
-                .take(MAX_DETAIL_ITEMS)
-                .map(|(k, v)| (redact_str(k, secrets), redact_value(v, secrets)))
+                .take(limit)
+                .map(|(k, v)| {
+                    (
+                        redact_str(k, secrets, capped),
+                        redact_value(v, secrets, capped),
+                    )
+                })
                 .collect(),
         ),
         other => other.clone(),
     }
 }
 
-fn redact_str(s: &str, secrets: &[(String, String)]) -> String {
+fn redact_str(s: &str, secrets: &[(String, String)], capped: bool) -> String {
     let mut out = s.to_string();
     for (name, value) in secrets {
         if out.contains(value.as_str()) {
             out = out.replace(value.as_str(), &format!("<secret {name}>"));
         }
     }
-    if out.chars().count() > MAX_DETAIL_STRING {
+    if capped && out.chars().count() > MAX_DETAIL_STRING {
         out = out.chars().take(MAX_DETAIL_STRING).collect::<String>() + "...";
     }
     out
@@ -278,6 +300,22 @@ mod tests {
         let many: Vec<u32> = (0..100).collect();
         let out = runs.redact(None, &json!(many));
         assert_eq!(out.as_array().unwrap().len(), MAX_DETAIL_ITEMS + 1);
+    }
+
+    #[test]
+    fn tool_values_keep_their_full_length_but_not_secrets() {
+        let runs = Arc::new(Runs::default());
+        let _run = runs.start("run-1", None);
+        runs.record_secret("run-1", "key", "s3cret");
+        let long = "x".repeat(MAX_DETAIL_STRING * 2) + " s3cret";
+        let many: Vec<u32> = (0..100).collect();
+        let out = runs.redact_secrets(Some("run-1"), &json!({ "text": long, "ids": many }));
+        assert!(out["text"].as_str().unwrap().ends_with(" <secret key>"));
+        assert_eq!(
+            out["text"].as_str().unwrap().len(),
+            MAX_DETAIL_STRING * 2 + 13
+        );
+        assert_eq!(out["ids"].as_array().unwrap().len(), 100);
     }
 
     #[test]

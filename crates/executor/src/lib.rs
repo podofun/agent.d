@@ -2053,7 +2053,23 @@ impl Executor {
                             action: call.name.clone(),
                             args: call.arguments.clone(),
                         };
-                        let text = match self.run(tool_caller.clone(), action).await {
+                        let result = self.run(tool_caller.clone(), action).await;
+                        if let Some(sink) = &sink {
+                            let run_id = tool_caller.run_id.as_deref();
+                            let (output, error) = match &result {
+                                Ok((res, _)) => {
+                                    (self.runs.redact_secrets(run_id, &res.value), None)
+                                }
+                                Err((e, _)) => (serde_json::Value::Null, Some(e.to_string())),
+                            };
+                            let _ = sink.send(agentd_ai::StreamEvent::ToolResult {
+                                name: call.name.clone(),
+                                input: self.runs.redact_secrets(run_id, &call.arguments),
+                                output,
+                                error,
+                            });
+                        }
+                        let text = match result {
                             Ok((res, _)) => serde_json::to_string(&res.value).unwrap_or_else(|e| {
                                 format!("the tool result could not be serialized to JSON ({e})")
                             }),

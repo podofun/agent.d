@@ -271,6 +271,17 @@ pub enum StreamEvent {
     /// The assistant asked for a tool. Emitted when the call is known
     /// (name complete); results flow through the normal tool loop.
     ToolCall { name: String },
+    /// A tool call finished in an executor-owned loop: its full input and
+    /// output, with secrets the run read replaced by their names. `error` is
+    /// set when the call failed.
+    ToolResult {
+        name: String,
+        input: serde_json::Value,
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        output: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// One provider turn finished. The executor-owned loop may start another
     /// turn after dispatching tools; the final turn is followed by the
     /// complete response instead.
