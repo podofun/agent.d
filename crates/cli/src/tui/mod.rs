@@ -84,7 +84,7 @@ pub(crate) async fn run(
     if let Some(id) = session
         && let Err(error) = app.open_session(&id).await
     {
-        app.notice = Some(format!("Could not open session: {error:#}"));
+        app.fail(format!("Could not open session: {error:#}"));
     }
     control::start(
         base.to_owned(),
@@ -104,10 +104,14 @@ pub(crate) async fn run(
         tokio::select! {
             update = app.received.recv() => {
                 if let Some(update) = update {
-                    app.apply(update);
+                    let size = screen.0.size()?;
+                    let area = Rect::new(0, 0, size.width, size.height);
+                    let mut updates = vec![update];
                     while let Ok(update) = app.received.try_recv() {
-                        app.apply(update);
+                        updates.push(update);
                     }
+                    apply_updates(&mut app, area, updates);
+                    app.send_queued().await;
                     dirty = true;
                 }
             }
@@ -117,11 +121,22 @@ pub(crate) async fn run(
                 let area = Rect::new(0, 0, size.width, size.height);
                 match handle_event(&mut app, event?, area).await? {
                     Handled::Quit => break,
-                    Handled::Redraw => dirty = true,
+                    Handled::Redraw => {
+                        // Picking a runner sends what waited for one.
+                        app.send_queued().await;
+                        dirty = true;
+                    }
                     Handled::Ignored => {}
                 }
             }
-            _ = spinner.tick(), if app.pending || app.animating() => dirty = true,
+            _ = spinner.tick(), if app.pending || app.animating() || app.drag.is_some() => {
+                // A drag held above or below the conversation keeps scrolling.
+                if app.drag.is_some() {
+                    let size = screen.0.size()?;
+                    drag_selection(&mut app, Rect::new(0, 0, size.width, size.height));
+                }
+                dirty = true;
+            }
         }
     }
     Ok(())
@@ -150,6 +165,7 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                 if app.approval.is_none() && app.tab == Tab::Chat =>
             {
                 app.selection = None;
+                app.drag = None;
                 if let Some(index) = ui::suggestion_at(app, area, mouse.column, mouse.row) {
                     let execute = picker_title(app.input.text()).is_some()
                         && app.suggestions()[index].execute;
@@ -167,12 +183,13 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if app.tab == Tab::Chat => {
-                let point = ui::point_at(app, area, mouse.column, mouse.row);
-                if let (Some(selection), Some(point)) = (app.selection.as_mut(), point) {
-                    selection.head = point;
+                if app.selection.is_some() {
+                    app.drag = Some((mouse.column, mouse.row));
+                    drag_selection(app, area);
                 }
             }
             MouseEventKind::Up(MouseButton::Left) if app.tab == Tab::Chat => {
+                app.drag = None;
                 // A press and release on the same cell is a click, not a
                 // selection: toggle the tool row under it, if any.
                 if app.selection.is_some_and(|selection| selection.is_click()) {
@@ -186,7 +203,7 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                 if app.approval.is_some() {
                     app.approval_scroll = app.approval_scroll.saturating_sub(3);
                 } else if app.tab == Tab::Chat {
-                    app.scroll = app.scroll.saturating_add(3);
+                    scroll_up(app, area, 3);
                 } else {
                     app.select_previous();
                 }
@@ -249,20 +266,23 @@ async fn handle_key(app: &mut App, key: KeyEvent, screen: Rect) -> Result<bool> 
 }
 
 /// Ctrl+C: deny, cancel, copy, clear, or quit, in that order of relevance.
+/// Quitting takes a second Ctrl+C, so a missed copy never closes the chat.
 fn handle_interrupt(app: &mut App) -> bool {
     if app.approval.is_some() {
         app.decide("deny");
     } else if app.pending {
         app.cancel_run();
     } else if let Some(result) = app.copy_selection().or_else(|| app.input.copy_selection()) {
-        if let Err(notice) = result {
-            app.notice = Some(notice);
+        if let Err(error) = result {
+            app.fail(error);
         }
     } else if !app.input.is_empty() {
         app.input.take();
         app.notice = None;
-    } else {
+    } else if app.quit_armed() {
         return true;
+    } else {
+        app.quit_pressed = Some(std::time::Instant::now());
     }
     false
 }
@@ -356,23 +376,98 @@ async fn handle_chat_key(app: &mut App, key: KeyEvent, screen: Rect) -> Result<O
         }
         KeyCode::End if app.input.is_empty() => app.jump_to_bottom(),
         KeyCode::F(5) => app.refresh().await,
-        KeyCode::PageUp => app.scroll = app.scroll.saturating_add(8),
+        KeyCode::BackTab => {
+            if let Err(error) = app.cycle_approval_mode().await {
+                app.fail(error.to_string());
+            }
+        }
+        KeyCode::PageUp => scroll_up(app, screen, 8),
         KeyCode::PageDown => scroll_down(app, 8),
         KeyCode::Char('n') if control => {
             if app.pending {
-                app.notice = Some("Wait for the current reply.".into());
+                app.fail("Wait for the current reply.");
             } else {
                 app.new_chat();
             }
         }
         KeyCode::Char('e') if control => {
-            if let Some(index) = app.latest_expandable_tool() {
-                ui::toggle_tool(app, screen, index);
+            if let Some(row) = app.latest_tool_row() {
+                ui::toggle_tool(app, screen, row);
             }
         }
         _ => return Ok(None),
     }
     Ok(Some(false))
+}
+
+/// Extend the selection to the dragged position. Above or below the
+/// conversation, it scrolls one line toward the mouse first, so holding the
+/// mouse there keeps selecting.
+fn drag_selection(app: &mut App, screen: Rect) {
+    let Some((x, y)) = app.drag.filter(|_| app.selection.is_some()) else {
+        app.drag = None;
+        return;
+    };
+    let inner = ui::conversation_inner(ui::screen_rows(screen, app)[1]);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    // One line every 100 ms just past the edge, faster the farther out.
+    let distance = if y < inner.y {
+        inner.y - y
+    } else {
+        (y + 1).saturating_sub(inner.bottom())
+    };
+    let interval = std::time::Duration::from_millis(100 / u64::from(distance.clamp(1, 4)));
+    let due = app
+        .drag_scrolled
+        .is_none_or(|scrolled| scrolled.elapsed() >= interval);
+    if distance > 0 && due {
+        if y < inner.y {
+            scroll_up(app, screen, 1);
+        } else {
+            app.scroll = app.scroll.saturating_sub(1);
+        }
+        app.drag_scrolled = Some(std::time::Instant::now());
+    }
+    let x = x.clamp(inner.x, inner.right() - 1);
+    let mut row = y.clamp(inner.y, inner.bottom() - 1);
+    // Below the last line, select to the end of it.
+    let point = loop {
+        if let Some(point) = ui::point_at(app, screen, x, row) {
+            break Some(point);
+        }
+        if row == inner.y {
+            break None;
+        }
+        row -= 1;
+    };
+    if let (Some(selection), Some(point)) = (app.selection.as_mut(), point) {
+        selection.head = point;
+    }
+}
+
+/// Apply streamed updates. At the bottom, the view follows new lines. Scrolled
+/// up, it stays on the lines being read while the reply grows below them.
+fn apply_updates(app: &mut App, screen: Rect, updates: Vec<app::Update>) {
+    let held = app.scroll > 0;
+    let before = if held { ui::max_scroll(app, screen) } else { 0 };
+    for update in updates {
+        app.apply(update);
+    }
+    if held && app.scroll > 0 {
+        let after = ui::max_scroll(app, screen);
+        app.scroll = (app.scroll + after).saturating_sub(before);
+    }
+}
+
+/// Scroll up, stopping at the first line. Without the stop, extra scrolling
+/// past the top had to be undone before scrolling down moved anything.
+fn scroll_up(app: &mut App, screen: Rect, lines: usize) {
+    app.scroll = app
+        .scroll
+        .saturating_add(lines)
+        .min(ui::max_scroll(app, screen));
 }
 
 fn scroll_down(app: &mut App, lines: usize) {
@@ -389,8 +484,12 @@ async fn submit_draft(app: &mut App) -> Result<bool> {
         return Ok(true);
     }
     if let Err(error) = app.submit(&input).await {
-        app.notice = Some(error.to_string());
-        app.input.set(input);
+        app.fail(error.to_string());
+        // A message that failed stays in the conversation, queued; only a
+        // command comes back to the draft.
+        if input.trim_start().starts_with('/') {
+            app.input.set(input);
+        }
     }
     Ok(false)
 }
@@ -494,6 +593,133 @@ mod tests {
         assert!(!handle_key(&mut app, key, screen).await.unwrap());
         assert_eq!(app.input.text(), "draft", "copy never clears the draft");
         assert!(app.selection.is_none(), "copy releases the selection");
+    }
+
+    #[tokio::test]
+    async fn errors_show_in_the_conversation() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        let screen = Rect::new(0, 0, 80, 24);
+        app.input.set("/approval maybe");
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key(&mut app, enter, screen).await.unwrap();
+        let last = app.entries.last().unwrap();
+        assert!(matches!(last.kind, EntryKind::Error));
+        assert!(last.text.contains("usage: /approval"));
+        assert!(app.notice.is_none());
+        assert_eq!(app.input.text(), "/approval maybe", "the draft comes back");
+    }
+
+    #[tokio::test]
+    async fn dragging_above_the_conversation_scrolls_and_keeps_selecting() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        let screen = Rect::new(0, 0, 80, 24);
+        for turn in 0..30 {
+            app.push(EntryKind::User, format!("message {turn}"));
+        }
+        let inner = ui::conversation_inner(ui::screen_rows(screen, &app)[1]);
+        let (x, y) = (inner.x + 2, inner.bottom() - 1);
+        handle_event(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+            screen,
+        )
+        .await
+        .unwrap();
+        let anchor = app.selection.unwrap().anchor;
+        handle_event(
+            &mut app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), x, 0),
+            screen,
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.scroll, 1, "the drag scrolled up one line");
+        // Right away, it waits: scrolling is paced so it can be stopped.
+        drag_selection(&mut app, screen);
+        assert_eq!(app.scroll, 1);
+        // Holding the mouse there keeps scrolling, as the timer would.
+        for _ in 0..4 {
+            app.drag_scrolled = None;
+            drag_selection(&mut app, screen);
+        }
+        assert_eq!(app.scroll, 5);
+        let selection = app.selection.unwrap();
+        assert_eq!(selection.anchor, anchor);
+        assert_eq!(
+            selection.head.line,
+            anchor.line - inner.height as usize + 1 - 5
+        );
+
+        app.drag_scrolled = None;
+        handle_event(
+            &mut app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), x, 23),
+            screen,
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.scroll, 4, "below the conversation it scrolls down");
+        handle_event(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), x, 23),
+            screen,
+        )
+        .await
+        .unwrap();
+        assert!(app.drag.is_none());
+    }
+
+    #[test]
+    fn streaming_keeps_a_scrolled_up_view_still_and_follows_at_the_bottom() {
+        use app::Update;
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        let screen = Rect::new(0, 0, 80, 24);
+        for turn in 0..30 {
+            app.push(EntryKind::User, format!("message {turn}"));
+        }
+        app.pending = true;
+        let chunk =
+            || Update::Delta(serde_json::json!({ "type": "text_delta", "text": "line\n\n" }));
+        app.scroll = 5;
+        let top = |app: &App| ui::max_scroll(app, screen) - app.scroll;
+        let reading = top(&app);
+        apply_updates(&mut app, screen, vec![chunk(), chunk(), chunk()]);
+        assert!(app.scroll > 5, "the view moved up with the new lines");
+        assert_eq!(top(&app), reading, "the same lines stay on screen");
+
+        app.scroll = 0;
+        apply_updates(&mut app, screen, vec![chunk()]);
+        assert_eq!(app.scroll, 0, "at the bottom it follows the reply");
+    }
+
+    #[tokio::test]
+    async fn scrolling_up_stops_at_the_top() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        let screen = Rect::new(0, 0, 80, 24);
+        for turn in 0..30 {
+            app.push(EntryKind::User, format!("message {turn}"));
+        }
+        let top = ui::max_scroll(&app, screen);
+        assert!(top > 0);
+        for _ in 0..100 {
+            scroll_up(&mut app, screen, 3);
+        }
+        assert_eq!(app.scroll, top);
+        scroll_down(&mut app, 3);
+        assert_eq!(app.scroll, top - 3, "scrolling down moves at once");
+    }
+
+    #[tokio::test]
+    async fn quitting_takes_two_ctrl_c() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        let screen = Rect::new(0, 0, 80, 24);
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.input.set("draft");
+        assert!(!handle_key(&mut app, key, screen).await.unwrap());
+        assert!(app.input.is_empty(), "the first clears the draft");
+        assert!(!handle_key(&mut app, key, screen).await.unwrap());
+        assert!(app.quit_armed());
+        assert!(handle_key(&mut app, key, screen).await.unwrap());
     }
 
     #[tokio::test]

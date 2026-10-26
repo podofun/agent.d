@@ -28,16 +28,6 @@ pub(super) fn tool_output(text: &str) -> String {
     }
 }
 
-pub(super) fn tool_call(call: &Value) -> (String, String) {
-    let name = call["name"].as_str().unwrap_or("Tool call").to_owned();
-    let arguments = &call["arguments"];
-    if arguments.is_null() || arguments.as_object().is_some_and(serde_json::Map::is_empty) {
-        (name, String::new())
-    } else {
-        (name, value(arguments))
-    }
-}
-
 pub(super) fn value(value: &Value) -> String {
     let mut lines = Vec::new();
     collect(value, 0, &mut lines);
@@ -112,7 +102,7 @@ fn indent(depth: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{action_result, tool_call, tool_output, value};
+    use super::{action_result, tool_output, value};
     use serde_json::json;
 
     #[test]
@@ -136,18 +126,10 @@ mod tests {
     }
 
     #[test]
-    fn serialized_tool_output_and_call_arguments_are_rendered() {
+    fn serialized_tool_output_is_rendered() {
         assert_eq!(
             tool_output("{\"ok\":true,\"message\":\"ready\"}"),
             "Message: ready\nOk: Yes"
-        );
-        assert_eq!(
-            tool_call(&json!({ "name": "notes.read", "arguments": { "path": "README.md" } })),
-            ("notes.read".into(), "Path: README.md".into())
-        );
-        assert_eq!(
-            tool_call(&json!({ "name": "notes.read", "arguments": {} })),
-            ("notes.read".into(), String::new())
         );
         assert_eq!(tool_output("not JSON {here}"), "not JSON {here}");
         assert_eq!(

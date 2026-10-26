@@ -58,6 +58,8 @@ pub(super) enum EntryKind {
     Tool,
     Info,
     Error,
+    /// A change to the chat itself, such as its runner or approval mode.
+    Setting,
 }
 
 pub(super) struct Entry {
@@ -67,7 +69,20 @@ pub(super) struct Entry {
     /// Render `text` as markdown instead of preformatted lines.
     pub(super) markdown: bool,
     pub(super) expanded: bool,
+    /// On the first tool row of a run of tool rows: whether the run is shown
+    /// one row per call instead of as a single "Used N actions" row.
+    pub(super) group_open: bool,
+    /// On a tool row: the arguments the call was given.
+    pub(super) input: Option<Value>,
     rendered: RefCell<Option<(usize, Vec<Line<'static>>)>>,
+}
+
+/// A clickable tool row: one call, or a run of calls shown as one row,
+/// named by the index of its first entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ToolRow {
+    Entry(usize),
+    Group(usize),
 }
 
 pub(super) enum Update {
@@ -91,14 +106,16 @@ const CANCELLING: &str = "Cancelling runner…";
 const HELP: &str = "\
 ## Chat
 - `Enter` sends, `Shift+Enter` or `Ctrl+J` adds a newline
+- While the agent works, `Enter` queues the message; queued messages are sent together when the reply finishes
 - `/` lists commands. `/runner`, `/call`, and `/open` open searchable lists
 - `/rename NAME` labels the current chat
-- `Ctrl+N` starts a new chat, `F5` refreshes daemon state
-- `Ctrl+E` or a click expands the latest tool output
+- `Ctrl+N`, `/new`, or `/clear` starts a new chat, `F5` refreshes daemon state
+- `Ctrl+E` or a click expands the latest tool output or group of calls
+- `Shift+Tab` or `/approval` chooses who answers approvals: you, the classifier, or nobody
 - Drag with the mouse to select text; `Ctrl+C` copies it
 - `PageUp`, `PageDown`, or the mouse wheel scroll
 - `Esc` or `End` on an empty draft jumps to the bottom and clears the notice
-- `Ctrl+C` copies a selection, cancels a run, clears the draft, or quits
+- `Ctrl+C` copies a selection, cancels a run, or clears the draft; press it twice to quit
 
 ## Browse
 - `Ctrl+P` opens the browser; type to search everywhere
@@ -125,11 +142,30 @@ pub(super) struct App {
     pub(super) entries: Vec<Entry>,
     pub(super) streamed: String,
     pub(super) pending: bool,
+    /// Messages sent while a reply was running, oldest first. Each is sent
+    /// when the run before it finishes.
+    pub(super) queue: VecDeque<String>,
+    /// The queue failed to send. It waits for the next message, which
+    /// carries it, instead of being retried on its own.
+    pub(super) queue_held: bool,
+    /// Who answers this chat's approval requests: `human`, `classifier`, or
+    /// `nobody`. `None` follows the runner's default.
+    pub(super) approval_mode: Option<&'static str>,
+    /// Name of the folder `agentctl` runs in.
+    pub(super) workdir: String,
+    /// Git branch of that folder, if it is a repository.
+    pub(super) branch: Option<String>,
+    /// When Ctrl+C was last pressed with nothing else to do.
+    pub(super) quit_pressed: Option<std::time::Instant>,
     cancel: Option<oneshot::Sender<()>>,
     started: Option<std::time::Instant>,
     pub(super) scroll: usize,
     /// Mouse selection over the conversation.
     pub(super) selection: Option<Selection>,
+    /// Where the mouse is while it drags a selection.
+    pub(super) drag: Option<(u16, u16)>,
+    /// When a drag past the conversation's edge last scrolled it.
+    pub(super) drag_scrolled: Option<std::time::Instant>,
     /// Terminal size from the last event, for selection math.
     pub(super) screen: Rect,
     /// Whether the terminal renders 24-bit colour.
@@ -147,6 +183,8 @@ pub(super) struct App {
     pub(super) skills: Vec<Value>,
     pub(super) connected: bool,
     pub(super) notice: Option<String>,
+    /// Why the last refresh failed, shown in an empty browser list.
+    pub(super) load_error: Option<String>,
     pub(super) approval: Option<ApprovalRequest>,
     pub(super) approval_scroll: usize,
     approvals: VecDeque<ApprovalRequest>,
@@ -173,10 +211,24 @@ impl App {
             entries: Vec::new(),
             streamed: String::new(),
             pending: false,
+            queue: VecDeque::new(),
+            queue_held: false,
+            approval_mode: None,
+            workdir: std::env::current_dir()
+                .ok()
+                .and_then(|dir| {
+                    dir.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .unwrap_or_default(),
+            branch: None,
+            quit_pressed: None,
             cancel: None,
             started: None,
             scroll: 0,
             selection: None,
+            drag: None,
+            drag_scrolled: None,
             screen: Rect::new(0, 0, 80, 24),
             truecolor: std::env::var("COLORTERM")
                 .is_ok_and(|value| matches!(value.as_str(), "truecolor" | "24bit")),
@@ -191,6 +243,7 @@ impl App {
             skills: Vec::new(),
             connected: false,
             notice: None,
+            load_error: None,
             approval: None,
             approval_scroll: 0,
             approvals: VecDeque::new(),
@@ -222,6 +275,37 @@ impl App {
             false,
         ));
         self.content_arrived();
+    }
+
+    /// Fill in the row of a finished call with its input and output. Calls
+    /// finish in the order they were made, so it is the first row of this
+    /// reply with the same name and nothing filled in yet.
+    fn tool_finished(&mut self, value: &Value) {
+        let name = value["name"].as_str().unwrap_or("tool");
+        let reply_start = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry.kind, EntryKind::User))
+            .map_or(0, |index| index + 1);
+        let index = (reply_start..self.entries.len()).find(|&index| {
+            let entry = &self.entries[index];
+            matches!(entry.kind, EntryKind::Tool)
+                && entry.text == name
+                && entry.input.is_none()
+                && entry.body.is_empty()
+        });
+        let index = index.unwrap_or_else(|| {
+            self.push_tool(name, "");
+            self.entries.len() - 1
+        });
+        let output = match (&value["error"], &value["output"]) {
+            (Value::String(error), _) => format!("failed: {error}"),
+            (_, Value::String(text)) => presentation::tool_output(text),
+            (_, output) => presentation::value(output),
+        };
+        let entry = &mut self.entries[index];
+        set_input(entry, &value["input"]);
+        append_output(entry, &output);
     }
 
     fn content_arrived(&mut self) {
@@ -302,7 +386,20 @@ impl App {
         response_result(ws_call(&self.base, self.timeout, method, params).await?)
     }
 
+    /// Whether a second Ctrl+C now quits.
+    pub(super) fn quit_armed(&self) -> bool {
+        self.quit_pressed
+            .is_some_and(|pressed| pressed.elapsed() < std::time::Duration::from_millis(1500))
+    }
+
+    /// The model of the selected runner.
+    pub(super) fn model(&self) -> Option<&str> {
+        let runner = self.runner.as_deref()?;
+        self.runners.iter().find(|item| item["name"] == runner)?["model"].as_str()
+    }
+
     pub(super) async fn refresh(&mut self) {
+        self.branch = current_branch().await;
         let mut errors = Vec::new();
         let (runners, sessions, actions, services, skills) = tokio::join!(
             ws_call(&self.base, self.timeout, "runners.list", Value::Null),
@@ -346,7 +443,7 @@ impl App {
         ] {
             self.selected[tab.index()] = self.selected[tab.index()].min(length.saturating_sub(1));
         }
-        self.notice = if errors.is_empty() {
+        self.load_error = if errors.is_empty() {
             None
         } else {
             Some(errors.join(" · "))
@@ -423,21 +520,22 @@ impl App {
         match section {
             Tab::Runners => {
                 if self.pending {
-                    self.notice = Some("Wait for the current reply.".into());
+                    self.fail("Wait for the current reply.");
                     return;
                 }
-                self.runner = item["name"].as_str().map(str::to_owned);
-                self.new_chat();
+                if let Some(name) = item["name"].as_str() {
+                    self.switch_runner(name);
+                }
                 self.tab = Tab::Chat;
             }
             Tab::Sessions => {
                 if self.pending {
-                    self.notice = Some("Wait for the current reply.".into());
+                    self.fail("Wait for the current reply.");
                     return;
                 }
                 if let Some(id) = item["id"].as_str() {
                     if let Err(error) = self.open_session(id).await {
-                        self.notice = Some(error.to_string());
+                        self.fail(error.to_string());
                     } else {
                         self.tab = Tab::Chat;
                     }
@@ -453,7 +551,7 @@ impl App {
                 if let Some(name) = item["name"].as_str() {
                     match self.call("skills.inspect", json!({ "name": name })).await {
                         Ok(value) => self.push(EntryKind::Info, presentation::value(&value)),
-                        Err(error) => self.notice = Some(error.to_string()),
+                        Err(error) => self.fail(error.to_string()),
                     }
                     self.tab = Tab::Chat;
                 }
@@ -463,6 +561,8 @@ impl App {
     }
 
     pub(super) fn new_chat(&mut self) {
+        self.queue.clear();
+        self.queue_held = false;
         self.session = None;
         self.session_label = None;
         self.entries.clear();
@@ -471,6 +571,17 @@ impl App {
         self.selection = None;
         self.unread = false;
         self.notice = None;
+    }
+
+    /// Use another runner from the next message on. The conversation goes
+    /// on, and messages that waited for a runner go to this one.
+    fn switch_runner(&mut self, name: &str) {
+        if self.runner.as_deref() == Some(name) {
+            return;
+        }
+        self.runner = Some(name.to_owned());
+        self.queue_held = false;
+        self.setting("runner", format!("Switched to {name}"));
     }
 
     pub(super) async fn open_session(&mut self, id: &str) -> Result<()> {
@@ -485,6 +596,12 @@ impl App {
         self.new_chat();
         self.session = Some(session);
         self.session_label = value["label"].as_str().map(str::to_owned);
+        self.approval_mode = match value["approval"].as_str() {
+            Some("human") => Some("human"),
+            Some("classifier") => Some("classifier"),
+            Some("nobody") => Some("nobody"),
+            _ => None,
+        };
         self.load_turns(&value["turns"]);
         Ok(())
     }
@@ -515,9 +632,9 @@ impl App {
                 }
             }
             for call in turn["tool_calls"].as_array().into_iter().flatten() {
-                let (title, body) = presentation::tool_call(call);
                 awaiting_output.push_back(self.entries.len());
-                self.push_tool(title, body);
+                self.push_tool(call["name"].as_str().unwrap_or("tool"), "");
+                set_input(self.entries.last_mut().unwrap(), &call["arguments"]);
             }
         }
     }
@@ -530,17 +647,56 @@ impl App {
         if let Some(command) = input.strip_prefix('/') {
             return self.command(command).await;
         }
-        if self.pending {
-            return Err(anyhow!("wait for the current reply"));
+        // Wait for the reply, or for a runner, and send it then.
+        if self.pending || self.runner.is_none() {
+            self.queue.push_back(input.to_owned());
+            const NO_RUNNER: &str = "No runner selected. Pick one with Ctrl+P.";
+            let shown = self.entries.last().is_some_and(|entry| {
+                matches!(entry.kind, EntryKind::Error) && entry.text == NO_RUNNER
+            });
+            if self.runner.is_none() && !shown {
+                self.fail(NO_RUNNER);
+            }
+            return Ok(());
         }
-        let runner = self
-            .runner
-            .clone()
-            .context("select a runner in the Runners tab")?;
+        let mut messages: Vec<String> = self.queue.drain(..).collect();
+        messages.push(input.to_owned());
+        self.queue_held = false;
+        self.send(messages).await
+    }
+
+    /// Send `messages` as one prompt, so a reply answers all of them. If
+    /// they cannot be sent, they stay queued for the next message.
+    async fn send(&mut self, messages: Vec<String>) -> Result<()> {
+        let result = self.start_run(&messages).await;
+        if result.is_err() {
+            self.queue.extend(messages);
+            self.queue_held = true;
+        }
+        result
+    }
+
+    async fn start_run(&mut self, messages: &[String]) -> Result<()> {
+        let input = messages.join("\n\n");
+        let input = input.as_str();
+        let runner = self.runner.clone().context("no runner")?;
         if self.session.is_none() {
-            let created = self
-                .call("sessions.create", json!({ "runner": runner }))
-                .await?;
+            let mut params = json!({ "runner": runner });
+            if let Some(mode) = self.approval_mode {
+                params["approval"] = json!(mode);
+            }
+            // Name the chat after its first message. A taken name is not
+            // worth failing the message over, so fall back to no name.
+            params["label"] = json!(self.title_for(input));
+            let created = match self.call("sessions.create", params.clone()).await {
+                Ok(created) => created,
+                Err(error) if error.to_string().contains("already exists") => {
+                    params.as_object_mut().map(|map| map.remove("label"));
+                    self.call("sessions.create", params).await?
+                }
+                Err(error) => return Err(error),
+            };
+            self.session_label = created["label"].as_str().map(str::to_owned);
             self.session = Some(
                 created["id"]
                     .as_str()
@@ -549,9 +705,14 @@ impl App {
             );
             self.refresh_sessions().await;
         }
-        let params =
+        let mut params =
             json!({ "name": runner, "prompt": input, "session_id": self.session, "stream": true });
-        self.push(EntryKind::User, input);
+        if let Some(mode) = self.approval_mode {
+            params["approval"] = json!(mode);
+        }
+        for message in messages {
+            self.push(EntryKind::User, message.as_str());
+        }
         self.pending = true;
         self.started = Some(std::time::Instant::now());
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -577,6 +738,22 @@ impl App {
         Ok(())
     }
 
+    /// `title(message)`, with ` 2`, ` 3`, … when another chat has it.
+    fn title_for(&self, message: &str) -> String {
+        let base = title(message);
+        let taken = |name: &str| self.sessions.iter().any(|item| item["label"] == name);
+        (1..)
+            .map(|n| {
+                if n == 1 {
+                    base.clone()
+                } else {
+                    format!("{base} {n}")
+                }
+            })
+            .find(|name| !taken(name))
+            .unwrap_or(base)
+    }
+
     async fn refresh_sessions(&mut self) {
         if let Ok(Value::Array(items)) = self.call("sessions.list", json!({})).await {
             self.sessions = items;
@@ -588,11 +765,23 @@ impl App {
         let argument = argument.trim();
         match verb {
             "help" => self.push_markdown(EntryKind::Info, HELP),
-            "new" => {
+            "new" | "clear" => {
                 if self.pending {
                     return Err(anyhow!("wait for the current reply"));
                 }
                 self.new_chat();
+            }
+            "approval" => {
+                let mode = match argument {
+                    "human" => Some("human"),
+                    "classifier" => Some("classifier"),
+                    "nobody" => Some("nobody"),
+                    "default" => None,
+                    _ => {
+                        return Err(anyhow!("usage: /approval human|classifier|nobody|default"));
+                    }
+                };
+                self.set_approval_mode(mode).await?;
             }
             "runner" => {
                 if self.pending {
@@ -601,8 +790,7 @@ impl App {
                 if !self.runners.iter().any(|item| item["name"] == argument) {
                     return Err(anyhow!("runner `{argument}` is not registered"));
                 }
-                self.runner = Some(argument.to_owned());
-                self.new_chat();
+                self.switch_runner(argument);
             }
             "rename" => {
                 let session = self
@@ -619,6 +807,7 @@ impl App {
                     )
                     .await?;
                 self.session_label = renamed["label"].as_str().map(str::to_owned);
+                self.setting("name", format!("Renamed to {argument}"));
                 self.refresh_sessions().await;
             }
             "open" => {
@@ -668,6 +857,7 @@ impl App {
                     self.flush_streamed();
                     self.push_tool(value["name"].as_str().unwrap_or("tool"), "");
                 }
+                Some("tool_result") => self.tool_finished(&value),
                 _ => {}
             },
             Update::RunFinished(result) => {
@@ -688,7 +878,10 @@ impl App {
                             self.push(EntryKind::Agent, text);
                         }
                     }
-                    Err(error) => self.push(EntryKind::Error, error.to_string()),
+                    Err(error) => {
+                        self.push(EntryKind::Error, error.to_string());
+                        self.queue_held = true;
+                    }
                 }
             }
             Update::ActionFinished { name, result } => {
@@ -710,7 +903,7 @@ impl App {
             Update::ControlLost(error) => {
                 self.approval = None;
                 self.approvals.clear();
-                self.notice = Some(format!("Approvals unavailable: {error}"));
+                self.fail(format!("Approvals unavailable: {error}"));
             }
         }
         if self.scroll == 0 {
@@ -724,7 +917,7 @@ impl App {
         };
         let id = request.id;
         if self.decisions.send(Decision { id, verdict }).is_err() {
-            self.notice = Some("Approval connection closed".into());
+            self.fail("Approval connection closed");
         } else {
             let outcome = match verdict {
                 "allow_once" => "Allowed once",
@@ -737,6 +930,78 @@ impl App {
         self.approval_scroll = 0;
     }
 
+    /// Whether the queue goes out now: a runner is set, no reply is running,
+    /// and the queue did not just fail.
+    pub(super) fn queue_ready(&self) -> bool {
+        !self.queue.is_empty() && !self.pending && !self.queue_held && self.runner.is_some()
+    }
+
+    /// Send every queued message as one prompt, once a reply finished or a
+    /// runner is set.
+    pub(super) async fn send_queued(&mut self) {
+        if !self.queue_ready() {
+            return;
+        }
+        let messages: Vec<String> = self.queue.drain(..).collect();
+        if let Err(error) = self.send(messages).await {
+            self.fail(error.to_string());
+        }
+    }
+
+    /// Set who answers this chat's approval requests. Stored on the chat's
+    /// session, so it applies to the next reply and survives reopening.
+    pub(super) async fn set_approval_mode(&mut self, mode: Option<&'static str>) -> Result<()> {
+        if let Some(session) = &self.session {
+            self.call(
+                "sessions.set_approval",
+                json!({ "id": session, "approval": mode }),
+            )
+            .await?;
+        }
+        self.approval_mode = mode;
+        let label = match mode {
+            Some("classifier") => "Auto mode",
+            Some("nobody") => "No approvals",
+            Some(_) => "Manual approval",
+            None => "Default approval",
+        };
+        self.setting("approval", format!("Approval: {label}"));
+        Ok(())
+    }
+
+    /// Show an error in the conversation.
+    pub(super) fn fail(&mut self, message: impl Into<String>) {
+        self.push(EntryKind::Error, message.into());
+    }
+
+    /// Note a chat setting change in the conversation. Changing the same
+    /// setting again replaces the note instead of adding another. The
+    /// setting's name is kept in `body`, which a note does not show.
+    pub(super) fn setting(&mut self, name: &str, text: String) {
+        if let Some(last) = self.entries.last_mut()
+            && matches!(last.kind, EntryKind::Setting)
+            && last.body == name
+        {
+            last.text = text;
+            last.rendered.get_mut().take();
+            return;
+        }
+        self.push(EntryKind::Setting, text);
+        if let Some(last) = self.entries.last_mut() {
+            last.body = name.to_owned();
+        }
+    }
+
+    /// Shift+Tab: human, then classifier, then nobody, then back.
+    pub(super) async fn cycle_approval_mode(&mut self) -> Result<()> {
+        let next = match self.approval_mode {
+            None | Some("human") => "classifier",
+            Some("classifier") => "nobody",
+            _ => "human",
+        };
+        self.set_approval_mode(Some(next)).await
+    }
+
     pub(super) fn cancel_run(&mut self) {
         if let Some(cancel) = self.cancel.take() {
             let _ = cancel.send(());
@@ -744,8 +1009,35 @@ impl App {
         }
     }
 
-    pub(super) fn latest_expandable_tool(&self) -> Option<usize> {
-        self.entries.iter().rposition(Entry::is_expandable_tool)
+    /// The run of tool rows that `index` belongs to, as `start..end`.
+    pub(super) fn tool_run(&self, index: usize) -> std::ops::Range<usize> {
+        let is_tool = |entry: &Entry| matches!(entry.kind, EntryKind::Tool);
+        let start = self.entries[..index]
+            .iter()
+            .rposition(|entry| !is_tool(entry))
+            .map_or(0, |before| before + 1);
+        let end = self.entries[index..]
+            .iter()
+            .position(|entry| !is_tool(entry))
+            .map_or(self.entries.len(), |after| index + after);
+        start..end
+    }
+
+    /// What Ctrl+E toggles: the latest closed group of tool rows, or else
+    /// the latest tool row with output.
+    pub(super) fn latest_tool_row(&self) -> Option<ToolRow> {
+        let last = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry.kind, EntryKind::Tool))?;
+        let run = self.tool_run(last);
+        if run.len() >= 2 && !self.entries[run.start].group_open {
+            return Some(ToolRow::Group(run.start));
+        }
+        self.entries
+            .iter()
+            .rposition(Entry::is_expandable_tool)
+            .map(ToolRow::Entry)
     }
 }
 
@@ -757,12 +1049,14 @@ impl Entry {
             body,
             markdown,
             expanded: false,
+            group_open: false,
+            input: None,
             rendered: RefCell::new(None),
         }
     }
 
     pub(super) fn is_expandable_tool(&self) -> bool {
-        matches!(self.kind, EntryKind::Tool) && !self.body.is_empty()
+        matches!(self.kind, EntryKind::Tool) && (!self.body.is_empty() || self.input.is_some())
     }
 
     pub(super) fn set_expanded(&mut self, expanded: bool) {
@@ -788,12 +1082,53 @@ impl Entry {
     }
 }
 
+/// Keep a call's arguments, unless it had none.
+fn set_input(entry: &mut Entry, input: &Value) {
+    let empty = input.is_null() || input.as_object().is_some_and(serde_json::Map::is_empty);
+    entry.input = (!empty).then(|| input.clone());
+    entry.rendered.get_mut().take();
+}
+
 fn append_output(entry: &mut Entry, output: &str) {
     if !entry.body.is_empty() && !output.is_empty() {
         entry.body.push_str("\n\n");
     }
     entry.body.push_str(output);
     entry.rendered.get_mut().take();
+}
+
+/// A short chat name from its first message, unique among known chats.
+fn title(message: &str) -> String {
+    const MAX: usize = 40;
+    let mut title = String::new();
+    let mut length = 0;
+    for word in message.split_whitespace() {
+        let words = word.chars().count();
+        if length > 0 && length + 1 + words > MAX {
+            break;
+        }
+        if length > 0 {
+            title.push(' ');
+            length += 1;
+        }
+        title.push_str(word);
+        length += words;
+    }
+    title.chars().take(MAX).collect()
+}
+
+async fn current_branch() -> Option<String> {
+    let output = tokio::task::spawn_blocking(|| {
+        std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .stderr(std::process::Stdio::null())
+            .output()
+    })
+    .await
+    .ok()?
+    .ok()?;
+    let branch = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (output.status.success() && !branch.is_empty()).then_some(branch)
 }
 
 fn response_result(response: WsResponse) -> Result<Value> {
@@ -812,6 +1147,33 @@ fn response_result(response: WsResponse) -> Result<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn setting_changes_show_in_the_conversation_once_each() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.setting("approval", "Approval: Auto mode".into());
+        app.setting("approval", "Approval: No approvals".into());
+        app.setting("runner", "Switched to coder".into());
+        let texts: Vec<_> = app
+            .entries
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect();
+        assert_eq!(texts, ["Approval: No approvals", "Switched to coder"]);
+        assert!(matches!(app.entries[0].kind, EntryKind::Setting));
+    }
+
+    #[test]
+    fn chats_are_named_after_their_first_message() {
+        assert_eq!(title("  fix the\nlogin bug  "), "fix the login bug");
+        assert_eq!(title(&"word ".repeat(30)).chars().count(), 39);
+        assert_eq!(title(&"élan ".repeat(30)).chars().count(), 39);
+        assert_eq!(title(&"é".repeat(60)).chars().count(), 40);
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.sessions = vec![json!({ "label": "hello" }), json!({ "label": "hello 2" })];
+        assert_eq!(app.title_for("hello"), "hello 3");
+        assert_eq!(app.title_for("other"), "other");
+    }
 
     fn delta(value: Value) -> Update {
         Update::Delta(value)
@@ -906,7 +1268,32 @@ mod tests {
             { "role": "tool", "content": "\"+line\"" }
         ]));
         assert_eq!(app.entries[0].body, "On branch main");
-        assert_eq!(app.entries[1].body, "Staged: Yes\n\n+line");
+        assert!(
+            app.entries[0].input.is_none(),
+            "empty arguments are dropped"
+        );
+        assert_eq!(app.entries[1].body, "+line");
+        assert_eq!(app.entries[1].input, Some(json!({ "staged": true })));
+    }
+
+    #[test]
+    fn a_finished_call_fills_its_own_row() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push(EntryKind::User, "go");
+        app.apply(delta(json!({ "type": "tool_call", "name": "fs.read" })));
+        app.apply(delta(json!({ "type": "tool_call", "name": "fs.read" })));
+        app.apply(delta(json!({
+            "type": "tool_result", "name": "fs.read",
+            "input": { "path": "/a.rs" }, "output": "first"
+        })));
+        app.apply(delta(json!({
+            "type": "tool_result", "name": "fs.read",
+            "input": { "path": "/b.rs" }, "error": "denied"
+        })));
+        assert_eq!(app.entries[1].input, Some(json!({ "path": "/a.rs" })));
+        assert_eq!(app.entries[1].body, "first");
+        assert_eq!(app.entries[2].input, Some(json!({ "path": "/b.rs" })));
+        assert_eq!(app.entries[2].body, "failed: denied");
     }
 
     #[test]
@@ -998,5 +1385,90 @@ mod tests {
         app.session = Some("abc".into());
         let error = app.submit("/rename").await.unwrap_err().to_string();
         assert!(error.contains("usage: /rename"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn messages_sent_while_working_wait_and_stay_after_a_failure() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, Some("chat".into()));
+        app.pending = true;
+        app.submit("second").await.unwrap();
+        app.submit("third").await.unwrap();
+        assert_eq!(app.queue, ["second", "third"]);
+        assert!(!app.queue_ready(), "nothing is sent while working");
+
+        app.apply(Update::RunFinished(Err(anyhow!("the run failed"))));
+        assert_eq!(app.queue, ["second", "third"], "a failed reply keeps them");
+        assert!(app.input.is_empty());
+        assert!(!app.queue_ready(), "they wait for the next message");
+    }
+
+    #[tokio::test]
+    async fn queued_messages_go_as_one_prompt_and_fail_once() {
+        // Nothing listens on this port, so creating the session fails.
+        let mut app = App::new("http://127.0.0.1:9", 1000, Some("coder".into()));
+        app.queue.extend(["hey".to_owned(), "there".to_owned()]);
+        app.send_queued().await;
+        app.send_queued().await;
+        let errors = app
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.kind, EntryKind::Error))
+            .count();
+        assert_eq!(errors, 1);
+        assert_eq!(app.queue, ["hey", "there"], "they stay in the conversation");
+        assert!(app.input.is_empty(), "nothing goes back to the draft");
+
+        // The next message carries them, and fails as one.
+        assert!(app.submit("again").await.is_err());
+        assert_eq!(app.queue, ["hey", "there", "again"]);
+    }
+
+    #[tokio::test]
+    async fn messages_without_a_runner_wait_for_one() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.runners = vec![json!({ "name": "coder" })];
+        app.submit("hello").await.unwrap();
+        app.submit("and this").await.unwrap();
+        assert_eq!(app.queue, ["hello", "and this"]);
+        assert!(!app.queue_ready(), "nothing is sent without a runner");
+        let errors: Vec<_> = app
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.kind, EntryKind::Error))
+            .map(|entry| entry.text.as_str())
+            .collect();
+        assert_eq!(
+            errors,
+            ["No runner selected. Pick one with Ctrl+P."],
+            "shown once"
+        );
+
+        app.submit("/runner coder").await.unwrap();
+        assert_eq!(
+            app.queue,
+            ["hello", "and this"],
+            "picking a runner keeps them"
+        );
+        assert!(app.queue_ready());
+        assert_eq!(app.entries.last().unwrap().text, "Switched to coder");
+        assert_eq!(app.entries.len(), 2, "the conversation goes on");
+    }
+
+    #[tokio::test]
+    async fn clear_starts_a_new_chat_and_approval_needs_a_valid_mode() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push(EntryKind::User, "hello");
+        app.submit("/clear").await.unwrap();
+        assert!(app.entries.is_empty());
+
+        app.submit("/approval nobody").await.unwrap();
+        assert_eq!(app.approval_mode, Some("nobody"));
+        app.cycle_approval_mode().await.unwrap();
+        assert_eq!(app.approval_mode, Some("human"));
+        app.cycle_approval_mode().await.unwrap();
+        assert_eq!(app.approval_mode, Some("classifier"));
+        app.submit("/approval default").await.unwrap();
+        assert_eq!(app.approval_mode, None);
+        assert!(app.submit("/approval sometimes").await.is_err());
     }
 }

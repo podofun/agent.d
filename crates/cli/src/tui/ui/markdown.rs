@@ -1,4 +1,4 @@
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
@@ -13,7 +13,7 @@ pub(in crate::tui) struct Palette {
 
 pub(super) fn render(text: &str, width: usize, palette: Palette) -> Vec<Line<'static>> {
     let mut renderer = Renderer::new(width.max(1), palette);
-    for event in Parser::new_ext(text, Options::ENABLE_STRIKETHROUGH) {
+    for event in Parser::new_ext(text, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES) {
         renderer.event(event);
     }
     renderer.finish()
@@ -75,6 +75,50 @@ pub(super) fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'s
     lines
 }
 
+/// Column widths within `room`: each column its natural width when all fit.
+/// Otherwise every column first gets its longest word, so words stay whole,
+/// and the rest is shared. When even the words do not fit, narrow columns
+/// keep their width and wide ones share what is left. `None` when a column
+/// would get less than `MIN_COLUMN`.
+fn fit_columns(natural: &[usize], words: &[usize], room: usize) -> Option<Vec<usize>> {
+    if natural.iter().sum::<usize>() <= room {
+        return Some(natural.to_vec());
+    }
+    let floors: Vec<usize> = natural
+        .iter()
+        .zip(words)
+        .map(|(natural, word)| (*word).clamp(MIN_COLUMN.min(*natural), *natural))
+        .collect();
+    let floor: usize = floors.iter().sum();
+    if floor <= room {
+        let mut order: Vec<usize> = (0..natural.len()).collect();
+        order.sort_by_key(|&column| natural[column] - floors[column]);
+        let mut widths = floors.clone();
+        let mut left = room - floor;
+        for (done, &column) in order.iter().enumerate() {
+            let share = left / (natural.len() - done);
+            let extra = (natural[column] - floors[column]).min(share);
+            widths[column] += extra;
+            left -= extra;
+        }
+        return Some(widths);
+    }
+    let mut order: Vec<usize> = (0..natural.len()).collect();
+    order.sort_by_key(|&column| natural[column]);
+    let mut widths = vec![0; natural.len()];
+    let mut left = room;
+    for (done, &column) in order.iter().enumerate() {
+        let share = left / (natural.len() - done);
+        widths[column] = natural[column].min(share);
+        left -= widths[column];
+    }
+    widths
+        .iter()
+        .zip(natural)
+        .all(|(width, natural)| *width >= MIN_COLUMN.min(*natural))
+        .then_some(widths)
+}
+
 fn trim_trailing_space(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
     while spans
         .last()
@@ -84,6 +128,17 @@ fn trim_trailing_space(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
     }
     spans
 }
+
+/// A table being read: its column alignments, header cells, and rows.
+struct Table {
+    aligns: Vec<Alignment>,
+    head: Vec<Vec<Span<'static>>>,
+    rows: Vec<Vec<Vec<Span<'static>>>>,
+    row: Vec<Vec<Span<'static>>>,
+}
+
+/// Narrowest a column gets before the table is shown as records instead.
+const MIN_COLUMN: usize = 6;
 
 enum ListKind {
     Bullet,
@@ -100,6 +155,7 @@ struct Renderer {
     quote_depth: usize,
     code: Option<String>,
     marker: Option<String>,
+    table: Option<Table>,
 }
 
 impl Renderer {
@@ -114,6 +170,7 @@ impl Renderer {
             quote_depth: 0,
             code: None,
             marker: None,
+            table: None,
         }
     }
 
@@ -158,6 +215,15 @@ impl Renderer {
     fn start(&mut self, tag: Tag<'_>) {
         match tag {
             Tag::Paragraph if self.marker.is_none() => self.blank_line(),
+            Tag::Table(aligns) => {
+                self.blank_line();
+                self.table = Some(Table {
+                    aligns,
+                    head: Vec::new(),
+                    rows: Vec::new(),
+                    row: Vec::new(),
+                });
+            }
             Tag::Heading { level, .. } => {
                 self.blank_line();
                 let color = match level {
@@ -212,6 +278,28 @@ impl Renderer {
     fn end(&mut self, tag: TagEnd) {
         match tag {
             TagEnd::Paragraph | TagEnd::Item => self.flush_paragraph(),
+            TagEnd::TableCell => {
+                let cell = std::mem::take(&mut self.spans);
+                if let Some(table) = &mut self.table {
+                    table.row.push(cell);
+                }
+            }
+            TagEnd::TableHead => {
+                if let Some(table) = &mut self.table {
+                    table.head = std::mem::take(&mut table.row);
+                }
+            }
+            TagEnd::TableRow => {
+                if let Some(table) = &mut self.table {
+                    let row = std::mem::take(&mut table.row);
+                    table.rows.push(row);
+                }
+            }
+            TagEnd::Table => {
+                if let Some(table) = self.table.take() {
+                    self.push_table(table);
+                }
+            }
             TagEnd::Heading(_) => {
                 self.flush_paragraph();
                 self.style = Style::default();
@@ -270,6 +358,143 @@ impl Renderer {
                     .insert(0, Span::styled(prefix.clone(), prefix_style));
             }
             self.lines.push(line);
+        }
+    }
+
+    /// Columns sized to their content and separated by `│`. When the table
+    /// is too wide, the widest columns wrap; when even that leaves a column
+    /// narrower than `MIN_COLUMN`, each row is shown as `header: value` lines.
+    fn push_table(&mut self, table: Table) {
+        let indent = self.indent();
+        let room = self.width.saturating_sub(indent.width());
+        let columns = table
+            .rows
+            .iter()
+            .chain(std::iter::once(&table.head))
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0);
+        if columns == 0 {
+            return;
+        }
+        let cell_width =
+            |cell: &Vec<Span<'static>>| cell.iter().map(|s| s.content.width()).sum::<usize>();
+        let natural: Vec<usize> = (0..columns)
+            .map(|column| {
+                std::iter::once(&table.head)
+                    .chain(&table.rows)
+                    .filter_map(|row| row.get(column))
+                    .map(cell_width)
+                    .max()
+                    .unwrap_or(0)
+                    .max(1)
+            })
+            .collect();
+        let muted = Style::default().fg(self.palette.muted);
+        let longest_word: Vec<usize> = (0..columns)
+            .map(|column| {
+                std::iter::once(&table.head)
+                    .chain(&table.rows)
+                    .filter_map(|row| row.get(column))
+                    .flat_map(|cell| cell.iter())
+                    .flat_map(|span| span.content.split_whitespace())
+                    .map(UnicodeWidthStr::width)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+        let Some(widths) = fit_columns(
+            &natural,
+            &longest_word,
+            room.saturating_sub(3 * (columns - 1)),
+        ) else {
+            self.push_records(&table, &indent, room);
+            return;
+        };
+        let bold = |cell: &Vec<Span<'static>>| {
+            cell.iter()
+                .map(|span| span.clone().patch_style(Modifier::BOLD))
+                .collect::<Vec<_>>()
+        };
+        let mut rows: Vec<(Vec<Vec<Span<'static>>>, bool)> = Vec::new();
+        if !table.head.is_empty() {
+            rows.push((table.head.iter().map(bold).collect(), true));
+        }
+        rows.extend(table.rows.iter().map(|row| (row.clone(), false)));
+        let rule = widths
+            .iter()
+            .map(|width| "─".repeat(*width))
+            .collect::<Vec<_>>()
+            .join("─┼─");
+        let rule = Line::styled(format!("{indent}{rule}"), muted);
+        for (index, (row, _)) in rows.into_iter().enumerate() {
+            // A rule between rows, the one under the header included.
+            if index > 0 {
+                self.lines.push(rule.clone());
+            }
+            let cells: Vec<Vec<Line<'static>>> = (0..columns)
+                .map(|column| {
+                    let cell = row.get(column).cloned().unwrap_or_default();
+                    wrap_spans(cell, widths[column])
+                })
+                .collect();
+            let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+            for line_index in 0..height {
+                let mut spans = vec![Span::styled(indent.clone(), muted)];
+                for (column, cell) in cells.iter().enumerate() {
+                    if column > 0 {
+                        spans.push(Span::styled(" │ ", muted));
+                    }
+                    let line = cell.get(line_index).cloned().unwrap_or_default();
+                    let pad = widths[column].saturating_sub(line.width());
+                    let right = matches!(table.aligns.get(column), Some(Alignment::Right));
+                    if right {
+                        spans.push(Span::raw(" ".repeat(pad)));
+                    }
+                    spans.extend(line.spans);
+                    if !right && column + 1 < columns {
+                        spans.push(Span::raw(" ".repeat(pad)));
+                    }
+                }
+                self.lines.push(Line::from(trim_trailing_space(spans)));
+            }
+        }
+    }
+
+    /// A table too wide for its columns: each row as `header: value` lines,
+    /// with a blank line between rows.
+    fn push_records(&mut self, table: &Table, indent: &str, room: usize) {
+        let muted = Style::default().fg(self.palette.muted);
+        for (index, row) in table.rows.iter().enumerate() {
+            if index > 0 {
+                self.lines.push(Line::raw(""));
+            }
+            for (column, cell) in row.iter().enumerate() {
+                let label = table
+                    .head
+                    .get(column)
+                    .map(|head| {
+                        head.iter()
+                            .map(|span| span.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
+                let mut spans = Vec::new();
+                if !label.is_empty() {
+                    spans.push(Span::styled(format!("{label}: "), muted));
+                }
+                spans.extend(cell.iter().cloned());
+                for (line_index, mut line) in wrap_spans(spans, room.max(1)).into_iter().enumerate()
+                {
+                    let prefix = if line_index == 0 {
+                        indent.to_owned()
+                    } else {
+                        format!("{indent}  ")
+                    };
+                    line.spans.insert(0, Span::styled(prefix, muted));
+                    self.lines.push(line);
+                }
+            }
         }
     }
 
@@ -424,5 +649,56 @@ mod tests {
     fn zero_width_never_panics() {
         assert!(!render("# hi\n\n- a", 0, palette()).is_empty());
         assert!(wrap_plain("x", 0).len() == 1);
+    }
+
+    #[test]
+    fn tables_line_up_their_columns() {
+        let table = "| # | File | Change |\n|---|---|---|\n| 1 | `a.rs` | new |\n| 12 | b.rs | removed one test |";
+        let lines = text_of(&render(table, 60, palette()));
+        assert_eq!(
+            lines,
+            [
+                "#  │ File │ Change",
+                "───┼──────┼─────────────────",
+                "1  │ a.rs │ new",
+                "───┼──────┼─────────────────",
+                "12 │ b.rs │ removed one test",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_narrow_table_wraps_its_widest_column() {
+        let table = "| # | What changed |\n|---|---|\n| 1 | the tool rows now render their input and output |";
+        let lines = text_of(&render(table, 24, palette()));
+        assert_eq!(lines[0], "# │ What changed");
+        assert!(lines.len() > 3, "{lines:?}");
+        assert!(lines.iter().all(|line| line.width() <= 24), "{lines:?}");
+        assert!(lines[2].starts_with("1 │ the tool"), "{lines:?}");
+        assert!(lines[3].starts_with("  │ "), "{lines:?}");
+    }
+
+    #[test]
+    fn a_table_too_wide_for_its_columns_becomes_records() {
+        let table = "| Alpha | Beta | Gamma | Delta |\n|---|---|---|---|\n| one value | two value | three value | four value |";
+        let lines = text_of(&render(table, 20, palette()));
+        assert_eq!(lines[0], "Alpha: one value");
+        assert!(
+            lines.iter().any(|line| line.starts_with("Delta: ")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn shrinking_columns_keeps_paths_whole() {
+        let table = "| File | What changed |\n|---|---|\n| crates/cli/src/tui/presentation.rs | the old tool call helper is gone now |";
+        let lines = text_of(&render(table, 60, palette()));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("crates/cli/src/tui/presentation.rs")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().all(|line| line.width() <= 60), "{lines:?}");
     }
 }

@@ -4,6 +4,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use unicode_width::UnicodeWidthStr;
+
 use super::app::{App, Tab};
 
 mod approval;
@@ -13,15 +15,16 @@ mod logo;
 mod markdown;
 mod selection;
 
-pub(super) use conversation::{suggestion_at, toggle_tool, tool_at};
+pub(super) use conversation::conversation_inner;
+pub(super) use conversation::{max_scroll, suggestion_at, toggle_tool, tool_at};
 pub(super) use logo::SPIN as LEAF_SPIN;
-pub(super) use selection::{Selection, point_at, selected_text};
 #[cfg(test)]
-pub(super) use {conversation::conversation_inner, selection::Point};
+pub(super) use selection::Point;
+pub(super) use selection::{Selection, point_at, selected_text};
 
 pub(super) const PRIMARY: Color = Color::Rgb(177, 124, 245);
 pub(super) const SECONDARY: Color = Color::Rgb(122, 180, 234);
-pub(super) const MUTED: Color = Color::DarkGray;
+pub(super) const MUTED: Color = Color::Rgb(138, 143, 152);
 pub(super) const SUCCESS: Color = Color::Green;
 pub(super) const WARNING: Color = Color::Yellow;
 pub(super) const ERROR: Color = Color::Red;
@@ -70,7 +73,7 @@ pub(super) fn screen_rows(area: Rect, app: &App) -> [Rect; 5] {
     } else {
         0
     };
-    let available = area.height.saturating_sub(2 + 4 + composer_height + 1);
+    let available = area.height.saturating_sub(2 + 4 + composer_height + 2);
     let menu_height = if suggestions > 0 {
         (suggestions + 2).min(available)
     } else {
@@ -83,36 +86,52 @@ pub(super) fn screen_rows(area: Rect, app: &App) -> [Rect; 5] {
             Constraint::Min(4),
             Constraint::Length(menu_height),
             Constraint::Length(composer_height),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(area);
     [rows[0], rows[1], rows[2], rows[3], rows[4]]
 }
 
 fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let runner = app.runner.as_deref().unwrap_or("no runner");
-    let session = app
-        .session_label
-        .as_deref()
-        .or_else(|| app.session.as_deref().map(|id| &id[..id.len().min(8)]))
-        .unwrap_or("new chat");
-    let line = Line::from(vec![
-        Span::styled(
-            format!("  {runner}"),
-            Style::default().fg(SECONDARY).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("  ·  {session}"), Style::default().fg(MUTED)),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
-    if !app.connected {
-        let offline = Line::styled("offline  ", Style::default().fg(ERROR));
-        let width = offline.width() as u16;
-        if width < area.width {
-            frame.render_widget(
-                Paragraph::new(offline),
-                Rect::new(area.right() - width, area.y, width, 1),
-            );
-        }
+    let session = app.session_label.as_deref().unwrap_or("new chat");
+    let mut spans = vec![Span::styled(
+        format!("  {session}"),
+        Style::default().fg(SECONDARY).add_modifier(Modifier::BOLD),
+    )];
+    if app.selection.is_some() {
+        spans.push(Span::styled(
+            "  ·  Ctrl+C copies, Esc clears",
+            Style::default().fg(SECONDARY),
+        ));
+    } else if app.quit_armed() {
+        spans.push(Span::styled(
+            "  ·  Ctrl+C again to quit",
+            Style::default().fg(WARNING),
+        ));
+    }
+    if app.has_unread() {
+        spans.push(Span::styled("  ·  ↓ new", Style::default().fg(SECONDARY)));
+    }
+    if let Some(notice) = &app.notice {
+        let first = notice.lines().next().unwrap_or_default();
+        spans.push(Span::styled(
+            format!("  ·  {first}"),
+            Style::default().fg(MUTED),
+        ));
+    }
+    let offline = Line::styled("  offline  ", Style::default().fg(ERROR));
+    let reserved = if app.connected {
+        0
+    } else {
+        offline.width() as u16
+    };
+    let main = Rect::new(area.x, area.y, area.width.saturating_sub(reserved), 1);
+    frame.render_widget(Paragraph::new(Line::from(spans)), main);
+    if !app.connected && reserved < area.width {
+        frame.render_widget(
+            Paragraph::new(offline),
+            Rect::new(main.right(), area.y, reserved, 1),
+        );
     }
     frame.render_widget(
         Block::default()
@@ -124,7 +143,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 /// Where the welcome leaf sits on `screen`, or `None` when it is not shown.
 pub(super) fn leaf_area(app: &App, screen: Rect) -> Option<Rect> {
-    if app.tab != Tab::Chat || app.pending || !app.entries.is_empty() {
+    if app.tab != Tab::Chat || app.pending || !app.entries.is_empty() || !app.queue.is_empty() {
         return None;
     }
     welcome_layout(screen_rows(screen, app)[1]).and_then(|(leaf, _)| leaf)
@@ -195,34 +214,94 @@ fn draw_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 }
 
+/// Under the input: folder and branch, with runner and model on the right,
+/// and the approval mode below them. When the line is too narrow, the model
+/// shrinks first, then the branch, then the runner, then the folder.
 fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let line = if let Some(notice) = &app.notice {
-        Line::styled(format!("  {notice}"), Style::default().fg(ERROR))
-    } else if app.pending {
-        let elapsed = app
-            .started_at()
-            .map_or(0, |started| started.elapsed().as_secs());
-        Line::styled(
-            format!("  {} working  {elapsed}s", spinner_frame(app)),
-            Style::default().fg(WARNING),
-        )
-    } else if app.selection.is_some() {
-        Line::styled(
-            "  Ctrl+C copy  ·  Esc clear selection",
-            Style::default().fg(SECONDARY),
-        )
-    } else if app.has_unread() {
-        Line::styled(
-            "  ↓ new messages  ·  End jumps to the bottom",
-            Style::default().fg(SECONDARY),
-        )
+    if area.height == 0 {
+        return;
+    }
+    let runner = app.runner.as_deref().unwrap_or("no runner");
+    let branch = app.branch.as_deref().unwrap_or_default();
+    let model = app.model().unwrap_or_default();
+    // Two columns of padding at each edge and two between the sides.
+    let room = (area.width as usize).saturating_sub(6);
+    let [folder, runner, branch, model] = fit_parts([&app.workdir, runner, branch, model], room);
+    let mut left = vec![
+        Span::raw("  "),
+        Span::styled(folder, Style::default().add_modifier(Modifier::BOLD)),
+    ];
+    if !branch.is_empty() {
+        left.push(Span::raw(" "));
+        left.push(Span::styled(
+            branch,
+            Style::default().add_modifier(Modifier::ITALIC),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(left)), Rect { height: 1, ..area });
+    let runner_style = if app.runner.is_some() {
+        Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD)
     } else {
-        Line::styled(
-            "  Enter send  ·  Shift+Enter newline  ·  / commands  ·  Ctrl+P browse  ·  Ctrl+C quit",
-            Style::default().fg(MUTED),
-        )
+        Style::default().fg(MUTED)
     };
-    frame.render_widget(Paragraph::new(line), area);
+    let mut right = vec![Span::styled(runner, runner_style)];
+    if !model.is_empty() {
+        right.push(Span::raw(" "));
+        right.push(Span::styled(model, Style::default().fg(MUTED)));
+    }
+    right.push(Span::raw("  "));
+    frame.render_widget(
+        Paragraph::new(Line::from(right)).alignment(Alignment::Right),
+        Rect { height: 1, ..area },
+    );
+    let (mode, color) = match app.approval_mode {
+        Some("classifier") => ("Auto mode", WARNING),
+        Some("nobody") => ("No approvals", ERROR),
+        Some(_) => ("Manual approval", Color::Reset),
+        None => ("Default approval", Color::Reset),
+    };
+    if area.height > 1 {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!("  {mode}"),
+                Style::default().fg(color),
+            )),
+            Rect::new(area.x, area.y + 1, area.width, 1),
+        );
+    }
+}
+
+/// Share `room` columns between parts given in order of importance, with one
+/// column between parts. A part cut short ends in `…`; one with no room left
+/// is dropped.
+fn fit_parts<const N: usize>(parts: [&str; N], room: usize) -> [String; N] {
+    let mut left = room;
+    parts.map(|part| {
+        let width = part.width();
+        if part.is_empty() || left < 2 {
+            return String::new();
+        }
+        let fitted = truncate(part, left);
+        left = left.saturating_sub(width.min(left) + 1);
+        fitted
+    })
+}
+
+/// `text` cut to `width` columns, ending in `…` when it was longer.
+pub(super) fn truncate(text: &str, width: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    if text.width() <= width {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    for grapheme in text.graphemes(true) {
+        if out.width() + grapheme.width() + 1 > width {
+            break;
+        }
+        out.push_str(grapheme);
+    }
+    out.push('…');
+    out
 }
 
 fn draw_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -355,10 +434,10 @@ mod tests {
     #[test]
     fn welcome_leaf_grows_with_the_terminal() {
         let app = connected(true);
-        let small = leaf_cells(&welcome(&app, 80, 33));
+        let small = leaf_cells(&welcome(&app, 80, 34));
         let large = leaf_cells(&welcome(&app, 120, 44));
-        assert!(small > 0, "a 33 row terminal shows the leaf");
-        assert!(large > small, "{small} cells at 80x33, {large} at 120x44");
+        assert!(small > 0, "a 34 row terminal shows the leaf");
+        assert!(large > small, "{small} cells at 80x34, {large} at 120x44");
         let leaf = leaf_area(&app, Rect::new(0, 0, 200, 80)).unwrap();
         assert_eq!(leaf.height, 12, "even a huge terminal gets a modest leaf");
     }
@@ -516,27 +595,68 @@ mod tests {
     }
 
     #[test]
-    fn header_and_status_reflect_connection_runner_and_activity() {
+    fn a_narrow_status_line_shrinks_the_model_first_and_never_overlaps() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, Some("quick_chat".into()));
+        app.workdir = "agent.d".into();
+        app.branch = Some("feat/chat-queue-and-modes".into());
+        app.runners =
+            vec![serde_json::json!({ "name": "quick_chat", "model": "deepseek/deepseek-flash" })];
+        for width in [20u16, 40, 60, 100] {
+            let screen: Vec<char> = rendered(&app, width, 24).chars().collect();
+            let from = screen.len() - 2 * width as usize;
+            let line: String = screen[from..from + width as usize].iter().collect();
+            assert!(line.starts_with("  agent.d"), "{width}: {line}");
+            assert!(line.contains("quick"), "{width}: {line}");
+            assert!(
+                line.contains("  quick") || line.contains(" quick"),
+                "{width}: {line}"
+            );
+        }
+        assert_eq!(
+            fit_parts(["agent.d", "quick_chat", "feat/chat", "deepseek/flash"], 32),
+            ["agent.d", "quick_chat", "feat/chat", "de…"]
+        );
+        assert_eq!(truncate("deepseek", 4), "dee…");
+    }
+
+    #[test]
+    fn header_shows_the_chat_and_status_shows_where_it_runs() {
         let mut app = App::new("http://127.0.0.1:7777", 1000, Some("review".into()));
         app.connected = true;
-        let idle = rendered(&app, 100, 24);
-        let header = &idle[..100];
-        assert!(header.contains("  review  ·  new chat"));
-        assert!(!header.contains("agent.d"));
-        assert!(!header.contains("●"));
-        assert!(idle.contains("Enter send"));
-        app.session = Some("1f9bf89b-0000".into());
+        app.workdir = "agent.d".into();
+        app.branch = Some("main".into());
+        app.runners = vec![serde_json::json!({ "name": "review", "model": "anthropic/claude" })];
+        let header = |app: &App| rendered(app, 100, 24).chars().take(100).collect::<String>();
+        let status = |app: &App| {
+            let screen: Vec<char> = rendered(app, 100, 24).chars().collect();
+            let row = |from: usize| screen[from..from + 100].iter().collect::<String>();
+            (row(screen.len() - 200), row(screen.len() - 100))
+        };
+        assert!(header(&app).starts_with("  new chat"));
+        assert!(!header(&app).contains("review"));
+        let (place, mode) = status(&app);
+        assert!(place.starts_with("  agent.d main "), "{place}");
+        assert!(place.ends_with("review anthropic/claude  "), "{place}");
+        assert_eq!(mode.trim_end(), "  Default approval");
         app.session_label = Some("bugfix".into());
-        assert!(rendered(&app, 100, 24).contains("  review  ·  bugfix"));
+        assert!(header(&app).starts_with("  bugfix"));
         app.pending = true;
         app.push(EntryKind::User, "go");
         let busy = rendered(&app, 100, 24);
+        // Working shows inline in the conversation, not under the input.
         assert!(busy.contains("working"));
-        assert!(!busy.contains("Enter send"));
-        app.pending = false;
-        app.scroll = 3;
-        app.push(EntryKind::Agent, "late");
-        assert!(rendered(&app, 100, 24).contains("↓ new messages"));
+        assert!(!status(&app).0.contains("working"));
+        app.approval_mode = Some("classifier");
+        assert_eq!(status(&app).1.trim_end(), "  Auto mode");
+        assert!(!header(&app).contains("auto"));
+        app.notice = Some("Cancelling…\nmore".into());
+        assert!(header(&app).contains("Cancelling") && !header(&app).contains("more"));
+        app.notice = None;
+        app.selection = Some(super::Selection {
+            anchor: super::Point { line: 0, col: 0 },
+            head: super::Point { line: 0, col: 1 },
+        });
+        assert!(header(&app).contains("Ctrl+C copies, Esc clears"));
         app.connected = false;
         assert!(rendered(&app, 100, 24).contains("offline"));
     }

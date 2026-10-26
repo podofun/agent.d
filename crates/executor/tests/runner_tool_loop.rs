@@ -297,6 +297,22 @@ async fn streaming_run_emits_deltas_and_returns_complete_outcome() {
         ),
         "missing tool-call event: {deltas:?}"
     );
+    // The finished call carries its full input and output.
+    let result = deltas
+        .iter()
+        .find_map(|e| match e {
+            agentd_ai::StreamEvent::ToolResult {
+                name,
+                input,
+                output,
+                error,
+            } => Some((name, input, output, error)),
+            _ => None,
+        })
+        .expect("missing tool-result event");
+    assert_eq!(result.0, "notes.lookup");
+    assert_eq!(*result.1, serde_json::json!({ "q": "42" }));
+    assert!(!result.2.is_null() && result.3.is_none(), "{result:?}");
     let streamed_text: String = deltas
         .iter()
         .filter_map(|e| match e {

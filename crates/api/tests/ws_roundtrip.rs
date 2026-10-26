@@ -644,13 +644,20 @@ async fn sessions_roundtrip_over_ws() {
     assert_eq!(dup["ok"], false);
     assert_eq!(dup["code"], "session_label_taken");
 
-    // The session belongs to `bob`; a run without that user cannot see it.
+    // The session belongs to `bob`. An admin naming no user sees every
+    // session; naming another user, it does not.
     let anon = call(
         &mut sock,
-        serde_json::json!({"id": 3, "method": "runners.run", "params": {"name": "helper", "prompt": "first", "session_id": sid}}),
+        serde_json::json!({"id": 3, "method": "sessions.get", "params": {"id": sid}}),
     )
     .await;
-    assert_eq!(anon["code"], "session_not_found", "{anon}");
+    assert_eq!(anon["ok"], true, "{anon}");
+    let eve = call(
+        &mut sock,
+        serde_json::json!({"id": 31, "method": "runners.run", "params": {"name": "helper", "prompt": "first", "session_id": sid, "user": "eve"}}),
+    )
+    .await;
+    assert_eq!(eve["code"], "session_not_found", "{eve}");
 
     let run = call(
         &mut sock,
@@ -708,7 +715,7 @@ async fn sessions_roundtrip_over_ws() {
     .await;
     assert_eq!(both["code"], "bad_params");
 
-    // list: bob sees his session, an unnamed caller sees nothing.
+    // list: bob sees his session, and so does an admin naming no user.
     let list = call(
         &mut sock,
         serde_json::json!({"id": 9, "method": "sessions.list", "params": {"user": "bob"}}),
@@ -720,7 +727,7 @@ async fn sessions_roundtrip_over_ws() {
         serde_json::json!({"id": 10, "method": "sessions.list", "params": {}}),
     )
     .await;
-    assert_eq!(list_anon["result"].as_array().unwrap().len(), 0);
+    assert_eq!(list_anon["result"].as_array().unwrap().len(), 1);
     let list_no_params = call(
         &mut sock,
         serde_json::json!({"id": 30, "method": "sessions.list"}),

@@ -3,18 +3,20 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::super::app::{App, Entry, EntryKind};
+use super::super::app::{App, Entry, EntryKind, ToolRow};
 use super::super::commands;
+use super::super::presentation;
 use super::{
     ERROR, MUTED, PRIMARY, SECONDARY, SUCCESS, WARNING, markdown, palette, screen_rows, selection,
     spinner_frame,
 };
 
 pub(super) fn draw_conversation(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    if app.entries.is_empty() && !app.pending {
+    if app.entries.is_empty() && app.queue.is_empty() && !app.pending {
         super::draw_welcome(frame, app, area);
         return;
     }
@@ -34,7 +36,7 @@ pub(super) struct Conversation {
     pub(super) lines: Vec<Line<'static>>,
     /// Selectable column range of each line, parallel to `lines`.
     pub(super) selectable: Vec<std::ops::Range<usize>>,
-    tool_headers: Vec<(usize, usize)>,
+    tool_headers: Vec<(usize, ToolRow)>,
 }
 
 /// The rendered conversation at `width` text columns.
@@ -90,33 +92,134 @@ fn conversation_lines(app: &App, width: usize) -> Conversation {
     let mut lines = Vec::new();
     let mut selectable = Vec::new();
     let mut tool_headers = Vec::new();
-    for (index, entry) in app.entries.iter().enumerate() {
-        if entry.is_expandable_tool() {
-            tool_headers.push((lines.len(), index));
+    let mut index = 0;
+    while index < app.entries.len() {
+        let entry = &app.entries[index];
+        let run = if matches!(entry.kind, EntryKind::Tool) {
+            app.tool_run(index)
+        } else {
+            index..index + 1
+        };
+        if run.len() >= 2 {
+            // A run of tool calls reads as one row until it is opened.
+            let calls = &app.entries[run.clone()];
+            let open = entry.group_open;
+            tool_headers.push((lines.len(), ToolRow::Group(run.start)));
+            let header = group_header(app, calls, open, body_width);
+            selectable.push(GUTTER.min(width)..header.width().min(width));
+            lines.push(header);
+            if open {
+                for (offset, call) in calls.iter().enumerate() {
+                    if call.is_expandable_tool() {
+                        tool_headers.push((lines.len(), ToolRow::Entry(run.start + offset)));
+                    }
+                    let block = call.lines(body_width, || entry_lines(call, body_width));
+                    selectable.extend(
+                        block
+                            .iter()
+                            .enumerate()
+                            .map(|(row, line)| selectable_range(call, row, line))
+                            .map(|range| range.start + GUTTER..range.end + GUTTER),
+                    );
+                    lines.extend(block.into_iter().map(indented));
+                }
+            }
+        } else {
+            if entry.is_expandable_tool() {
+                tool_headers.push((lines.len(), ToolRow::Entry(index)));
+            }
+            let block = entry.lines(body_width, || entry_lines(entry, body_width));
+            selectable.extend(
+                block
+                    .iter()
+                    .enumerate()
+                    .map(|(row, line)| selectable_range(entry, row, line)),
+            );
+            lines.extend(block);
         }
-        let block = entry.lines(body_width, || entry_lines(entry, body_width));
-        selectable.extend(
-            block
-                .iter()
-                .enumerate()
-                .map(|(row, line)| selectable_range(entry, row, line)),
-        );
-        lines.extend(block);
         lines.push(Line::raw(""));
         selectable.push(0..0);
+        index = run.end;
     }
     if app.pending {
-        let live = markdown::render(&app.streamed, body_width, palette());
+        // The live reply, or while nothing has arrived yet, how long the
+        // agent has been working.
+        let live = if app.streamed.trim().is_empty() {
+            let elapsed = app
+                .started_at()
+                .map_or(0, |started| started.elapsed().as_secs());
+            vec![Line::styled(
+                format!("working  {elapsed}s"),
+                Style::default().fg(MUTED),
+            )]
+        } else {
+            markdown::render(&app.streamed, body_width, palette())
+        };
         let live = with_gutter(spinner_frame(app), WARNING, live);
         // The live block changes every tick, so it is never selectable.
         selectable.extend(live.iter().map(|_| 0..0));
         lines.extend(live);
+    }
+    for queued in &app.queue {
+        lines.push(Line::raw(""));
+        selectable.push(0..0);
+        let mut body = emphasized(markdown::wrap_plain(queued, body_width));
+        if let Some(last) = body.last_mut() {
+            let tag = if app.queue_held {
+                "  not sent"
+            } else {
+                "  queued"
+            };
+            last.spans
+                .push(Span::styled(tag, Style::default().fg(MUTED)));
+        }
+        let queued = with_gutter("›", SECONDARY, body);
+        selectable.extend(queued.iter().map(|_| 0..0));
+        lines.extend(queued);
     }
     Conversation {
         lines,
         selectable,
         tool_headers,
     }
+}
+
+/// "Used 14 actions and 1 tool": a call is an action when its name is a
+/// registered action, and a tool otherwise.
+fn used_label(app: &App, calls: &[Entry]) -> String {
+    let actions = calls
+        .iter()
+        .filter(|call| {
+            app.actions
+                .iter()
+                .any(|action| action.as_str() == Some(call.text.as_str()))
+        })
+        .count();
+    let tools = calls.len() - actions;
+    let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    match (actions, tools) {
+        (0, tools) => format!("Used {}", plural(tools, "tool")),
+        (actions, 0) => format!("Used {}", plural(actions, "action")),
+        (actions, tools) => format!(
+            "Used {} and {}",
+            plural(actions, "action"),
+            plural(tools, "tool")
+        ),
+    }
+}
+
+fn group_header(app: &App, calls: &[Entry], open: bool, width: usize) -> Line<'static> {
+    let label = used_label(app, calls);
+    let marker = if open { "▾" } else { "▸" };
+    let title: String = label
+        .graphemes(true)
+        .take(width.saturating_sub(2))
+        .collect();
+    Line::from(vec![
+        gutter("✦", WARNING),
+        Span::styled(format!("{title} "), Style::default().fg(SECONDARY)),
+        Span::styled(marker, Style::default().fg(MUTED)),
+    ])
 }
 
 /// Columns of `line` (row `row` of its entry) that hold the entry's own
@@ -147,8 +250,21 @@ fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
         EntryKind::User => with_gutter("›", SECONDARY, emphasized(body)),
         EntryKind::Agent => with_gutter("◆", PRIMARY, body),
         EntryKind::Info => with_gutter("i", SUCCESS, body),
-        EntryKind::Error => with_gutter("!", ERROR, body),
+        EntryKind::Error => with_gutter(
+            "!",
+            ERROR,
+            body.into_iter()
+                .map(|line| line.patch_style(Style::default().fg(ERROR)))
+                .collect(),
+        ),
         EntryKind::Tool => tool_lines(entry, width),
+        EntryKind::Setting => with_gutter(
+            "•",
+            SECONDARY,
+            body.into_iter()
+                .map(|line| line.patch_style(Style::default().fg(MUTED)))
+                .collect(),
+        ),
     }
 }
 
@@ -159,34 +275,137 @@ fn emphasized(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// A call's row: its name, then each short argument (paths, patterns,
+/// commands) in full. Collapsed, it previews the first lines of the long
+/// argument it carries (such as content being written), or else of its
+/// output. Expanded, it shows every long argument and the whole output.
 fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
-    let count = entry.body.lines().count();
-    let summary = if !entry.is_expandable_tool() {
-        String::new()
-    } else if entry.expanded {
-        "▾".to_owned()
-    } else {
-        format!("▸ {count} line{}", if count == 1 { "" } else { "s" })
+    let (short, long) = split_input(entry.input.as_ref());
+    let marker = match (entry.is_expandable_tool(), entry.expanded) {
+        (false, _) => "",
+        (true, true) => " ▾",
+        (true, false) => " ▸",
     };
-    let title_width = width.saturating_sub(summary.width() + 1);
-    let mut title: String = entry.text.graphemes(true).take(title_width).collect();
-    title.push_str(&" ".repeat(title_width.saturating_sub(title.width()) + 1));
-    let mut lines = vec![Line::from(vec![
-        gutter("✦", WARNING),
-        Span::styled(title, Style::default().fg(SECONDARY)),
-        Span::styled(summary, Style::default().fg(MUTED)),
-    ])];
-    if entry.expanded {
-        for mut part in markdown::wrap_plain(&entry.body, width.saturating_sub(2)) {
+    let mut spans = vec![
+        Span::styled(entry.text.clone(), Style::default().fg(SECONDARY)),
+        Span::styled(marker, Style::default().fg(MUTED)),
+    ];
+    for (key, value) in short {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(format!("{key} "), Style::default().fg(MUTED)));
+        spans.push(Span::raw(value));
+    }
+    let mut lines = with_gutter("✦", WARNING, markdown::wrap_spans(spans, width));
+    let inner = width.saturating_sub(2);
+    if !entry.expanded {
+        let preview = long.first().map_or(entry.body.as_str(), |(_, text)| text);
+        lines.extend(output_preview(preview, inner));
+        return lines;
+    }
+    let block = |lines: &mut Vec<Line<'static>>, label: &str, text: &str, bar: Color| {
+        if !label.is_empty() {
+            lines.push(indented(Line::styled(
+                format!("  {label}"),
+                Style::default().fg(MUTED),
+            )));
+        }
+        for mut part in markdown::wrap_plain(text, inner) {
             part.spans
-                .insert(0, Span::styled("│ ", Style::default().fg(WARNING)));
+                .insert(0, Span::styled("│ ", Style::default().fg(bar)));
             lines.push(indented(part));
         }
+    };
+    for (key, text) in &long {
+        block(&mut lines, key, text, MUTED);
+    }
+    if !entry.body.is_empty() {
+        let label = if long.is_empty() { "" } else { "result" };
+        block(&mut lines, label, &entry.body, WARNING);
     }
     lines
 }
 
-pub(in crate::tui) fn tool_at(app: &App, screen: Rect, x: u16, y: u16) -> Option<usize> {
+/// Named argument values, in the order the call gave them.
+type Fields = Vec<(String, String)>;
+
+/// A call's arguments, split into short ones that fit on its row and long
+/// ones (multi-line text, nested values) shown as blocks.
+fn split_input(input: Option<&Value>) -> (Fields, Fields) {
+    const SHORT: usize = 200;
+    let (mut short, mut long) = (Vec::new(), Vec::new());
+    let Some(input) = input else {
+        return (short, long);
+    };
+    let Value::Object(fields) = input else {
+        long.push(("input".to_owned(), presentation::value(input)));
+        return (short, long);
+    };
+    let scalar = |value: &Value| match value {
+        Value::String(text) if !text.contains('\n') && text.chars().count() <= SHORT => {
+            Some(text.clone())
+        }
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    };
+    for (key, value) in fields {
+        let fitted = match value {
+            Value::Array(items) => items
+                .iter()
+                .map(scalar)
+                .collect::<Option<Vec<_>>>()
+                .map(|items| items.join(" "))
+                .filter(|joined| joined.chars().count() <= SHORT),
+            Value::Null => continue,
+            other => scalar(other),
+        };
+        match fitted {
+            Some(text) => short.push((key.clone(), text)),
+            None => long.push((
+                key.clone(),
+                value
+                    .as_str()
+                    .map_or_else(|| presentation::value(value), str::to_owned),
+            )),
+        }
+    }
+    (short, long)
+}
+
+/// The first lines of a collapsed call's text, muted and cut to one row each.
+fn output_preview(body: &str, width: usize) -> Vec<Line<'static>> {
+    const ROWS: usize = 3;
+    body.lines()
+        .map(str::trim_end)
+        .skip_while(|line| line.trim().is_empty())
+        .take(ROWS)
+        .map(|line| {
+            let mut text: String = line.graphemes(true).take(width).collect();
+            if text.width() < line.width() {
+                text = text
+                    .graphemes(true)
+                    .take(width.saturating_sub(1))
+                    .collect::<String>()
+                    + "…";
+            }
+            indented(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(text, Style::default().fg(MUTED)),
+            ]))
+        })
+        .collect()
+}
+
+/// How far the conversation can scroll up on `screen`.
+pub(in crate::tui) fn max_scroll(app: &App, screen: Rect) -> usize {
+    let inner = conversation_inner(screen_rows(screen, app)[1]);
+    conversation_lines(app, inner.width.saturating_sub(1).max(1) as usize)
+        .lines
+        .len()
+        .saturating_sub(inner.height as usize)
+}
+
+pub(in crate::tui) fn tool_at(app: &App, screen: Rect, x: u16, y: u16) -> Option<ToolRow> {
     let inner = conversation_inner(screen_rows(screen, app)[1]);
     if x < inner.x || x >= inner.right() || y < inner.y || y >= inner.bottom() {
         return None;
@@ -196,33 +415,49 @@ pub(in crate::tui) fn tool_at(app: &App, screen: Rect, x: u16, y: u16) -> Option
     conversation
         .tool_headers
         .into_iter()
-        .find_map(|(header, index)| (line == header).then_some(index))
+        .find_map(|(header, row)| (line == header).then_some(row))
 }
 
-pub(in crate::tui) fn toggle_tool(app: &mut App, screen: Rect, index: usize) {
-    if !app
-        .entries
-        .get(index)
-        .is_some_and(Entry::is_expandable_tool)
-    {
-        return;
-    }
-    let expanded = !app.entries[index].expanded;
-    app.entries[index].set_expanded(expanded);
-    app.selection = None;
+/// Open or close a tool row, or a run of them, and keep it in view.
+pub(in crate::tui) fn toggle_tool(app: &mut App, screen: Rect, row: ToolRow) {
     let inner = conversation_inner(screen_rows(screen, app)[1]);
-    let conversation = conversation_lines(app, inner.width.saturating_sub(1).max(1) as usize);
-    if let Some((header, _)) = conversation
-        .tool_headers
-        .iter()
-        .find(|(_, entry)| *entry == index)
-    {
-        app.scroll = conversation
-            .lines
-            .len()
-            .saturating_sub(inner.height as usize)
-            .saturating_sub(*header);
+    let width = inner.width.saturating_sub(1).max(1) as usize;
+    let before = conversation_lines(app, width).offset(inner.height, app.scroll);
+    match row {
+        ToolRow::Entry(index) => {
+            if !app
+                .entries
+                .get(index)
+                .is_some_and(Entry::is_expandable_tool)
+            {
+                return;
+            }
+            let expanded = !app.entries[index].expanded;
+            app.entries[index].set_expanded(expanded);
+        }
+        ToolRow::Group(index) => {
+            let Some(entry) = app.entries.get_mut(index) else {
+                return;
+            };
+            entry.group_open = !entry.group_open;
+        }
     }
+    app.selection = None;
+    let after = conversation_lines(app, width);
+    let Some(&(header, _)) = after.tool_headers.iter().find(|(_, target)| *target == row) else {
+        return;
+    };
+    // Keep the row where it was on screen; a row out of view moves to the top.
+    let height = inner.height as usize;
+    let row_on_screen = header
+        .checked_sub(before)
+        .filter(|row| *row < height)
+        .unwrap_or(0);
+    app.scroll = after
+        .lines
+        .len()
+        .saturating_sub(height)
+        .saturating_sub(header - row_on_screen);
 }
 
 pub(super) fn draw_suggestions(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -347,18 +582,19 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("✦  git.status"));
-        assert!(rendered.contains("3 lines"));
-        assert!(!rendered.contains("modified: README.md"));
+        assert!(rendered.contains("✦  git.status ▸"));
+        // Collapsed output shows as a short preview, not as the quoted body.
+        assert!(rendered.contains("modified: README.md"));
+        assert!(!rendered.contains("│ modified"));
 
         let inner = conversation_inner(screen_rows(screen, &app)[1]);
         let conversation = conversation_lines(&app, inner.width.saturating_sub(1) as usize);
         let header = conversation.tool_headers[0].0 - conversation.offset(inner.height, app.scroll);
         assert_eq!(
             tool_at(&app, screen, inner.x, inner.y + header as u16),
-            Some(0)
+            Some(ToolRow::Entry(0))
         );
-        toggle_tool(&mut app, screen, 0);
+        toggle_tool(&mut app, screen, ToolRow::Entry(0));
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let rendered = terminal
             .backend()
@@ -368,6 +604,63 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("│ modified: README.md"));
+    }
+
+    #[test]
+    fn opening_a_call_keeps_its_row_in_place() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        for turn in 0..10 {
+            app.push(EntryKind::User, format!("question {turn}"));
+        }
+        app.push_tool("git.diff", "line\n".repeat(30));
+        app.push(EntryKind::Agent, "done");
+        let screen = Rect::new(0, 0, 80, 20);
+        let inner = conversation_inner(screen_rows(screen, &app)[1]);
+        let width = inner.width.saturating_sub(1) as usize;
+        let row_of = |app: &App| {
+            let conversation = conversation_lines(app, width);
+            conversation.tool_headers[0].0 - conversation.offset(inner.height, app.scroll)
+        };
+        let before = row_of(&app);
+        toggle_tool(&mut app, screen, ToolRow::Entry(10));
+        assert!(app.entries[10].expanded);
+        assert_eq!(row_of(&app), before);
+    }
+
+    #[test]
+    fn a_call_shows_full_paths_and_what_it_writes() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push_tool("fs.write", "Done");
+        app.entries[0].input = Some(serde_json::json!({
+            "path": "/home/me/project/crates/cli/src/tui/ui/conversation.rs",
+            "content": "fn main() {\n    run();\n}"
+        }));
+        let text = rendered(&app, 50, 20);
+        // The path wraps in full instead of being cut.
+        assert!(text.contains("path"), "{text}");
+        assert!(text.contains("/home/me/project/crates"), "{text}");
+        assert!(text.contains("versation.rs"), "{text}");
+        assert!(
+            text.contains("fn main() {"),
+            "collapsed shows what is written"
+        );
+        assert!(!text.contains("result"));
+
+        app.entries[0].set_expanded(true);
+        let text = rendered(&app, 50, 20);
+        assert!(text.contains("content"));
+        assert!(text.contains("│ }"));
+        assert!(text.contains("result"));
+        assert!(text.contains("│ Done"));
+    }
+
+    #[test]
+    fn long_preview_lines_are_cut_with_an_ellipsis() {
+        let lines = output_preview(&format!("\n{}\nb\nc\nd", "x".repeat(50)), 10);
+        let text: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        assert_eq!(text.len(), 3);
+        assert!(text[0].ends_with("xxxxxxxxx…"), "{}", text[0]);
+        assert!(text[2].ends_with('c'));
     }
 
     fn rendered(app: &App, width: u16, height: u16) -> String {
@@ -393,8 +686,7 @@ mod tests {
         assert!(text.contains("›  hello **there**"));
         assert!(text.contains("◆  Hi friend"));
         assert!(text.contains("• item"));
-        assert!(text.contains("✦  git.status"));
-        assert!(text.contains("3 lines"));
+        assert!(text.contains("✦  git.status ▸"));
         assert!(!text.contains("you"));
         assert!(!text.contains("agent "));
     }
@@ -460,5 +752,55 @@ mod tests {
         for width in [1u16, 5, 8, 11] {
             let _ = rendered(&app, width, 6);
         }
+    }
+
+    #[test]
+    fn a_run_of_calls_reads_as_one_row_until_opened() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.actions = vec![
+            serde_json::json!("git.status"),
+            serde_json::json!("git.diff"),
+        ];
+        app.push(EntryKind::User, "check the repo");
+        app.push_tool("git.status", "clean");
+        app.push_tool("git.diff", "");
+        app.push_tool("web_search", "");
+        let text = |app: &App| {
+            conversation_lines(app, 60)
+                .lines
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let closed = text(&app);
+        assert!(closed.contains("Used 2 actions and 1 tool ▸"), "{closed}");
+        assert!(!closed.contains("git.diff"), "{closed}");
+
+        let screen = Rect::new(0, 0, 60, 24);
+        toggle_tool(&mut app, screen, ToolRow::Group(1));
+        let open = text(&app);
+        assert!(open.contains("Used 2 actions and 1 tool ▾"), "{open}");
+        assert!(
+            open.contains("git.diff") && open.contains("web_search"),
+            "{open}"
+        );
+        assert_eq!(app.latest_tool_row(), Some(ToolRow::Entry(1)));
+    }
+
+    #[test]
+    fn working_shows_inline_and_queued_messages_follow_it() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push(EntryKind::User, "first");
+        app.pending = true;
+        app.queue.push_back("second".into());
+        let text = conversation_lines(&app, 60)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("working"), "{text}");
+        assert!(text.contains("second  queued"), "{text}");
     }
 }

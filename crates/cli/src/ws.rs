@@ -61,11 +61,19 @@ pub(crate) fn ws_url_with_path(base: &str, path: &str) -> Result<String> {
     Ok(u.to_string())
 }
 
-/// Bearer token for the `/ws` handshake: `AGENTD_TOKEN` wins, else the token
-/// the daemon persisted to its state dir. `None` when neither exists (the
-/// daemon may be running with `--no-auth`).
+/// Bearer token for the `/ws` handshake, in this order: `AGENTD_TOKEN` (an
+/// explicit way to connect as a non-admin client), then the admin token
+/// (`AGENTD_ADMIN_TOKEN` or its file), then the public token file. On your
+/// own machine every command connects as admin and sees the same sessions;
+/// where the admin token is not readable they all fall back together.
+/// `None` when nothing exists (the daemon may be running with `--no-auth`).
 pub(crate) fn resolve_ws_token() -> Option<String> {
-    token_from_env_or_file("AGENTD_TOKEN", "token")
+    std::env::var("AGENTD_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .or_else(|| token_from_env_or_file("AGENTD_ADMIN_TOKEN", "admin-token"))
+        .or_else(|| token_from_env_or_file("AGENTD_TOKEN", "token"))
 }
 
 /// A bearer token from `$var`, falling back to `<state-dir>/agentd/<file>`.
