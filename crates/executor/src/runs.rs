@@ -34,7 +34,17 @@ pub(crate) struct Runs {
     records: Mutex<HashMap<String, RunRecord>>,
     /// Questions being asked, keyed by run, kind, and the unredacted request.
     /// Identical questions in flight share one answer.
-    asking: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Verdict>>>>,
+    asking: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Answered>>>>,
+}
+
+/// One question's answer, with who decided it and, when that was not a
+/// human, why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Answered {
+    pub(crate) verdict: Verdict,
+    /// `human` or `classifier`.
+    pub(crate) decided_by: &'static str,
+    pub(crate) reason: Option<String>,
 }
 
 /// Removes a run's record when the run ends or is cancelled.
@@ -124,9 +134,9 @@ impl Runs {
     /// Ask a question once per run, kind, and unredacted request: identical
     /// questions in flight wait for the first one's answer. Without a run
     /// every question is asked on its own.
-    pub(crate) async fn ask<F>(&self, key: Option<String>, ask: F) -> Verdict
+    pub(crate) async fn ask<F>(&self, key: Option<String>, ask: F) -> Answered
     where
-        F: std::future::Future<Output = Verdict>,
+        F: std::future::Future<Output = Answered>,
     {
         let Some(key) = key else {
             return ask.await;
@@ -138,7 +148,7 @@ impl Runs {
             .entry(key.clone())
             .or_default()
             .clone();
-        let verdict = *cell.get_or_init(|| ask).await;
+        let verdict = cell.get_or_init(|| ask).await.clone();
         let mut asking = self.asking.lock().unwrap();
         if asking.get(&key).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
             asking.remove(&key);
@@ -295,14 +305,21 @@ mod tests {
         let ask = |asked: Arc<std::sync::atomic::AtomicUsize>| async move {
             asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            Verdict::AllowOnce
+            Answered {
+                verdict: Verdict::AllowOnce,
+                decided_by: "human",
+                reason: None,
+            }
         };
         let key = || Some("run-1\0inline\0shell.exec:cargo".to_string());
         let (a, b) = tokio::join!(
             runs.ask(key(), ask(asked.clone())),
             runs.ask(key(), ask(asked.clone()))
         );
-        assert_eq!((a, b), (Verdict::AllowOnce, Verdict::AllowOnce));
+        assert_eq!(
+            (a.verdict, b.verdict),
+            (Verdict::AllowOnce, Verdict::AllowOnce)
+        );
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
         // Once answered, the next identical question is asked again.
         runs.ask(key(), ask(asked.clone())).await;

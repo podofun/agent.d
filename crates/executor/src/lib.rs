@@ -18,6 +18,7 @@
 //! work identically whether the caller is a one-shot HTTP request, an LLM
 //! tool call, or a background Discord gateway loop.
 
+mod classifier;
 mod runs;
 
 use std::sync::Arc;
@@ -96,6 +97,16 @@ impl Dispatcher for Executor {
             }
         }
     }
+}
+
+/// A classifier refusal: who refused what, then its reason, then the usual
+/// diagnostic.
+fn classifier_refusal(what: &str, reason: Option<&str>, err: &dyn std::fmt::Display) -> String {
+    let reason = reason
+        .filter(|r| !r.is_empty())
+        .map(|r| format!(" {}", r.trim_end_matches('.').to_owned() + "."))
+        .unwrap_or_default();
+    format!("The classifier refused `{what}`.{reason}\n{err}")
 }
 
 /// Outcome of escalating a denial to the approval broker.
@@ -367,6 +378,8 @@ pub struct Executor {
     /// Records of runs in flight: approved files and hosts, secrets read,
     /// and questions being asked.
     runs: Arc<runs::Runs>,
+    /// Questions the classifier answers at once.
+    classifier_slots: tokio::sync::Semaphore,
 }
 
 /// Removes the session id from the in-flight set when the run ends.
@@ -410,6 +423,7 @@ impl Executor {
             sessions: None,
             active_sessions: Arc::new(std::sync::Mutex::new(Default::default())),
             runs: Arc::new(runs::Runs::default()),
+            classifier_slots: tokio::sync::Semaphore::new(classifier::CLASSIFIER_SLOTS),
         }
     }
 
@@ -550,7 +564,9 @@ impl Executor {
                         "`{action_name}` was refused without asking, because this run's approval is `nobody`\n{err}"
                     ),
                 })
-            } else if !decision.is_escalatable() || self.broker.is_none() {
+            } else if !decision.is_escalatable()
+                || (self.broker.is_none() && caller.approval != Some(ApprovalSetting::Classifier))
+            {
                 // A denial, or no approver wired: reject with a diagnostic
                 // that names the denied component and the grants.toml fix.
                 Some(decision_to_error(
@@ -664,29 +680,73 @@ impl Executor {
 
     // ---------- approval escalation ----------
 
+    /// Answer one question: the classifier when the run's approval is
+    /// `classifier` and it may answer this kind, otherwise (or when it is
+    /// unsure) a human. Identical questions in flight share the answer. The
+    /// classifier never allows forever.
+    async fn decide(
+        &self,
+        req: agentd_types::ApprovalRequest,
+        key: Option<String>,
+    ) -> runs::Answered {
+        self.runs
+            .ask(key, async {
+                let mut unsure = None;
+                if self.classifier_answers(&req) {
+                    match self.classify(&req).await {
+                        classifier::ClassifierAnswer::Allow(reason) => {
+                            return runs::Answered {
+                                verdict: agentd_types::Verdict::AllowOnce,
+                                decided_by: "classifier",
+                                reason: Some(reason),
+                            };
+                        }
+                        classifier::ClassifierAnswer::Refuse(reason) => {
+                            return runs::Answered {
+                                verdict: agentd_types::Verdict::Deny,
+                                decided_by: "classifier",
+                                reason: Some(reason),
+                            };
+                        }
+                        classifier::ClassifierAnswer::Unsure(reason) => {
+                            unsure = Some(format!("the classifier was unsure: {reason}"));
+                        }
+                    }
+                }
+                let verdict = match &self.broker {
+                    Some(broker) => broker.request(req).await,
+                    None => agentd_types::Verdict::Deny,
+                };
+                runs::Answered {
+                    verdict,
+                    decided_by: "human",
+                    reason: unsure,
+                }
+            })
+            .await
+    }
+
     /// Record a question refused without asking because the run's approval
     /// is `nobody`.
     async fn trace_nobody(&self, action: &str, caller: &Caller) {
         self.trace
             .record(
-                TraceEvent::ok(
+                TraceEvent::decision(
                     action,
                     serde_json::json!({
                         "run_id": caller.run_id,
                         "session_id": caller.session_id,
                     }),
-                    0,
                     serde_json::json!({ "approval": "Deny", "decided_by": "nobody" }),
                 )
-                .with_execution(caller.execution_str())
-                .with_kind("approval"),
+                .with_execution(caller.execution_str()),
             )
             .await;
     }
 
-    /// Escalate a non-`Allow`, escalatable decision to the approval broker and
-    /// translate the verdict into an [`Escalation`]. Only called when a broker
-    /// is wired and `decision.is_escalatable()`.
+    /// Ask about a non-`Allow`, escalatable decision (the classifier or a
+    /// human, see [`Executor::decide`]) and translate the answer into an
+    /// [`Escalation`].
     async fn escalate(
         &self,
         decision: Decision,
@@ -696,11 +756,6 @@ impl Executor {
         args: &serde_json::Value,
     ) -> Escalation {
         use std::sync::atomic::Ordering;
-
-        let broker = self
-            .broker
-            .as_ref()
-            .expect("escalate called without a broker");
 
         // Classify + compute the missing perms (Tool layer) using the same
         // wildcard-aware `contains` the engine uses, so we persist exactly what
@@ -761,10 +816,11 @@ impl Executor {
             .as_ref()
             .map(|r| format!("{r}\0{kind:?}\0{}\0{args}", action_meta.name));
         let detail = req.detail.clone();
-        let verdict = self.runs.ask(key, broker.request(req)).await;
+        let answered = self.decide(req, key).await;
+        let verdict = answered.verdict;
         self.trace
             .record(
-                TraceEvent::ok(
+                TraceEvent::decision(
                     &action_meta.name,
                     serde_json::json!({
                         "request_id": id,
@@ -772,22 +828,33 @@ impl Executor {
                         "session_id": caller.session_id,
                         "detail": detail,
                     }),
-                    0,
-                    serde_json::json!({ "approval": format!("{verdict:?}"), "decided_by": "human" }),
+                    serde_json::json!({
+                        "approval": format!("{verdict:?}"),
+                        "decided_by": answered.decided_by,
+                        "reason": answered.reason,
+                    }),
                 )
-                .with_execution(caller.execution_str())
-                .with_kind("approval"),
+                .with_execution(caller.execution_str()),
             )
             .await;
 
         match verdict {
-            agentd_types::Verdict::Deny => Escalation::Reject(decision_to_error(
-                decision,
-                action_meta,
-                tool_name,
-                caller,
-                &self.engine.load(),
-            )),
+            agentd_types::Verdict::Deny => {
+                let err = decision_to_error(
+                    decision,
+                    action_meta,
+                    tool_name,
+                    caller,
+                    &self.engine.load(),
+                );
+                Escalation::Reject(match (answered.decided_by, answered.reason) {
+                    ("classifier", reason) => RegistryError::Denied {
+                        layer: "approval".into(),
+                        reason: classifier_refusal(&action_meta.name, reason.as_deref(), &err),
+                    },
+                    _ => err,
+                })
+            }
             agentd_types::Verdict::AllowOnce => Escalation::Proceed {
                 extra: PermissionSet::from_iter(missing),
             },
@@ -1263,16 +1330,30 @@ impl agentd_types::InlineApprovals for Executor {
         &self,
         req: agentd_types::InlineApprovalRequest,
     ) -> agentd_types::Verdict {
+        self.request_inline_explained(req).await.verdict
+    }
+
+    async fn request_inline_explained(
+        &self,
+        req: agentd_types::InlineApprovalRequest,
+    ) -> agentd_types::InlineAnswer {
         use std::sync::atomic::Ordering;
+        let refused = |refusal: Option<String>| agentd_types::InlineAnswer {
+            verdict: agentd_types::Verdict::Deny,
+            refusal,
+        };
 
         if req.caller.approval == Some(ApprovalSetting::Nobody) {
             let action = req.call_chain.first().map_or("<lua>", String::as_str);
             self.trace_nobody(action, &req.caller).await;
-            return agentd_types::Verdict::Deny;
+            return refused(Some(format!(
+                "`{}` was refused without asking, because this run's approval is `nobody`.",
+                req.permission
+            )));
         }
-        let Some(broker) = self.broker.as_ref() else {
-            return agentd_types::Verdict::Deny;
-        };
+        if self.broker.is_none() && req.caller.approval != Some(ApprovalSetting::Classifier) {
+            return refused(None);
+        }
         let id = self.approval_seq.fetch_add(1, Ordering::Relaxed);
         let action = req
             .call_chain
@@ -1315,10 +1396,11 @@ impl agentd_types::InlineApprovals for Executor {
             )
         });
         let detail = approval.detail.clone();
-        let verdict = self.runs.ask(key, broker.request(approval)).await;
+        let answered = self.decide(approval, key).await;
+        let verdict = answered.verdict;
         self.trace
             .record(
-                TraceEvent::ok(
+                TraceEvent::decision(
                     &action,
                     serde_json::json!({
                         "request_id": id,
@@ -1327,16 +1409,23 @@ impl agentd_types::InlineApprovals for Executor {
                         "session_id": req.caller.session_id,
                         "detail": detail,
                     }),
-                    0,
-                    serde_json::json!({ "approval": format!("{verdict:?}"), "decided_by": "human" }),
+                    serde_json::json!({
+                        "approval": format!("{verdict:?}"),
+                        "decided_by": answered.decided_by,
+                        "reason": answered.reason,
+                    }),
                 )
-                .with_execution(req.caller.execution_str())
-                .with_kind("approval"),
+                .with_execution(req.caller.execution_str()),
             )
             .await;
-        if verdict != agentd_types::Verdict::Deny
-            && let Some(run_id) = req.caller.run_id.as_deref()
-        {
+        if verdict == agentd_types::Verdict::Deny {
+            return refused((answered.decided_by == "classifier").then(|| {
+                classifier_refusal(&req.permission, answered.reason.as_deref(), &"")
+                    .trim_end()
+                    .to_string()
+            }));
+        }
+        if let Some(run_id) = req.caller.run_id.as_deref() {
             self.runs.allow(run_id, &req.permission);
         }
         if verdict == agentd_types::Verdict::AllowForever
@@ -1352,9 +1441,19 @@ impl agentd_types::InlineApprovals for Executor {
                 permission = %req.permission,
                 "allow-forever could not be saved ({e}); degrading to allow-once"
             );
-            return agentd_types::Verdict::AllowOnce;
+            return agentd_types::InlineAnswer {
+                verdict: agentd_types::Verdict::AllowOnce,
+                refusal: None,
+            };
         }
-        verdict
+        agentd_types::InlineAnswer {
+            verdict,
+            refusal: None,
+        }
+    }
+
+    fn classifier_configured(&self) -> bool {
+        self.classifier_name().is_some()
     }
 
     fn run_allows(&self, run_id: &str, permission: &str) -> bool {
@@ -1489,6 +1588,19 @@ impl Executor {
             options.admin,
             caller.approval,
         )?;
+        // `classifier` with no classifier configured (a reload removed it)
+        // runs as `human`, which is only ever stricter.
+        let approval = if approval == ApprovalSetting::Classifier
+            && self.classifier_name().is_none()
+        {
+            tracing::warn!(
+                runner = runner_name,
+                "approval resolved to `classifier`, but `[approval].classifier` names no runner, so this run uses `human`"
+            );
+            ApprovalSetting::Human
+        } else {
+            approval
+        };
         let run_id = format!(
             "run-{}",
             RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

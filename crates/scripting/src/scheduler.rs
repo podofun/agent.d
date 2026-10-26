@@ -293,13 +293,20 @@ pub async fn drive(
                 // shell child's sandbox may reach. Files and hosts are also
                 // remembered on the run by the hook, and `AllowForever` has
                 // persisted the grant to grants.toml for later invocations.
-                match hook.request_inline(request).await {
+                let answer = hook.request_inline_explained(request).await;
+                match answer.verdict {
                     agentd_types::Verdict::AllowOnce | agentd_types::Verdict::AllowForever => {
                         ctx.one_time_pass = Some(pass);
                         next = vec![serde_json::json!({ "ok": true, "approved": true })];
                     }
                     agentd_types::Verdict::Deny => {
-                        next = vec![serde_json::json!({ "ok": false, "error": denied_msg })];
+                        // Who refused and why comes first, then the usual
+                        // diagnostic.
+                        let error = match answer.refusal {
+                            Some(refusal) => format!("{refusal}\n{denied_msg}"),
+                            None => denied_msg,
+                        };
+                        next = vec![serde_json::json!({ "ok": false, "error": error })];
                     }
                 }
             }

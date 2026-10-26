@@ -2993,7 +2993,7 @@ fn sessions_create_binding(lua: &Lua, opts: Option<Table>) -> mlua::Result<Value
         new = new
             .label(t.get("label")?)
             .runner(t.get("runner")?)
-            .approval(parse_approval(t.get("approval")?)?);
+            .approval(parse_approval(lua, t.get("approval")?)?);
     }
     let meta = with_sessions(lua, |s| s.create(new).map_err(sess_err))?;
     lua.to_value(&meta)
@@ -3039,16 +3039,31 @@ fn sessions_turns_binding(lua: &Lua, id: String) -> mlua::Result<Value> {
     lua.to_value(&v)
 }
 
-/// An approval setting as Lua writes it: `"human"`, `"nobody"`, or nil.
-fn parse_approval(v: Option<String>) -> mlua::Result<Option<agentd_permissions::ApprovalSetting>> {
-    v.map(|s| {
-        serde_json::from_value(serde_json::Value::String(s.clone())).map_err(|_| {
-            mlua::Error::external(format!(
-                "`approval` must be \"human\" or \"nobody\", not \"{s}\""
-            ))
+/// An approval setting as Lua writes it: `"human"`, `"classifier"`,
+/// `"nobody"`, or nil. `classifier` needs `[approval].classifier`.
+fn parse_approval(
+    lua: &Lua,
+    v: Option<String>,
+) -> mlua::Result<Option<agentd_permissions::ApprovalSetting>> {
+    let setting: Option<agentd_permissions::ApprovalSetting> = v
+        .map(|s| {
+            serde_json::from_value(serde_json::Value::String(s.clone())).map_err(|_| {
+                mlua::Error::external(format!(
+                    "`approval` must be \"human\", \"classifier\" or \"nobody\", not \"{s}\""
+                ))
+            })
         })
-    })
-    .transpose()
+        .transpose()?;
+    if setting == Some(agentd_permissions::ApprovalSetting::Classifier)
+        && !lua
+            .app_data_ref::<InlineApprovalsHandle>()
+            .is_some_and(|h| h.0.classifier_configured())
+    {
+        return Err(mlua::Error::external(
+            "`approval = \"classifier\"` needs a classifier, and `[approval].classifier` in grants.toml names no runner",
+        ));
+    }
+    Ok(setting)
 }
 
 /// `ctx.sessions.set_approval(id, approval)`: store who answers questions for
@@ -3059,7 +3074,7 @@ fn sessions_set_approval_binding(
     (id, approval): (String, Option<String>),
 ) -> mlua::Result<Value> {
     check_permission_inline(lua, &Permission::new("sessions.write"))?;
-    let approval = parse_approval(approval)?;
+    let approval = parse_approval(lua, approval)?;
     let scope = session_scope(lua)?;
     if with_sessions(lua, |s| s.get_in(&scope, &id).map_err(sess_err))?.is_none() {
         return Err(mlua::Error::external(format!(

@@ -64,6 +64,21 @@ impl TraceEvent {
             kind: None,
         }
     }
+    /// An approval decision. The request is redacted like any args; the
+    /// decision (the verdict, who decided, and the classifier's reason) is
+    /// kept as written, since it holds no request data.
+    pub fn decision(action: &str, request: serde_json::Value, decision: serde_json::Value) -> Self {
+        Self {
+            ts: Utc::now().to_rfc3339(),
+            action: action.to_string(),
+            args: redact(&request),
+            duration_ms: 0,
+            result: Some(decision),
+            error: None,
+            execution: None,
+            kind: Some("approval".into()),
+        }
+    }
     pub fn err(action: &str, args: serde_json::Value, dur_ms: u128, err: String) -> Self {
         Self {
             ts: Utc::now().to_rfc3339(),
@@ -165,6 +180,18 @@ mod tests {
         );
         let s = serde_json::to_string(&red).unwrap();
         assert!(!s.contains("secret") && !s.contains("hunter2"));
+    }
+
+    #[test]
+    fn decisions_keep_who_decided_but_redact_the_request() {
+        let e = TraceEvent::decision(
+            "tool.act",
+            serde_json::json!({ "detail": { "token": "abc" } }),
+            serde_json::json!({ "approval": "Deny", "decided_by": "classifier" }),
+        );
+        assert_eq!(e.args["detail"]["token"], "<string:3b>");
+        assert_eq!(e.result.unwrap()["decided_by"], "classifier");
+        assert_eq!(e.kind.as_deref(), Some("approval"));
     }
 
     #[test]

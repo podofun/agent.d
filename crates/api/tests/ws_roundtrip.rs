@@ -983,4 +983,15 @@ async fn sessions_store_their_approval_setting() {
     )
     .await;
     assert_eq!(steal["code"], "session_not_found", "{steal}");
+
+    // No `[approval].classifier`, so a session cannot be set to `classifier`.
+    let no_classifier = call(
+        &mut admin,
+        serde_json::json!({"id": 5, "method": "sessions.set_approval", "params": {"id": aid, "approval": "classifier"}}),
+    )
+    .await;
+    assert_eq!(
+        no_classifier["code"], "classifier_not_configured",
+        "{no_classifier}"
+    );
 }

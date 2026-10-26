@@ -118,6 +118,30 @@ pub trait InlineApprovals: Send + Sync {
     /// Note that the run read `value` from the secret `name`, so it is
     /// replaced by the name wherever it appears in a question.
     fn record_secret(&self, _run_id: &str, _name: &str, _value: &str) {}
+
+    /// Ask like [`InlineApprovals::request_inline`], also returning the
+    /// sentence explaining a refusal by someone other than a human (for
+    /// example the classifier's reason), to put ahead of the denial.
+    async fn request_inline_explained(&self, req: InlineApprovalRequest) -> InlineAnswer {
+        InlineAnswer {
+            verdict: self.request_inline(req).await,
+            refusal: None,
+        }
+    }
+
+    /// Whether `[approval].classifier` names a runner, so a session may be
+    /// set to `classifier`.
+    fn classifier_configured(&self) -> bool {
+        false
+    }
+}
+
+/// An inline question's answer, with who refused it and why when that was
+/// not a human.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineAnswer {
+    pub verdict: Verdict,
+    pub refusal: Option<String>,
 }
 
 /// The operator's hard denials (`[denial].actions` and
