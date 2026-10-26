@@ -409,6 +409,7 @@ fn inline_req(perm: &str) -> InlineApprovalRequest {
         call_chain: vec!["tool.act".into()],
         permission: perm.into(),
         caller: Caller::interface("http"),
+        detail: None,
     }
 }
 
@@ -576,4 +577,20 @@ async fn allow_forever_on_confirm_writes_approval_skip() {
     let on_disk = std::fs::read_to_string(&path).unwrap();
     let file = agentd_permissions::parse_grants(&on_disk).unwrap();
     assert!(file.approval.skips("tool.act"), "{on_disk}");
+}
+
+/// A question about an action shows what it would do: its arguments.
+#[tokio::test]
+async fn a_question_shows_the_action_arguments() {
+    let mut exec = base_executor(&["cap:foo"], false, engine_with_tool_grant(&[]));
+    let broker = MockBroker::new(Verdict::AllowOnce);
+    exec.set_broker(broker.clone());
+    let call = ActionCall {
+        action: "tool.act".into(),
+        args: serde_json::json!({ "branch": "main" }),
+    };
+    exec.run(Caller::interface("http"), call).await.unwrap();
+    let seen = broker.seen.lock().unwrap();
+    let req = seen.as_ref().unwrap();
+    assert_eq!(req.detail, Some(serde_json::json!({ "branch": "main" })));
 }

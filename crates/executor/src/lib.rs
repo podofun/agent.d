@@ -18,6 +18,8 @@
 //! work identically whether the caller is a one-shot HTTP request, an LLM
 //! tool call, or a background Discord gateway loop.
 
+mod runs;
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -362,6 +364,9 @@ pub struct Executor {
     /// Session ids with a run in flight; a second run on the same id is
     /// refused rather than interleaved.
     active_sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Records of runs in flight: approved files and hosts, secrets read,
+    /// and questions being asked.
+    runs: Arc<runs::Runs>,
 }
 
 /// Removes the session id from the in-flight set when the run ends.
@@ -404,6 +409,7 @@ impl Executor {
             forever_write_lock: tokio::sync::Mutex::new(()),
             sessions: None,
             active_sessions: Arc::new(std::sync::Mutex::new(Default::default())),
+            runs: Arc::new(runs::Runs::default()),
         }
     }
 
@@ -569,7 +575,7 @@ impl Executor {
                 );
                 let confirm_question = matches!(decision, Decision::NeedsConfirmation { .. });
                 match self
-                    .escalate(decision, &action_meta, tool_name.as_deref(), &caller)
+                    .escalate(decision, &action_meta, tool_name.as_deref(), &caller, &args)
                     .await
                 {
                     Escalation::Proceed { extra } => {
@@ -687,6 +693,7 @@ impl Executor {
         action_meta: &PermActionMeta,
         tool_name: Option<&str>,
         caller: &Caller,
+        args: &serde_json::Value,
     ) -> Escalation {
         use std::sync::atomic::Ordering;
 
@@ -744,16 +751,29 @@ impl Executor {
             missing: missing.clone(),
             reason,
             caller: caller.clone(),
+            detail: Some(self.runs.redact(caller.run_id.as_deref(), args)),
+            run_id: caller.run_id.clone(),
+            session_id: caller.session_id.clone(),
+            warning: None,
         };
-
-        let verdict = broker.request(req).await;
+        let key = caller
+            .run_id
+            .as_ref()
+            .map(|r| format!("{r}\0{kind:?}\0{}\0{args}", action_meta.name));
+        let detail = req.detail.clone();
+        let verdict = self.runs.ask(key, broker.request(req)).await;
         self.trace
             .record(
                 TraceEvent::ok(
                     &action_meta.name,
-                    serde_json::json!({ "request_id": id }),
+                    serde_json::json!({
+                        "request_id": id,
+                        "run_id": caller.run_id,
+                        "session_id": caller.session_id,
+                        "detail": detail,
+                    }),
                     0,
-                    serde_json::json!({ "approval": format!("{verdict:?}") }),
+                    serde_json::json!({ "approval": format!("{verdict:?}"), "decided_by": "human" }),
                 )
                 .with_execution(caller.execution_str())
                 .with_kind("approval"),
@@ -1275,20 +1295,50 @@ impl agentd_types::InlineApprovals for Executor {
                 req.permission
             ),
             caller: req.caller.clone(),
+            detail: req
+                .detail
+                .as_ref()
+                .map(|d| self.runs.redact(req.caller.run_id.as_deref(), d)),
+            run_id: req.caller.run_id.clone(),
+            session_id: req.caller.session_id.clone(),
+            warning: runs::interpreter_warning(&req.permission),
         };
-        let verdict = broker.request(approval).await;
+        // Identical questions are matched on the unredacted request.
+        let key = req.caller.run_id.as_ref().map(|r| {
+            format!(
+                "{r}\0inline\0{}\0{}",
+                req.permission,
+                req.detail
+                    .as_ref()
+                    .map(|d| d.to_string())
+                    .unwrap_or_default()
+            )
+        });
+        let detail = approval.detail.clone();
+        let verdict = self.runs.ask(key, broker.request(approval)).await;
         self.trace
             .record(
                 TraceEvent::ok(
                     &action,
-                    serde_json::json!({ "request_id": id, "permission": req.permission }),
+                    serde_json::json!({
+                        "request_id": id,
+                        "permission": req.permission,
+                        "run_id": req.caller.run_id,
+                        "session_id": req.caller.session_id,
+                        "detail": detail,
+                    }),
                     0,
-                    serde_json::json!({ "approval": format!("{verdict:?}") }),
+                    serde_json::json!({ "approval": format!("{verdict:?}"), "decided_by": "human" }),
                 )
                 .with_execution(req.caller.execution_str())
                 .with_kind("approval"),
             )
             .await;
+        if verdict != agentd_types::Verdict::Deny
+            && let Some(run_id) = req.caller.run_id.as_deref()
+        {
+            self.runs.allow(run_id, &req.permission);
+        }
         if verdict == agentd_types::Verdict::AllowForever
             && let Err(e) = self
                 .persist_inline_grant(
@@ -1305,6 +1355,14 @@ impl agentd_types::InlineApprovals for Executor {
             return agentd_types::Verdict::AllowOnce;
         }
         verdict
+    }
+
+    fn run_allows(&self, run_id: &str, permission: &str) -> bool {
+        self.runs.allows(run_id, permission)
+    }
+
+    fn record_secret(&self, run_id: &str, name: &str, value: &str) {
+        self.runs.record_secret(run_id, name, value);
     }
 }
 
@@ -1417,7 +1475,7 @@ impl Executor {
         runner_name: &str,
         options: &RunOptions,
         session: Option<&agentd_sessions::SessionMeta>,
-    ) -> Result<Caller, RunnerError> {
+    ) -> Result<(Caller, runs::RunGuard), RunnerError> {
         let runner_default = self
             .engine
             .load()
@@ -1431,13 +1489,15 @@ impl Executor {
             options.admin,
             caller.approval,
         )?;
-        caller.approval = Some(approval);
-        caller.run_id = Some(format!(
+        let run_id = format!(
             "run-{}",
             RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        );
+        let guard = self.runs.start(&run_id, caller.run_id.as_deref());
+        caller.approval = Some(approval);
+        caller.run_id = Some(run_id);
         caller.session_id = session.map(|m| m.id.clone());
-        Ok(caller)
+        Ok((caller, guard))
     }
 
     async fn run_runner_inner(
@@ -1448,7 +1508,7 @@ impl Executor {
         sink: Option<agentd_ai::StreamSink>,
     ) -> Result<RunnerOutcome, RunnerError> {
         let Some(session_id) = options.session_id.take() else {
-            let caller = self.start_run(caller, runner_name, &options, None)?;
+            let (caller, _run) = self.start_run(caller, runner_name, &options, None)?;
             let (out, _) = self.run_model(caller, runner_name, options, sink).await?;
             return Ok(out);
         };
@@ -1468,7 +1528,7 @@ impl Executor {
             .get_in(&scope, &session_id)
             .map_err(|e| RunnerError::Session(e.to_string()))?
             .ok_or_else(|| RunnerError::SessionNotFound(session_id.clone()))?;
-        let caller = self.start_run(caller, runner_name, &options, Some(&meta))?;
+        let (caller, _run) = self.start_run(caller, runner_name, &options, Some(&meta))?;
         let _guard = {
             let mut set = self.active_sessions.lock().unwrap();
             if !set.insert(session_id.clone()) {

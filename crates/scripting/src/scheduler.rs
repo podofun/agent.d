@@ -98,13 +98,16 @@ pub(crate) enum Op {
     },
     /// An inline permission denial escalating to the approval broker. Handled
     /// directly in [`drive`] (not [`perform`]) because an approving verdict
-    /// must insert the permission into the coroutine's `ActiveContext`
-    /// effective grants before the retry resume.
+    /// must give the coroutine's `ActiveContext` a one-time pass before the
+    /// retry resume.
     Approval {
         hook: Arc<dyn agentd_types::InlineApprovals>,
         request: agentd_types::InlineApprovalRequest,
         /// The human-readable denial to raise if the verdict is `Deny`.
         denied_msg: String,
+        /// The pass the retry presents: the request's permission and
+        /// unredacted detail.
+        pass: String,
     },
 }
 
@@ -282,16 +285,17 @@ pub async fn drive(
                 hook,
                 request,
                 denied_msg,
+                pass,
             }) => {
-                // Inline permission escalation. On an approving verdict the
-                // permission joins THIS execution's effective grants so the
-                // wrapper's retry passes; `AllowForever` has additionally
-                // persisted it to grants.toml inside the hook.
-                let permission = request.permission.clone();
+                // Inline permission escalation. An approving verdict gives the
+                // wrapper's retry a one-time pass for exactly this request. It
+                // never joins the effective grants, so it cannot widen what a
+                // shell child's sandbox may reach. Files and hosts are also
+                // remembered on the run by the hook, and `AllowForever` has
+                // persisted the grant to grants.toml for later invocations.
                 match hook.request_inline(request).await {
                     agentd_types::Verdict::AllowOnce | agentd_types::Verdict::AllowForever => {
-                        ctx.effective_grants
-                            .insert(agentd_permissions::Permission::new(permission));
+                        ctx.one_time_pass = Some(pass);
                         next = vec![serde_json::json!({ "ok": true, "approved": true })];
                     }
                     agentd_types::Verdict::Deny => {
