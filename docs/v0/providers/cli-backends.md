@@ -43,6 +43,8 @@ granted = ["ai:anthropic-cli"]
 ## Use `anthropic-cli` with a runner
 
 During a runner call, agent.d gives the action list to `claude`, which calls the actions through a private local connection to agent.d.
+agent.d turns off all the built-in Claude Code tools, so the actions in this list are the only tools.
+Each action call goes through the agent.d checks.
 
 ```lua
 agentd.runner({
@@ -66,6 +68,9 @@ Each action also needs its tool permissions because the `actions` field in Lua d
 
 For each `openai-cli` call, agent.d starts `codex exec` with the `read-only` sandbox and the `never` approval policy.
 This provider returns text only and cannot call agent.d actions.
+Codex can still read files in its sandbox, and agent.d cannot check those reads.
+So while `[denial]` lists any `fs.read`, `fs.write`, or `net` permission, agent.d refuses `openai-cli` calls.
+See [What a denial guarantees](/v0/security/denials#ai-providers).
 
 ```lua
 agentd.tool({

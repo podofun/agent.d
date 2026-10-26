@@ -62,6 +62,8 @@ conn:url() -> string
 granted = ["net:discord.com", "net:gateway.discord.gg"]
 ```
 
+agent.d checks the address that it connects to. If the host name points to an IP address in `[denial]`, the connection is refused. The connection also checks `[denial]` again each time it sends, so a new denial applies to a connection that is already open. See [Hosts](/v0/security/denials#hosts).
+
 ## Examples
 
 ```lua

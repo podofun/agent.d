@@ -54,12 +54,18 @@ client:request(req: table) -> Response
 
 ## Permission
 
-The slug `net:<host>` must be granted for every hostname you contact. Wildcards are supported: `net:*` permits all outbound HTTP.
+The slug `net:<host>` must be granted for every host you contact. A `*` at the end matches more hosts: `net:*` allows every host, and `net:api.example.*` allows every host that starts with `api.example.`.
 
 ```toml
 [tool.github]
 granted = ["net:api.github.com"]
 ```
+
+### Redirects and addresses
+
+`ctx.http` follows redirects, and it checks each one. A redirect to a host that is not granted, or that is denied, stops the request with an error. `ctx.http` follows at most 10 redirects.
+
+`ctx.http` also checks the address that it connects to. If the host name points to an IP address in `[denial]`, the request is refused. `ctx.http` ignores proxy settings in the environment, so the connection always goes to the host that agent.d checked. See [Hosts](/v0/security/denials#hosts).
 
 ## Examples
 

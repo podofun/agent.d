@@ -111,6 +111,7 @@ export default defineConfig({
             { text: 'grants.toml', link: '/v0/security/grants' },
             { text: 'Permission slugs', link: '/v0/security/permission-slugs' },
             { text: 'Interactive approvals', link: '/v0/security/approvals' },
+            { text: 'What a denial guarantees', link: '/v0/security/denials' },
             { text: 'The shell sandbox', link: '/v0/security/sandbox' },
             { text: 'Security best practices', link: '/v0/security/best-practices' }
           ]
