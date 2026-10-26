@@ -277,3 +277,56 @@ async fn scripts_only_see_their_callers_sessions() {
     let err = call(&host, &grants, "s.new", serde_json::Value::Null).await;
     assert!(err.is_err(), "create with a user option must be refused");
 }
+
+/// `ctx.sessions.create` and `set_approval` store a session's approval
+/// setting; an unknown value is refused, and admin sessions stay invisible.
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_store_an_approval_setting() {
+    let (host, store) = host_with(
+        r#"
+        agentd.tool{ name = "s" }
+        agentd.action{ name = "s.mk", handler = function(_, ctx)
+          return ctx.sessions.create({ approval = "nobody" }) end }
+        agentd.action{ name = "s.set", handler = function(args, ctx)
+          return ctx.sessions.set_approval(args.id, args.approval) end }
+        "#,
+    );
+    let made = call(&host, &["sessions.write"], "s.mk", serde_json::Value::Null)
+        .await
+        .unwrap();
+    assert_eq!(made["approval"], "nobody");
+    let id = made["id"].as_str().unwrap().to_string();
+
+    let set = call(
+        &host,
+        &["sessions.write"],
+        "s.set",
+        serde_json::json!({ "id": id, "approval": "human" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(set["approval"], "human");
+
+    let bad = call(
+        &host,
+        &["sessions.write"],
+        "s.set",
+        serde_json::json!({ "id": id, "approval": "sometimes" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(bad.to_string().contains("\"human\" or \"nobody\""), "{bad}");
+
+    let admin = store
+        .create(NewSession::in_scope(&Scope::admin(None)))
+        .unwrap();
+    let hidden = call(
+        &host,
+        &["sessions.write"],
+        "s.set",
+        serde_json::json!({ "id": admin.id, "approval": "human" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(hidden.to_string().contains("does not exist"), "{hidden}");
+}

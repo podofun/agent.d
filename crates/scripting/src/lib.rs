@@ -2974,7 +2974,10 @@ fn sessions_create_binding(lua: &Lua, opts: Option<Table>) -> mlua::Result<Value
                 "`ctx.sessions.create` takes the user from `ctx.caller.user`, not from its options — the interface that authenticated the user sets it",
             ));
         }
-        new = new.label(t.get("label")?).runner(t.get("runner")?);
+        new = new
+            .label(t.get("label")?)
+            .runner(t.get("runner")?)
+            .approval(parse_approval(t.get("approval")?)?);
     }
     let meta = with_sessions(lua, |s| s.create(new).map_err(sess_err))?;
     lua.to_value(&meta)
@@ -3020,6 +3023,37 @@ fn sessions_turns_binding(lua: &Lua, id: String) -> mlua::Result<Value> {
     lua.to_value(&v)
 }
 
+/// An approval setting as Lua writes it: `"human"`, `"nobody"`, or nil.
+fn parse_approval(v: Option<String>) -> mlua::Result<Option<agentd_permissions::ApprovalSetting>> {
+    v.map(|s| {
+        serde_json::from_value(serde_json::Value::String(s.clone())).map_err(|_| {
+            mlua::Error::external(format!(
+                "`approval` must be \"human\" or \"nobody\", not \"{s}\""
+            ))
+        })
+    })
+    .transpose()
+}
+
+/// `ctx.sessions.set_approval(id, approval)`: store who answers questions for
+/// runs in the session; nil clears it. Lua is never an admin, so a looser
+/// value it stores applies only to an admin's runs.
+fn sessions_set_approval_binding(
+    lua: &Lua,
+    (id, approval): (String, Option<String>),
+) -> mlua::Result<Value> {
+    check_permission_inline(lua, &Permission::new("sessions.write"))?;
+    let approval = parse_approval(approval)?;
+    let scope = session_scope(lua)?;
+    if with_sessions(lua, |s| s.get_in(&scope, &id).map_err(sess_err))?.is_none() {
+        return Err(mlua::Error::external(format!(
+            "session `{id}` does not exist"
+        )));
+    }
+    let meta = with_sessions(lua, |s| s.set_approval(&id, approval).map_err(sess_err))?;
+    lua.to_value(&meta)
+}
+
 fn sessions_delete_binding(lua: &Lua, id: String) -> mlua::Result<bool> {
     check_permission_inline(lua, &Permission::new("sessions.write"))?;
     let scope = session_scope(lua)?;
@@ -3054,6 +3088,10 @@ fn build_sessions_table(lua: &Lua) -> mlua::Result<Table> {
     t.set(
         "delete",
         yieldable_wrap(lua, lua.create_function(sessions_delete_binding)?)?,
+    )?;
+    t.set(
+        "set_approval",
+        yieldable_wrap(lua, lua.create_function(sessions_set_approval_binding)?)?,
     )?;
     // `open(label, opts?)`: find-or-create by label. The common bridge call.
     let open: Function = lua

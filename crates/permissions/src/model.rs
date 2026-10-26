@@ -228,6 +228,45 @@ pub struct Caller {
     /// its N agent dispatches share one id in the trace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<ExecutionId>,
+    /// The run this call belongs to, minted when the run starts. Set by the
+    /// executor only, never read from the wire.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// The durable session the run belongs to. Set by the executor only,
+    /// never read from the wire. (`session` is the connection id.)
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Who answers this run's questions, resolved once when the run starts.
+    /// Set by the executor only, never read from the wire. `None` (no run)
+    /// behaves as [`ApprovalSetting::Human`].
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalSetting>,
+}
+
+/// Who answers a run's questions. Ordered from strict to loose, so the
+/// stricter of two settings is the smaller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalSetting {
+    /// Anything not granted is refused, and nothing is asked.
+    Nobody,
+    /// Questions go to connected approvers. The default.
+    Human,
+}
+
+impl ApprovalSetting {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalSetting::Nobody => "nobody",
+            ApprovalSetting::Human => "human",
+        }
+    }
+}
+
+impl std::fmt::Display for ApprovalSetting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl Caller {

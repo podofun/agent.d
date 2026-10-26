@@ -19,6 +19,7 @@ use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentd_ai::Message;
+use agentd_permissions::ApprovalSetting;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -97,6 +98,11 @@ pub struct SessionMeta {
     /// Caller's external id (e.g. `telegram-42`). Unique per daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Who answers questions for runs in this session. Whether it applies is
+    /// decided at each run: a stricter value always does, a looser one only
+    /// for an admin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalSetting>,
     /// Unix seconds.
     pub created_at: u64,
     pub updated_at: u64,
@@ -115,6 +121,7 @@ pub struct NewSession {
     /// Caller's external id, unique per owner.
     pub label: Option<String>,
     pub runner: Option<String>,
+    pub approval: Option<ApprovalSetting>,
 }
 
 impl NewSession {
@@ -131,6 +138,10 @@ impl NewSession {
     }
     pub fn runner(mut self, runner: Option<String>) -> Self {
         self.runner = runner;
+        self
+    }
+    pub fn approval(mut self, approval: Option<ApprovalSetting>) -> Self {
+        self.approval = approval;
         self
     }
 }
@@ -174,6 +185,9 @@ pub trait SessionStore: Send + Sync {
     /// Replace the label. `None` clears it. `LabelTaken` if another session of
     /// the same owner already uses it, `NotFound` if the session is gone.
     fn relabel(&self, id: &str, label: Option<String>) -> Result<SessionMeta>;
+    /// Replace the approval setting. `None` clears it. `NotFound` if the
+    /// session is gone.
+    fn set_approval(&self, id: &str, approval: Option<ApprovalSetting>) -> Result<SessionMeta>;
 }
 
 pub(crate) fn now_secs() -> u64 {
@@ -195,6 +209,7 @@ pub(crate) fn fresh_meta(new: NewSession) -> SessionMeta {
         runner: new.runner,
         user: new.user,
         label: new.label,
+        approval: new.approval,
         created_at: now,
         updated_at: now,
         turn_count: 0,
@@ -323,6 +338,16 @@ impl SessionStore for MemSessionStore {
         }
         let meta = g.metas.get_mut(id).unwrap();
         meta.label = label;
+        meta.updated_at = now_secs();
+        Ok(meta.clone())
+    }
+    fn set_approval(&self, id: &str, approval: Option<ApprovalSetting>) -> Result<SessionMeta> {
+        let mut g = self.inner.write().unwrap();
+        let meta = g
+            .metas
+            .get_mut(id)
+            .ok_or_else(|| SessionError::NotFound(id.to_string()))?;
+        meta.approval = approval;
         meta.updated_at = now_secs();
         Ok(meta.clone())
     }

@@ -263,6 +263,7 @@ name = "agentd-runners"
 version = "0.10.0-alpha"
 dependencies = [
  "agentd-ai",
+ "agentd-permissions",
  "agentd-skills",
  "async-trait",
  "serde",
@@ -331,6 +332,7 @@ version = "0.10.0-alpha"
 dependencies = [
  "agentd-ai",
  "agentd-memory",
+ "agentd-permissions",
  "redb",
  "serde",
  "serde_json",

@@ -65,6 +65,7 @@ async fn a_tool_the_run_was_not_given_is_never_dispatched() {
                 .into_iter()
                 .map(String::from)
                 .collect(),
+            ..Default::default()
         },
     );
     let runners = RunnerRegistry::new();
