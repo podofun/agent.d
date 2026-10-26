@@ -472,3 +472,108 @@ async fn inline_allow_forever_without_persistence_degrades_to_allow_once() {
     let v = exec.request_inline(inline_req("net:api.github.com")).await;
     assert_eq!(v, Verdict::AllowOnce);
 }
+
+// ---------- one question at a time ----------
+
+/// Broker that answers every question with `verdict` and records each kind.
+struct RecordingBroker {
+    verdict: Verdict,
+    kinds: std::sync::Mutex<Vec<agentd_types::ApprovalKind>>,
+}
+#[async_trait]
+impl ApprovalBroker for RecordingBroker {
+    async fn request(&self, req: ApprovalRequest) -> Verdict {
+        self.kinds.lock().unwrap().push(req.kind);
+        self.verdict
+    }
+}
+
+fn recording(verdict: Verdict) -> Arc<RecordingBroker> {
+    Arc::new(RecordingBroker {
+        verdict,
+        kinds: std::sync::Mutex::new(Vec::new()),
+    })
+}
+
+/// After one approval the engine runs again, so each remaining question is
+/// asked in turn: the runner allowlist, then the missing grant, then confirm.
+#[tokio::test]
+async fn every_question_is_asked_in_turn() {
+    let mut exec = base_executor(&["cap:foo"], true, engine_with_runner(&[]));
+    let broker = recording(Verdict::AllowOnce);
+    exec.set_broker(broker.clone());
+    let res = exec
+        .run(Caller::default().with_runner("reviewer"), act())
+        .await;
+    assert!(res.is_ok(), "three approvals should proceed: {res:?}");
+    use agentd_types::ApprovalKind::*;
+    assert_eq!(
+        *broker.kinds.lock().unwrap(),
+        vec![RunnerAction, MissingGrant, Confirm]
+    );
+}
+
+/// A refusal of a later question still rejects, after earlier approvals.
+#[tokio::test]
+async fn a_refused_later_question_rejects() {
+    let mut exec = base_executor(&["cap:foo"], false, engine_with_runner(&[]));
+    struct AllowRunnerOnly;
+    #[async_trait]
+    impl ApprovalBroker for AllowRunnerOnly {
+        async fn request(&self, req: ApprovalRequest) -> Verdict {
+            match req.kind {
+                agentd_types::ApprovalKind::RunnerAction => Verdict::AllowOnce,
+                _ => Verdict::Deny,
+            }
+        }
+    }
+    exec.set_broker(Arc::new(AllowRunnerOnly));
+    let res = exec
+        .run(Caller::default().with_runner("reviewer"), act())
+        .await;
+    assert!(res.is_err(), "the missing grant was refused: {res:?}");
+}
+
+/// An interface allowlist miss is a denial, decided before the missing grant
+/// could become a question, so nobody is asked.
+#[tokio::test]
+async fn an_interface_miss_is_refused_without_asking() {
+    let mut file = GrantsFile::default();
+    let mut iface = InterfaceGrants::default();
+    iface.allowed_actions.insert("other.act".into());
+    file.interface.insert("telegram".into(), iface);
+    let mut exec = base_executor(&["cap:foo"], false, engine_from_file(file));
+    let broker = recording(Verdict::AllowOnce);
+    exec.set_broker(broker.clone());
+    let err = exec
+        .run(Caller::interface("telegram"), act())
+        .await
+        .unwrap_err()
+        .0;
+    assert!(err.to_string().contains("interface `telegram`"), "{err}");
+    assert!(broker.kinds.lock().unwrap().is_empty(), "nobody is asked");
+}
+
+/// "Allow forever" on a confirm question writes `[approval].skip`.
+#[tokio::test]
+async fn allow_forever_on_confirm_writes_approval_skip() {
+    use std::io::Write;
+    let mut tf = tempfile::NamedTempFile::new().unwrap();
+    write!(tf, "[tool.tool]\ngranted = [\"cap:foo\"]\n").unwrap();
+    let path = tf.path().to_path_buf();
+
+    let mut exec = base_executor(&["cap:foo"], true, engine_with_tool_grant(&["cap:foo"]));
+    exec.set_broker(MockBroker::new(Verdict::AllowForever));
+    exec.set_grants_path(path.clone());
+    let reload_path = path.clone();
+    exec.set_reload_grants(Arc::new(move || {
+        let text = std::fs::read_to_string(&reload_path).map_err(|e| e.to_string())?;
+        let file = agentd_permissions::parse_grants(&text)?;
+        Ok(Engine::new(Grants::from_file(file)))
+    }));
+    let res = exec.run(Caller::interface("http"), act()).await;
+    assert!(res.is_ok(), "{res:?}");
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    let file = agentd_permissions::parse_grants(&on_disk).unwrap();
+    assert!(file.approval.skips("tool.act"), "{on_disk}");
+}

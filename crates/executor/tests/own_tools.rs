@@ -69,7 +69,7 @@ fn executor(denied: &[&str]) -> Arc<Executor> {
         },
     );
     for d in denied {
-        file.policy.deny_permissions.insert(Permission::new(*d));
+        file.denial.permissions.insert(Permission::new(*d));
     }
     let runners = RunnerRegistry::new();
     runners.insert(RunnerDef {

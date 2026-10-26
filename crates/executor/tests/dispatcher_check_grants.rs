@@ -127,9 +127,9 @@ async fn denials_come_from_the_current_grants() {
     use agentd_types::Denials;
 
     let mut file = GrantsFile::default();
-    file.policy.deny_actions.insert("pkg.publish".into());
-    file.policy
-        .deny_permissions
+    file.denial.actions.insert("pkg.publish".into());
+    file.denial
+        .permissions
         .insert(Permission::new("net:tracker.example.com"));
     let exec = build_executor(file);
     let denials: &dyn Denials = exec.as_ref();
