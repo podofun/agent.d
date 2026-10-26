@@ -204,6 +204,16 @@ async fn boot_runner_with_interfaces(
     grant: bool,
     interface_tokens: HashMap<String, String>,
 ) -> (String, Arc<agentd_api::Lifecycle>) {
+    boot_runner_with_tokens(provider, grant, interface_tokens, None).await
+}
+
+/// Like `boot_runner_with_interfaces`, also accepting `admin_token` on `/ws`.
+async fn boot_runner_with_tokens(
+    provider: Arc<dyn agentd_ai::Provider>,
+    grant: bool,
+    interface_tokens: HashMap<String, String>,
+    admin_token: Option<&str>,
+) -> (String, Arc<agentd_api::Lifecycle>) {
     let host = LuaHost::new().expect("lua host");
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -253,8 +263,9 @@ async fn boot_runner_with_interfaces(
         lifecycle: lifecycle.clone(),
         executor: Arc::new(arc_swap::ArcSwap::from(executor)),
         // With interfaces configured, auth is on: the public token is `ws`.
-        auth_token: (!interface_tokens.is_empty()).then(|| Arc::new("public-token".to_string())),
-        admin_token: None,
+        auth_token: (!interface_tokens.is_empty() || admin_token.is_some())
+            .then(|| Arc::new("public-token".to_string())),
+        admin_token: admin_token.map(|t| Arc::new(t.to_string())),
         interface_tokens: Arc::new(interface_tokens),
         broker: Arc::new(agentd_approvals::Broker::new(
             std::time::Duration::from_secs(30),
@@ -621,7 +632,8 @@ async fn sessions_roundtrip_over_ws() {
     assert_eq!(created["ok"], true, "{created}");
     let sid = created["result"]["id"].as_str().unwrap().to_string();
     assert_eq!(created["result"]["label"], "tg-1");
-    assert_eq!(created["result"]["owner"], "interface:ws");
+    // No tokens at all is `--no-auth`, where every `ws` connection is admin.
+    assert_eq!(created["result"]["owner"], "admin:ws");
     assert_eq!(created["result"]["user"], "bob");
 
     let dup = call(
@@ -868,4 +880,61 @@ async fn interface_tokens_isolate_sessions_between_interfaces() {
 
     // The provider only ever saw alice's own run.
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
+}
+
+/// The admin token on `/ws` makes an admin connection. Its sessions are owned
+/// by `admin:ws`, which a public-token connection can neither see nor run on.
+#[tokio::test]
+async fn admin_connections_own_sessions_no_public_client_can_reach() {
+    let provider = ControlledProvider::new();
+    let (url, _) =
+        boot_runner_with_tokens(provider.clone(), true, HashMap::new(), Some("admin-token")).await;
+    let mut admin = connect_as(&url, "admin-token").await;
+    let mut public = connect_as(&url, "public-token").await;
+
+    let a = call(
+        &mut admin,
+        serde_json::json!({"id": 1, "method": "sessions.create", "params": {"label": "mine"}}),
+    )
+    .await;
+    assert_eq!(a["result"]["owner"], "admin:ws", "{a}");
+    let aid = a["result"]["id"].as_str().unwrap().to_string();
+    let p = call(
+        &mut public,
+        serde_json::json!({"id": 1, "method": "sessions.create", "params": {"label": "mine"}}),
+    )
+    .await;
+    assert_eq!(p["result"]["owner"], "interface:ws", "{p}");
+
+    let run = call(
+        &mut admin,
+        serde_json::json!({"id": 2, "method": "runners.run", "params": {"name": "helper", "prompt": "hi", "session_id": aid}}),
+    )
+    .await;
+    assert_eq!(run["ok"], true, "{run}");
+
+    let list = call(
+        &mut public,
+        serde_json::json!({"id": 2, "method": "sessions.list", "params": {}}),
+    )
+    .await;
+    let ids: Vec<&str> = list["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert!(!ids.contains(&aid.as_str()), "{list}");
+    let steal = call(
+        &mut public,
+        serde_json::json!({"id": 3, "method": "runners.run", "params": {"name": "helper", "prompt": "hi", "session_id": aid}}),
+    )
+    .await;
+    assert_eq!(steal["code"], "session_not_found", "{steal}");
+    let get = call(
+        &mut public,
+        serde_json::json!({"id": 4, "method": "sessions.get", "params": {"id": aid}}),
+    )
+    .await;
+    assert_eq!(get["code"], "session_not_found", "{get}");
 }

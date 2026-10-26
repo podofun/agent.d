@@ -567,6 +567,9 @@ fn count_label(count: usize, singular: &str) -> String {
 fn resolve_ws_token(cfg: &Config) -> Result<Option<String>> {
     if cfg.no_auth {
         tracing::warn!("--no-auth: /ws accepts any local connection without a token");
+        tracing::warn!(
+            "--no-auth: every /ws client is an admin connection, so it can see admin sessions and relax approval for its runs"
+        );
         return Ok(None);
     }
     if let Some(token) = &cfg.auth_token {
