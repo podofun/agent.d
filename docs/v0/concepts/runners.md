@@ -27,8 +27,8 @@ agentd.runner({
 When a caller invokes `runners.run` (or `ctx.run`), the runtime:
 
 1. Composes the system prompt from the runner's `system` text and its resolved skills.
-2. Checks the runner’s `ai:<provider>` grant and policy, then sends the prompt and history to the named provider.
-3. If the model returns a tool call, the runtime checks the permission engine and, if approved, dispatches the action.
+2. Checks the runner’s `ai:<provider>` grant and `[denial]`, then sends the prompt and history to the named provider.
+3. If the model returns a tool call, the runtime checks that the action is one of the runner's actions, then checks the permission engine. If the call is allowed, it runs the action.
 4. The result is fed back to the model and the loop continues.
 5. The loop ends when the model returns a final text response or `max_turns` is reached.
 
@@ -41,22 +41,24 @@ max_turns = 32
 
 ## The action allowlist
 
-The `actions` field on a runner is an **advisory** allowlist — permission layer 3. It narrows which actions a runner may call, but it does not grant any capabilities by itself. `grants.toml` is authoritative:
+A runner has two action lists, and each has its own job:
 
-```text
-tool/package grants ∩ action.requires ∩ runner.allow ∩ interface.allow ∩ policy = Decision
-```
+- The `actions` field in Lua lists the actions that the model can see and call. The model cannot call any other action, even one that `grants.toml` would allow.
+- `allowed_actions` in `[runner.<name>]` of `grants.toml` lists the actions that the runner may call without a question. If the model calls one of its actions that is not on this list, agent.d asks first.
 
-A runner with no `actions` list has no constraint at layer 3 — the other four layers still apply. If you set `allowed_actions` in `grants.toml` for a runner, that overrides (or narrows) what the runner definition says.
+Neither list gives the action its permissions. The action's tool still needs its grants.
 
 ```toml
 [runner.backend_reviewer]
 granted = ["ai:anthropic"]
 allowed_actions = ["git.diff", "git.status"]
+approval = "human"
 ```
 
+The `approval` key sets who answers the runner's questions. See [Who answers](/v0/security/approvals#who-answers).
+
 ::: info Relation to grants
-See [Permissions](/v0/concepts/permissions) for the full five-layer model and [grants reference](/v0/security/grants) for `grants.toml` syntax.
+See [Permissions](/v0/concepts/permissions) for how a call is decided and [grants reference](/v0/security/grants) for `grants.toml` syntax.
 :::
 
 ## Invoking a runner

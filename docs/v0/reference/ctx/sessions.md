@@ -4,18 +4,19 @@ A session is a conversation the daemon remembers for you. Pass a `session_id` to
 
 `ctx.sessions` creates and inspects those sessions. The runner call itself goes through the usual `ctx.run`.
 
-**Required permissions:** `sessions.read` for `get`, `find`, `list` and `turns`; `sessions.write` for `create` and `delete`. Grant both permissions for `open`, because it looks up the session before creating it.
+**Required permissions:** `sessions.read` for `get`, `find`, `list` and `turns`; `sessions.write` for `create`, `set_approval` and `delete`. Grant both permissions for `open`, because it looks up the session before creating it.
 
 ## Methods at a glance
 
 | Call | Result |
 |---|---|
-| `ctx.sessions.create({ label = "telegram-42", runner = "support" })` | New session metadata; the options table and both fields are optional. |
+| `ctx.sessions.create({ label = "telegram-42", runner = "support" })` | New session metadata; the options table and every field in it are optional. |
 | `ctx.sessions.open("telegram-42", { runner = "support" })` | Existing or new session metadata; the options table is optional. |
 | `ctx.sessions.get(id)` | Session metadata, or `nil` if it is not visible or does not exist. |
 | `ctx.sessions.find(label)` | Session metadata, or `nil` if it is not visible or does not exist. |
 | `ctx.sessions.list(50)` | Visible sessions, newest first; the limit defaults to 50 and is capped at 500. |
 | `ctx.sessions.turns(id)` | Stored messages, oldest first; an error if the session is not visible or does not exist. |
+| `ctx.sessions.set_approval(id, "nobody")` | Updated session metadata; `nil` clears the setting. |
 | `ctx.sessions.delete(id)` | `true` if deleted, otherwise `false`. |
 
 A `Session` looks like this:
@@ -27,6 +28,7 @@ local session = {
   label = "telegram-42",   -- your own id for it, optional, unique per owner
   user = "alice",          -- the caller's user at creation, optional
   runner = "support",      -- optional, informational
+  approval = "nobody",     -- who answers questions for its runs, optional
   turn_count = 4,
   next_seq = 4,
   compactions = 0,
@@ -46,6 +48,16 @@ Use `open` to find a session by label or create it if it does not exist. For exa
 ### `ctx.sessions.create`
 
 Starts a fresh session and returns it. Its owner is the calling interface (or service) and its `user` is `ctx.caller.user`; neither can be set from the options table. Pass a `label` when you need to find it again by name; labels are unique per owner and a taken label is an error.
+
+You can also pass `approval` to set who answers questions for runs in the session: `"human"`, `"classifier"`, or `"nobody"`. See [Approval in a session](#approval-in-a-session).
+
+### `ctx.sessions.set_approval`
+
+Changes the approval setting of a session, or clears it with `nil`. The change applies to the next run in the session. A session outside the caller's scope is an error.
+
+```lua
+ctx.sessions.set_approval(session.id, "nobody")
+```
 
 ### `ctx.sessions.get` / `ctx.sessions.find`
 
@@ -119,6 +131,16 @@ What that means in practice:
 - Give each client its own token under [`[interfaces.<name>]`](/v0/reference/configuration#interfaces-name-sections). Your web backend and your Telegram bridge then cannot see each other's sessions, and neither can the daemon's own token.
 - Have the bridge authenticate the person first, then pass their id as `user` on every call: `create`, the run, `get`, `delete`. The daemon trusts the interface for that assertion and enforces it from then on.
 - Scripts inherit the scope of whoever called them through `ctx.caller`; they cannot widen it, and `ctx.sessions.create` refuses a `user` option for that reason.
+
+Sessions that an [admin connection](/v0/security/approvals#admin-connections) creates belong to admin connections only. Lua scripts and other clients never see them.
+
+## Approval in a session
+
+A session can carry an approval setting. It tells agent.d who answers questions for every run in the session: a human, a classifier, or nobody. A bridge can set `nobody` on each chat, for example, so that a stranger in a group chat can never cause an approval request.
+
+agent.d decides each run's setting when the run starts. It starts from the runner's default, then applies the session's value, then the value given to the run. A stricter value always applies. A looser value applies only when an admin connection starts the run, so a session value from Lua can only make a run stricter. See [Where the setting comes from](/v0/security/approvals#where-the-setting-comes-from).
+
+`"classifier"` needs `[approval].classifier` in `grants.toml`. Without it, `create` and `set_approval` refuse the value.
 
 ## Storage
 

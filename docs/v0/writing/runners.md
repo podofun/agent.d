@@ -72,32 +72,26 @@ agentd.runner({
 })
 ```
 
-## The `actions` advisory allowlist
+## The `actions` list
 
-`actions` is a **hint** to the model about which tools it should consider calling.
-It is **not** a security boundary — that role belongs to
-[grants.toml](/v0/security/grants). A runner call adds a runner-layer allowlist to
-the permission engine's five-layer intersection:
+`actions` lists the tools that the model can see and call. The model cannot
+call an action that is not in this list, even if `grants.toml` would allow it.
 
-```
-tool/package grants ∩ action.requires ∩ runner.allow ∩ interface.allow ∩ policy
-```
-
-So even if an action appears in `actions`, it will be denied unless the runner is
-granted that action in `grants.toml`. Conversely, omitting an action from
-`actions` does not block it if all permission layers are satisfied — `actions` is
-advisory.
+The list does not give permissions. [grants.toml](/v0/security/grants) decides
+what the runner may do. If the model calls one of its actions that is not in
+`allowed_actions` for the runner, agent.d asks before the action runs. The
+action's tool still needs the permissions that the action requires.
 
 ```toml
-# grants.toml — actual enforcement
+# grants.toml
 [runner.backend_reviewer]
 granted = ["ai:anthropic"]
 allowed_actions = ["git.diff", "git.status"]
 ```
 
 ::: tip
-Keep `actions` and `allowed_actions` in sync. The Lua field informs the model;
-the `grants.toml` entry enforces policy.
+Keep `actions` and `allowed_actions` the same. Then the model sees exactly the
+actions that it may call without a question.
 :::
 
 ## Calling a runner

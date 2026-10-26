@@ -8,8 +8,8 @@ Every capability in agent.d is identified by a **permission slug** of the form `
 domain[:specifier]
 ```
 
-- **`domain`** — the capability class (e.g. `shell.exec`, `net`, `fs.read`).
-- **`specifier`** — an optional qualifier that narrows the grant to a specific target. Specifiers support wildcards using `**` glob syntax.
+- **`domain`**: the capability class (e.g. `shell.exec`, `net`, `fs.read`).
+- **`specifier`**: an optional qualifier that narrows the grant to a specific target. A `*` at the end of a specifier matches more values. See [Wildcard rules](#wildcard-rules).
 
 A grant without a specifier covers the whole domain only when the domain does not define a specifier. For domains that do define specifiers (such as `net` and `fs.*`), you must include a specifier in the grant for it to be useful.
 
@@ -17,7 +17,9 @@ A grant without a specifier covers the whole domain only when the domain does no
 
 ### `shell.exec`
 
-Run a child process via `ctx.shell`. The specifier is the **bare binary name** — the first argument passed to `ctx.shell`, not a full path.
+Run a child process via `ctx.shell`. The specifier is a **program name or path**, such as `git` or `/usr/local/bin/deploy`.
+
+agent.d finds the program file that a denial names and compares files, not text. So a denial of `shell.exec:python3` also stops `/usr/bin/python3` and a link to it. See [What a denial guarantees](/v0/security/denials#programs).
 
 | Slug | Meaning |
 |---|---|
@@ -105,7 +107,7 @@ granted = [
 Gates model calls. The specifier is the **provider prefix** (the part before
 the `/` in a `"<provider>/<model_id>"` string).
 
-For direct `ctx.ai` calls, the executing tool or service holds the `ai:` grant. For `ctx.run` and `runners.run`, the target runner must hold `ai:<resolved-provider>` in `[runner.<name>].granted`. This check also applies to nested calls, streaming, and per-call model overrides. A tool or service delegates model execution by calling a configured runner; its own AI grant is not transferred to that runner. Global `deny_permissions` overrides the runner grant.
+For direct `ctx.ai` calls, the executing tool or service holds the `ai:` grant. For `ctx.run` and `runners.run`, the target runner must hold `ai:<resolved-provider>` in `[runner.<name>].granted`. This check also applies to nested calls, streaming, and per-call model overrides. A tool or service delegates model execution by calling a configured runner; its own AI grant is not transferred to that runner. A denial in `[denial].permissions` overrides the runner grant.
 
 ```toml
 [runner.discord_chat]
@@ -140,13 +142,20 @@ OAuth grant for a provider. The specifier is the **provider name**. Declare this
 
 ## Wildcard rules
 
-- `*` matches any single path segment or any single value (e.g. `net:*` matches all hostnames).
-- `**` matches zero or more path segments in filesystem and memory globs (e.g. `fs.read:/data/**`, `memory.read:ns/**`).
-- Path grants are always resolved before matching — a tool cannot reach past a glob with aliases or `..` traversal.
+A `*` is supported only at the end of a specifier:
+
+- `*` alone matches every value. `net:*` matches every host.
+- A value that ends with `*` matches every value that starts the same way. `net:api.example.*` matches `api.example.com` and `api.example.org`.
+- In paths, `/**` matches the folder and everything under it, and `/*` matches only the files directly in the folder. `fs.read:/data/**` covers `/data/a/b.txt`, and `fs.read:/data/*` covers `/data/b.txt` only.
+
+agent.d refuses to load a `grants.toml` with a pattern that can never match, such as `net:*.example.com` or `fs.read:/srv/*/logs`. It also refuses an IPv6 address prefix such as `net:2001:db8:*`, because agent.d compares IPv6 addresses in their shortest form. Grant or deny full addresses instead.
+
+agent.d always resolves file paths before it compares them, so an alias or a `..` segment cannot get around a rule.
 
 ## See also
 
 - [grants.toml reference](/v0/security/grants)
 - [Interactive approvals](/v0/security/approvals)
+- [What a denial guarantees](/v0/security/denials)
 - [Permissions concept](/v0/concepts/permissions)
 - [Best practices](/v0/security/best-practices)

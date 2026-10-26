@@ -40,7 +40,7 @@ Both forms are identical in behavior; use whichever is cleaner at the call site.
 
 ## Permission
 
-The permission slug is `shell.exec:<bin>` where `<bin>` is the bare binary name from the first argument (e.g. `shell.exec:git` for `ctx.shell("git", …)`). A wildcard grant `shell.exec` permits all binaries.
+The permission slug is `shell.exec:<bin>`, where `<bin>` is the first argument, for example `shell.exec:git` for `ctx.shell("git", …)`. A bare `shell.exec` grant allows every program.
 
 Grant example in `grants.toml`:
 
@@ -48,6 +48,19 @@ Grant example in `grants.toml`:
 [tool.git]
 granted = ["shell.exec:git"]
 ```
+
+### When the program is not granted
+
+If the tool does not have the grant, agent.d asks before the program runs. The approval request shows the full command (`argv`) and its working directory (`cwd`), so the approver sees what will run. An allow covers this one run of the command. If the handler runs the same command again, agent.d asks again, because the command can do something different after the agent changes files. See [Interactive approvals](/v0/security/approvals).
+
+A call that runs outside a handler, for example while `init.lua` loads, cannot wait for an answer. It is refused.
+
+### When a denial applies
+
+agent.d checks `[denial]` before it asks anything:
+
+- A denied program is refused, whether the call names it by name or by path. See [Programs](/v0/security/denials#programs).
+- A command is refused when its sandbox could reach a denied file or host. See [Shell commands](/v0/security/denials#shell-commands).
 
 ## Examples
 

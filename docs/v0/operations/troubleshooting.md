@@ -34,7 +34,7 @@ For quick local debugging, start the daemon with `--no-auth` (`AGENTD_NO_AUTH=1`
 
 **Symptom:** An `agentctl call` or a `ctx.call()` inside a Lua handler returns a permission error.
 
-The permission engine is default-deny across five layers. A call is denied when any layer rejects it.
+The permission engine is default-deny. A call fails when a denial matches it, or when a question about it does not get an allow.
 
 **Diagnose:** Run the approval console and retry the call:
 
@@ -49,8 +49,22 @@ The console prints the missing permission slugs and the caller identity. From th
    [tool.git]
    granted = ["shell.exec:git"]
    ```
-2. **Runner or interface allowlist** — the action is not in `runner.allowed_actions` or `interface.allowed_actions`. Add it, or remove the allowlist restriction if intentional.
-3. **Policy hard-denial** — if `deny_actions` or `deny_permissions` in `[policy]` matches the call, it will never be escalated to approval. Remove the policy entry to allow the call.
+2. **Runner or interface allowlist**: the action is not in `runner.allowed_actions` or `interface.allowed_actions`. Add it, or remove the allowlist restriction if intentional.
+3. **A denial**: `[denial].actions` or `[denial].permissions` matches the call. agent.d never asks about a denial. Remove the entry to allow the call.
+4. **The run's approval is `nobody`**: the error says that the call "was refused without asking". The run can use only what is granted. Add the grant, or start the run with a looser setting from an admin connection.
+5. **The classifier refused**: the error starts with "The classifier refused" and gives its reason. Change the classifier's instructions, or add the grant.
+
+## A shell command is refused because of a denial
+
+**Symptom:** A `ctx.shell` call fails with "this shell command could read what ... denies in grants.toml".
+
+The command's sandbox opens a folder that contains a denied file, or allows a host that you denied. A sandbox cannot hide one file in a folder that it opens, so agent.d refuses the command. Move the denied file out of the granted folders, or grant narrower folders and hosts. See [What a denial guarantees](/v0/security/denials#fix-a-refused-shell-command).
+
+## `grants.toml` does not load
+
+**Symptom:** The daemon does not start, or a reload with `--watch` prints an error about `grants.toml`.
+
+agent.d refuses a file with a mistake, so that a rule never fails without you knowing. The error names the line to fix. Common causes are a misspelled key, a `*` in the middle of a value, a relative file path in `[denial]`, and an old `[policy]` section. See [The file is strict](/v0/security/grants#the-file-is-strict).
 
 ## Confirm actions rejected by `ctx.call`
 

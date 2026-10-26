@@ -21,6 +21,8 @@ ctx.run(name: string, opts: {
   history?:  { role: string, content: string }[],
   max_tokens?: integer,
   timeout_ms?: integer,
+  session_id?: string,
+  approval?: "human" | "classifier" | "nobody",
 }) -> RunResult
 
 -- Run a runner and decode/validate JSON from its reply
@@ -67,6 +69,9 @@ Runs the named runner with a prompt and drives its full tool-use loop until the 
 | `model` | `string` | Override the runner's model for this call. |
 | `messages` | `table[]` | Full message history for the request. |
 | `history` | `table[]` | Prior conversation turns to prepend. |
+| `approval` | `string` | Who answers this run's questions: `"human"`, `"classifier"`, or `"nobody"`. From Lua, you can only make a run stricter. |
+
+A run that `ctx.run` starts is never looser than the run that started it. If the parent run is `nobody`, the new run is `nobody` too. A value that is looser than the runner's setting is an error, `approval_forbidden`. See [Where the setting comes from](/v0/security/approvals#where-the-setting-comes-from).
 
 ### `ctx.structured(name, opts)`
 

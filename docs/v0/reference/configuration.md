@@ -26,11 +26,11 @@ CLI flag  >  environment variable  >  config.toml  >  built-in default
 | `--log <filter>` | `-l` | `AGENTD_LOG` | `warn` | tracing-subscriber filter string |
 | `--token <s>` | `-t` | `AGENTD_TOKEN` | auto-minted | `/ws` bearer token |
 | `--admin-token <s>` | — | `AGENTD_ADMIN_TOKEN` | auto-minted | `/control` bearer token |
-| `--no-auth` | — | `AGENTD_NO_AUTH` | `false` | Disable `/ws` and `/control` auth |
+| `--no-auth` | — | `AGENTD_NO_AUTH` | `false` | Disable `/ws` and `/control` auth. Every `ws` client becomes an [admin connection](/v0/security/approvals#admin-connections) |
 | `--approval-timeout <n>` | — | `AGENTD_APPROVAL_TIMEOUT_MS` | `120000` | Approval wait budget (ms) |
 | `--secrets <backend>` | — | `AGENTD_SECRETS` | `keyring` | Secrets backend: `keyring`, `env`, or `dir:<path>` |
 | `--watch` | `-w` | `AGENTD_WATCH` | `false` | Dev hot reload |
-| `--install-sandbox` | — | — | — | Windows only: one-time setup for sandboxed networking, then exit. See [Shell sandbox](/v0/security/sandbox#windows-one-time-network-setup) |
+| `--install-sandbox` | — | — | — | Windows only: one-time setup for sandboxed networking, then exit. See [Shell sandbox](/v0/security/sandbox#one-time-setup) |
 | `--uninstall-sandbox` | — | — | — | Reverse `--install-sandbox` (macOS/Windows), then exit |
 
 ::: info Deprecated aliases

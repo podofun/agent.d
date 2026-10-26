@@ -1,122 +1,116 @@
 # Permissions
 
-agent.d's permission engine is default-deny. No action can touch the local system, network, secrets, or AI providers unless every layer of the permission stack allows it. This page explains the model so you can reason about access decisions and debug them.
+agent.d is default-deny. An action cannot touch your files, the network, your secrets, or an AI provider unless you allowed it. This page explains how agent.d decides, so you can predict a decision and find the cause when a call fails.
 
-## The five-layer intersection
+## Two stages: denials, then questions
 
-Every action call is evaluated through five layers. All five must pass — a denial at any layer blocks the call:
+agent.d checks each action call in two stages.
 
-```text
-tool/package grants
-  ∩ action.requires
-  ∩ runner.allow
-  ∩ interface.allow
-  ∩ policy
-  = Decision
-```
+**The denials come first.** A denial is a rule that nobody can override, and agent.d never asks about it. A call is refused immediately when:
 
-| Layer | What it checks | Configured in |
+- The action is in `[denial].actions`.
+- A permission that the action needs is in `[denial].permissions`.
+- The call comes from a service or an interface, and the action is not in its `allowed_actions` list.
+
+**The questions come next.** A question is something that you did not grant yet. agent.d asks about one question at a time, in this order:
+
+1. The call comes from a runner, and the action is not in the runner's `allowed_actions` list.
+2. The tool does not have every permission that the action needs.
+3. The action has `confirm = true`, and `[approval].skip` does not list it.
+
+When all checks pass, the call runs. When a question gets an allow, agent.d checks the call again from the start, so an allow never skips a later check. Who answers the questions depends on the run's approval setting: a human, a classifier, or nobody. See [Interactive approvals](/v0/security/approvals).
+
+| Check | What it asks | Where you configure it |
 |---|---|---|
-| **1. Tool / package grants** | Does the tool (or package) have the capability slug granted? | `grants.toml` `[tool.*]` / `[package.*]` |
-| **2. Action requires** | Does the action declare it needs this slug? | `action.requires` in Lua |
-| **3. Runner allowlist** | If called from a runner, is this action in the runner's allowlist? | `grants.toml` `[runner.*].allowed_actions` |
-| **4. Interface allowlist** | If called from an interface, is this action in the interface's allowlist? | `grants.toml` `[interface.*].allowed_actions` |
-| **5. Policy** | Is the action or permission hard-denied by policy? | `grants.toml` `[policy]` |
+| Denied action | Is the action denied for everyone? | `[denial].actions` |
+| Denied permission | Does the action need a denied permission? | `[denial].permissions` |
+| Service allowlist | Can this service call the action? | `[service.<name>].allowed_actions` |
+| Interface allowlist | Can this client call the action? | `[interface.<name>].allowed_actions` |
+| Runner allowlist | Can this runner call the action without a question? | `[runner.<name>].allowed_actions` |
+| Tool grants | Does the tool have what the action needs? | `[tool.<name>].granted`, `[package.<name>]` |
+| Confirm | Does someone approve this call? | `confirm = true` in Lua, `[approval].skip` |
 
-A runner or interface with no `allowed_actions` entry has **no constraint at that layer** — the other layers still apply.
+For interfaces and services, an empty `allowed_actions` list means "no limit". For runners, an action that is not on the list causes a question.
 
 ## grants.toml is the only source of grants
 
-Component manifests declare what they need — they never grant anything. The `requires` field on a tool or action is documentation for operators and the package system. Access is only conferred by `grants.toml`:
+A component says what it needs in its `requires` field. That field never gives access. Only `grants.toml` gives access:
 
 ```toml
-# Layer 1: grant the git tool the ability to run the git binary
+# The git tool can run the git program
 [tool.git]
 granted = ["shell.exec:git"]
 
-# Layer 3: restrict the reviewer runner to only these two actions
+# The reviewer runner can call these two actions without a question
 [runner.backend_reviewer]
 granted = ["ai:anthropic"]
 allowed_actions = ["git.diff", "git.status"]
 
-# Layer 4: restrict a hypothetical Telegram interface
+# A Telegram client can call only git.status
 [interface.telegram]
 allowed_actions = ["git.status"]
 
-# Service: its own granted capabilities + optional action allowlist
+# A service has its own grants and an optional action list
 [service.discord_handler]
 granted         = ["ai:openai", "net:discord.com", "memory.read:discord/**", "memory.write:discord/**"]
 allowed_actions = ["discord.send"]
 
-# Approve a whole installed package's declared permission set
+# Approve all the permissions that a package declares
 [package.acme]
 trusted = true
 
-# Layer 5: hard denials and confirm pre-approvals
-[policy]
-deny_actions     = ["shell.exec"]
-deny_permissions = []
-auto_confirm     = []
+# What nobody may do
+[denial]
+actions     = ["pkg.publish"]
+permissions = []
 ```
+
+See the [grants.toml reference](/v0/security/grants) for every section and key.
 
 ## Permission slugs
 
-Slugs have the shape `domain[:specifier]`. Wildcards are supported on the specifier:
+A permission is a slug with the form `domain[:specifier]`. A `*` at the end of the specifier matches more values:
 
 | Slug | What it covers |
 |---|---|
-| `shell.exec` | Run any process via `ctx.shell`. |
-| `shell.exec:git` | Run only the `git` binary (first arg to `ctx.shell`). |
-| `net:<host>` | HTTP or WebSocket to that host. |
-| `net:*` | HTTP or WebSocket to any host. |
-| `fs.read:<glob>` | Filesystem reads matching the glob. |
-| `fs.write:<glob>` | Filesystem writes matching the glob. |
-| `secret:<key>` | Keyring access for a specific key. |
-| `secret:*` | Keyring access for any key. |
-| `memory.read:<ns-glob>` | Read from durable memory namespaces matching the glob. |
-| `memory.write:<ns-glob>` | Write to durable memory namespaces matching the glob. |
-| `ai:<provider>` | Model calls through a specific provider prefix. |
+| `shell.exec` | Run any program with `ctx.shell`. |
+| `shell.exec:git` | Run the `git` program only. |
+| `net:<host>` | HTTP or WebSocket calls to that host. |
+| `net:*` | HTTP or WebSocket calls to any host. |
+| `fs.read:<glob>` | Read the files that match the glob. |
+| `fs.write:<glob>` | Write the files that match the glob. |
+| `secret:<key>` | Read or write one secret. |
+| `secret:*` | Read or write any secret. |
+| `memory.read:<ns-glob>` | Read memory namespaces that match the glob. |
+| `memory.write:<ns-glob>` | Write memory namespaces that match the glob. |
+| `ai:<provider>` | Model calls through one provider. |
 | `ai:*` | Model calls through any provider. |
-| `oauth:<provider>` | OAuth grant for a provider. |
+| `oauth:<provider>` | An OAuth grant for a provider. |
 
-Glob matching on `fs.*` slugs is path-aware (`fs.write:/tmp/**` covers any path under `/tmp/`).
+File globs follow paths: `fs.write:/tmp/**` covers every file under `/tmp/`. See [Permission slugs](/v0/security/permission-slugs) for the full rules.
 
-## Filesystem path resolution
+## File paths are resolved first
 
-Before checking a `fs.read` or `fs.write` grant, the runtime resolves the requested path — following symlinks and collapsing `..` segments. This means path-scoped grants cannot be bypassed through aliases or traversal tricks. A grant of `fs.read:/workspace/**` does not cover `/etc/passwd` even if a symlink inside `/workspace` points there.
+Before agent.d compares a file path with a grant or a denial, it resolves the path. It follows symlinks and removes `..` segments. So an alias cannot get around a rule. A grant of `fs.read:/workspace/**` does not cover `/etc/passwd`, even when a symlink inside `/workspace` points there.
 
-## How each caller type contributes layers
+## Approvals inside a handler
 
-| Caller | Layer 1 | Layer 2 | Layer 3 | Layer 4 | Layer 5 |
-|---|---|---|---|---|---|
-| WebSocket client → action | tool grants | action.requires | — | interface.allowed_actions | policy |
-| Runner tool-use step | tool grants | action.requires | runner.allowed_actions | interface.allowed_actions | policy |
-| Service → capability | service.granted | — | service.allowed_actions (optional) | — | policy |
-| Action → action (`ctx.call`) | tool grants | action.requires | inherited runner allow | inherited interface allow | policy |
+The checks above happen when an action starts. A handler then uses `ctx` to reach the outside world, and each `ctx` call is checked again when it happens. If the handler needs something that its tool was not granted, the handler pauses and agent.d asks. An allow covers only that request. It does not add to the handler's grants, so it never widens what the [shell sandbox](/v0/security/sandbox) opens.
 
-## Manifests declare, grants.toml grants
+## Packages declare, grants.toml grants
 
-A package's `package.toml` (or a tool's `requires`) declares permissions — this tells you and the installer what the component needs. But declaration alone grants nothing. To activate a package's declared permission set, you must trust it:
+A package's `package.toml` lists the permissions it needs. This tells you what you approve, but it gives nothing by itself. To give a package its declared permissions, trust it:
 
 ```toml
 [package.acme]
 trusted = true
 ```
 
-Without this, the package contributes zero grants and all its actions fail at layer 1.
+Without this entry, the package gets no permissions, and its actions cannot use anything that needs a grant.
 
-## Policy: hard denials
+## `confirm` actions
 
-`[policy].deny_actions` and `deny_permissions` are absolute — they are never escalated to interactive approval. Use them to enforce invariants that must hold regardless of what any caller requests:
-
-```toml
-[policy]
-deny_actions = ["shell.exec"]   # never allow raw shell execution
-```
-
-## `confirm` actions and interactive approvals
-
-When an action is declared with `confirm = true`, each call requires explicit operator approval (unless `auto_confirm` covers it). The runtime suspends the call and sends an approval request to the `/control` plane:
+An action with `confirm = true` needs an approval for each call, unless `[approval].skip` lists it:
 
 ```lua
 agentd.action({
@@ -126,22 +120,16 @@ agentd.action({
 })
 ```
 
-An operator running `agentctl grants listen` sees the request and chooses:
-- **once** — allow this call only.
-- **forever** — add to `auto_confirm` in `grants.toml` and reload.
-- **deny** — reject the call.
-
-If no operator is connected before `approval_timeout_ms` (default 120 s), the request fails closed with a denial.
-
-Policy denials and allowlist denials are **not** escalated to approval — they are hard stops.
+An approver can allow the call one time, allow it forever, or deny it. "Allow forever" adds the action to `[approval].skip`. If nobody answers within `approval_timeout_ms` (default 120 seconds), the call is refused.
 
 ::: warning
-`allow_forever` from the approval console writes to `grants.toml` automatically. Review it after a session if you granted anything you want to make permanent.
+"Allow forever" writes to `grants.toml` for you. Read the file after a session to see what you allowed.
 :::
 
 ## See also
 
-- [Security: grants](/v0/security/grants)
+- [grants.toml reference](/v0/security/grants)
 - [Permission slugs](/v0/security/permission-slugs)
 - [Interactive approvals](/v0/security/approvals)
+- [What a denial guarantees](/v0/security/denials)
 - [Tutorial: permissions](/v0/tutorial/permissions)

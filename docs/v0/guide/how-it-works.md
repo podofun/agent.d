@@ -20,9 +20,9 @@ Say you open the chat and ask the code reviewer to look at your staged changes. 
 
 **The runtime finds who owns the action.** Every action belongs to a tool, so `git.diff` belongs to the `git` tool. An action nobody registered fails straight away.
 
-**Every layer has to say yes.** The runtime checks the call against the tool's grants, what the action declares it needs, what this runner is allowed to call, what the connecting client is allowed to call, and any global policy. Access is the overlap of all of them, so a single missing yes means no. The [permission model](/v0/concepts/permissions) walks through each layer.
+**Denials first, then grants.** The runtime first checks your denials: things nobody may do, whatever the grants say. Then it checks the call against what this runner may call, the tool's grants, and what the action declares it needs. Every check has to say yes. The [permission model](/v0/concepts/permissions) walks through each one.
 
-**A missing grant can become a question instead of an error.** If an approver is connected, for example you in the chat, the runtime pauses and asks. You can allow it once, allow it from now on (which writes the grant into `grants.toml` for you), or deny it. Nobody answering within two minutes counts as a no. Rules you mark as hard denials are never offered for approval. See [Interactive approvals](/v0/security/approvals).
+**A missing grant can become a question instead of an error.** The runtime pauses and asks. You can allow it once, allow it from now on (which writes the grant into `grants.toml` for you), or deny it. Nobody answering within two minutes counts as a no. You choose who answers for each runner: you, a classifier runner that checks each step, or nobody, for bots that must never wait. Denials are never offered for approval. See [Interactive approvals](/v0/security/approvals).
 
 **The handler runs with only what it was granted.** Your Lua handler receives the call's arguments and a `ctx` handle, which is how it reaches the outside world: running programs, reading files, making HTTP requests, reading secrets, storing memory, calling a model, or calling another action. Each of those is checked again at the moment it is used, and any program it starts runs inside the [shell sandbox](/v0/security/sandbox), confined to the folders and hosts you granted.
 
