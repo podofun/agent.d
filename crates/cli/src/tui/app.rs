@@ -67,7 +67,18 @@ pub(super) struct Entry {
     /// Render `text` as markdown instead of preformatted lines.
     pub(super) markdown: bool,
     pub(super) expanded: bool,
+    /// On the first tool row of a run of tool rows: whether the run is shown
+    /// one row per call instead of as a single "Used N actions" row.
+    pub(super) group_open: bool,
     rendered: RefCell<Option<(usize, Vec<Line<'static>>)>>,
+}
+
+/// A clickable tool row: one call, or a run of calls shown as one row,
+/// named by the index of its first entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ToolRow {
+    Entry(usize),
+    Group(usize),
 }
 
 pub(super) enum Update {
@@ -91,10 +102,12 @@ const CANCELLING: &str = "Cancelling runner…";
 const HELP: &str = "\
 ## Chat
 - `Enter` sends, `Shift+Enter` or `Ctrl+J` adds a newline
+- While the agent works, `Enter` queues the message; it is sent when the reply finishes
 - `/` lists commands. `/runner`, `/call`, and `/open` open searchable lists
 - `/rename NAME` labels the current chat
-- `Ctrl+N` starts a new chat, `F5` refreshes daemon state
-- `Ctrl+E` or a click expands the latest tool output
+- `Ctrl+N`, `/new`, or `/clear` starts a new chat, `F5` refreshes daemon state
+- `Ctrl+E` or a click expands the latest tool output or group of calls
+- `Shift+Tab` or `/approval` chooses who answers approvals: you, the classifier, or nobody
 - Drag with the mouse to select text; `Ctrl+C` copies it
 - `PageUp`, `PageDown`, or the mouse wheel scroll
 - `Esc` or `End` on an empty draft jumps to the bottom and clears the notice
@@ -125,6 +138,12 @@ pub(super) struct App {
     pub(super) entries: Vec<Entry>,
     pub(super) streamed: String,
     pub(super) pending: bool,
+    /// Messages sent while a reply was running, oldest first. Each is sent
+    /// when the run before it finishes.
+    pub(super) queue: VecDeque<String>,
+    /// Who answers this chat's approval requests: `human`, `classifier`, or
+    /// `nobody`. `None` follows the runner's default.
+    pub(super) approval_mode: Option<&'static str>,
     cancel: Option<oneshot::Sender<()>>,
     started: Option<std::time::Instant>,
     pub(super) scroll: usize,
@@ -173,6 +192,8 @@ impl App {
             entries: Vec::new(),
             streamed: String::new(),
             pending: false,
+            queue: VecDeque::new(),
+            approval_mode: None,
             cancel: None,
             started: None,
             scroll: 0,
@@ -463,6 +484,7 @@ impl App {
     }
 
     pub(super) fn new_chat(&mut self) {
+        self.queue.clear();
         self.session = None;
         self.session_label = None;
         self.entries.clear();
@@ -485,6 +507,12 @@ impl App {
         self.new_chat();
         self.session = Some(session);
         self.session_label = value["label"].as_str().map(str::to_owned);
+        self.approval_mode = match value["approval"].as_str() {
+            Some("human") => Some("human"),
+            Some("classifier") => Some("classifier"),
+            Some("nobody") => Some("nobody"),
+            _ => None,
+        };
         self.load_turns(&value["turns"]);
         Ok(())
     }
@@ -531,16 +559,19 @@ impl App {
             return self.command(command).await;
         }
         if self.pending {
-            return Err(anyhow!("wait for the current reply"));
+            self.queue.push_back(input.to_owned());
+            return Ok(());
         }
         let runner = self
             .runner
             .clone()
             .context("select a runner in the Runners tab")?;
         if self.session.is_none() {
-            let created = self
-                .call("sessions.create", json!({ "runner": runner }))
-                .await?;
+            let mut params = json!({ "runner": runner });
+            if let Some(mode) = self.approval_mode {
+                params["approval"] = json!(mode);
+            }
+            let created = self.call("sessions.create", params).await?;
             self.session = Some(
                 created["id"]
                     .as_str()
@@ -549,8 +580,11 @@ impl App {
             );
             self.refresh_sessions().await;
         }
-        let params =
+        let mut params =
             json!({ "name": runner, "prompt": input, "session_id": self.session, "stream": true });
+        if let Some(mode) = self.approval_mode {
+            params["approval"] = json!(mode);
+        }
         self.push(EntryKind::User, input);
         self.pending = true;
         self.started = Some(std::time::Instant::now());
@@ -588,11 +622,23 @@ impl App {
         let argument = argument.trim();
         match verb {
             "help" => self.push_markdown(EntryKind::Info, HELP),
-            "new" => {
+            "new" | "clear" => {
                 if self.pending {
                     return Err(anyhow!("wait for the current reply"));
                 }
                 self.new_chat();
+            }
+            "approval" => {
+                let mode = match argument {
+                    "human" => Some("human"),
+                    "classifier" => Some("classifier"),
+                    "nobody" => Some("nobody"),
+                    "default" => None,
+                    _ => {
+                        return Err(anyhow!("usage: /approval human|classifier|nobody|default"));
+                    }
+                };
+                self.set_approval_mode(mode).await?;
             }
             "runner" => {
                 if self.pending {
@@ -688,7 +734,10 @@ impl App {
                             self.push(EntryKind::Agent, text);
                         }
                     }
-                    Err(error) => self.push(EntryKind::Error, error.to_string()),
+                    Err(error) => {
+                        self.push(EntryKind::Error, error.to_string());
+                        self.restore_queue();
+                    }
                 }
             }
             Update::ActionFinished { name, result } => {
@@ -737,6 +786,60 @@ impl App {
         self.approval_scroll = 0;
     }
 
+    /// The next queued message, once no reply is running.
+    pub(super) fn next_queued(&mut self) -> Option<String> {
+        if self.pending {
+            return None;
+        }
+        self.queue.pop_front()
+    }
+
+    /// After a failed or cancelled reply, put queued messages back into the
+    /// draft so nothing typed is lost.
+    fn restore_queue(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        let mut parts: Vec<String> = self.queue.drain(..).collect();
+        if !self.input.is_empty() {
+            parts.push(self.input.take());
+        }
+        self.input.set(parts.join("\n\n"));
+        self.notice = Some("Queued messages are back in the draft.".into());
+    }
+
+    /// Set who answers this chat's approval requests. Stored on the chat's
+    /// session, so it applies to the next reply and survives reopening.
+    pub(super) async fn set_approval_mode(&mut self, mode: Option<&'static str>) -> Result<()> {
+        if let Some(session) = &self.session {
+            self.call(
+                "sessions.set_approval",
+                json!({ "id": session, "approval": mode }),
+            )
+            .await?;
+        }
+        self.approval_mode = mode;
+        self.notice = Some(match mode {
+            Some("classifier") => {
+                "Approval: the classifier answers, a human when it is unsure.".into()
+            }
+            Some("nobody") => "Approval: nobody. Anything not granted is refused.".into(),
+            Some(_) => "Approval: you answer each request.".into(),
+            None => "Approval: the runner's default.".into(),
+        });
+        Ok(())
+    }
+
+    /// Shift+Tab: human, then classifier, then nobody, then back.
+    pub(super) async fn cycle_approval_mode(&mut self) -> Result<()> {
+        let next = match self.approval_mode {
+            None | Some("human") => "classifier",
+            Some("classifier") => "nobody",
+            _ => "human",
+        };
+        self.set_approval_mode(Some(next)).await
+    }
+
     pub(super) fn cancel_run(&mut self) {
         if let Some(cancel) = self.cancel.take() {
             let _ = cancel.send(());
@@ -744,8 +847,35 @@ impl App {
         }
     }
 
-    pub(super) fn latest_expandable_tool(&self) -> Option<usize> {
-        self.entries.iter().rposition(Entry::is_expandable_tool)
+    /// The run of tool rows that `index` belongs to, as `start..end`.
+    pub(super) fn tool_run(&self, index: usize) -> std::ops::Range<usize> {
+        let is_tool = |entry: &Entry| matches!(entry.kind, EntryKind::Tool);
+        let start = self.entries[..index]
+            .iter()
+            .rposition(|entry| !is_tool(entry))
+            .map_or(0, |before| before + 1);
+        let end = self.entries[index..]
+            .iter()
+            .position(|entry| !is_tool(entry))
+            .map_or(self.entries.len(), |after| index + after);
+        start..end
+    }
+
+    /// What Ctrl+E toggles: the latest closed group of tool rows, or else
+    /// the latest tool row with output.
+    pub(super) fn latest_tool_row(&self) -> Option<ToolRow> {
+        let last = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry.kind, EntryKind::Tool))?;
+        let run = self.tool_run(last);
+        if run.len() >= 2 && !self.entries[run.start].group_open {
+            return Some(ToolRow::Group(run.start));
+        }
+        self.entries
+            .iter()
+            .rposition(Entry::is_expandable_tool)
+            .map(ToolRow::Entry)
     }
 }
 
@@ -757,6 +887,7 @@ impl Entry {
             body,
             markdown,
             expanded: false,
+            group_open: false,
             rendered: RefCell::new(None),
         }
     }
@@ -998,5 +1129,40 @@ mod tests {
         app.session = Some("abc".into());
         let error = app.submit("/rename").await.unwrap_err().to_string();
         assert!(error.contains("usage: /rename"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn messages_sent_while_working_are_queued_and_restored_on_failure() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, Some("chat".into()));
+        app.pending = true;
+        app.submit("second").await.unwrap();
+        app.submit("third").await.unwrap();
+        assert_eq!(app.queue, ["second", "third"]);
+        assert_eq!(app.next_queued(), None, "nothing is sent while working");
+
+        app.apply(Update::RunFinished(Err(anyhow!("the run failed"))));
+        assert!(app.queue.is_empty());
+        assert_eq!(app.input.text(), "second\n\nthird");
+
+        app.queue.push_back("fourth".into());
+        assert_eq!(app.next_queued().as_deref(), Some("fourth"));
+    }
+
+    #[tokio::test]
+    async fn clear_starts_a_new_chat_and_approval_needs_a_valid_mode() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push(EntryKind::User, "hello");
+        app.submit("/clear").await.unwrap();
+        assert!(app.entries.is_empty());
+
+        app.submit("/approval nobody").await.unwrap();
+        assert_eq!(app.approval_mode, Some("nobody"));
+        app.cycle_approval_mode().await.unwrap();
+        assert_eq!(app.approval_mode, Some("human"));
+        app.cycle_approval_mode().await.unwrap();
+        assert_eq!(app.approval_mode, Some("classifier"));
+        app.submit("/approval default").await.unwrap();
+        assert_eq!(app.approval_mode, None);
+        assert!(app.submit("/approval sometimes").await.is_err());
     }
 }

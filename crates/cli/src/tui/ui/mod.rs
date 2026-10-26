@@ -96,13 +96,27 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .as_deref()
         .or_else(|| app.session.as_deref().map(|id| &id[..id.len().min(8)]))
         .unwrap_or("new chat");
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!("  {runner}"),
             Style::default().fg(SECONDARY).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("  ·  {session}"), Style::default().fg(MUTED)),
-    ]);
+    ];
+    // Who answers approvals, when the chat chose it.
+    match app.approval_mode {
+        Some("classifier") => spans.push(Span::styled(
+            "  ·  auto (classifier)",
+            Style::default().fg(WARNING),
+        )),
+        Some("nobody") => spans.push(Span::styled(
+            "  ·  no approvals",
+            Style::default().fg(ERROR),
+        )),
+        Some(_) => spans.push(Span::styled("  ·  ask me", Style::default().fg(MUTED))),
+        None => {}
+    }
+    let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line), area);
     if !app.connected {
         let offline = Line::styled("offline  ", Style::default().fg(ERROR));
@@ -198,14 +212,6 @@ fn draw_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let line = if let Some(notice) = &app.notice {
         Line::styled(format!("  {notice}"), Style::default().fg(ERROR))
-    } else if app.pending {
-        let elapsed = app
-            .started_at()
-            .map_or(0, |started| started.elapsed().as_secs());
-        Line::styled(
-            format!("  {} working  {elapsed}s", spinner_frame(app)),
-            Style::default().fg(WARNING),
-        )
     } else if app.selection.is_some() {
         Line::styled(
             "  Ctrl+C copy  ·  Esc clear selection",
@@ -216,9 +222,14 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             "  ↓ new messages  ·  End jumps to the bottom",
             Style::default().fg(SECONDARY),
         )
+    } else if app.pending {
+        Line::styled(
+            "  Enter queues a message  ·  Ctrl+C cancels the reply",
+            Style::default().fg(MUTED),
+        )
     } else {
         Line::styled(
-            "  Enter send  ·  Shift+Enter newline  ·  / commands  ·  Ctrl+P browse  ·  Ctrl+C quit",
+            "  Enter send  ·  / commands  ·  Shift+Tab approval  ·  Ctrl+P browse  ·  Ctrl+C quit",
             Style::default().fg(MUTED),
         )
     };
@@ -531,8 +542,14 @@ mod tests {
         app.pending = true;
         app.push(EntryKind::User, "go");
         let busy = rendered(&app, 100, 24);
+        // Working shows inline in the conversation, not under the input.
         assert!(busy.contains("working"));
-        assert!(!busy.contains("Enter send"));
+        let status = &busy[busy.len() - 100..];
+        assert!(!status.contains("working"), "{status}");
+        assert!(status.contains("Enter queues"), "{status}");
+        app.approval_mode = Some("classifier");
+        assert!(rendered(&app, 100, 24)[..100].contains("auto (classifier)"));
+        app.approval_mode = None;
         app.pending = false;
         app.scroll = 3;
         app.push(EntryKind::Agent, "late");

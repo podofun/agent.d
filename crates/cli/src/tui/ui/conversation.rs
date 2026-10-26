@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::super::app::{App, Entry, EntryKind};
+use super::super::app::{App, Entry, EntryKind, ToolRow};
 use super::super::commands;
 use super::{
     ERROR, MUTED, PRIMARY, SECONDARY, SUCCESS, WARNING, markdown, palette, screen_rows, selection,
@@ -34,7 +34,7 @@ pub(super) struct Conversation {
     pub(super) lines: Vec<Line<'static>>,
     /// Selectable column range of each line, parallel to `lines`.
     pub(super) selectable: Vec<std::ops::Range<usize>>,
-    tool_headers: Vec<(usize, usize)>,
+    tool_headers: Vec<(usize, ToolRow)>,
 }
 
 /// The rendered conversation at `width` text columns.
@@ -90,33 +90,132 @@ fn conversation_lines(app: &App, width: usize) -> Conversation {
     let mut lines = Vec::new();
     let mut selectable = Vec::new();
     let mut tool_headers = Vec::new();
-    for (index, entry) in app.entries.iter().enumerate() {
-        if entry.is_expandable_tool() {
-            tool_headers.push((lines.len(), index));
+    let mut index = 0;
+    while index < app.entries.len() {
+        let entry = &app.entries[index];
+        let run = if matches!(entry.kind, EntryKind::Tool) {
+            app.tool_run(index)
+        } else {
+            index..index + 1
+        };
+        if run.len() >= 2 {
+            // A run of tool calls reads as one row until it is opened.
+            let calls = &app.entries[run.clone()];
+            let open = entry.group_open;
+            tool_headers.push((lines.len(), ToolRow::Group(run.start)));
+            let header = group_header(app, calls, open, body_width);
+            selectable.push(GUTTER.min(width)..header.width().min(width));
+            lines.push(header);
+            if open {
+                for (offset, call) in calls.iter().enumerate() {
+                    if call.is_expandable_tool() {
+                        tool_headers.push((lines.len(), ToolRow::Entry(run.start + offset)));
+                    }
+                    let block = call.lines(body_width, || entry_lines(call, body_width));
+                    selectable.extend(
+                        block
+                            .iter()
+                            .enumerate()
+                            .map(|(row, line)| selectable_range(call, row, line))
+                            .map(|range| range.start + GUTTER..range.end + GUTTER),
+                    );
+                    lines.extend(block.into_iter().map(indented));
+                }
+            }
+        } else {
+            if entry.is_expandable_tool() {
+                tool_headers.push((lines.len(), ToolRow::Entry(index)));
+            }
+            let block = entry.lines(body_width, || entry_lines(entry, body_width));
+            selectable.extend(
+                block
+                    .iter()
+                    .enumerate()
+                    .map(|(row, line)| selectable_range(entry, row, line)),
+            );
+            lines.extend(block);
         }
-        let block = entry.lines(body_width, || entry_lines(entry, body_width));
-        selectable.extend(
-            block
-                .iter()
-                .enumerate()
-                .map(|(row, line)| selectable_range(entry, row, line)),
-        );
-        lines.extend(block);
         lines.push(Line::raw(""));
         selectable.push(0..0);
+        index = run.end;
     }
     if app.pending {
-        let live = markdown::render(&app.streamed, body_width, palette());
+        // The live reply, or while nothing has arrived yet, how long the
+        // agent has been working.
+        let live = if app.streamed.trim().is_empty() {
+            let elapsed = app
+                .started_at()
+                .map_or(0, |started| started.elapsed().as_secs());
+            vec![Line::styled(
+                format!("working  {elapsed}s"),
+                Style::default().fg(MUTED),
+            )]
+        } else {
+            markdown::render(&app.streamed, body_width, palette())
+        };
         let live = with_gutter(spinner_frame(app), WARNING, live);
         // The live block changes every tick, so it is never selectable.
         selectable.extend(live.iter().map(|_| 0..0));
         lines.extend(live);
+    }
+    for queued in &app.queue {
+        lines.push(Line::raw(""));
+        selectable.push(0..0);
+        let mut body = markdown::wrap_plain(queued, body_width);
+        if let Some(last) = body.last_mut() {
+            last.spans.push(Span::raw("  queued"));
+        }
+        let body: Vec<Line<'static>> = body
+            .into_iter()
+            .map(|line| line.patch_style(Style::default().fg(MUTED)))
+            .collect();
+        let queued = with_gutter("›", MUTED, body);
+        selectable.extend(queued.iter().map(|_| 0..0));
+        lines.extend(queued);
     }
     Conversation {
         lines,
         selectable,
         tool_headers,
     }
+}
+
+/// "Used 14 actions and 1 tool": a call is an action when its name is a
+/// registered action, and a tool otherwise.
+fn used_label(app: &App, calls: &[Entry]) -> String {
+    let actions = calls
+        .iter()
+        .filter(|call| {
+            app.actions
+                .iter()
+                .any(|action| action.as_str() == Some(call.text.as_str()))
+        })
+        .count();
+    let tools = calls.len() - actions;
+    let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    match (actions, tools) {
+        (0, tools) => format!("Used {}", plural(tools, "tool")),
+        (actions, 0) => format!("Used {}", plural(actions, "action")),
+        (actions, tools) => format!(
+            "Used {} and {}",
+            plural(actions, "action"),
+            plural(tools, "tool")
+        ),
+    }
+}
+
+fn group_header(app: &App, calls: &[Entry], open: bool, width: usize) -> Line<'static> {
+    let label = used_label(app, calls);
+    let marker = if open { "▾" } else { "▸" };
+    let title: String = label
+        .graphemes(true)
+        .take(width.saturating_sub(2))
+        .collect();
+    Line::from(vec![
+        gutter("✦", WARNING),
+        Span::styled(format!("{title} "), Style::default().fg(SECONDARY)),
+        Span::styled(marker, Style::default().fg(MUTED)),
+    ])
 }
 
 /// Columns of `line` (row `row` of its entry) that hold the entry's own
@@ -186,7 +285,7 @@ fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-pub(in crate::tui) fn tool_at(app: &App, screen: Rect, x: u16, y: u16) -> Option<usize> {
+pub(in crate::tui) fn tool_at(app: &App, screen: Rect, x: u16, y: u16) -> Option<ToolRow> {
     let inner = conversation_inner(screen_rows(screen, app)[1]);
     if x < inner.x || x >= inner.right() || y < inner.y || y >= inner.bottom() {
         return None;
@@ -196,26 +295,37 @@ pub(in crate::tui) fn tool_at(app: &App, screen: Rect, x: u16, y: u16) -> Option
     conversation
         .tool_headers
         .into_iter()
-        .find_map(|(header, index)| (line == header).then_some(index))
+        .find_map(|(header, row)| (line == header).then_some(row))
 }
 
-pub(in crate::tui) fn toggle_tool(app: &mut App, screen: Rect, index: usize) {
-    if !app
-        .entries
-        .get(index)
-        .is_some_and(Entry::is_expandable_tool)
-    {
-        return;
+/// Open or close a tool row, or a run of them, and keep it in view.
+pub(in crate::tui) fn toggle_tool(app: &mut App, screen: Rect, row: ToolRow) {
+    match row {
+        ToolRow::Entry(index) => {
+            if !app
+                .entries
+                .get(index)
+                .is_some_and(Entry::is_expandable_tool)
+            {
+                return;
+            }
+            let expanded = !app.entries[index].expanded;
+            app.entries[index].set_expanded(expanded);
+        }
+        ToolRow::Group(index) => {
+            let Some(entry) = app.entries.get_mut(index) else {
+                return;
+            };
+            entry.group_open = !entry.group_open;
+        }
     }
-    let expanded = !app.entries[index].expanded;
-    app.entries[index].set_expanded(expanded);
     app.selection = None;
     let inner = conversation_inner(screen_rows(screen, app)[1]);
     let conversation = conversation_lines(app, inner.width.saturating_sub(1).max(1) as usize);
     if let Some((header, _)) = conversation
         .tool_headers
         .iter()
-        .find(|(_, entry)| *entry == index)
+        .find(|(_, target)| *target == row)
     {
         app.scroll = conversation
             .lines
@@ -356,9 +466,9 @@ mod tests {
         let header = conversation.tool_headers[0].0 - conversation.offset(inner.height, app.scroll);
         assert_eq!(
             tool_at(&app, screen, inner.x, inner.y + header as u16),
-            Some(0)
+            Some(ToolRow::Entry(0))
         );
-        toggle_tool(&mut app, screen, 0);
+        toggle_tool(&mut app, screen, ToolRow::Entry(0));
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let rendered = terminal
             .backend()
@@ -460,5 +570,55 @@ mod tests {
         for width in [1u16, 5, 8, 11] {
             let _ = rendered(&app, width, 6);
         }
+    }
+
+    #[test]
+    fn a_run_of_calls_reads_as_one_row_until_opened() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.actions = vec![
+            serde_json::json!("git.status"),
+            serde_json::json!("git.diff"),
+        ];
+        app.push(EntryKind::User, "check the repo");
+        app.push_tool("git.status", "clean");
+        app.push_tool("git.diff", "");
+        app.push_tool("web_search", "");
+        let text = |app: &App| {
+            conversation_lines(app, 60)
+                .lines
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let closed = text(&app);
+        assert!(closed.contains("Used 2 actions and 1 tool ▸"), "{closed}");
+        assert!(!closed.contains("git.diff"), "{closed}");
+
+        let screen = Rect::new(0, 0, 60, 24);
+        toggle_tool(&mut app, screen, ToolRow::Group(1));
+        let open = text(&app);
+        assert!(open.contains("Used 2 actions and 1 tool ▾"), "{open}");
+        assert!(
+            open.contains("git.diff") && open.contains("web_search"),
+            "{open}"
+        );
+        assert_eq!(app.latest_tool_row(), Some(ToolRow::Entry(1)));
+    }
+
+    #[test]
+    fn working_shows_inline_and_queued_messages_follow_it() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push(EntryKind::User, "first");
+        app.pending = true;
+        app.queue.push_back("second".into());
+        let text = conversation_lines(&app, 60)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("working"), "{text}");
+        assert!(text.contains("second  queued"), "{text}");
     }
 }

@@ -25,6 +25,16 @@ const COMMANDS: &[Command] = &[
         takes_argument: false,
     },
     Command {
+        name: "clear",
+        description: "Start a new chat (same as /new)",
+        takes_argument: false,
+    },
+    Command {
+        name: "approval",
+        description: "Choose who answers approvals (Shift+Tab cycles)",
+        takes_argument: true,
+    },
+    Command {
         name: "runner",
         description: "Switch runner",
         takes_argument: true,
@@ -68,6 +78,7 @@ pub(super) fn matching(
             "runner" => runner_suggestions(query, runners),
             "call" => action_suggestions(query, actions),
             "open" => session_suggestions(query, sessions),
+            "approval" => approval_suggestions(query),
             _ => Vec::new(),
         };
     }
@@ -94,6 +105,8 @@ pub(super) fn picker_title(input: &str) -> Option<&'static str> {
         Some(" Actions · type to search ")
     } else if input.starts_with("/open ") {
         Some(" Chats · type to search ")
+    } else if input.starts_with("/approval ") {
+        Some(" Approval · who answers requests ")
     } else {
         None
     }
@@ -171,6 +184,28 @@ fn session_suggestions(query: &str, sessions: &[Value]) -> Vec<Suggestion> {
     )
 }
 
+fn approval_suggestions(query: &str) -> Vec<Suggestion> {
+    const MODES: &[(&str, &str)] = &[
+        ("human", "You answer each request"),
+        (
+            "classifier",
+            "The classifier answers, you when it is unsure",
+        ),
+        ("nobody", "Refuse anything not granted, ask nobody"),
+        ("default", "Use the runner's default"),
+    ];
+    MODES
+        .iter()
+        .filter(|(name, _)| name.starts_with(query))
+        .map(|(name, description)| Suggestion {
+            label: (*name).into(),
+            description: (*description).into(),
+            completion: Some(format!("/approval {name}")),
+            execute: true,
+        })
+        .collect()
+}
+
 fn empty_hint(
     suggestions: Vec<Suggestion>,
     list_empty: bool,
@@ -206,7 +241,13 @@ mod tests {
         let sessions = vec![
             serde_json::json!({ "id": "abc123", "label": "work", "runner": "helper", "turn_count": 4 }),
         ];
-        assert_eq!(matching("/", &runners, &actions, &sessions).len(), 7);
+        assert_eq!(matching("/", &runners, &actions, &sessions).len(), 9);
+        assert_eq!(
+            matching("/approval cl", &runners, &actions, &sessions)[0]
+                .completion
+                .as_deref(),
+            Some("/approval classifier")
+        );
         assert_eq!(
             matching("/ren", &runners, &actions, &sessions)[0]
                 .completion

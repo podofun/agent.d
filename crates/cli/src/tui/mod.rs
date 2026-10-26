@@ -108,6 +108,13 @@ pub(crate) async fn run(
                     while let Ok(update) = app.received.try_recv() {
                         app.apply(update);
                     }
+                    // A finished reply sends the next queued message.
+                    if let Some(next) = app.next_queued()
+                        && let Err(error) = app.submit(&next).await
+                    {
+                        app.notice = Some(error.to_string());
+                        app.input.set(next);
+                    }
                     dirty = true;
                 }
             }
@@ -356,6 +363,11 @@ async fn handle_chat_key(app: &mut App, key: KeyEvent, screen: Rect) -> Result<O
         }
         KeyCode::End if app.input.is_empty() => app.jump_to_bottom(),
         KeyCode::F(5) => app.refresh().await,
+        KeyCode::BackTab => {
+            if let Err(error) = app.cycle_approval_mode().await {
+                app.notice = Some(error.to_string());
+            }
+        }
         KeyCode::PageUp => app.scroll = app.scroll.saturating_add(8),
         KeyCode::PageDown => scroll_down(app, 8),
         KeyCode::Char('n') if control => {
@@ -366,8 +378,8 @@ async fn handle_chat_key(app: &mut App, key: KeyEvent, screen: Rect) -> Result<O
             }
         }
         KeyCode::Char('e') if control => {
-            if let Some(index) = app.latest_expandable_tool() {
-                ui::toggle_tool(app, screen, index);
+            if let Some(row) = app.latest_tool_row() {
+                ui::toggle_tool(app, screen, row);
             }
         }
         _ => return Ok(None),
