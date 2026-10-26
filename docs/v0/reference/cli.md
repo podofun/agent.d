@@ -9,7 +9,7 @@
 | `--url <URL>` (`-u`) | `AGENTD_URL` | `http://127.0.0.1:7777` | Daemon base URL |
 | `--timeout <ms>` | — | `30000` | Connect timeout in milliseconds |
 
-**Token resolution.** For `/ws` commands, `agentctl` reads the bearer token from `AGENTD_TOKEN` first, then falls back to `$XDG_STATE_HOME/agentd/token` (the file the daemon writes at startup). If neither exists the daemon must be running with `--no-auth`. For `grants listen` the same logic applies to `AGENTD_ADMIN_TOKEN` / `$XDG_STATE_HOME/agentd/admin-token` on the `/control` plane.
+**Token resolution.** For `/ws` commands, `agentctl` uses the first token it finds, in this order: `AGENTD_TOKEN`, then the admin token (`AGENTD_ADMIN_TOKEN` or `$XDG_STATE_HOME/agentd/admin-token`), then `$XDG_STATE_HOME/agentd/token`. The daemon writes both files at startup. So on your own machine, every command connects as an [admin connection](/v0/security/approvals#admin-connections) and sees the same chats. Set `AGENTD_TOKEN` to connect as an ordinary client instead. If no token exists, the daemon must be running with `--no-auth`. For `grants listen` the same logic applies to `AGENTD_ADMIN_TOKEN` / `$XDG_STATE_HOME/agentd/admin-token` on the `/control` plane.
 
 **Transport.** Every command except `health` opens a WebSocket connection to `/ws`, sends one JSON envelope, and exits when the response arrives. `health` uses `GET /health` (HTTP).
 
@@ -41,19 +41,34 @@ If you have one runner, chat selects it for you. Otherwise pick one with `/runne
 
 When a runner needs permission for something, chat asks you on the spot, and you allow or deny it without leaving the conversation.
 
+You choose who answers these requests for each chat. Press Shift+Tab to switch between three modes, or use `/approval`:
+
+| Mode | What happens |
+|---|---|
+| `human` (ask me) | Chat asks you about each request. |
+| `classifier` (auto) | The classifier answers each request, and asks you only when it is unsure. You need a classifier in `grants.toml`. See [The classifier](/v0/security/approvals#the-classifier). |
+| `nobody` (no approvals) | Anything that is not granted is refused, and nobody is asked. |
+
+The header shows the current mode. The chat keeps its mode when you reopen it. `/approval default` returns to the runner's default.
+
+You can keep typing while the agent works. Press Enter, and your message waits in the conversation, marked "queued". Chat sends it when the reply finishes. If the reply fails or you cancel it, queued messages go back into your draft.
+
+When an agent calls several actions in a row, chat shows one line, for example "Used 14 actions and 1 tool". Click it, or press Ctrl+E, to see each call.
+
 Type `/` to see what you can do:
 
 | Command | Description |
 |---|---|
 | `/runner <name>` | Switch to another runner |
-| `/new` | Start a new chat |
+| `/new` or `/clear` | Start a new chat |
+| `/approval <mode>` | Choose who answers requests: `human`, `classifier`, `nobody`, or `default` |
 | `/open <id>` | Reopen a past chat |
 | `/rename <name>` | Name the current chat so it is easy to find later |
 | `/call <action> [json]` | Run an action |
 | `/help` | Show every command and shortcut |
 | `/quit` | Leave chat |
 
-Enter sends your message, Shift+Enter adds a new line, Ctrl+P opens a search across runners, chats, actions, services, and skills (start typing to filter), and Ctrl+C stops a reply or leaves chat. Drag with the mouse to select text in the conversation and press Ctrl+C to copy it.
+Enter sends your message, Shift+Enter adds a new line, Shift+Tab switches the approval mode, Ctrl+P opens a search across runners, chats, actions, services, and skills (start typing to filter), and Ctrl+C stops a reply or leaves chat. Drag with the mouse to select text in the conversation and press Ctrl+C to copy it.
 
 ---
 

@@ -90,11 +90,12 @@ Pass the bearer token on the WebSocket handshake:
 Authorization: Bearer <token>
 ```
 
-Token resolution order (same as `agentctl`):
+`agentctl` picks its `/ws` token in this order:
 
-1. `AGENTD_TOKEN` environment variable
-2. `$XDG_STATE_HOME/agentd/token` — the file the daemon writes at startup
-3. If neither exists, the daemon must be running with `--no-auth`
+1. The `AGENTD_TOKEN` environment variable. Use it to connect as an ordinary client.
+2. The admin token: `AGENTD_ADMIN_TOKEN`, or `$XDG_STATE_HOME/agentd/admin-token`. See [Admin token on `/ws`](#admin-token-on-ws).
+3. `$XDG_STATE_HOME/agentd/token`, the public token file that the daemon writes at startup.
+4. If none exists, the daemon must be running with `--no-auth`.
 
 `/health` is always open and requires no token.
 
