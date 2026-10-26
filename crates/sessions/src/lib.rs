@@ -73,10 +73,16 @@ impl Scope {
         }
     }
 
-    /// May this caller see `meta`? Same owner, and when the session was
-    /// created for a specific user, the same user.
+    /// May this caller see `meta`? An admin sees sessions of every owner;
+    /// acting as a named user, only those that user may see. Anyone else
+    /// needs the same owner, and when the session was created for a
+    /// specific user, the same user.
     pub fn permits(&self, meta: &SessionMeta) -> bool {
-        meta.owner == self.owner && (meta.user.is_none() || meta.user == self.user)
+        let user_ok = meta.user.is_none() || meta.user == self.user;
+        if self.owner == ADMIN_OWNER {
+            return self.user.is_none() || user_ok;
+        }
+        meta.owner == self.owner && user_ok
     }
 }
 
@@ -402,6 +408,21 @@ mod tests {
         assert_eq!(s.list(&tg_alice, 10).unwrap().len(), 0);
         assert!(s.get_in(&web_bob, &alice.id).unwrap().is_none());
         assert!(s.get_in(&web_alice, &alice.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn admin_sees_every_session_and_others_do_not_see_admin_sessions() {
+        let s = MemSessionStore::new();
+        let web = s
+            .create(NewSession::in_scope(&scope("interface:web", Some("alice"))))
+            .unwrap();
+        let admin = s.create(NewSession::in_scope(&Scope::admin(None))).unwrap();
+        assert!(Scope::admin(None).permits(&web));
+        assert_eq!(s.list(&Scope::admin(None), 10).unwrap().len(), 2);
+        assert!(!scope("interface:web", Some("alice")).permits(&admin));
+        // Acting as a user, an admin sees only what that user may see.
+        assert!(Scope::admin(Some("alice")).permits(&web));
+        assert!(!Scope::admin(Some("bob")).permits(&web));
     }
 
     #[test]
