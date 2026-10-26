@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use agentd_ai::{CompletionRequest, Message, ProviderError, ProviderRegistry};
+use agentd_permissions::ApprovalSetting;
 use agentd_skills::SkillRegistry;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -78,6 +79,14 @@ pub enum RunnerError {
     SessionBusy(String),
     #[error("{0}")]
     Session(String),
+    /// A non-admin asked for a looser approval setting than its run allows.
+    #[error(
+        "only an admin client can relax approval for a run. This run resolves to `{resolved}`, so `{requested}` was refused"
+    )]
+    ApprovalForbidden {
+        requested: ApprovalSetting,
+        resolved: ApprovalSetting,
+    },
     #[error("runner `{name}` references unknown skill `{skill}`")]
     UnknownSkill { name: String, skill: String },
     #[error("runner `{name}` could not resolve a provider for model `{}`", model.as_deref().unwrap_or("(none configured)"))]
@@ -145,6 +154,39 @@ impl Default for CompactPolicy {
     }
 }
 
+/// Resolve who answers a run's questions, once, when it starts.
+///
+/// Starts from the runner's default (`human` when unset), then applies the
+/// session's stored value, then the value passed for this run. A stricter
+/// step always applies; a looser one only for an admin. A looser stored
+/// session value is simply not applied for anyone else, while a looser
+/// explicit run value is an error. A nested run (`parent` set) then takes
+/// the stricter of its own value and its parent's.
+pub fn resolve_approval(
+    runner_default: Option<ApprovalSetting>,
+    session: Option<ApprovalSetting>,
+    requested: Option<ApprovalSetting>,
+    admin: bool,
+    parent: Option<ApprovalSetting>,
+) -> Result<ApprovalSetting, RunnerError> {
+    let mut resolved = runner_default.unwrap_or(ApprovalSetting::Human);
+    if let Some(s) = session
+        && (s <= resolved || admin)
+    {
+        resolved = s;
+    }
+    if let Some(r) = requested {
+        if r > resolved && !admin {
+            return Err(RunnerError::ApprovalForbidden {
+                requested: r,
+                resolved,
+            });
+        }
+        resolved = r;
+    }
+    Ok(parent.map_or(resolved, |p| p.min(resolved)))
+}
+
 /// Per-run inputs shared by the transport and executor. History is either
 /// caller-owned (`messages`) or daemon-owned (`session_id`), never both.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -160,6 +202,10 @@ pub struct RunOptions {
     pub model: Option<String>,
     pub max_tokens: Option<u32>,
     pub timeout_ms: Option<u64>,
+    /// Who answers this run's questions. Only tightens unless the run is
+    /// started by an admin; a looser value from anyone else is
+    /// `approval_forbidden`.
+    pub approval: Option<ApprovalSetting>,
     /// The run was started over an admin connection. Set by the transport,
     /// never read from the wire, and never passed on to nested runs. It
     /// scopes the run's session to admin sessions.
@@ -433,6 +479,79 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+    use agentd_permissions::ApprovalSetting::{Human, Nobody};
+
+    #[test]
+    fn approval_starts_from_the_runner_default() {
+        assert_eq!(
+            resolve_approval(None, None, None, false, None).unwrap(),
+            Human
+        );
+        assert_eq!(
+            resolve_approval(Some(Nobody), None, None, false, None).unwrap(),
+            Nobody
+        );
+    }
+
+    #[test]
+    fn a_stricter_step_always_applies() {
+        assert_eq!(
+            resolve_approval(None, Some(Nobody), None, false, None).unwrap(),
+            Nobody
+        );
+        assert_eq!(
+            resolve_approval(None, None, Some(Nobody), false, None).unwrap(),
+            Nobody
+        );
+    }
+
+    #[test]
+    fn a_looser_step_applies_only_for_an_admin() {
+        // A looser stored session value is not applied for a non-admin.
+        assert_eq!(
+            resolve_approval(Some(Nobody), Some(Human), None, false, None).unwrap(),
+            Nobody
+        );
+        assert_eq!(
+            resolve_approval(Some(Nobody), Some(Human), None, true, None).unwrap(),
+            Human
+        );
+        // A looser explicit run value from a non-admin is an error.
+        let err = resolve_approval(Some(Nobody), None, Some(Human), false, None).unwrap_err();
+        assert!(matches!(
+            err,
+            RunnerError::ApprovalForbidden {
+                requested: Human,
+                resolved: Nobody
+            }
+        ));
+        assert_eq!(
+            resolve_approval(Some(Nobody), None, Some(Human), true, None).unwrap(),
+            Human
+        );
+    }
+
+    #[test]
+    fn a_session_gives_no_looseness_to_a_stricter_runner() {
+        // The same `human` session, used with a `nobody` runner, stays `nobody`.
+        assert_eq!(
+            resolve_approval(Some(Nobody), Some(Human), None, false, None).unwrap(),
+            Nobody
+        );
+    }
+
+    #[test]
+    fn a_nested_run_takes_the_stricter_of_its_own_and_its_parent() {
+        assert_eq!(
+            resolve_approval(None, None, None, false, Some(Nobody)).unwrap(),
+            Nobody
+        );
+        assert_eq!(
+            resolve_approval(Some(Nobody), None, None, false, Some(Human)).unwrap(),
+            Nobody
+        );
+    }
+
     use super::*;
     use agentd_ai::MockProvider;
     use agentd_skills::SkillDef;

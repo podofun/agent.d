@@ -51,6 +51,7 @@ pub fn expand_grants(packages: &[LoadedPackage], grants: &mut GrantsFile) {
                     RunnerGrants {
                         allowed_actions: pkg.actions.iter().cloned().collect(),
                         granted: PermissionSet::empty(),
+                        ..Default::default()
                     },
                 );
             }

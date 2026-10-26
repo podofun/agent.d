@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 agentd-ai.workspace = true
+agentd-permissions.workspace = true
 agentd-skills.workspace = true
 async-trait.workspace = true
 serde.workspace = true

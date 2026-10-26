@@ -30,7 +30,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Approval, Denial, Permission, PermissionSet};
+use crate::model::{Approval, ApprovalSetting, Denial, Permission, PermissionSet};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +46,10 @@ pub struct RunnerGrants {
     pub allowed_actions: std::collections::BTreeSet<String>,
     #[serde(default)]
     pub granted: PermissionSet,
+    /// Who answers this runner's questions by default. `None` is `human`.
+    /// It lives here, never in Lua, so a runner cannot choose its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalSetting>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -156,6 +160,21 @@ pub fn parse_grants(body: &str) -> Result<GrantsFile, String> {
         .map_err(|e| format!("is not valid TOML ({e}). Fix the syntax and try again"))?;
     if table.contains_key("policy") {
         return Err("still has a `[policy]` section, which was replaced. Move `deny_actions` to `[denial].actions`, `deny_permissions` to `[denial].permissions`, and `auto_confirm` to `[approval].skip`".into());
+    }
+    for kind in ["tool", "service", "interface", "package"] {
+        if let Some(name) = table
+            .get(kind)
+            .and_then(|v| v.as_table())
+            .and_then(|t| {
+                t.iter()
+                    .find(|(_, v)| v.as_table().is_some_and(|e| e.contains_key("approval")))
+            })
+            .map(|(name, _)| name)
+        {
+            return Err(format!(
+                "sets `approval` in `[{kind}.{name}]`, but approval is set per runner only. Move it to a `[runner.<name>]` section"
+            ));
+        }
     }
     let file: GrantsFile = table.try_into().map_err(|e| {
         format!("has an entry agentd does not know ({e}). Check the spelling of the section and key names")
@@ -320,6 +339,15 @@ mod tests {
         assert!(err("[denial]\npermissions = [\"fs.read:.env\"]\n").contains("absolute"));
         assert!(err("[denial]\npermissions = [\"fs.write:~/secrets\"]\n").contains("absolute"));
         parse_grants("[denial]\npermissions = [\"fs.read:/proj/.env\", \"fs.read\"]\n").unwrap();
+    }
+
+    #[test]
+    fn approval_is_a_runner_setting_only() {
+        let f = parse_grants("[runner.coder]\napproval = \"nobody\"\n").unwrap();
+        assert_eq!(f.runner["coder"].approval, Some(ApprovalSetting::Nobody));
+        let e = err("[tool.git]\napproval = \"nobody\"\n");
+        assert!(e.contains("[tool.git]") && e.contains("per runner"), "{e}");
+        assert!(err("[runner.coder]\napproval = \"sometimes\"\n").contains("sometimes"));
     }
 
     #[test]

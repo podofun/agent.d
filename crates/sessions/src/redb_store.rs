@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use agentd_ai::Message;
 use agentd_memory::Database;
+use agentd_permissions::ApprovalSetting;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::{
@@ -255,6 +256,23 @@ impl SessionStore for RedbSessionStore {
         Ok(meta)
     }
 
+    fn set_approval(&self, id: &str, approval: Option<ApprovalSetting>) -> Result<SessionMeta> {
+        let wtx = self.db.begin_write().map_err(backend)?;
+        let meta = {
+            let mut sessions = wtx.open_table(SESSIONS).map_err(backend)?;
+            let mut meta = Self::read_meta(&sessions, id)?
+                .ok_or_else(|| SessionError::NotFound(id.to_string()))?;
+            meta.approval = approval;
+            meta.updated_at = now_secs();
+            sessions
+                .insert(id, encode(&meta)?.as_slice())
+                .map_err(backend)?;
+            meta
+        };
+        wtx.commit().map_err(backend)?;
+        Ok(meta)
+    }
+
     fn delete(&self, id: &str) -> Result<bool> {
         let wtx = self.db.begin_write().map_err(backend)?;
         let existed = {
@@ -442,6 +460,23 @@ mod tests {
             .map(|m| m.id)
             .collect();
         assert!(ids.contains(&a.id) && ids.contains(&b.id));
+    }
+
+    #[test]
+    fn approval_is_stored_and_cleared() {
+        let (_dir, s) = store();
+        let a = s
+            .create(new().approval(Some(ApprovalSetting::Nobody)))
+            .unwrap();
+        assert_eq!(a.approval, Some(ApprovalSetting::Nobody));
+        let b = s.set_approval(&a.id, Some(ApprovalSetting::Human)).unwrap();
+        assert_eq!(b.approval, Some(ApprovalSetting::Human));
+        assert_eq!(
+            s.get(&a.id).unwrap().unwrap().approval,
+            Some(ApprovalSetting::Human)
+        );
+        assert_eq!(s.set_approval(&a.id, None).unwrap().approval, None);
+        assert!(s.set_approval("missing", None).is_err());
     }
 
     #[test]

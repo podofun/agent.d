@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use agentd_ai::ProviderRegistry;
 use agentd_permissions::{
-    ActionMeta as PermActionMeta, Caller, Decision, Engine, PermissionSet,
+    ActionMeta as PermActionMeta, ApprovalSetting, Caller, Decision, Engine, PermissionSet,
     ToolMeta as PermToolMeta,
     engine::{Approved, DenyLayer},
 };
@@ -37,6 +37,9 @@ use agentd_types::{
 };
 use async_trait::async_trait;
 use tokio::task::JoinHandle;
+
+/// Run ids are unique per daemon process.
+static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[async_trait]
 impl Dispatcher for Executor {
@@ -523,7 +526,25 @@ impl Executor {
             if decision == Decision::Allow {
                 break;
             }
-            let err = if !decision.is_escalatable() || self.broker.is_none() {
+            let err = if decision.is_escalatable()
+                && caller.approval == Some(ApprovalSetting::Nobody)
+            {
+                // `nobody`: anything not granted is refused, nothing is asked.
+                let err = decision_to_error(
+                    decision,
+                    &action_meta,
+                    tool_name.as_deref(),
+                    &caller,
+                    &self.engine.load(),
+                );
+                self.trace_nobody(&action_name, &caller).await;
+                Some(RegistryError::Denied {
+                    layer: "approval".into(),
+                    reason: format!(
+                        "`{action_name}` was refused without asking, because this run's approval is `nobody`\n{err}"
+                    ),
+                })
+            } else if !decision.is_escalatable() || self.broker.is_none() {
                 // A denial, or no approver wired: reject with a diagnostic
                 // that names the denied component and the grants.toml fix.
                 Some(decision_to_error(
@@ -636,6 +657,26 @@ impl Executor {
     }
 
     // ---------- approval escalation ----------
+
+    /// Record a question refused without asking because the run's approval
+    /// is `nobody`.
+    async fn trace_nobody(&self, action: &str, caller: &Caller) {
+        self.trace
+            .record(
+                TraceEvent::ok(
+                    action,
+                    serde_json::json!({
+                        "run_id": caller.run_id,
+                        "session_id": caller.session_id,
+                    }),
+                    0,
+                    serde_json::json!({ "approval": "Deny", "decided_by": "nobody" }),
+                )
+                .with_execution(caller.execution_str())
+                .with_kind("approval"),
+            )
+            .await;
+    }
 
     /// Escalate a non-`Allow`, escalatable decision to the approval broker and
     /// translate the verdict into an [`Escalation`]. Only called when a broker
@@ -1204,6 +1245,11 @@ impl agentd_types::InlineApprovals for Executor {
     ) -> agentd_types::Verdict {
         use std::sync::atomic::Ordering;
 
+        if req.caller.approval == Some(ApprovalSetting::Nobody) {
+            let action = req.call_chain.first().map_or("<lua>", String::as_str);
+            self.trace_nobody(action, &req.caller).await;
+            return agentd_types::Verdict::Deny;
+        }
         let Some(broker) = self.broker.as_ref() else {
             return agentd_types::Verdict::Deny;
         };
@@ -1362,6 +1408,38 @@ impl Executor {
         result
     }
 
+    /// Fix who answers this run's questions and give the run its ids. Runs
+    /// once, when the run starts; the values ride on the caller, which every
+    /// check inside the run sees.
+    fn start_run(
+        &self,
+        mut caller: Caller,
+        runner_name: &str,
+        options: &RunOptions,
+        session: Option<&agentd_sessions::SessionMeta>,
+    ) -> Result<Caller, RunnerError> {
+        let runner_default = self
+            .engine
+            .load()
+            .grants()
+            .runner(runner_name)
+            .and_then(|g| g.approval);
+        let approval = agentd_runners::resolve_approval(
+            runner_default,
+            session.and_then(|m| m.approval),
+            options.approval,
+            options.admin,
+            caller.approval,
+        )?;
+        caller.approval = Some(approval);
+        caller.run_id = Some(format!(
+            "run-{}",
+            RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        caller.session_id = session.map(|m| m.id.clone());
+        Ok(caller)
+    }
+
     async fn run_runner_inner(
         self: &Arc<Self>,
         caller: Caller,
@@ -1370,6 +1448,7 @@ impl Executor {
         sink: Option<agentd_ai::StreamSink>,
     ) -> Result<RunnerOutcome, RunnerError> {
         let Some(session_id) = options.session_id.take() else {
+            let caller = self.start_run(caller, runner_name, &options, None)?;
             let (out, _) = self.run_model(caller, runner_name, options, sink).await?;
             return Ok(out);
         };
@@ -1389,6 +1468,7 @@ impl Executor {
             .get_in(&scope, &session_id)
             .map_err(|e| RunnerError::Session(e.to_string()))?
             .ok_or_else(|| RunnerError::SessionNotFound(session_id.clone()))?;
+        let caller = self.start_run(caller, runner_name, &options, Some(&meta))?;
         let _guard = {
             let mut set = self.active_sessions.lock().unwrap();
             if !set.insert(session_id.clone()) {

@@ -837,7 +837,8 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
                     let caller = ws_caller(conn, p.session, p.user);
                     let new = agentd_sessions::NewSession::in_scope(&conn_scope(conn, &caller))
                         .label(p.label)
-                        .runner(p.runner);
+                        .runner(p.runner)
+                        .approval(p.approval);
                     match store.create(new) {
                         Ok(meta) => ok_ser(id, &meta),
                         Err(e) => session_error(id, e),
@@ -928,6 +929,34 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
                 Err(e) => bad_params(id, e),
             }
         }
+        "sessions.set_approval" => {
+            let Some(store) = executor.sessions() else {
+                return no_sessions(id);
+            };
+            match serde_json::from_value::<SetApprovalParams>(req.params) {
+                Ok(p) => {
+                    // Anyone who can see a session can store a value on it.
+                    // Whether it takes effect is decided at each run.
+                    let scope = conn_scope(conn, &ws_caller(conn, p.session, p.user));
+                    match store.get_in(&scope, &p.id) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            return err(
+                                id,
+                                "session_not_found",
+                                format!("session `{}` does not exist", p.id),
+                            );
+                        }
+                        Err(e) => return session_error(id, e),
+                    }
+                    match store.set_approval(&p.id, p.approval) {
+                        Ok(meta) => ok_ser(id, &meta),
+                        Err(e) => session_error(id, e),
+                    }
+                }
+                Err(e) => bad_params(id, e),
+            }
+        }
         "sessions.delete" => {
             let Some(store) = executor.sessions() else {
                 return no_sessions(id);
@@ -981,6 +1010,7 @@ struct NameParam {
 struct CreateSessionParams {
     label: Option<String>,
     runner: Option<String>,
+    approval: Option<agentd_permissions::ApprovalSetting>,
     session: Option<String>,
     user: Option<String>,
 }
@@ -995,6 +1025,16 @@ struct IdParam {
 }
 
 /// `sessions.rename`: a missing or null `label` clears it.
+#[derive(Deserialize)]
+struct SetApprovalParams {
+    id: String,
+    approval: Option<agentd_permissions::ApprovalSetting>,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct RenameParams {
     id: String,
@@ -1105,6 +1145,7 @@ fn tip_for(code: &str) -> Option<String> {
             "Store the API key with `agentctl secret set <name> <value>` — https://docs.podo.fun/agentd/v0/providers/credentials"
         }
         "bad_params" => "Pass args as `-d key=value` or `-j '<json>'`",
+        "approval_forbidden" => "Connect with the admin token, or use a stricter setting",
         _ => return None,
     };
     Some(tip.to_string())
@@ -1165,6 +1206,7 @@ fn runner_error(id: u64, e: RunnerError) -> WsResponse {
         RunnerError::UnknownSkill { .. } => "unknown_skill",
         RunnerError::NoProvider { .. } => "no_provider",
         RunnerError::TurnLimit { .. } => "runner_turn_limit",
+        RunnerError::ApprovalForbidden { .. } => "approval_forbidden",
         RunnerError::Provider {
             source: agentd_ai::ProviderError::Config(_),
             ..

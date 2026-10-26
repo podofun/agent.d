@@ -26,6 +26,6 @@ pub use engine::{Decision, Engine, EngineError};
 pub use grants::{Grants, GrantsFile, load_grants_file, parse_grants};
 pub use grants::{InterfaceGrants, PackageGrants, RunnerGrants, ServiceGrants, ToolGrants};
 pub use model::{
-    ActionMeta, Approval, Caller, Denial, ExecutionId, InterfaceId, Permission, PermissionSet,
-    RunnerId, ServiceId, SessionId, ToolMeta, UserId,
+    ActionMeta, Approval, ApprovalSetting, Caller, Denial, ExecutionId, InterfaceId, Permission,
+    PermissionSet, RunnerId, ServiceId, SessionId, ToolMeta, UserId,
 };

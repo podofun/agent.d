@@ -938,3 +938,49 @@ async fn admin_connections_own_sessions_no_public_client_can_reach() {
     .await;
     assert_eq!(get["code"], "session_not_found", "{get}");
 }
+
+/// `sessions.create` and `sessions.set_approval` store a session's setting;
+/// a session another client cannot see cannot be changed.
+#[tokio::test]
+async fn sessions_store_their_approval_setting() {
+    let provider = ControlledProvider::new();
+    let (url, _) =
+        boot_runner_with_tokens(provider.clone(), true, HashMap::new(), Some("admin-token")).await;
+    let mut admin = connect_as(&url, "admin-token").await;
+    let mut public = connect_as(&url, "public-token").await;
+
+    let a = call(
+        &mut admin,
+        serde_json::json!({"id": 1, "method": "sessions.create", "params": {"approval": "nobody"}}),
+    )
+    .await;
+    assert_eq!(a["result"]["approval"], "nobody", "{a}");
+    let aid = a["result"]["id"].as_str().unwrap().to_string();
+
+    let set = call(
+        &mut admin,
+        serde_json::json!({"id": 2, "method": "sessions.set_approval", "params": {"id": aid, "approval": "human"}}),
+    )
+    .await;
+    assert_eq!(set["result"]["approval"], "human", "{set}");
+    let cleared = call(
+        &mut admin,
+        serde_json::json!({"id": 3, "method": "sessions.set_approval", "params": {"id": aid, "approval": null}}),
+    )
+    .await;
+    assert!(cleared["result"].get("approval").is_none(), "{cleared}");
+
+    let bad = call(
+        &mut admin,
+        serde_json::json!({"id": 4, "method": "sessions.set_approval", "params": {"id": aid, "approval": "sometimes"}}),
+    )
+    .await;
+    assert_eq!(bad["code"], "bad_params", "{bad}");
+
+    let steal = call(
+        &mut public,
+        serde_json::json!({"id": 1, "method": "sessions.set_approval", "params": {"id": aid, "approval": "nobody"}}),
+    )
+    .await;
+    assert_eq!(steal["code"], "session_not_found", "{steal}");
+}
