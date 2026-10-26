@@ -43,7 +43,7 @@ The keyring is backed by the OS credential store and is not persisted in files c
 The `/ws` and `/control` endpoints accept different bearer tokens (`AGENTD_TOKEN` and `AGENTD_ADMIN_TOKEN` respectively). Issue distinct tokens for each surface:
 
 - Give clients the `/ws` token only.
-- Keep the `/control` (admin) token restricted to operators running `agentctl grants listen` or custom approval tooling.
+- Keep the admin token restricted to operators. It answers approval requests on `/control`, and on `/ws` it can make approval looser for a run. See [Admin connections](/v0/security/approvals#admin-connections).
 
 Never share the admin token with untrusted clients.
 
@@ -69,19 +69,35 @@ agentd.action({
 })
 ```
 
-Pre-approve only after you are confident the action is safe in your environment, using `auto_confirm` in `[policy]`.
+Pre-approve an action only after you are sure it is safe in your environment. To do that, add it to `[approval].skip`.
 
-## Use the policy denylist for permanent blocks
+## Use `[denial]` for permanent blocks
 
-If there are actions or permissions that should *never* be granted — regardless of what `grants.toml` says — add them to `[policy]`:
+If an action or a permission must *never* be used, whatever `grants.toml` grants, add it to `[denial]`:
 
 ```toml
-[policy]
-deny_actions     = ["shell.exec"]   # block all unrestricted shell execution
-deny_permissions = ["fs.write:/**"] # block root filesystem writes
+[denial]
+actions     = ["pkg.publish"]                   # never publish a package
+permissions = ["fs.read:/home/me/project/.env"] # never read this file
 ```
 
-Policy denials are hard — they are never escalated to approval.
+Nobody is asked about a denial, and nobody can approve it. Keep denied files outside the folders that you grant to shell commands. Otherwise, agent.d must refuse those commands, because a sandbox cannot hide one file in a folder that it opens. See [What a denial guarantees](/v0/security/denials).
+
+## Choose who answers for each runner
+
+Set `approval` for each runner in `grants.toml`:
+
+- Use `"nobody"` for bots and other runs that nobody watches. The run can use only what you granted, and it never waits for an answer.
+- Use `"classifier"` when an agent must continue without you, but each new step needs a check. Give the classifier clear instructions about what to allow.
+- Keep `"human"` when you want to decide each step yourself.
+
+```toml
+[runner.discord_bot]
+granted  = ["ai:openai"]
+approval = "nobody"
+```
+
+A client can make a run stricter, but only an admin connection can make it looser. So a runner set to `"nobody"` stays safe even when a client asks for more. See [Interactive approvals](/v0/security/approvals#who-answers).
 
 ## Review package permission sets before trusting
 

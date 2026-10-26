@@ -37,6 +37,12 @@ A child process can only reach hosts you allow with `net:` grants. With no `net:
 
 A `net:` grant names a destination in one of three forms: `net:1.2.3.4` (an IP address), `net:api.example.com` (a host name), or `net:api.example.*` (a host name with a wildcard suffix).
 
+## Denials and the sandbox
+
+The sandbox can only allow. It cannot remove one file from a folder that it opens, or one host from a pattern that it allows. So when a shell command could reach something in `[denial]`, agent.d refuses the command before it starts. For example, if you grant `fs.read:/home/me/project/**` and deny `fs.read:/home/me/project/.env`, every shell command with that grant is refused. Keep denied files outside the folders that you grant to shell commands, or grant narrower folders.
+
+See [What a denial guarantees](/v0/security/denials#shell-commands) for every case and the error message.
+
 ## One-time setup
 
 On macOS and Windows, only the operating system's administrator can change firewall rules. agent.d itself always runs as a normal user, so it installs a small helper service, once per machine, that applies these rules for it. On macOS, the helper is a system service with a few dedicated sandbox user accounts. On Windows, it is a Windows service. Install it with administrator rights:
@@ -57,5 +63,6 @@ The sandbox fails closed: if confinement cannot be established, the call errors 
 
 - [Permission slugs](/v0/security/permission-slugs)
 - [grants.toml reference](/v0/security/grants)
+- [What a denial guarantees](/v0/security/denials)
 - [Best practices](/v0/security/best-practices)
 - [`ctx.shell` reference](/v0/reference/ctx/shell)

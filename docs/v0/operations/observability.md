@@ -79,7 +79,11 @@ A denied action call appears in the trace and in the log at `warn` level. If you
 
 1. Check which grant is missing: `agentctl grants listen` shows the missing permissions in the approval request.
 2. Add the grant to `grants.toml` under the appropriate `[tool.*]`, `[runner.*]`, `[service.*]`, or `[interface.*]` section.
-3. Verify the `[policy]` section does not list the action in `deny_actions` — policy denials are hard and are never escalated to approval.
+3. Check that `[denial]` does not list the action or one of its permissions. A denial is never sent for approval.
+
+### Approval decisions
+
+Each approval decision appears in the trace as an event with the kind `approval`. Its result tells you who decided (`human`, `classifier`, or `nobody`), the answer, and the classifier's reason when the classifier decided. The request in the event stays hidden, like all trace arguments. Use these events to see what a classifier allowed while you were away, or why a `nobody` run could not finish.
 
 ### Service health
 

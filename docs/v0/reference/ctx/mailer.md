@@ -73,6 +73,8 @@ Grants are tool-scoped. A `mail` tool that sends through `smtp.example.com` and 
 granted = ["net:smtp.example.com", "secret:smtp_user", "secret:smtp_pass"]
 ```
 
+agent.d checks the address that it connects to. If the host name points to an IP address in `[denial]`, the connection is refused. The connection also checks `[denial]` again each time it sends, so a new denial applies to a connection that is already open. See [Hosts](/v0/security/denials#hosts).
+
 ## Examples
 
 Actions are fully-qualified `tool.action` names declared against a tool. Both examples below belong to the `mail` tool granted above.

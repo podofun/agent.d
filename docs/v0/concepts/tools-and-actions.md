@@ -45,7 +45,7 @@ end)
 | `name` | yes | Fully-qualified `tool.action` identifier. |
 | `handler` | yes | `function(args, ctx)` called when the action is invoked. |
 | `requires` | no | Permission slugs the handler needs (e.g. `"shell.exec:git"`). |
-| `confirm` | no | When `true`, each call requires interactive operator approval unless `auto_confirm` covers it. |
+| `confirm` | no | When `true`, each call needs an approval, unless `[approval].skip` in `grants.toml` lists the action. |
 | `tool` | no | Owning tool name; inferred from the `name` prefix when omitted. |
 | `input` | no | Ergonomic schema for the action's args. Surfaced to LLM runners as the tool's `input_schema` and validated before the handler runs. |
 | `output` | no | Schema for the return value, validated after the handler runs (registry-side only). |

@@ -33,7 +33,7 @@ Lua code never touches the host directly. Every privileged operation goes throug
 | `executor` | Hot-swappable runtime core (wrapped in `ArcSwap`): owns loaded tools, runners, skills, and services; dispatches requests |
 | `scripting` | Lua VM integration (mlua): exposes `agentd.*` registration API and all `ctx.*` capability methods to Lua |
 | `luals` | LuaLS type-stub generator: writes `.luals/agentd.lua`, `.luals/project.lua`, `.luarc.json` |
-| `permissions` | Default-deny five-layer permission engine: evaluates `tool grants ∩ action.requires ∩ runner.allow ∩ interface.allow ∩ policy` |
+| `permissions` | Default-deny permission engine: checks `[denial]` and the service and interface allowlists first, then asks about the runner allowlist, tool grants, and confirm, one at a time |
 | `approvals` | Interactive approval plane: pushes `approval.request` events over `/control`, waits for `approvals.resolve`, handles timeout (deny on expiry) |
 | `runners` | Runner dispatch: builds system prompt from skills, drives the model tool-use loop up to `max_turns`, returns `RunResult` |
 | `skills` | Skill registry: loads `.md` skill files (YAML frontmatter + Markdown body) and provides lookup by name |
@@ -76,7 +76,7 @@ The path through the runtime:
 1. `daemon` accepts the WebSocket upgrade and authenticates the bearer token.
 2. The connection loop reads the envelope and routes on `method`.
 3. For `actions.call`, the dispatcher loads the current `Executor` via `ArcSwap`.
-4. The `permissions` crate evaluates the five-layer intersection for the caller's identity and the action's `requires` set.
+4. The `permissions` crate checks the denials, then the questions, for the caller's identity and the action's `requires` set. The executor asks each question and checks again after every answer.
 5. If approved, `scripting` invokes the Lua handler with a `ctx` handle scoped to the approved permissions.
 6. Each `ctx.*` call (shell, fs, http, …) re-checks its specific grant before touching the host.
 7. The handler returns a Lua value; it is serialised to JSON and returned in `{ "id": 1, "ok": true, "result": … }`.
@@ -103,5 +103,5 @@ The default test suite avoids network calls and live model requests. Optional in
 ## See also
 
 - [Concepts: runtime](/v0/concepts/runtime) — runtime concepts from a user perspective
-- [Concepts: permissions](/v0/concepts/permissions) — the five-layer permission model
+- [Concepts: permissions](/v0/concepts/permissions): how a call is decided
 - [Reference: configuration](/v0/reference/configuration) — daemon and runtime config knobs

@@ -13,13 +13,13 @@ agent.d is built from a small set of named building blocks. Understanding each o
 | [Services](/v0/concepts/services) | Long-running background Lua tasks (gateways, pollers) with restart supervision. |
 | [Memory and State](/v0/concepts/memory-and-state) | Durable namespaced key/value storage (`ctx.memory`) that survives restarts, versus ephemeral per-reload state (`ctx.state`). |
 | [Interfaces and Callers](/v0/concepts/interfaces-and-callers) | Interfaces are client surfaces (WebSocket today); every call carries a Caller identity that the permission engine uses. |
-| [Permissions](/v0/concepts/permissions) | A five-layer intersection that decides whether a capability call is allowed, confirmed, or denied. |
+| [Permissions](/v0/concepts/permissions) | Denials first, then questions: how agent.d decides whether a call runs, waits for an approval, or is refused. |
 
 ## How they connect
 
 At startup the runtime evaluates `init.lua`, which registers tools, actions, runners, skills, and services. The daemon then opens three endpoints — `/health`, `/ws`, and `/control` — and waits for client calls.
 
-When a call arrives, the permission engine intersects the grants, action requirements, allowlists, and policy to reach a decision. Approved calls receive a `ctx` handle scoped to the capabilities they need. Results are returned to the caller and written to the trace log.
+When a call arrives, the permission engine checks the denials first, then the grants, the allowlists, and the action's requirements. A call that is not granted can become a question. Approved calls receive a `ctx` handle scoped to the capabilities they need. Results are returned to the caller and written to the trace log.
 
 ## See also
 

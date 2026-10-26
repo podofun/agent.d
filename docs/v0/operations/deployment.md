@@ -85,7 +85,7 @@ export AGENTD_ADMIN_TOKEN=<ctrl-token>
 ```
 
 ::: warning
-Do **not** use `--no-auth` / `AGENTD_NO_AUTH` in production unless the socket is fully isolated. With auth disabled, any process that can reach the port can call any action.
+Do **not** use `--no-auth` / `AGENTD_NO_AUTH` in production unless the socket is fully isolated. With auth disabled, any process that can reach the port can call any action. It is also an [admin connection](/v0/security/approvals#admin-connections), so it can make approval looser for its runs and see admin sessions.
 :::
 
 `/health` (`GET /health` → `ok`) is always open and requires no token. Use it as a liveness probe.

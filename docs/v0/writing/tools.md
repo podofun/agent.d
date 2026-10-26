@@ -253,7 +253,7 @@ operator is connected, the request times out and fails closed.
 `ctx.call()` cannot invoke `confirm`-gated actions — only direct callers (runners,
 interfaces, services) can trigger them.
 
-[`[policy].auto_confirm`](/v0/security/grants) pre-approves specific action names so
+[`[approval].skip`](/v0/security/grants#approval) pre-approves specific action names so
 they pass the `confirm` gate automatically.
 
 ## Worked example — the git tool

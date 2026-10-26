@@ -32,6 +32,14 @@ agent.d sets the Codex sandbox to `read-only`, the approval policy to `untrusted
 
 agent.d disables the built-in Codex tools, so Codex can use only the runner actions through a private local connection to agent.d.
 
+## Denials and Codex
+
+Codex can still read files in its own read-only sandbox, and agent.d cannot check those reads.
+So while `[denial]` in `grants.toml` lists any `fs.read`, `fs.write`, or `net` permission, agent.d refuses every call to this provider.
+The error names the denial.
+To use a denial and an agent together, use a provider that agent.d controls, such as `anthropic` or `openai`.
+See [What a denial guarantees](/v0/security/denials#ai-providers).
+
 The Codex provider has a 180-second turn timeout. Runner calls also have a whole-run deadline, which defaults to 120 seconds; see [runner request limits](/v0/reference/protocol#runners-run).
 
 ## Use the provider with a runner

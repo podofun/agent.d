@@ -98,6 +98,15 @@ Token resolution order (same as `agentctl`):
 
 `/health` is always open and requires no token.
 
+### Admin token on `/ws`
+
+`/ws` also accepts the admin token (see [`/control` token](#control-token)). A connection that presents it is an **admin connection** for as long as it stays open. It works like the `ws` interface, with two differences:
+
+- It can make a run's approval setting looser. See [Where the setting comes from](/v0/security/approvals#where-the-setting-comes-from).
+- Its sessions belong to admin connections only (`owner` is `admin:ws`). Other connections cannot see or use them.
+
+With `--no-auth` there are no tokens, so every `ws` connection is an admin connection. A connection with an interface token is never an admin connection.
+
 ### Interface tokens
 
 Besides the daemon token, `config.toml` can declare `[interfaces.<name>]` entries, each with its own bearer token. A connection presenting one is interface `<name>` for every request it makes: `ctx.caller.interface` reports it, `[interface.<name>]` grants apply, and chat sessions it creates belong to it. The daemon token remains interface `ws`. See [configuration](/v0/reference/configuration#interfaces-name-sections).
@@ -237,6 +246,7 @@ Run a runner with a prompt, an explicit message history, or a stored session. Th
 | `session` | string | no | Override session id |
 | `user` | string | no | Caller-supplied user id |
 | `stream` | bool | no | Push `runner.delta` event frames while the run is in flight |
+| `approval` | string | no | Who answers this run's questions: `human`, `classifier`, or `nobody`. A value looser than the runner's setting is `approval_forbidden`, unless the connection is an [admin connection](#admin-token-on-ws) |
 
 **Result:** `{ "text": "...", "provider": "...", "model": "...", "stop_reason"?: "...", "session_id"?: "..." }`
 
@@ -289,9 +299,9 @@ On SIGINT or SIGTERM the daemon stops admitting work and allows up to 30 seconds
 
 Create a chat session to store conversation history. The result contains session metadata; pass its `id` as `session_id` in `runners.run`.
 
-The optional parameters are `label`, `runner`, `session` and `user`, all strings. A label is a name you choose, such as a chat id or ticket number. Labels are unique per interface, including across users; an existing label returns `session_label_taken`. The `runner` field is informational and does not restrict which runner can use the session. The `session` and `user` fields set the caller identity, as they do for `actions.call` and `runners.run`.
+The optional parameters are `label`, `runner`, `approval`, `session` and `user`, all strings. A label is a name you choose, such as a chat id or ticket number. Labels are unique per interface, including across users; an existing label returns `session_label_taken`. The `runner` field is informational and does not restrict which runner can use the session. The `approval` field sets who answers questions for runs in the session (`human`, `classifier`, or `nobody`); see [`sessions.set_approval`](#sessions-set-approval). The `session` and `user` fields set the caller identity, as they do for `actions.call` and `runners.run`.
 
-The session belongs to the connection's interface (`interface:ws` for the daemon token, or `interface:<name>` for an [interface token](#interface-tokens)). If you pass `user`, later requests must carry the same user to access it. Without `user`, the session is visible to all callers from that interface.
+The session belongs to the connection's interface (`interface:ws` for the daemon token, `interface:<name>` for an [interface token](#interface-tokens), or `admin:ws` for an [admin connection](#admin-token-on-ws)). If you pass `user`, later requests must carry the same user to access it. Without `user`, the session is visible to all callers from that interface.
 
 Send this request over `/ws`:
 
@@ -325,6 +335,16 @@ Change a session's label. Pass the required string `id`, the new `label` (omit i
 
 ```json
 { "id": 13, "method": "sessions.rename", "params": { "id": "8f3a1c2d-…", "label": "bugfix", "user": "alice" } }
+```
+
+### `sessions.set_approval`
+
+Change who answers questions for runs in a session. Pass the required string `id`, and `approval` as `human`, `classifier`, or `nobody`. Send `null` to clear the setting. You can also pass the string parameters `session` and `user`. The result is the updated session metadata.
+
+Any caller that can see a session can change its setting. agent.d decides at each run whether the value applies: a stricter value always applies, and a looser value applies only to runs that an admin connection starts. A change applies to the next run, not to a run that is busy. `classifier` returns `classifier_not_configured` when `[approval].classifier` in `grants.toml` names no runner.
+
+```json
+{ "id": 14, "method": "sessions.set_approval", "params": { "id": "8f3a1c2d-…", "approval": "nobody" } }
 ```
 
 ### `sessions.delete`
@@ -388,6 +408,8 @@ List background services with their current state.
 | `no_provider` | The runner could not resolve a provider for its model | You can configure new providers in your `config.toml` |
 | `runner_turn_limit` | The runner used all `runtime.max_turns` turns without finishing. In a session, the work so far is kept | Send another message to let it continue, or raise `max_turns` under `[runtime]` in `config.toml` |
 | `provider_upstream` | AI provider returned an error | — |
+| `approval_forbidden` | A run asked for an approval setting looser than its runner or session allows, from a connection that is not an admin connection | Connect with the admin token, or use a stricter setting |
+| `classifier_not_configured` | A session was set to `classifier`, but `[approval].classifier` names no runner | Name a classifier runner in `[approval].classifier` in grants.toml, or use `human` or `nobody` |
 
 ---
 
@@ -401,24 +423,26 @@ Connecting to `/control` with a valid admin token immediately registers the conn
 
 ### Push frame: `approval.request`
 
-When an action triggers a `confirm = true` approval or the permission engine raises an escalation, the server pushes:
+When a call needs an approval and the run's setting sends it to a human, the server pushes:
 
 ```json
 {
   "event": "approval.request",
   "req": {
     "id": 7,
-    "action": "shell.exec",
-    "tool": "git",
-    "kind": "confirm",
-    "reason": "Running git push to origin",
-    "missing": ["shell.exec:git"],
+    "kind": "missing_grant",
+    "action": "dev.shell",
+    "tool": "dev",
+    "reason": "the handler asked for `shell.exec:cargo` mid-run, which tool `dev` has not been granted",
+    "requires": ["shell.exec:cargo"],
+    "missing": ["shell.exec:cargo"],
+    "detail": { "argv": ["cargo", "test"], "cwd": "/home/me/project" },
+    "run_id": "run-12",
+    "session_id": "8f3a1c2d-…",
     "caller": {
-      "runner": "backend_reviewer",
-      "interface": null,
-      "service": null,
-      "session": "ws-3",
-      "user": null
+      "runner": "coder",
+      "interface": "ws",
+      "session": "ws-3"
     }
   }
 }
@@ -427,12 +451,19 @@ When an action triggers a `confirm = true` approval or the permission engine rai
 | Field | Description |
 |---|---|
 | `id` | Request id to echo in `approvals.resolve` |
+| `kind` | Why agent.d asks: `missing_grant`, `runner_action`, or `confirm` |
 | `action` | Fully-qualified action name |
 | `tool` | Tool that owns the action |
-| `kind` | Approval kind (`confirm`, etc.) |
-| `reason` | Human-readable explanation from the action |
+| `reason` | Human-readable explanation |
+| `requires` | Every permission the action or call needs |
 | `missing` | Permission slugs that are not yet granted |
+| `detail` | What the call does: an action's arguments, or a command's `argv` and `cwd`. Secret values are replaced by `<secret name>`. Present when known |
+| `run_id` | The run that asks. Present when the call belongs to a run |
+| `session_id` | The chat session of the run. Present when the run uses one |
+| `warning` | Text to show before "allow forever", for example for an interpreter. Present when needed |
 | `caller` | Identity of the caller that triggered this request |
+
+Questions that the classifier answers, or that `nobody` refuses, are not pushed. See [Interactive approvals](/v0/security/approvals#who-answers).
 
 ### `approvals.subscribe`
 
