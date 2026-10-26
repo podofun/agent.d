@@ -269,31 +269,41 @@ impl Caller {
     }
 }
 
-/// Context-level policy: blanket denies that override grants.
+/// `[denial]`: what nobody may do or reach, whatever the grants say. A denial
+/// is decided before any question, so it is never offered for approval.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Policy {
-    /// Action names this policy denies outright.
+#[serde(deny_unknown_fields)]
+pub struct Denial {
+    /// Action names nobody may call.
     #[serde(default)]
-    pub deny_actions: BTreeSet<String>,
-    /// Permissions this policy denies regardless of grant.
+    pub actions: BTreeSet<String>,
+    /// Permissions nobody may use.
     #[serde(default)]
-    pub deny_permissions: PermissionSet,
-    /// Action names whose `confirm = true` gate is pre-approved. Set by an
-    /// operator "allow forever" on a confirm action; promotes that action's
-    /// `NeedsConfirmation` to `Allow`.
-    #[serde(default)]
-    pub auto_confirm: BTreeSet<String>,
+    pub permissions: PermissionSet,
 }
 
-impl Policy {
+impl Denial {
     pub fn denies_action(&self, name: &str) -> bool {
-        self.deny_actions.contains(name)
+        self.actions.contains(name)
     }
     pub fn denies_permission(&self, p: &Permission) -> bool {
-        self.deny_permissions.contains(p)
+        self.permissions.contains(p)
     }
-    pub fn auto_confirms(&self, name: &str) -> bool {
-        self.auto_confirm.contains(name)
+}
+
+/// `[approval]`: how questions get answered.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Approval {
+    /// Confirm-gated actions that are never asked about. An "allow forever"
+    /// on a confirm question adds the action here.
+    #[serde(default)]
+    pub skip: BTreeSet<String>,
+}
+
+impl Approval {
+    pub fn skips(&self, name: &str) -> bool {
+        self.skip.contains(name)
     }
 }
 

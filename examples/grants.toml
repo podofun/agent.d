@@ -1,8 +1,7 @@
-# 5-layer permission engine grants.
-#   tool ∩ action.requires ∩ runner.allowed_actions
-#                          ∩ interface.allowed_actions
-#                          ∩ policy
-#   = Decision. Default-deny.
+# Permission grants. Default-deny.
+#   [denial] is checked first: nobody may do or reach what it lists, and nobody
+#   is asked. Then a call needs the runner's allowed_actions, the tool's granted
+#   permissions, and, for confirm actions, an answer or an [approval].skip entry.
 #
 # A tool's manifest `requires` is NEVER self-granting. This file is the
 # only source of grants.
@@ -42,12 +41,16 @@ allowed_actions = ["git.diff", "git.status"]
 # [package.acme]
 # trusted = true
 
-# Final policy layer (denylist).
+# What nobody may do or reach, whatever the grants say. Never asked about.
+# File denials must be absolute paths.
 #
-# [policy]
-# deny_actions = ["shell.exec"]
-# deny_permissions = []
-# Actions whose `confirm = true` gate is pre-approved (promoted to Allow).
-# An operator "allow forever" on a confirm action via `agentctl grants listen`
-# appends here automatically; you may also hand-edit it.
-# auto_confirm = []
+# [denial]
+# actions = ["pkg.publish"]
+# permissions = ["net:tracker.example.com", "fs.read:/home/me/project/.env"]
+
+# How questions get answered. `skip` lists confirm actions that are never
+# asked about. An "allow forever" on a confirm question via
+# `agentctl grants listen` appends here automatically; you may also hand-edit it.
+#
+# [approval]
+# skip = []

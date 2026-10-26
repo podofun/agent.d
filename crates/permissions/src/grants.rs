@@ -14,25 +14,33 @@
 //! allowed_actions = ["git.status"]
 //! granted = []
 //!
-//! [policy]
-//! deny_actions = []
-//! deny_permissions = []
+//! [denial]
+//! actions = []
+//! permissions = []
+//!
+//! [approval]
+//! skip = []
 //! ```
+//!
+//! Every table rejects unknown keys, so a misspelled section or key fails to
+//! load instead of silently dropping a rule.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{PermissionSet, Policy};
+use crate::model::{Approval, Denial, Permission, PermissionSet};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolGrants {
     #[serde(default)]
     pub granted: PermissionSet,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunnerGrants {
     #[serde(default)]
     pub allowed_actions: std::collections::BTreeSet<String>,
@@ -41,6 +49,7 @@ pub struct RunnerGrants {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InterfaceGrants {
     #[serde(default)]
     pub allowed_actions: std::collections::BTreeSet<String>,
@@ -49,6 +58,7 @@ pub struct InterfaceGrants {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceGrants {
     /// Permission slugs the service can exercise via `agentd.context.*`.
     #[serde(default)]
@@ -60,6 +70,7 @@ pub struct ServiceGrants {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PackageGrants {
     /// Single approval that inherits to every component the package registers.
     /// The loader desugars a trusted package into per-tool/runner/service rows;
@@ -69,6 +80,7 @@ pub struct PackageGrants {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantsFile {
     #[serde(default)]
     pub tool: BTreeMap<String, ToolGrants>,
@@ -81,7 +93,9 @@ pub struct GrantsFile {
     #[serde(default)]
     pub package: BTreeMap<String, PackageGrants>,
     #[serde(default)]
-    pub policy: Policy,
+    pub denial: Denial,
+    #[serde(default)]
+    pub approval: Approval,
 }
 
 /// Materialized grants used by the engine. Provides fast lookups.
@@ -114,8 +128,11 @@ impl Grants {
     pub fn package(&self, name: &str) -> Option<&PackageGrants> {
         self.file.package.get(name)
     }
-    pub fn policy(&self) -> &Policy {
-        &self.file.policy
+    pub fn denial(&self) -> &Denial {
+        &self.file.denial
+    }
+    pub fn approval(&self) -> &Approval {
+        &self.file.approval
     }
 }
 
@@ -125,16 +142,101 @@ pub fn load_grants_file(path: &Path) -> Result<GrantsFile, String> {
     }
     let body = std::fs::read_to_string(path).map_err(|e| {
         format!(
-            "could not read the grants file `{}` ({e}) — check that the file exists and is readable",
+            "could not read the grants file `{}` ({e}). Check that the file exists and is readable",
             path.display()
         )
     })?;
-    toml::from_str(&body).map_err(|e| {
-        format!(
-            "the grants file `{}` is not valid TOML ({e}) — fix the syntax and try again",
-            path.display()
+    parse_grants(&body).map_err(|e| format!("the grants file `{}` {e}", path.display()))
+}
+
+/// Parse and check grants.toml text. Errors read as the end of a sentence
+/// that starts with the file's name.
+pub fn parse_grants(body: &str) -> Result<GrantsFile, String> {
+    let table: toml::Table = toml::from_str(body)
+        .map_err(|e| format!("is not valid TOML ({e}). Fix the syntax and try again"))?;
+    if table.contains_key("policy") {
+        return Err("still has a `[policy]` section, which was replaced. Move `deny_actions` to `[denial].actions`, `deny_permissions` to `[denial].permissions`, and `auto_confirm` to `[approval].skip`".into());
+    }
+    let file: GrantsFile = table.try_into().map_err(|e| {
+        format!("has an entry agentd does not know ({e}). Check the spelling of the section and key names")
+    })?;
+    check_grants(&file)?;
+    Ok(file)
+}
+
+/// Reject a rule that could never match: a permission pattern the matcher
+/// does not support, or a file denial that is not an absolute path.
+fn check_grants(file: &GrantsFile) -> Result<(), String> {
+    let sets = file
+        .tool
+        .iter()
+        .map(|(n, g)| (format!("[tool.{n}]"), &g.granted))
+        .chain(
+            file.runner
+                .iter()
+                .map(|(n, g)| (format!("[runner.{n}]"), &g.granted)),
         )
-    })
+        .chain(
+            file.interface
+                .iter()
+                .map(|(n, g)| (format!("[interface.{n}]"), &g.granted)),
+        )
+        .chain(
+            file.service
+                .iter()
+                .map(|(n, g)| (format!("[service.{n}]"), &g.granted)),
+        )
+        .chain(std::iter::once((
+            "[denial]".to_string(),
+            &file.denial.permissions,
+        )));
+    for (section, set) in sets {
+        for p in set.iter() {
+            if let Some(why) = unsupported_pattern(p) {
+                return Err(format!(
+                    "lists `{}` in `{section}`, which can never match because {why}",
+                    p.as_str()
+                ));
+            }
+        }
+    }
+    for p in file.denial.permissions.iter() {
+        if let ("fs.read" | "fs.write", Some(path)) = p.parts()
+            && !is_absolute_path(path)
+        {
+            return Err(format!(
+                "denies `{}`, which is not an absolute path, so it could deny nothing. Write the full path, starting from the root",
+                p.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Why the matcher can never match `p`, if it cannot. A `*` is supported only
+/// at the very end (`api.*`, `/dir/*`, `/dir/**`), and IPv6 addresses are
+/// compared in their shortest form, so a prefix of one may never match.
+fn unsupported_pattern(p: &Permission) -> Option<&'static str> {
+    let (domain, spec) = p.parts();
+    if domain.contains('*') {
+        return Some("a `*` is only supported at the end of the part after the colon");
+    }
+    let spec = spec?;
+    let body = spec.trim_end_matches('*');
+    if body.contains('*') {
+        return Some("a `*` is only supported at the end, as in `api.*` or `/dir/**`");
+    }
+    if domain == "net" && spec.ends_with('*') && body.contains(':') {
+        return Some(
+            "IPv6 addresses are compared in their shortest form, so grant or deny whole addresses",
+        );
+    }
+    None
+}
+
+fn is_absolute_path(path: &str) -> bool {
+    !path.starts_with('~')
+        && (Path::new(path).is_absolute() || path.starts_with('/') || path.starts_with('\\'))
 }
 
 #[cfg(test)]
@@ -154,17 +256,70 @@ mod tests {
             [interface.telegram]
             allowed_actions = ["git.status"]
 
-            [policy]
-            deny_actions = ["shell.exec"]
+            [denial]
+            actions = ["shell.exec"]
+            permissions = ["fs.read:/proj/.env"]
+
+            [approval]
+            skip = ["deploy.preview"]
         "#;
-        let f: GrantsFile = toml::from_str(toml).unwrap();
+        let f = parse_grants(toml).unwrap();
         assert_eq!(f.tool.len(), 1);
         let tool = f.tool.get("google_calendar").unwrap();
         assert!(tool.granted.0.iter().any(|p| p.as_str() == "oauth:google"));
         let runner = f.runner.get("backend_reviewer").unwrap();
         assert!(runner.allowed_actions.contains("git.diff"));
-        assert!(f.policy.deny_actions.contains("shell.exec"));
+        assert!(f.denial.actions.contains("shell.exec"));
+        assert!(f.approval.skips("deploy.preview"));
         let _g = Grants::from_file(f);
+    }
+
+    fn err(toml: &str) -> String {
+        parse_grants(toml).unwrap_err()
+    }
+
+    #[test]
+    fn a_leftover_policy_section_names_the_new_sections() {
+        let e = err("[policy]\ndeny_actions = [\"x\"]\n");
+        assert!(e.contains("[denial].actions"), "{e}");
+        assert!(e.contains("[approval].skip"), "{e}");
+    }
+
+    #[test]
+    fn misspelled_sections_and_keys_fail_to_load() {
+        assert!(err("[denail]\nactions = []\n").contains("denail"));
+        assert!(err("[denial]\naction = []\n").contains("action"));
+        assert!(err("[tool.t]\ngrant = []\n").contains("grant"));
+        assert!(err("[approval]\nskips = []\n").contains("skips"));
+    }
+
+    #[test]
+    fn unsupported_patterns_are_rejected() {
+        let e = err("[denial]\npermissions = [\"net:*.example.com\"]\n");
+        assert!(
+            e.contains("net:*.example.com") && e.contains("[denial]"),
+            "{e}"
+        );
+        assert!(err("[tool.t]\ngranted = [\"fs.read:/a/*/b\"]\n").contains("[tool.t]"));
+        assert!(err("[tool.t]\ngranted = [\"fs.*\"]\n").contains("fs.*"));
+        assert!(err("[tool.t]\ngranted = [\"net:2001:db8:*\"]\n").contains("IPv6"));
+        for ok in [
+            "net:api.*",
+            "fs.read:/dir/**",
+            "fs.read:/dir/*",
+            "net:169.254.*",
+            "net:*",
+            "shell.exec",
+        ] {
+            parse_grants(&format!("[tool.t]\ngranted = [\"{ok}\"]\n")).unwrap();
+        }
+    }
+
+    #[test]
+    fn file_denials_must_be_absolute() {
+        assert!(err("[denial]\npermissions = [\"fs.read:.env\"]\n").contains("absolute"));
+        assert!(err("[denial]\npermissions = [\"fs.write:~/secrets\"]\n").contains("absolute"));
+        parse_grants("[denial]\npermissions = [\"fs.read:/proj/.env\", \"fs.read\"]\n").unwrap();
     }
 
     #[test]
