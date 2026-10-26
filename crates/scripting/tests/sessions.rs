@@ -315,7 +315,10 @@ async fn sessions_store_an_approval_setting() {
     )
     .await
     .unwrap_err();
-    assert!(bad.to_string().contains("\"human\" or \"nobody\""), "{bad}");
+    assert!(
+        bad.to_string().contains("\"classifier\" or \"nobody\""),
+        "{bad}"
+    );
 
     let admin = store
         .create(NewSession::in_scope(&Scope::admin(None)))

@@ -834,6 +834,9 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
             };
             match serde_json::from_value::<CreateSessionParams>(req.params) {
                 Ok(p) => {
+                    if let Some(e) = classifier_missing(id, &executor, p.approval) {
+                        return e;
+                    }
                     let caller = ws_caller(conn, p.session, p.user);
                     let new = agentd_sessions::NewSession::in_scope(&conn_scope(conn, &caller))
                         .label(p.label)
@@ -935,6 +938,9 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
             };
             match serde_json::from_value::<SetApprovalParams>(req.params) {
                 Ok(p) => {
+                    if let Some(e) = classifier_missing(id, &executor, p.approval) {
+                        return e;
+                    }
                     // Anyone who can see a session can store a value on it.
                     // Whether it takes effect is decided at each run.
                     let scope = conn_scope(conn, &ws_caller(conn, p.session, p.user));
@@ -1064,6 +1070,24 @@ struct SessionRef {
     user: Option<String>,
 }
 
+/// A session may be set to `classifier` only when `[approval].classifier`
+/// names a runner.
+fn classifier_missing(
+    id: u64,
+    executor: &Executor,
+    approval: Option<agentd_permissions::ApprovalSetting>,
+) -> Option<WsResponse> {
+    (approval == Some(agentd_permissions::ApprovalSetting::Classifier)
+        && executor.classifier_name().is_none())
+    .then(|| {
+        err(
+            id,
+            "classifier_not_configured",
+            "`approval: \"classifier\"` needs a classifier, and `[approval].classifier` in grants.toml names no runner",
+        )
+    })
+}
+
 fn no_sessions(id: u64) -> WsResponse {
     err(
         id,
@@ -1146,6 +1170,9 @@ fn tip_for(code: &str) -> Option<String> {
         }
         "bad_params" => "Pass args as `-d key=value` or `-j '<json>'`",
         "approval_forbidden" => "Connect with the admin token, or use a stricter setting",
+        "classifier_not_configured" => {
+            "Name a classifier runner in `[approval].classifier` in grants.toml, or use `human` or `nobody`"
+        }
         _ => return None,
     };
     Some(tip.to_string())

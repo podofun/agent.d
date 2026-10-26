@@ -133,6 +133,11 @@ pub fn build_runtime(cfg: &Config, shared: &Shared) -> Result<BuiltRuntime> {
         executor.set_grants_path(cfg.grants_file.clone());
         executor.set_reload_grants(reload);
     }
+    // The classifier and runner approval defaults need both grants and
+    // runners, so they are checked here, on every load and reload.
+    executor
+        .validate_approval_config()
+        .map_err(|e| anyhow!(e))?;
 
     let executor = Arc::new(executor);
     // Wire the executor back into Lua so `ctx.run` / `agentd.runners.run` work.

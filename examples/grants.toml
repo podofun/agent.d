@@ -24,6 +24,9 @@ granted = ["shell.exec:git"]
 [runner.backend_reviewer]
 granted = ["ai:anthropic"]
 allowed_actions = ["git.diff", "git.status"]
+# Who answers this runner's questions: "human" (the default), "classifier",
+# or "nobody" (anything not granted is refused, nothing is asked).
+# approval = "human"
 
 # Per-interface action allowlist. Empty = no constraint.
 #
@@ -52,5 +55,9 @@ allowed_actions = ["git.diff", "git.status"]
 # asked about. An "allow forever" on a confirm question via
 # `agentctl grants listen` appends here automatically; you may also hand-edit it.
 #
+# `classifier` names the runner that answers questions for runs whose approval
+# is "classifier". It must have no actions and use a provider agent.d drives.
+#
 # [approval]
+# classifier = "approval_classifier"
 # skip = []

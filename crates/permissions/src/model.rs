@@ -252,6 +252,9 @@ pub enum ApprovalSetting {
     Nobody,
     /// Questions go to connected approvers. The default.
     Human,
+    /// Questions go to the runner named in `[approval].classifier`, which
+    /// answers allow, refuse, or unsure. Unsure goes to a human.
+    Classifier,
 }
 
 impl ApprovalSetting {
@@ -259,6 +262,7 @@ impl ApprovalSetting {
         match self {
             ApprovalSetting::Nobody => "nobody",
             ApprovalSetting::Human => "human",
+            ApprovalSetting::Classifier => "classifier",
         }
     }
 }
@@ -334,6 +338,10 @@ impl Denial {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Approval {
+    /// The runner that answers questions for runs whose approval is
+    /// `classifier`. Validated where runners are known, on every load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier: Option<String>,
     /// Confirm-gated actions that are never asked about. An "allow forever"
     /// on a confirm question adds the action here.
     #[serde(default)]
