@@ -9,7 +9,7 @@
 //!    that loopback.
 //! 3. claude calls `notes.lookup` over MCP HTTP.
 //! 4. MCP server forwards to `Executor::run`.
-//! 5. Permission engine: tool grants OK, runner allowlist OK, policy OK.
+//! 5. Permission engine: tool grants OK, runner allowlist OK, no denial.
 //! 6. Registry (LuaHost) invokes the Lua handler.
 //! 7. Lua handler runs `agentd.context.fs.write(marker, ...)` — that
 //!    creates a real file we can stat from the test, proving the handler

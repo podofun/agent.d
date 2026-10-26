@@ -24,7 +24,8 @@ use std::time::Instant;
 use agentd_ai::ProviderRegistry;
 use agentd_permissions::{
     ActionMeta as PermActionMeta, Caller, Decision, Engine, PermissionSet,
-    ToolMeta as PermToolMeta, engine::DenyLayer,
+    ToolMeta as PermToolMeta,
+    engine::{Approved, DenyLayer},
 };
 use agentd_runners::{CompactPolicy, RunOptions, RunnerError, RunnerOutcome, RunnerRegistry};
 use agentd_services::{ServiceRegistry, ServiceState};
@@ -55,9 +56,8 @@ impl Dispatcher for Executor {
     ) -> agentd_types::GrantDecision {
         // Mint a virtual ActionMeta scoped to `tool`. The engine runs
         // the full 5-layer check exactly like it would for any real
-        // action: policy denylist → tool package grants cover required
-        // → runner allowlist on action name → interface allowlist →
-        // confirm. The caller (CodexAppServerProvider) passes
+        // action: denials, the service and interface allowlists, the runner
+        // allowlist, tool package grants cover required, then confirm. The caller (CodexAppServerProvider) passes
         // `tool = "codex"` and `action_name` it picks (e.g.
         // `codex.shell.exec`); user policy decides whether the runner
         // is allowed to use it.
@@ -112,7 +112,7 @@ fn decision_to_error(
 ) -> RegistryError {
     match decision {
         Decision::NeedsConfirmation { reason } => RegistryError::NeedsConfirmation(format!(
-            "{reason} (caller {})\nfix: run `agentctl grants listen` and approve the request, or add `{}` to `[policy].auto_confirm` in grants.toml",
+            "{reason} (caller {})\nfix: run `agentctl grants listen` and approve the request, or add `{}` to `[approval].skip` in grants.toml",
             caller_summary(caller),
             action_meta.name
         )),
@@ -204,14 +204,14 @@ fn denial_reason(
                 toml_array(&[action.to_string()])
             )
         }
-        DenyLayer::Policy => {
+        DenyLayer::Denial => {
             let fix = if raw_reason.contains("permission `") {
-                "remove the denied permission from `[policy].deny_permissions` in grants.toml"
+                "remove the permission from `[denial].permissions` in grants.toml"
             } else {
-                "remove the action from `[policy].deny_actions` in grants.toml"
+                "remove the action from `[denial].actions` in grants.toml"
             };
             format!(
-                "action `{action}` is blocked by policy\nreason: {raw_reason}\ncaller: {caller_text}\nfix: {fix}"
+                "action `{action}` is denied by the operator\nreason: {raw_reason}\ncaller: {caller_text}\nfix: {fix}"
             )
         }
     }
@@ -240,7 +240,7 @@ fn caller_runner_name(caller: &Caller) -> Option<String> {
 
 fn deny_layer_label(layer: DenyLayer) -> &'static str {
     match layer {
-        DenyLayer::Policy => "policy",
+        DenyLayer::Denial => "denial",
         DenyLayer::Tool => "tool",
         DenyLayer::Runner => "runner",
         DenyLayer::Interface => "interface",
@@ -507,45 +507,62 @@ impl Executor {
             }
         }
 
-        let decision = self
-            .engine
-            .load()
-            .check(&caller, tool_meta.as_ref(), &action_meta);
-
-        // Permissions granted to *this dispatch only* on top of the static
-        // grants (populated by an "allow once" verdict).
-        let mut extra_grants = PermissionSet::empty();
-        if !matches!(decision, Decision::Allow) {
-            let escalatable = decision.is_escalatable() && self.broker.is_some();
-            if escalatable {
-                match self
-                    .escalate(decision, &action_meta, tool_name.as_deref(), &caller)
-                    .await
-                {
-                    Escalation::Proceed { extra } => extra_grants = extra,
-                    Escalation::Reject(err) => {
-                        let dur = started.elapsed().as_millis();
-                        self.trace
-                            .record(
-                                TraceEvent::err(&action_name, args, dur, err.to_string())
-                                    .with_execution(execution.clone())
-                                    .with_kind("action"),
-                            )
-                            .await;
-                        return Err((err, dur));
-                    }
-                }
-            } else {
-                // Not escalatable (policy / interface / service) or no
-                // broker wired: reject with a diagnostic that names the
-                // denied component and the grants.toml fix.
-                let err = decision_to_error(
+        // Check, then ask one question at a time. Every approving answer is
+        // recorded and the engine runs again, so an answer never skips a
+        // denial or a later question. There are at most three questions
+        // (runner allowlist, grants, confirm).
+        let mut approved = Approved::default();
+        let mut asked = 0;
+        loop {
+            let decision = self.engine.load().check_approved(
+                &caller,
+                tool_meta.as_ref(),
+                &action_meta,
+                &approved,
+            );
+            if decision == Decision::Allow {
+                break;
+            }
+            let err = if !decision.is_escalatable() || self.broker.is_none() {
+                // A denial, or no approver wired: reject with a diagnostic
+                // that names the denied component and the grants.toml fix.
+                Some(decision_to_error(
                     decision,
                     &action_meta,
                     tool_name.as_deref(),
                     &caller,
                     &self.engine.load(),
+                ))
+            } else if asked >= 3 {
+                Some(RegistryError::Invocation(format!(
+                    "the permission check for `{action_name}` asked a fourth question, which should never happen. This is a bug in agentd, please report it"
+                )))
+            } else {
+                asked += 1;
+                let runner_question = matches!(
+                    decision,
+                    Decision::Deny {
+                        layer: DenyLayer::Runner,
+                        ..
+                    }
                 );
+                let confirm_question = matches!(decision, Decision::NeedsConfirmation { .. });
+                match self
+                    .escalate(decision, &action_meta, tool_name.as_deref(), &caller)
+                    .await
+                {
+                    Escalation::Proceed { extra } => {
+                        for p in extra.iter() {
+                            approved.permissions.insert(p.clone());
+                        }
+                        approved.runner_action |= runner_question;
+                        approved.confirm |= confirm_question;
+                        None
+                    }
+                    Escalation::Reject(err) => Some(err),
+                }
+            };
+            if let Some(err) = err {
                 let dur = started.elapsed().as_millis();
                 self.trace
                     .record(
@@ -557,6 +574,7 @@ impl Executor {
                 return Err((err, dur));
             }
         }
+        let extra_grants = approved.permissions;
 
         // Base grants are read AFTER escalation: an "allow forever" verdict has
         // already reloaded the engine, so the missing perm is now static here;
@@ -737,7 +755,7 @@ impl Executor {
                     .await
                 {
                     Ok(()) => Escalation::Proceed {
-                        extra: PermissionSet::empty(),
+                        extra: PermissionSet::from_iter(missing),
                     },
                     Err(e) => Escalation::Reject(RegistryError::Invocation(format!(
                         "the approval was granted but could not be saved to grants.toml ({e}) — approve again or edit grants.toml by hand"
@@ -795,11 +813,11 @@ impl Executor {
             agentd_types::ApprovalKind::Confirm => {
                 let ac = doc
                     .as_table_mut()
-                    .entry("policy")
+                    .entry("approval")
                     .or_insert(toml_edit::table())
                     .as_table_mut()
-                    .ok_or("the `policy` key in grants.toml is not a table — remove or rename the conflicting `policy` entry")?
-                    .entry("auto_confirm")
+                    .ok_or("the `approval` key in grants.toml is not a table. Remove or rename the conflicting `approval` entry")?
+                    .entry("skip")
                     .or_insert(toml_edit::value(toml_edit::Array::new()));
                 append_unique(
                     ensure_string_array(ac),
@@ -1170,16 +1188,11 @@ impl ExecutorHandle {
 /// the very next call.
 impl agentd_types::Denials for Executor {
     fn denied_permissions(&self) -> agentd_permissions::PermissionSet {
-        self.engine
-            .load()
-            .grants()
-            .policy()
-            .deny_permissions
-            .clone()
+        self.engine.load().grants().denial().permissions.clone()
     }
 
     fn denies_action(&self, name: &str) -> bool {
-        self.engine.load().grants().policy().denies_action(name)
+        self.engine.load().grants().denial().denies_action(name)
     }
 }
 
@@ -1446,8 +1459,8 @@ impl Executor {
         let engine = self.engine.load();
         let denied = engine
             .grants()
-            .policy()
-            .deny_permissions
+            .denial()
+            .permissions
             .iter()
             .find(|p| matches!(p.parts().0, "fs.read" | "fs.write" | "net"))
             .cloned();
@@ -1768,6 +1781,18 @@ impl Executor {
                     });
                     for call in resp.tool_calls {
                         let id = call.id.clone();
+                        // The model may only call the tools this run offered,
+                        // never any registered action it names.
+                        if !req.tools.iter().any(|t| t.name == call.name) {
+                            req.messages.push(agentd_ai::Message::tool_result(
+                                id,
+                                format!(
+                                    "tool call failed (`{}` is not one of the tools this runner was given)",
+                                    call.name
+                                ),
+                            ));
+                            continue;
+                        }
                         let action = ActionCall {
                             action: call.name.clone(),
                             args: call.arguments.clone(),

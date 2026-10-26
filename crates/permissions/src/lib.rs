@@ -1,7 +1,7 @@
 //! Permission model. Default-deny. Five-layer intersection:
 //!
 //! ```text
-//! tool-package-grants ∩ action-requires ∩ runner-allow ∩ interface-allow ∩ policy = Decision
+//! denials first, then runner-allow, tool-package-grants ⊇ action-requires, confirm = Decision
 //! ```
 //!
 //! Permissions are flat string slugs. A slug has shape `domain[:specifier]`:
@@ -23,9 +23,9 @@ pub mod grants;
 pub mod model;
 
 pub use engine::{Decision, Engine, EngineError};
-pub use grants::{Grants, GrantsFile, load_grants_file};
+pub use grants::{Grants, GrantsFile, load_grants_file, parse_grants};
 pub use grants::{InterfaceGrants, PackageGrants, RunnerGrants, ServiceGrants, ToolGrants};
 pub use model::{
-    ActionMeta, Caller, ExecutionId, InterfaceId, Permission, PermissionSet, Policy, RunnerId,
-    ServiceId, SessionId, ToolMeta, UserId,
+    ActionMeta, Approval, Caller, Denial, ExecutionId, InterfaceId, Permission, PermissionSet,
+    RunnerId, ServiceId, SessionId, ToolMeta, UserId,
 };

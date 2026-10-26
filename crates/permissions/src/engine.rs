@@ -1,12 +1,20 @@
-//! Permission engine: enforces the 5-layer intersection.
+//! Permission engine: decides whether a caller may run an action.
 //!
-//! Layer order (first failure decides):
-//!   1. Policy denial of action name
-//!   2. Tool package has all permissions the action requires
-//!   3. Runner is allowed to call this action (if caller has a runner)
-//!   4. Interface is allowed to trigger this action (if caller has an interface)
-//!   5. Policy denial of any required permission
-//!   6. Action confirm flag -> NeedsConfirmation
+//! Denials are decided first, so a question is only ever asked about
+//! something no denial forbids:
+//!   1. `[denial].actions`
+//!   2. `[denial].permissions`, against every permission the action requires
+//!   3. the service allowlist (if the caller is a service)
+//!   4. the interface allowlist (if the caller is an interface)
+//!
+//! Then the questions, one at a time, in this order:
+//!   5. the runner allowlist (if the caller is a runner)
+//!   6. the tool's grants cover every required permission
+//!   7. the action's confirm gate, unless `[approval].skip` lists it
+//!
+//! [`Approved`] records what has been approved so far, so the caller can run
+//! the check again after each answer until it is granted, denied, or reaches
+//! the next question.
 //!
 //! Default: **deny**. A subject that is not listed in grants gets no permissions
 //! and no allowlist. Tool with no granted set cannot satisfy any action that
@@ -15,7 +23,7 @@
 use thiserror::Error;
 
 use crate::grants::Grants;
-use crate::model::{ActionMeta, Caller, ToolMeta};
+use crate::model::{ActionMeta, Caller, PermissionSet, ToolMeta};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -26,17 +34,29 @@ pub enum Decision {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenyLayer {
-    Policy,
+    Denial,
     Tool,
     Runner,
     Interface,
     Service,
 }
 
+/// What has been approved so far for one action invocation. Every approving
+/// answer adds to it before the check runs again.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Approved {
+    /// Permissions approved on top of the tool's grants.
+    pub permissions: PermissionSet,
+    /// The runner may call this action although its allowlist omits it.
+    pub runner_action: bool,
+    /// The confirm gate was answered.
+    pub confirm: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error(
-        "tool `{0}` is not registered — check the tool name in grants.toml against the loaded tools"
+        "tool `{0}` is not registered. Check the tool name in grants.toml against the loaded tools"
     )]
     UnknownTool(String),
 }
@@ -57,10 +77,13 @@ impl Engine {
     /// Authorize the model capability independently of tool dispatch.
     pub fn check_runner_provider(&self, runner: &str, provider: &str) -> Decision {
         let permission = crate::Permission::new(format!("ai:{provider}"));
-        if self.grants.policy().denies_permission(&permission) {
+        if self.grants.denial().denies_permission(&permission) {
             return Decision::Deny {
-                layer: DenyLayer::Policy,
-                reason: format!("permission `{}` is denied by policy", permission.as_str()),
+                layer: DenyLayer::Denial,
+                reason: format!(
+                    "permission `{}` is in `[denial].permissions` in grants.toml",
+                    permission.as_str()
+                ),
             };
         }
         if !self
@@ -79,29 +102,31 @@ impl Engine {
         Decision::Allow
     }
 
-    /// Check whether `caller` may execute `action` under `tool`.
+    /// Check whether `caller` may execute `action` under `tool`, with nothing
+    /// approved yet. See [`Engine::check_approved`].
+    pub fn check(&self, caller: &Caller, tool: Option<&ToolMeta>, action: &ActionMeta) -> Decision {
+        self.check_approved(caller, tool, action, &Approved::default())
+    }
+
+    /// Check whether `caller` may execute `action` under `tool`, given what
+    /// has been approved so far.
     ///
     /// `tool` is the package metadata for the tool the action belongs to. If
     /// the action's `tool` field is `None` and `tool` is also `None`, the
     /// engine treats package perms as empty (only useful for actions that
     /// require no permissions, e.g. trivial built-ins).
-    pub fn check(&self, caller: &Caller, tool: Option<&ToolMeta>, action: &ActionMeta) -> Decision {
-        let policy = self.grants.policy();
-
-        // 1. Policy denial on action name.
-        if policy.denies_action(&action.name) {
-            return Decision::Deny {
-                layer: DenyLayer::Policy,
-                reason: format!(
-                    "action `{}` is on the policy deny list in grants.toml",
-                    action.name
-                ),
-            };
-        }
+    pub fn check_approved(
+        &self,
+        caller: &Caller,
+        tool: Option<&ToolMeta>,
+        action: &ActionMeta,
+        approved: &Approved,
+    ) -> Decision {
+        let denial = self.grants.denial();
 
         // Required permissions are the UNION of the action's own `requires`
         // and the declaring tool's `requires`. Declaring on the tool, the
-        // action, or both is equivalent — every permission in the union must
+        // action, or both is equivalent: every permission in the union must
         // be covered by the grants file.
         let mut required = action.requires.clone();
         if let Some(t) = tool {
@@ -110,35 +135,122 @@ impl Engine {
             }
         }
 
-        // 2. Tool package covers required permissions.
+        // 1. Denied action.
+        if denial.denies_action(&action.name) {
+            return Decision::Deny {
+                layer: DenyLayer::Denial,
+                reason: format!(
+                    "action `{}` is in `[denial].actions` in grants.toml",
+                    action.name
+                ),
+            };
+        }
+
+        // 2. Denied permission.
+        if let Some(req) = required.iter().find(|r| denial.denies_permission(r)) {
+            return Decision::Deny {
+                layer: DenyLayer::Denial,
+                reason: format!(
+                    "permission `{}` is in `[denial].permissions` in grants.toml",
+                    req.as_str()
+                ),
+            };
+        }
+
+        // 3. Service allowlist (if a service is identified). Services that
+        //    dispatch actions via `agentd.context.tools.call(...)` are gated
+        //    here. Empty `allowed_actions` = no constraint at this layer.
+        if let Some(svc_id) = &caller.service {
+            match self.grants.service(svc_id.as_str()) {
+                Some(svc)
+                    if svc.allowed_actions.is_empty()
+                        || svc.allowed_actions.contains(&action.name) => {}
+                Some(_) => {
+                    return Decision::Deny {
+                        layer: DenyLayer::Service,
+                        reason: format!(
+                            "service `{}` is not allowed to call `{}`. Add the action to the service's `allowed_actions` list in grants.toml",
+                            svc_id.as_str(),
+                            action.name
+                        ),
+                    };
+                }
+                None => {
+                    return Decision::Deny {
+                        layer: DenyLayer::Service,
+                        reason: format!(
+                            "service `{}` has no entry in grants.toml. Add a `[service.{}]` section to register it",
+                            svc_id.as_str(),
+                            svc_id.as_str()
+                        ),
+                    };
+                }
+            }
+        }
+
+        // 4. Interface allowlist (if an interface is identified). No entry
+        //    means no constraint: interface gating is opt-in.
+        if let Some(iface_id) = &caller.interface
+            && let Some(iface) = self.grants.interface(iface_id.as_str())
+            && !iface.allowed_actions.is_empty()
+            && !iface.allowed_actions.contains(&action.name)
+        {
+            return Decision::Deny {
+                layer: DenyLayer::Interface,
+                reason: format!(
+                    "interface `{}` is not allowed to call `{}`. Add the action to the interface's `allowed_actions` list in grants.toml",
+                    iface_id.as_str(),
+                    action.name
+                ),
+            };
+        }
+
+        // 5. Runner allowlist (if a runner is identified).
+        if let Some(runner_id) = &caller.runner
+            && !approved.runner_action
+            && !self
+                .grants
+                .runner(runner_id.as_str())
+                .is_some_and(|r| r.allowed_actions.contains(&action.name))
+        {
+            return Decision::Deny {
+                layer: DenyLayer::Runner,
+                reason: format!(
+                    "runner `{}` is not allowed to call `{}`. Add the action to the runner's `allowed_actions` list in grants.toml",
+                    runner_id.as_str(),
+                    action.name
+                ),
+            };
+        }
+
+        // 6. Tool grants, plus what was approved, cover required permissions.
         //
         // The ONLY source of "granted" is the grants file. A tool's own
-        // manifest declares what it `requires` (what it asks for) — that is
-        // never self-granting. If the user hasn't approved the tool in the
-        // grants file, the tool has no permissions. Default-deny.
+        // manifest declares what it `requires` (what it asks for), which is
+        // never self-granting. Grants are keyed by tool NAME: prefer the
+        // registered `ToolMeta` name, but fall back to the action's own
+        // declared tool so an action with no explicit `agentd.tool{...}` is
+        // still grantable via `[tool.<ns>]`. The executor's denial reporter
+        // and "allow forever" persistence key off `action.tool` the same way.
         if !required.is_empty() {
-            // Grants are keyed by tool NAME, not by a registered tool object.
-            // Prefer the registered `ToolMeta` name, but fall back to the action's
-            // own declared tool (its `tool.action` namespace) so an action with no
-            // explicit `agentd.tool{...}` is still grantable via `[tool.<ns>]`. The
-            // executor's denial reporter and "allow forever" persistence both key
-            // off `action.tool`; binding here the same way keeps all three in sync
-            // and avoids the `<unknown>` / ungrantable-action footgun.
             let tool_name = tool.map(|t| t.name.as_str()).or(action.tool.as_deref());
-            let pkg_granted = tool_name
+            let mut granted = tool_name
                 .and_then(|n| self.grants.tool(n).map(|g| g.granted.clone()))
-                .unwrap_or_else(crate::model::PermissionSet::empty);
-            if !pkg_granted.covers_all(&required) {
+                .unwrap_or_else(PermissionSet::empty);
+            for p in approved.permissions.iter() {
+                granted.insert(p.clone());
+            }
+            if !granted.covers_all(&required) {
                 let missing: Vec<String> = required
                     .iter()
-                    .filter(|r| !pkg_granted.contains(r))
+                    .filter(|r| !granted.contains(r))
                     .map(|p| p.as_str().to_string())
                     .collect();
                 let tool_name = tool_name.unwrap_or("<unknown>");
                 return Decision::Deny {
                     layer: DenyLayer::Tool,
                     reason: format!(
-                        "tool `{tool_name}` has not been granted {} — add {} to its `granted` list in grants.toml",
+                        "tool `{tool_name}` has not been granted {}. Add {} to its `granted` list in grants.toml",
                         missing
                             .iter()
                             .map(|m| format!("`{m}`"))
@@ -150,85 +262,9 @@ impl Engine {
             }
         }
 
-        // 3. Runner allowlist (if a runner is identified).
-        if let Some(runner_id) = &caller.runner {
-            let r = self.grants.runner(runner_id.as_str()).ok_or(());
-            match r {
-                Ok(r) if r.allowed_actions.contains(&action.name) => {}
-                _ => {
-                    return Decision::Deny {
-                        layer: DenyLayer::Runner,
-                        reason: format!(
-                            "runner `{}` is not allowed to call `{}` — add the action to the runner's `allowed_actions` list in grants.toml",
-                            runner_id.as_str(),
-                            action.name
-                        ),
-                    };
-                }
-            }
-        }
-
-        // 3b. Service allowlist (if a service is identified). Services that
-        //     dispatch actions via `agentd.context.tools.call(...)` are gated
-        //     here. Empty `allowed_actions` = no constraint at this layer.
-        if let Some(svc_id) = &caller.service {
-            if let Some(svc) = self.grants.service(svc_id.as_str()) {
-                if !svc.allowed_actions.is_empty() && !svc.allowed_actions.contains(&action.name) {
-                    return Decision::Deny {
-                        layer: DenyLayer::Service,
-                        reason: format!(
-                            "service `{}` is not allowed to call `{}` — add the action to the service's `allowed_actions` list in grants.toml",
-                            svc_id.as_str(),
-                            action.name
-                        ),
-                    };
-                }
-            } else {
-                return Decision::Deny {
-                    layer: DenyLayer::Service,
-                    reason: format!(
-                        "service `{}` has no entry in grants.toml — add a `[service.{}]` section to register it",
-                        svc_id.as_str(),
-                        svc_id.as_str()
-                    ),
-                };
-            }
-        }
-
-        // 4. Interface allowlist (if an interface is identified).
-        if let Some(iface_id) = &caller.interface
-            && let Some(iface) = self.grants.interface(iface_id.as_str())
-            && !iface.allowed_actions.is_empty()
-            && !iface.allowed_actions.contains(&action.name)
-        {
-            return Decision::Deny {
-                layer: DenyLayer::Interface,
-                reason: format!(
-                    "interface `{}` is not allowed to call `{}` — add the action to the interface's `allowed_actions` list in grants.toml",
-                    iface_id.as_str(),
-                    action.name
-                ),
-            };
-        }
-        // No interface grant entry => no constraint applied at this layer.
-        // Interface gating is opt-in: if you want to gate Telegram, list it.
-
-        // 5. Policy denial of any required permission.
-        for req in required.iter() {
-            if policy.denies_permission(req) {
-                return Decision::Deny {
-                    layer: DenyLayer::Policy,
-                    reason: format!(
-                        "permission `{}` is on the policy deny list in grants.toml",
-                        req.as_str()
-                    ),
-                };
-            }
-        }
-
-        // 6. Confirmation gating. An operator "allow forever" on a confirm
-        //    action records it in `policy.auto_confirm`, promoting it to Allow.
-        if action.confirm && !policy.auto_confirms(&action.name) {
+        // 7. Confirm gate. An "allow forever" on a confirm question adds the
+        //    action to `[approval].skip`.
+        if action.confirm && !approved.confirm && !self.grants.approval().skips(&action.name) {
             return Decision::NeedsConfirmation {
                 reason: format!(
                     "action `{}` requires operator confirmation before it can run",
@@ -246,8 +282,8 @@ impl Decision {
     /// Escalatable: a missing grant (Tool layer), a runner calling an action
     /// outside its allowlist (Runner layer — absence from a default-deny list
     /// is not explicit operator intent, so a human gets to decide), and
-    /// confirm gating. The policy denylist and interface/service allowlists
-    /// are explicit operator intent and stay hard-deny.
+    /// confirm gating. `[denial]` and the interface/service allowlists are
+    /// explicit operator intent and are never asked about.
     pub fn is_escalatable(&self) -> bool {
         matches!(
             self,
@@ -264,7 +300,7 @@ impl Decision {
 mod tests {
     use super::*;
     use crate::grants::{GrantsFile, InterfaceGrants, RunnerGrants, ToolGrants};
-    use crate::model::{Caller, PermissionSet, Policy};
+    use crate::model::{Caller, Denial, PermissionSet};
 
     fn engine_with(file: GrantsFile) -> Engine {
         Engine::new(Grants::from_file(file))
@@ -458,11 +494,11 @@ mod tests {
     }
 
     #[test]
-    fn policy_action_deny_short_circuits() {
-        let mut policy = Policy::default();
-        policy.deny_actions.insert("calendar.list_events".into());
+    fn denied_action_short_circuits() {
+        let mut denial = Denial::default();
+        denial.actions.insert("calendar.list_events".into());
         let file = GrantsFile {
-            policy,
+            denial,
             ..Default::default()
         };
         let engine = engine_with(file);
@@ -475,14 +511,14 @@ mod tests {
         assert!(matches!(
             decision,
             Decision::Deny {
-                layer: DenyLayer::Policy,
+                layer: DenyLayer::Denial,
                 ..
             }
         ));
     }
 
     #[test]
-    fn policy_permission_deny_overrides_grant() {
+    fn denied_permission_overrides_grant() {
         let mut file = GrantsFile::default();
         file.tool.insert(
             "google_calendar".into(),
@@ -490,14 +526,14 @@ mod tests {
                 granted: PermissionSet::from_iter(["calendar.read"]),
             },
         );
-        file.policy.deny_permissions = PermissionSet::from_iter(["calendar.read"]);
+        file.denial.permissions = PermissionSet::from_iter(["calendar.read"]);
         let engine = engine_with(file);
         let caller = Caller::default();
         let decision = engine.check(&caller, Some(&calendar_tool(&[])), &read_action());
         assert!(matches!(
             decision,
             Decision::Deny {
-                layer: DenyLayer::Policy,
+                layer: DenyLayer::Denial,
                 ..
             }
         ));
@@ -519,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_confirm_promotes_needs_confirmation_to_allow() {
+    fn approval_skip_promotes_needs_confirmation_to_allow() {
         let mut file = GrantsFile::default();
         file.tool.insert(
             "google_calendar".into(),
@@ -527,9 +563,7 @@ mod tests {
                 granted: PermissionSet::from_iter(["calendar.write"]),
             },
         );
-        file.policy
-            .auto_confirm
-            .insert("calendar.create_event".into());
+        file.approval.skip.insert("calendar.create_event".into());
         let engine = engine_with(file);
         let decision = engine.check(
             &Caller::default(),
@@ -551,7 +585,7 @@ mod tests {
         );
         assert!(
             !Decision::Deny {
-                layer: DenyLayer::Policy,
+                layer: DenyLayer::Denial,
                 reason: "x".into()
             }
             .is_escalatable()
@@ -656,6 +690,125 @@ mod tests {
             c
         }
     }
+    fn runner_caller(name: &str) -> Caller {
+        Caller::default().with_runner(name)
+    }
+
+    /// A denial is decided before any question, so a runner calling an
+    /// action outside its allowlist with a denied permission is denied, not
+    /// asked about the allowlist.
+    #[test]
+    fn denials_come_before_every_question() {
+        let mut file = GrantsFile::default();
+        file.runner.insert("r".into(), RunnerGrants::default());
+        file.denial.permissions = PermissionSet::from_iter(["calendar.read"]);
+        let decision = engine_with(file).check(
+            &runner_caller("r"),
+            Some(&calendar_tool(&[])),
+            &read_action(),
+        );
+        assert!(matches!(
+            decision,
+            Decision::Deny {
+                layer: DenyLayer::Denial,
+                ..
+            }
+        ));
+    }
+
+    /// An interface allowlist miss is a denial, decided before the tool's
+    /// missing grant would become a question.
+    #[test]
+    fn an_interface_miss_comes_before_a_missing_grant() {
+        let mut file = GrantsFile::default();
+        file.interface.insert(
+            "telegram".into(),
+            InterfaceGrants {
+                allowed_actions: ["other".to_string()].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        let caller = Caller::interface("telegram");
+        let decision = engine_with(file).check(&caller, Some(&calendar_tool(&[])), &read_action());
+        assert!(matches!(
+            decision,
+            Decision::Deny {
+                layer: DenyLayer::Interface,
+                ..
+            }
+        ));
+    }
+
+    /// Questions come one at a time: runner allowlist, then grants, then
+    /// confirm, each passed once it is recorded as approved.
+    #[test]
+    fn questions_come_one_at_a_time_until_granted() {
+        let mut file = GrantsFile::default();
+        file.runner.insert("r".into(), RunnerGrants::default());
+        let engine = engine_with(file);
+        let caller = runner_caller("r");
+        let tool = calendar_tool(&[]);
+        let mut approved = Approved::default();
+
+        let d = engine.check_approved(&caller, Some(&tool), &write_action(), &approved);
+        assert!(
+            matches!(
+                d,
+                Decision::Deny {
+                    layer: DenyLayer::Runner,
+                    ..
+                }
+            ),
+            "{d:?}"
+        );
+        approved.runner_action = true;
+
+        let d = engine.check_approved(&caller, Some(&tool), &write_action(), &approved);
+        assert!(
+            matches!(
+                d,
+                Decision::Deny {
+                    layer: DenyLayer::Tool,
+                    ..
+                }
+            ),
+            "{d:?}"
+        );
+        approved
+            .permissions
+            .insert(crate::Permission::new("calendar.write"));
+
+        let d = engine.check_approved(&caller, Some(&tool), &write_action(), &approved);
+        assert!(matches!(d, Decision::NeedsConfirmation { .. }), "{d:?}");
+        approved.confirm = true;
+
+        let d = engine.check_approved(&caller, Some(&tool), &write_action(), &approved);
+        assert_eq!(d, Decision::Allow);
+    }
+
+    /// An approved permission never overrides a denial of it.
+    #[test]
+    fn an_approved_permission_does_not_override_its_denial() {
+        let mut file = GrantsFile::default();
+        file.denial.permissions = PermissionSet::from_iter(["calendar.read"]);
+        let approved = Approved {
+            permissions: PermissionSet::from_iter(["calendar.read"]),
+            ..Default::default()
+        };
+        let decision = engine_with(file).check_approved(
+            &Caller::default(),
+            Some(&calendar_tool(&[])),
+            &read_action(),
+            &approved,
+        );
+        assert!(matches!(
+            decision,
+            Decision::Deny {
+                layer: DenyLayer::Denial,
+                ..
+            }
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -664,7 +817,7 @@ mod runner_capability_tests {
     use crate::{GrantsFile, PermissionSet, RunnerGrants};
 
     #[test]
-    fn runner_provider_requires_explicit_grant_and_policy_wins() {
+    fn runner_provider_requires_explicit_grant_and_denial_wins() {
         let mut file = GrantsFile::default();
         assert!(matches!(
             Engine::new(Grants::from_file(file.clone())).check_runner_provider("chat", "mock"),
@@ -691,11 +844,11 @@ mod runner_capability_tests {
             Engine::new(Grants::from_file(file.clone())).check_runner_provider("chat", "other"),
             Decision::Allow
         );
-        file.policy.deny_permissions = PermissionSet::from_iter(["ai:other"]);
+        file.denial.permissions = PermissionSet::from_iter(["ai:other"]);
         assert!(matches!(
             Engine::new(Grants::from_file(file)).check_runner_provider("chat", "other"),
             Decision::Deny {
-                layer: DenyLayer::Policy,
+                layer: DenyLayer::Denial,
                 ..
             }
         ));

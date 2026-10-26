@@ -91,8 +91,8 @@ pub trait InlineApprovals: Send + Sync {
     async fn request_inline(&self, req: InlineApprovalRequest) -> Verdict;
 }
 
-/// The operator's hard denials (`[policy].deny_actions` and
-/// `deny_permissions`), read at the moment of each call so a reload applies
+/// The operator's hard denials (`[denial].actions` and
+/// `[denial].permissions`), read at the moment of each call so a reload applies
 /// at once. A denied call is refused even when a grant covers it, and is never
 /// offered for approval. Implemented by the executor. The denied permissions
 /// are handed over as a set, so the caller can resolve path denials the same
