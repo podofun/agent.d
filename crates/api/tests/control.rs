@@ -144,6 +144,10 @@ async fn subscribe_push_resolve_roundtrip() {
                 missing: vec!["cap:foo".into()],
                 reason: "needs cap:foo".into(),
                 caller: Default::default(),
+                detail: None,
+                run_id: None,
+                session_id: None,
+                warning: None,
             })
             .await
     });

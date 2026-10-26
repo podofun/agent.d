@@ -77,7 +77,7 @@ pub(super) enum Update {
         name: String,
         result: Result<WsResponse>,
     },
-    Approval(ApprovalRequest),
+    Approval(Box<ApprovalRequest>),
     ControlLost(String),
 }
 
@@ -699,6 +699,7 @@ impl App {
                 }
             }
             Update::Approval(request) => {
+                let request = *request;
                 if self.approval.is_none() {
                     self.approval = Some(request);
                     self.approval_scroll = 0;

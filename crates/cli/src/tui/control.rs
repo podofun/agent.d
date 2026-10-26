@@ -66,7 +66,7 @@ async fn listen(
                     && value["event"] == "approval.request"
                     && let Ok(request) = serde_json::from_value::<ApprovalRequest>(value["req"].clone())
                 {
-                    let _ = updates.send(Update::Approval(request));
+                    let _ = updates.send(Update::Approval(Box::new(request)));
                 }
             }
             decision = decisions.recv() => {

@@ -87,6 +87,14 @@ pub(crate) struct ActiveContext {
     /// caller's cwd, each pop restores it, so a callee's `cwd` override lasts
     /// exactly for the duration of that nested call.
     pub(crate) cwd_stack: Vec<Option<PathBuf>>,
+    /// A one-time pass for exactly one approved request, keyed by its
+    /// permission and unredacted detail. The retry of the call that asked
+    /// consumes it. It never joins `effective_grants`, so the sandbox
+    /// builder never sees it.
+    pub(crate) one_time_pass: Option<String>,
+    /// Secrets read in this execution, as `(name, value)`, replaced by their
+    /// names in any question it raises.
+    pub(crate) secrets_read: Vec<(String, String)>,
 }
 
 /// Where `import("name")` resolves installed packages. Set by the daemon.
@@ -2121,25 +2129,33 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
         build_sandbox_policy(&active.effective_grants)
     };
     refuse_if_reach_denied(lua, &mut policy)?;
-    let allowed = {
+    let granted = {
         let active = lua
             .app_data_ref::<ActiveContext>()
             .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
-        active.effective_grants.contains(&bare_perm) || active.effective_grants.contains(&bin_perm)
+        active.effective_grants.contains(&bare_perm)
     };
-    if !allowed {
-        let active = lua
-            .app_data_ref::<ActiveContext>()
-            .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
-        let scoped = format!("shell.exec:{}", req.bin);
-        return Err(mlua::Error::external(inline_denial(
-            &active,
+    if !granted {
+        // An ungranted program becomes a question showing what would run.
+        // An allow covers this one invocation: its effect depends on files
+        // the run may have changed since, so the same argv is asked again.
+        let argv: Vec<&str> = std::iter::once(req.bin.as_str())
+            .chain(req.args.iter().map(String::as_str))
+            .collect();
+        let detail = serde_json::json!({
+            "argv": argv,
+            "cwd": cwd.as_ref().map(|c| c.display().to_string()),
+        });
+        check_inline(
+            lua,
+            &bin_perm,
+            Some(detail),
             &format!(
                 "the script tried to run the binary `{}` without the `{}` grant (or the broader `shell.exec` grant)",
-                req.bin, scoped
+                req.bin,
+                bin_perm.as_str()
             ),
-            &[scoped],
-        )));
+        )?;
     }
 
     // Must be attached before the request is wrapped into Op::Shell so the
@@ -3118,10 +3134,19 @@ fn build_sessions_table(lua: &Lua) -> mlua::Result<Table> {
 
 fn auth_get_binding(lua: &Lua, key: String) -> mlua::Result<String> {
     check_permission_inline(lua, &Permission::new(format!("secret:{key}")))?;
-    with_secrets(lua, |s| {
+    let value = with_secrets(lua, |s| {
         s.get(&key)
             .map_err(|e| mlua::Error::external(e.to_string()))
-    })
+    })?;
+    // Remember the value so no question this run raises ever shows it.
+    let run_id = lua.app_data_mut::<ActiveContext>().and_then(|mut a| {
+        a.secrets_read.push((key.clone(), value.clone()));
+        a.caller.run_id.clone()
+    });
+    if let (Some(run_id), Some(h)) = (run_id, lua.app_data_ref::<InlineApprovalsHandle>()) {
+        h.0.record_secret(&run_id, &key, &value);
+    }
+    Ok(value)
 }
 
 fn auth_set_binding(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
@@ -3961,28 +3986,75 @@ pub(crate) fn refuse_if_denied(lua: &Lua, req: &Permission) -> mlua::Result<()> 
 }
 
 pub(crate) fn check_permission_inline(lua: &Lua, req: &Permission) -> mlua::Result<()> {
-    refuse_if_denied(lua, req)?;
-    let active = lua
-        .app_data_ref::<ActiveContext>()
-        .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
-    if active.effective_grants.contains(req) {
-        return Ok(());
-    }
-    let denial = inline_denial(
-        &active,
+    check_inline(
+        lua,
+        req,
+        None,
         &format!(
             "the script tried to use a capability that requires the `{}` grant",
             req.as_str()
         ),
-        &[req.as_str().to_string()],
-    );
+    )
+}
+
+/// The key a one-time pass is issued and checked under: the permission and
+/// the unredacted detail of the request that asked.
+fn pass_key(req: &Permission, detail: Option<&serde_json::Value>) -> String {
+    format!(
+        "{}\0{}",
+        req.as_str(),
+        detail.map(|d| d.to_string()).unwrap_or_default()
+    )
+}
+
+/// Check one capability inside a running handler. Granted, already allowed
+/// for the rest of the run (files and hosts), or carrying a one-time pass for
+/// exactly this request: go ahead. Otherwise, inside a coroutine with an
+/// approver wired, become a question showing `detail`; elsewhere refuse with
+/// `what` as the explanation.
+fn check_inline(
+    lua: &Lua,
+    req: &Permission,
+    detail: Option<serde_json::Value>,
+    what: &str,
+) -> mlua::Result<()> {
+    refuse_if_denied(lua, req)?;
+    let key = pass_key(req, detail.as_ref());
+    {
+        let mut active = lua
+            .app_data_mut::<ActiveContext>()
+            .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
+        if active.effective_grants.contains(req) {
+            return Ok(());
+        }
+        if active.one_time_pass.as_deref() == Some(key.as_str()) {
+            active.one_time_pass = None;
+            return Ok(());
+        }
+    }
+    let run_allows = {
+        let active = lua.app_data_ref::<ActiveContext>();
+        let hook = lua.app_data_ref::<InlineApprovalsHandle>();
+        match (active.as_ref().and_then(|a| a.caller.run_id.clone()), hook) {
+            (Some(run_id), Some(h)) => h.0.run_allows(&run_id, req.as_str()),
+            _ => false,
+        }
+    };
+    if run_allows {
+        return Ok(());
+    }
+    let active = lua
+        .app_data_ref::<ActiveContext>()
+        .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state — this is a bug in agentd, please report it"))?;
+    let denial = inline_denial(&active, what, &[req.as_str().to_string()]);
     drop(active);
     // Escalatable only when an approval hook is wired AND we are inside a
     // scheduler coroutine (the wrapper needs to yield the approval op). The
     // top-level block_on path — init.lua load time — stays a hard deny.
     if lua.app_data_ref::<InlineApprovalsHandle>().is_some() && scheduler::is_in_coroutine(lua) {
+        let detail = detail.map(|d| d.to_string()).unwrap_or_default();
         return Err(mlua::Error::external(format!(
-            "{ESCALATE_MARK}{}{ESCALATE_MARK}{denial}",
+            "{ESCALATE_MARK}{}{ESCALATE_MARK}{detail}{ESCALATE_MARK}{denial}",
             req.as_str()
         )));
     }
@@ -4003,9 +4075,14 @@ fn escalate_binding(lua: &Lua, err: Value) -> mlua::Result<Value> {
         return Ok(Value::Nil);
     };
     let rest = &text[start + ESCALATE_MARK.len()..];
-    let Some((perm, denial)) = rest.split_once(ESCALATE_MARK) else {
+    let Some((perm, rest)) = rest.split_once(ESCALATE_MARK) else {
         return Ok(Value::Nil);
     };
+    let Some((detail, denial)) = rest.split_once(ESCALATE_MARK) else {
+        return Ok(Value::Nil);
+    };
+    let detail: Option<serde_json::Value> = serde_json::from_str(detail).ok();
+    let pass = pass_key(&Permission::new(perm), detail.as_ref());
     let Some(hook) = lua
         .app_data_ref::<InlineApprovalsHandle>()
         .map(|h| h.0.clone())
@@ -4022,6 +4099,9 @@ fn escalate_binding(lua: &Lua, err: Value) -> mlua::Result<Value> {
             call_chain: active.call_chain.clone(),
             permission: perm.to_string(),
             caller: active.caller.clone(),
+            // Secrets read in this execution are hidden here; the executor
+            // also hides those read anywhere else in the run.
+            detail: detail.map(|d| hide_secrets(d, &active.secrets_read)),
         }
     };
     scheduler::build_marker(
@@ -4030,8 +4110,36 @@ fn escalate_binding(lua: &Lua, err: Value) -> mlua::Result<Value> {
             hook,
             request,
             denied_msg: denial.to_string(),
+            pass,
         },
     )
+}
+
+/// `v` with every secret value in `secrets` replaced by its name.
+fn hide_secrets(v: serde_json::Value, secrets: &[(String, String)]) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::String(mut s) => {
+            for (name, value) in secrets {
+                if !value.is_empty() && s.contains(value.as_str()) {
+                    s = s.replace(value.as_str(), &format!("<secret {name}>"));
+                }
+            }
+            Value::String(s)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|i| hide_secrets(i, secrets))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, hide_secrets(v, secrets)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 fn inline_denial(active: &ActiveContext, what: &str, missing: &[String]) -> String {
@@ -4238,6 +4346,7 @@ impl Registry for LuaHost {
             grant_name,
             cwd,
             cwd_stack: Vec::new(),
+            ..Default::default()
         };
 
         // Phase 2: drive. Scheduler swaps ActiveContext into app-data on
@@ -4289,6 +4398,7 @@ impl Registry for LuaHost {
             grant_name: Some(svc_name.clone()),
             cwd,
             cwd_stack: Vec::new(),
+            ..Default::default()
         };
 
         let thread = {

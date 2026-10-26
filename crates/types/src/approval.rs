@@ -53,6 +53,21 @@ pub struct ApprovalRequest {
     pub reason: String,
     /// Identity of the invocation that tripped the denial.
     pub caller: Caller,
+    /// What is actually being done: the action's arguments, a shell call's
+    /// `argv` and `cwd`, a file's resolved path, or a host. Secrets read in
+    /// the run are replaced by their names, and long values are capped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+    /// The run the question belongs to, so approvers can tell windows apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// The durable session the run belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Shown before an approver writes "allow forever", for example on an
+    /// interpreter, which would grant arbitrary execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// Transport-agnostic approver. Implemented by `agentd-approvals::Broker`.
@@ -79,6 +94,10 @@ pub struct InlineApprovalRequest {
     /// The single permission slug the handler needs (e.g. `fs.read:/tmp/x`).
     pub permission: String,
     pub caller: Caller,
+    /// What the handler is doing, unredacted: a shell call's `argv` and
+    /// `cwd`, for example. The executor redacts it before anyone sees it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
 }
 
 /// Escalation point for [`InlineApprovalRequest`]s. Implemented by the
@@ -89,6 +108,16 @@ pub trait InlineApprovals: Send + Sync {
     /// Escalate an inline capability denial. Returns [`Verdict::Deny`] when no
     /// broker/approver is available or the operator rejects (fail closed).
     async fn request_inline(&self, req: InlineApprovalRequest) -> Verdict;
+
+    /// Whether the run already allowed `permission` for the rest of the run
+    /// (files and hosts only). Such allows never join a handler's grants.
+    fn run_allows(&self, _run_id: &str, _permission: &str) -> bool {
+        false
+    }
+
+    /// Note that the run read `value` from the secret `name`, so it is
+    /// replaced by the name wherever it appears in a question.
+    fn record_secret(&self, _run_id: &str, _name: &str, _value: &str) {}
 }
 
 /// The operator's hard denials (`[denial].actions` and

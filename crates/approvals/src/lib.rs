@@ -111,6 +111,10 @@ mod tests {
             missing: vec!["p".into()],
             reason: "r".into(),
             caller: Default::default(),
+            detail: None,
+            run_id: None,
+            session_id: None,
+            warning: None,
         }
     }
 
