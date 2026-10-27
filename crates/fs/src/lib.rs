@@ -6,10 +6,12 @@
 //! permission slug the gate checks is unambiguous; callers may normalize
 //! relative inputs first.
 
+mod baseline;
 mod history;
 mod patch;
 mod verified;
 
+pub use baseline::{Baseline, ScanChange, ScanLimits, Snapshot};
 pub use history::{FileDiff, FileHistory, History, Operation, Revision};
 pub use patch::{FilePatch, Hunk, PatchError, apply_patch, create_diff, format_patch, parse_patch};
 pub use verified::{open_verified, read_bytes_verified, real_path};
@@ -91,6 +93,11 @@ pub enum FsError {
         actual.display()
     )]
     Changed { path: PathBuf, actual: PathBuf },
+    #[error(
+        "`{}` holds more than {limit} files, which is too many to track changes in",
+        root.display()
+    )]
+    TooManyFiles { root: PathBuf, limit: usize },
 }
 
 #[derive(Debug, Clone, Serialize)]

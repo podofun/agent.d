@@ -8,8 +8,9 @@ serde.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync"] }
 diffy = "0.5.2"
+ignore = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
