@@ -790,7 +790,10 @@ async fn timeout_kills_the_command_and_its_children() {
     let dir = tempfile::tempdir().unwrap();
     let task = tokio::spawn(exec(tree_req(dir.path(), Some(30_000))));
     let grandchild = read_pid(dir.path()).await;
-    assert!(running(grandchild), "the grandchild should be running before the timeout");
+    assert!(
+        running(grandchild),
+        "the grandchild should be running before the timeout"
+    );
     let res = task.await.unwrap().expect("a timeout is a result");
     assert!(res.timed_out, "{res:?}");
     assert_stops(grandchild).await;
