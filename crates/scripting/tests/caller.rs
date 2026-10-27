@@ -215,3 +215,31 @@ async fn secret_exists_denied_without_grant() {
         "got: {err}"
     );
 }
+
+#[tokio::test]
+async fn caller_exposes_the_chat_session_and_run() {
+    let dir = write_init(
+        r#"
+        agentd.action("who", function(_, ctx)
+            return { session_id = ctx.caller.session_id, run_id = ctx.caller.run_id }
+        end)
+        "#,
+    );
+    let host = LuaHost::new().unwrap();
+    host.load_file(&dir.path().join("init.lua")).unwrap();
+
+    let caller = Caller {
+        session_id: Some("chat-1".into()),
+        run_id: Some("run-7".into()),
+        ..Caller::default()
+    };
+    let v = call(&host, caller, &[], "who").await.unwrap();
+    assert_eq!(v["session_id"], "chat-1");
+    assert_eq!(v["run_id"], "run-7");
+
+    let v = call(&host, Caller::default(), &[], "who").await.unwrap();
+    assert!(
+        v.get("session_id").is_none() || v["session_id"].is_null(),
+        "{v}"
+    );
+}
