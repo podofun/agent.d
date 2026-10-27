@@ -249,7 +249,8 @@ function string.split(s, sep) end
 ---@class Ctx.ShellResult
 ---@field stdout string
 ---@field stderr string
----@field exit_code integer
+---@field exit_code? integer
+---@field timed_out boolean
 
 ---@class Ctx.ShellOpts
 ---@field bin string

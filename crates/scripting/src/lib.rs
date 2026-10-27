@@ -2314,9 +2314,13 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
         .block_on(shell_exec(req))
         .map_err(|e| mlua::Error::external(e.to_string()))?;
     let out = lua.create_table()?;
-    out.set("exit_code", result.exit_code)?;
+    // A killed program has no exit code; `timed_out` says why.
+    if !result.timed_out {
+        out.set("exit_code", result.exit_code)?;
+    }
     out.set("stdout", result.stdout)?;
     out.set("stderr", result.stderr)?;
+    out.set("timed_out", result.timed_out)?;
     Ok(Value::Table(out))
 }
 

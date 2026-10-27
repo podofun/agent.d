@@ -161,7 +161,7 @@ async fn shell_exec_allowed_with_grant() {
     assert_eq!(code, 0);
 }
 
-async fn run_shell_action(body: &str) -> String {
+async fn run_shell_action(body: &str) -> Result<serde_json::Value, String> {
     let dir = write_tools(&[(
         "s.lua",
         &format!(
@@ -178,7 +178,7 @@ async fn run_shell_action(body: &str) -> String {
     let host = LuaHost::new().unwrap();
     host.load_dir(dir.path()).unwrap();
     let started = std::time::Instant::now();
-    let err = host
+    let res = host
         .call(
             ctx(&["shell.exec"], &["s.slow"]),
             ActionCall {
@@ -186,40 +186,51 @@ async fn run_shell_action(body: &str) -> String {
                 args: serde_json::Value::Null,
             },
         )
-        .await
-        .unwrap_err();
+        .await;
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
-    err.to_string()
+    res.map(|r| r.value).map_err(|e| e.to_string())
 }
 
-// Unix-only: spawns `/bin/sleep`.
+// Unix-only: spawns `/bin/sh`.
 #[cfg(unix)]
 #[tokio::test]
-async fn shell_timeout_option_stops_the_program() {
-    let msg =
-        run_shell_action(r#"return ctx.shell("/bin/sleep", {"30"}, { timeout_ms = 200 })"#).await;
-    assert!(
-        msg.contains("`/bin/sleep` was stopped after 200 ms"),
-        "got: {msg}"
-    );
+async fn shell_timeout_option_stops_the_program_and_keeps_its_output() {
+    let res = run_shell_action(
+        r#"return ctx.shell("/bin/sh", {"-c", "echo started; sleep 30"}, { timeout_ms = 500 })"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(res["timed_out"], true, "{res}");
+    assert!(res["exit_code"].is_null(), "{res}");
+    assert_eq!(res["stdout"].as_str().unwrap().trim(), "started", "{res}");
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn shell_timeout_field_in_the_table_form_stops_the_program() {
-    let msg = run_shell_action(
-        r#"return ctx.shell({ bin = "/bin/sleep", args = {"30"}, timeout_ms = 1500 })"#,
+    let res = run_shell_action(
+        r#"return ctx.shell({ bin = "/bin/sleep", args = {"30"}, timeout_ms = 500 })"#,
     )
-    .await;
-    assert!(
-        msg.contains("`/bin/sleep` was stopped after 1.5 s"),
-        "got: {msg}"
-    );
+    .await
+    .unwrap();
+    assert_eq!(res["timed_out"], true, "{res}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_program_that_finishes_reports_it_did_not_time_out() {
+    let res = run_shell_action(r#"return ctx.shell("/bin/echo", {"hi"}, { timeout_ms = 10000 })"#)
+        .await
+        .unwrap();
+    assert_eq!(res["timed_out"], false, "{res}");
+    assert_eq!(res["exit_code"], 0, "{res}");
 }
 
 #[tokio::test]
 async fn shell_timeout_must_be_a_positive_whole_number() {
-    let msg = run_shell_action(r#"return ctx.shell("echo", {"hi"}, { timeout_ms = -5 })"#).await;
+    let msg = run_shell_action(r#"return ctx.shell("echo", {"hi"}, { timeout_ms = -5 })"#)
+        .await
+        .unwrap_err();
     assert!(
         msg.contains("must be a positive whole number of milliseconds"),
         "got: {msg}"

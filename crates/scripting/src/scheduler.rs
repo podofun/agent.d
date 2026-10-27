@@ -437,10 +437,12 @@ fn http_response_to_json(resp: HttpResponse) -> serde_json::Value {
 }
 
 fn shell_result_to_json(r: ExecResult) -> serde_json::Value {
+    // A killed program has no exit code; `timed_out` says why.
     serde_json::json!({
-        "exit_code": r.exit_code,
+        "exit_code": (!r.timed_out).then_some(r.exit_code),
         "stdout": r.stdout,
         "stderr": r.stderr,
+        "timed_out": r.timed_out,
     })
 }
 
