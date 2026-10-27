@@ -736,3 +736,71 @@ async fn a_hard_link_in_a_granted_folder_to_a_denied_file_is_refused() {
     .unwrap_err();
     assert!(matches!(err, ShellError::DeniedReach(_)), "{err}");
 }
+
+/// A PowerShell command that starts a hidden `ping` running ~30 s, records its
+/// pid in the granted folder, then blocks itself for 30 s.
+fn tree_req(dir: &std::path::Path, timeout_ms: Option<u64>) -> ExecRequest {
+    let pid_file = dir.join("pid");
+    let mut r = req(
+        powershell(),
+        ps(format!(
+            "$p = Start-Process -FilePath ping.exe -ArgumentList '-n','30','127.0.0.1' -WindowStyle Hidden -PassThru; \
+             Set-Content -Path '{}' -Value $p.Id; Start-Sleep -Seconds 30",
+            pid_file.display()
+        )),
+        policy(dir),
+    );
+    r.timeout_ms = timeout_ms;
+    r
+}
+
+async fn read_pid(dir: &std::path::Path) -> u32 {
+    for _ in 0..800 {
+        if let Ok(text) = std::fs::read_to_string(dir.join("pid"))
+            && let Ok(pid) = text.trim().parse()
+        {
+            return pid;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("the script never wrote its pid file");
+}
+
+fn running(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+        .unwrap_or(false)
+}
+
+async fn assert_stops(pid: u32) {
+    for _ in 0..200 {
+        if !running(pid) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("process {pid} is still running");
+}
+
+#[tokio::test]
+async fn timeout_kills_the_command_and_its_children() {
+    let _serial = SANDBOX_SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let err = exec(tree_req(dir.path(), Some(8000))).await.unwrap_err();
+    assert!(matches!(err, ShellError::TimedOut { .. }), "got {err}");
+    assert_stops(read_pid(dir.path()).await).await;
+}
+
+#[tokio::test]
+async fn dropping_the_exec_future_kills_the_command_and_its_children() {
+    let _serial = SANDBOX_SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let task = tokio::spawn(exec(tree_req(dir.path(), None)));
+    let grandchild = read_pid(dir.path()).await;
+    assert!(running(grandchild));
+    task.abort();
+    let _ = task.await;
+    assert_stops(grandchild).await;
+}
