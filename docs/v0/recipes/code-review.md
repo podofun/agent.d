@@ -111,7 +111,7 @@ import("runners/backend_reviewer.lua")
 agentd.skills.load("skills/reviewer.md")
 ```
 
-`import()` resolves relative to `init.lua`. `agentd.skills.load()` loads a single skill file and returns its name.
+`import()` resolves relative to `init.lua`. `agentd.skills.load()` loads a single skill file and returns the skill, which you can keep if you want to change it later.
 
 ## Step 5 — grants.toml
 
