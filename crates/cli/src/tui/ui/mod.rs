@@ -387,19 +387,6 @@ fn draw_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 }
 
-pub(super) fn centered(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
-    let width =
-        ((u32::from(area.width) * u32::from(width_percent) / 100).max(1) as u16).min(area.width);
-    let height =
-        ((u32::from(area.height) * u32::from(height_percent) / 100).max(1) as u16).min(area.height);
-    Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::app::EntryKind;

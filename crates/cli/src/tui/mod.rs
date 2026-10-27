@@ -205,7 +205,7 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                 } else if app.tab == Tab::Chat {
                     scroll_up(app, area, 3);
                 } else {
-                    app.select_previous();
+                    app.move_selection(-1, false);
                 }
             }
             MouseEventKind::ScrollDown => {
@@ -214,7 +214,7 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                 } else if app.tab == Tab::Chat {
                     scroll_down(app, 3);
                 } else {
-                    app.select_next();
+                    app.move_selection(1, false);
                 }
             }
             _ => return Ok(Handled::Ignored),
@@ -314,11 +314,15 @@ async fn handle_browser_key(app: &mut App, key: KeyEvent) {
             query.push(c);
             app.set_query(query);
         }
-        KeyCode::Tab => app.tab = app.tab.next(),
-        KeyCode::BackTab => app.tab = app.tab.previous(),
+        KeyCode::Tab | KeyCode::Right => app.tab = app.tab.next(),
+        KeyCode::BackTab | KeyCode::Left => app.tab = app.tab.previous(),
         KeyCode::F(5) => app.refresh().await,
-        KeyCode::Up => app.select_previous(),
-        KeyCode::Down => app.select_next(),
+        KeyCode::Up => app.move_selection(-1, true),
+        KeyCode::Down => app.move_selection(1, true),
+        KeyCode::PageUp => app.move_selection(-10, false),
+        KeyCode::PageDown => app.move_selection(10, false),
+        KeyCode::Home => app.move_selection(isize::MIN / 2, false),
+        KeyCode::End => app.move_selection(isize::MAX / 2, false),
         KeyCode::Enter => app.activate_selected().await,
         _ => {}
     }
@@ -532,13 +536,80 @@ mod tests {
         let mut app = App::new("http://127.0.0.1:7777", 1000, None);
         app.actions = vec![serde_json::json!("a"), serde_json::json!("b")];
         app.tab = Tab::All;
-        app.select_next();
+        app.move_selection(1, true);
         assert_eq!(app.selected_index(), 1);
         let screen = Rect::new(0, 0, 80, 24);
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('b')), screen)
             .await
             .unwrap();
         assert_eq!(app.selected_index(), 0);
+    }
+
+    #[tokio::test]
+    async fn browser_sections_cycle_without_closing() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.tab = Tab::All;
+        let screen = Rect::new(0, 0, 80, 24);
+        let mut seen = Vec::new();
+        for _ in 0..Tab::ALL.len() - 1 {
+            handle_key(&mut app, KeyEvent::from(KeyCode::Right), screen)
+                .await
+                .unwrap();
+            seen.push(app.tab);
+        }
+        assert_eq!(
+            seen,
+            [
+                Tab::Sessions,
+                Tab::Runners,
+                Tab::Skills,
+                Tab::Actions,
+                Tab::Services,
+                Tab::All
+            ]
+        );
+        handle_key(&mut app, KeyEvent::from(KeyCode::Left), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.tab, Tab::Services);
+        handle_key(&mut app, KeyEvent::from(KeyCode::BackTab), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.tab, Tab::Actions);
+    }
+
+    #[tokio::test]
+    async fn arrow_keys_wrap_and_page_keys_stop_at_the_ends() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.actions = (0..15)
+            .map(|i| serde_json::json!(format!("a{i}")))
+            .collect();
+        app.tab = Tab::Actions;
+        let screen = Rect::new(0, 0, 80, 24);
+        let press = |code| KeyEvent::from(code);
+        handle_key(&mut app, press(KeyCode::Up), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.selected_index(), 14);
+        handle_key(&mut app, press(KeyCode::Down), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.selected_index(), 0);
+        handle_key(&mut app, press(KeyCode::PageDown), screen)
+            .await
+            .unwrap();
+        handle_key(&mut app, press(KeyCode::PageDown), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.selected_index(), 14);
+        handle_key(&mut app, press(KeyCode::Home), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.selected_index(), 0);
+        handle_key(&mut app, press(KeyCode::End), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.selected_index(), 14);
     }
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
