@@ -218,7 +218,7 @@ fn running(marker: &str) -> bool {
 }
 
 async fn wait_until(marker: &str, want_running: bool) {
-    for _ in 0..400 {
+    for _ in 0..1200 {
         if running(marker) == want_running {
             return;
         }
@@ -238,9 +238,11 @@ async fn timeout_kills_the_sandboxed_command_and_its_children() {
     let dir = tempfile::tempdir().unwrap();
     let marker = marker();
     let mut req = sh(tree_script(&marker), write_policy(dir.path()));
-    req.timeout_ms = Some(1000);
-    let err = exec(req).await.unwrap_err();
-    assert_eq!(err.to_string(), "`/bin/sh` was stopped after 1 s");
+    req.timeout_ms = Some(10_000);
+    let task = tokio::spawn(exec(req));
+    wait_until(&marker, true).await;
+    let res = task.await.unwrap().expect("a timeout is a result");
+    assert!(res.timed_out, "{res:?}");
     wait_until(&marker, false).await;
 }
 

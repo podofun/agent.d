@@ -230,12 +230,48 @@ mod macos {
     /// the child's stdio back to the daemon via `SCM_RIGHTS`.
     struct MacBackend {
         pending_fds: Vec<RawFd>,
+        conn_fd: RawFd,
     }
 
     impl MacBackend {
-        fn new(_conn_fd: RawFd) -> Self {
+        fn new(conn_fd: RawFd) -> Self {
             MacBackend {
                 pending_fds: Vec::new(),
+                conn_fd,
+            }
+        }
+
+        /// Whether the daemon hung up, waiting up to 100 ms to find out. The
+        /// daemon sends nothing while it waits for `Exit`, so a readable
+        /// socket that yields no bytes is the hang-up.
+        fn daemon_hung_up(&self) -> bool {
+            let mut pfd = libc::pollfd {
+                fd: self.conn_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll(2) and recv(2) on the live connection fd, with a
+            // stack-owned pollfd and a one-byte stack buffer.
+            unsafe {
+                if libc::poll(&mut pfd, 1, 100) <= 0 {
+                    return false;
+                }
+                if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                    return true;
+                }
+                let mut byte = 0u8;
+                let got = libc::recv(
+                    self.conn_fd,
+                    &mut byte as *mut u8 as *mut libc::c_void,
+                    1,
+                    libc::MSG_PEEK,
+                );
+                if got > 0 {
+                    // Unexpected data: leave it for the request loop and back
+                    // off, so this never spins.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                got == 0
             }
         }
     }
@@ -304,10 +340,24 @@ mod macos {
 
         fn wait_child(&mut self, pid: i32) -> i32 {
             let mut status = 0;
-            // SAFETY: waitpid(2) on a pid this broker forked; `status` is a valid
-            // local out-param. std has no child-reaping API for a bare pid we
-            // fork()'d ourselves (Command owns its own Child), so libc is required.
-            unsafe { libc::waitpid(pid, &mut status, 0) };
+            // Poll instead of blocking, so a daemon that hangs up mid-wait (a
+            // timeout or a cancelled run) still gets the child's group killed.
+            // SAFETY: waitpid(2)/killpg(2) on a pid this broker forked, which
+            // leads its own group; `status` is a valid local out-param. std has
+            // no child-reaping API for a bare pid we fork()'d ourselves.
+            loop {
+                let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if reaped != 0 {
+                    break;
+                }
+                if self.daemon_hung_up() {
+                    unsafe {
+                        libc::killpg(pid, libc::SIGKILL);
+                        libc::waitpid(pid, &mut status, 0);
+                    }
+                    break;
+                }
+            }
             if libc::WIFEXITED(status) {
                 libc::WEXITSTATUS(status)
             } else if libc::WIFSIGNALED(status) {

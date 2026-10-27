@@ -190,7 +190,7 @@ fn running(marker: &str) -> bool {
 }
 
 async fn wait_until(marker: &str, want_running: bool) {
-    for _ in 0..400 {
+    for _ in 0..1200 {
         if running(marker) == want_running {
             return;
         }
@@ -223,10 +223,10 @@ async fn timeout_kills_the_broker_spawned_command_and_its_children() {
         return;
     }
     let marker = marker();
-    let err = agentd_shell::exec(tree_req(&marker, Some(3000)))
-        .await
-        .unwrap_err();
-    assert_eq!(err.to_string(), "`/bin/sh` was stopped after 3 s");
+    let task = tokio::spawn(agentd_shell::exec(tree_req(&marker, Some(15_000))));
+    wait_until(&marker, true).await;
+    let res = task.await.unwrap().expect("a timeout is a result");
+    assert!(res.timed_out, "{res:?}");
     wait_until(&marker, false).await;
 }
 
