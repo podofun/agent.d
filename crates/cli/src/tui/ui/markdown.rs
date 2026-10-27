@@ -811,6 +811,11 @@ mod tests {
         let wrapped = wrap_spans(vec![Span::raw("a\tb\r\nc")], 20);
         assert_eq!(text_of(&wrapped), vec!["a    b c"]);
         let cut = cut_spans(vec![Span::raw("\tx\u{1F44B}y")], 6);
-        assert_eq!(cut.iter().map(|span| span.content.as_ref()).collect::<String>(), "    x");
+        assert_eq!(
+            cut.iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "    x"
+        );
     }
 }

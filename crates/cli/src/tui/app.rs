@@ -82,6 +82,9 @@ pub(super) struct Entry {
     pub(super) changes: Vec<FileChange>,
     /// On a tool row: the call failed, or ran a program that exited nonzero.
     pub(super) failed: bool,
+    /// On a tool row: the call's output as the tool returned it, when it is
+    /// an object, so the row can lay its fields out instead of flat text.
+    pub(super) output: Option<Value>,
     rendered: RefCell<Option<(usize, Vec<Line<'static>>)>>,
 }
 
@@ -206,6 +209,9 @@ pub(super) struct App {
     pub(super) scroll: usize,
     /// Mouse selection over the conversation.
     pub(super) selection: Option<Selection>,
+    /// The clickable conversation row under the mouse: its line, and what
+    /// clicking it opens.
+    pub(super) hover: Option<(usize, ToolRow)>,
     /// Where the mouse is while it drags a selection.
     pub(super) drag: Option<(u16, u16)>,
     /// When a drag past the conversation's edge last scrolled it.
@@ -271,6 +277,7 @@ impl App {
             started: None,
             scroll: 0,
             selection: None,
+            hover: None,
             drag: None,
             drag_scrolled: None,
             screen: Rect::new(0, 0, 80, 24),
@@ -349,6 +356,7 @@ impl App {
         };
         let entry = &mut self.entries[index];
         entry.failed = call_failed(value);
+        entry.output = output_object(&value["output"]);
         set_input(entry, &value["input"]);
         append_output(entry, &output);
         let changes = value["changes"]
@@ -676,10 +684,17 @@ impl App {
             match turn["role"].as_str() {
                 Some("tool") => {
                     let output = presentation::tool_output(turn["content"].as_str().unwrap_or(""));
-                    match awaiting_output.pop_front() {
-                        Some(index) => append_output(&mut self.entries[index], &output),
-                        None => self.push_tool("Result", output),
-                    }
+                    let index = match awaiting_output.pop_front() {
+                        Some(index) => {
+                            append_output(&mut self.entries[index], &output);
+                            index
+                        }
+                        None => {
+                            self.push_tool("Result", output);
+                            self.entries.len() - 1
+                        }
+                    };
+                    self.entries[index].output = output_object(&turn["content"]);
                 }
                 role => {
                     let kind = match role {
@@ -1164,6 +1179,7 @@ impl Entry {
             input: None,
             changes: Vec::new(),
             failed: false,
+            output: None,
             rendered: RefCell::new(None),
         }
     }
@@ -1216,6 +1232,15 @@ fn call_failed(value: &Value) -> bool {
         output => output,
     };
     output["exit_code"].as_i64().is_some_and(|code| code != 0)
+}
+
+/// A call's output when it is an object, whether sent as one or as JSON text.
+fn output_object(output: &Value) -> Option<Value> {
+    let parsed = match output {
+        Value::String(text) => serde_json::from_str(text).ok()?,
+        output => output.clone(),
+    };
+    parsed.is_object().then_some(parsed)
 }
 
 /// Keep a call's arguments, unless it had none.

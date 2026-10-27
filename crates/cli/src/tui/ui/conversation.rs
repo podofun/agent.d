@@ -25,6 +25,12 @@ pub(super) fn draw_conversation(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if let Some(selection) = &app.selection {
         selection::highlight(&mut conversation.lines, &conversation.selectable, selection);
     }
+    if let Some(hover) = app.hover
+        && conversation.tool_headers.contains(&hover)
+        && let Some(line) = conversation.lines.get_mut(hover.0)
+    {
+        hovered(line);
+    }
     let offset = conversation.offset(inner.height, app.scroll);
     frame.render_widget(
         Paragraph::new(conversation.lines).scroll((offset.min(u16::MAX as usize) as u16, 0)),
@@ -303,9 +309,6 @@ fn emphasized(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
 /// one, before the rest are counted instead.
 const COLLAPSED_FILES: usize = 8;
 const EXPANDED_FILES: usize = 20;
-/// Arguments that carry what a call wrote, left out of an expanded row that
-/// shows the diff instead.
-const SHOWN_BY_DIFF: [&str; 3] = ["content", "patch", "diff"];
 /// Starts the line of each file a call changed.
 const CHANGE_MARK: &str = "± ";
 
@@ -340,11 +343,11 @@ fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
     let inner = width.saturating_sub(2);
     if !entry.expanded {
         if entry.changes.is_empty() {
-            lines.extend(output_preview(&entry.body, inner, 3));
+            lines.extend(output_preview(preview_text(entry), inner, 3));
             return lines;
         }
         if entry.failed {
-            lines.extend(output_preview(&entry.body, inner, 1));
+            lines.extend(output_preview(preview_text(entry), inner, 1));
         }
     }
     let shown = if entry.expanded {
@@ -368,75 +371,375 @@ fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
     if !entry.expanded {
         return lines;
     }
-    // The diff already shows what was written.
-    let long: Fields = if entry.changes.is_empty() {
+    // A call that changed files shows what it did as their diffs: the text
+    // it was given and the receipt it returned would only repeat them.
+    if !entry.changes.is_empty() && !entry.failed {
+        return lines;
+    }
+    let long = if entry.changes.is_empty() {
         long
     } else {
-        long.into_iter()
-            .filter(|(key, _)| !SHOWN_BY_DIFF.contains(&key.as_str()))
-            .collect()
-    };
-    let block = |lines: &mut Vec<Line<'static>>, label: &str, text: &str, bar: Color| {
-        if !label.is_empty() {
-            lines.push(indented(Line::styled(
-                format!("  {label}"),
-                Style::default().fg(MUTED),
-            )));
-        }
-        for mut part in markdown::wrap_plain(text, inner) {
-            part.spans
-                .insert(0, Span::styled("│ ", Style::default().fg(bar)));
-            lines.push(indented(part));
-        }
+        Vec::new()
     };
     for (key, text) in &long {
-        block(&mut lines, key, text, MUTED);
+        block(&mut lines, inner, key, text, MUTED);
     }
-    if !entry.body.is_empty() {
-        let label = if long.is_empty() { "" } else { "result" };
-        block(&mut lines, label, &entry.body, WARNING);
+    match entry.output.as_ref() {
+        Some(output) if run_output(output).is_some() => {
+            lines.extend(run_lines(output, inner));
+        }
+        Some(Value::Object(fields)) if !entry.failed => {
+            lines.extend(field_lines(fields, inner));
+        }
+        _ if !entry.body.is_empty() => {
+            let label = if long.is_empty() { "" } else { "result" };
+            block(&mut lines, inner, label, &entry.body, WARNING);
+        }
+        _ => {}
     }
     lines
 }
 
+/// A labelled block of text behind a `│ ` bar in `bar`'s color.
+fn block(lines: &mut Vec<Line<'static>>, width: usize, label: &str, text: &str, bar: Color) {
+    labelled(lines, label, Style::default().fg(MUTED));
+    bar_lines(lines, width, text, bar);
+}
+
+fn labelled(lines: &mut Vec<Line<'static>>, label: &str, style: Style) {
+    if !label.is_empty() {
+        lines.push(indented(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(label.to_owned(), style),
+        ])));
+    }
+}
+
+fn bar_lines(lines: &mut Vec<Line<'static>>, width: usize, text: &str, bar: Color) {
+    for mut part in markdown::wrap_plain(text, width) {
+        part.spans
+            .insert(0, Span::styled("│ ", Style::default().fg(bar)));
+        lines.push(indented(part));
+    }
+}
+
+/// The parts of a program run's output: what it printed, what it printed
+/// as errors, how it exited, and whether it was stopped or cut short.
+struct RunOutput<'a> {
+    stdout: &'a str,
+    stderr: &'a str,
+    exit_code: Option<i64>,
+    timed_out: bool,
+    truncated: bool,
+}
+
+/// `output` read as a program run, when it has the shape of one: an
+/// `exit_code`, or `stdout` or `stderr` text, and no other fields.
+fn run_output(output: &Value) -> Option<RunOutput<'_>> {
+    const FIELDS: [&str; 5] = ["stdout", "stderr", "exit_code", "timed_out", "truncated"];
+    let fields = output.as_object()?;
+    if !fields.keys().all(|key| FIELDS.contains(&key.as_str()))
+        || !(fields.contains_key("exit_code")
+            || fields.contains_key("stdout")
+            || fields.contains_key("stderr"))
+    {
+        return None;
+    }
+    let text = |key: &str| match fields.get(key) {
+        None | Some(Value::Null) => Some(""),
+        Some(value) => value.as_str(),
+    };
+    let flag = |key: &str| match fields.get(key) {
+        None | Some(Value::Null) => Some(false),
+        Some(value) => value.as_bool(),
+    };
+    Some(RunOutput {
+        stdout: text("stdout")?,
+        stderr: text("stderr")?,
+        exit_code: match fields.get("exit_code") {
+            None | Some(Value::Null) => None,
+            Some(code) => Some(code.as_i64()?),
+        },
+        timed_out: flag("timed_out")?,
+        truncated: flag("truncated")?,
+    })
+}
+
+/// A program run: anything wrong with it first, in red, then what it
+/// printed. Empty errors, a zero exit code and unset flags are left out.
+fn run_lines(output: &Value, width: usize) -> Vec<Line<'static>> {
+    let Some(run) = run_output(output) else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    let error = Style::default().fg(ERROR);
+    let mut notes = Vec::new();
+    if let Some(code) = run.exit_code.filter(|code| *code != 0) {
+        notes.push(format!("exit code {code}"));
+    }
+    if run.timed_out {
+        notes.push("stopped: ran too long".to_owned());
+    }
+    if run.truncated {
+        notes.push("output cut".to_owned());
+    }
+    for note in notes {
+        labelled(&mut lines, &note, error);
+    }
+    if !run.stderr.trim().is_empty() {
+        labelled(&mut lines, "errors", error);
+        bar_lines(&mut lines, width, run.stderr.trim_end(), ERROR);
+    }
+    if !run.stdout.trim().is_empty() {
+        labelled(&mut lines, "output", Style::default().fg(MUTED));
+        bar_lines(&mut lines, width, run.stdout.trim_end(), MUTED);
+    }
+    lines
+}
+
+/// Other object results, one field per line: the label muted, the value
+/// plain, and a value that does not fit on one line set below its label.
+fn field_lines(fields: &serde_json::Map<String, Value>, width: usize) -> Vec<Line<'static>> {
+    let label = Style::default().fg(MUTED);
+    let mut lines = Vec::new();
+    for (key, value) in fields {
+        let name = presentation::field_label(key);
+        let inline = match value {
+            Value::Null => continue,
+            Value::String(text) if !text.contains('\n') => Some(text.clone()),
+            Value::Number(_) | Value::Bool(_) => Some(presentation::value(value)),
+            _ => None,
+        };
+        match inline {
+            Some(text) => {
+                let spans = vec![Span::styled(format!("{name}  "), label), Span::raw(text)];
+                for mut line in markdown::wrap_spans(spans, width) {
+                    line.spans
+                        .insert(0, Span::styled("│ ", Style::default().fg(WARNING)));
+                    lines.push(indented(line));
+                }
+            }
+            None => {
+                lines.push(indented(Line::from(vec![
+                    Span::styled("│ ", Style::default().fg(WARNING)),
+                    Span::styled(name, label),
+                ])));
+                let nested = presentation::value(value);
+                for mut line in markdown::wrap_plain(&nested, width.saturating_sub(2)) {
+                    line.spans.insert(0, Span::raw("  "));
+                    line.spans
+                        .insert(0, Span::styled("│ ", Style::default().fg(WARNING)));
+                    lines.push(indented(line));
+                }
+            }
+        }
+    }
+    lines
+}
+
+/// A line's text as runs, each flagged when it changed.
+type Marked = Vec<(String, bool)>;
+
+/// The changed words of a line pair stand out on a darker background.
+const REMOVED_WORD: Color = Color::Indexed(52);
+const ADDED_WORD: Color = Color::Indexed(22);
+
 /// A change's diff, one `│ ` line per diff line, cut to `width` and never
-/// wrapped. Hunk headers are muted, the `+` and `-` markers colored, and
-/// the code after them highlighted by the file's type. The `---` and `+++`
-/// file headers are left out, since the summary line names the file. Lines
-/// skip the highlight memo, since the row keeps its rendered lines.
+/// wrapped. Removed lines are red and added lines green, and when removed
+/// lines are followed by added ones, each pair marks the words that changed.
+/// Context lines are highlighted by the file's type. The first hunk header
+/// is left out and later ones become a muted `⋯`, as are the `---` and
+/// `+++` file headers, since the summary line names the file. Lines skip
+/// the highlight memo, since the row keeps its rendered lines.
 fn diff_lines(change: &FileChange, width: usize) -> Vec<Line<'static>> {
     let Some(diff) = &change.diff else {
         return Vec::new();
     };
     let syntax = highlight::Syntax::find(highlight::language_for_path(&change.path));
     let muted = Style::default().fg(MUTED);
-    let code = |text: &str| -> Vec<Span<'static>> {
-        syntax
-            .and_then(|syntax| syntax.line(text))
-            .unwrap_or_else(|| vec![Span::raw(text.to_owned())])
-    };
-    let mut in_hunk = false;
+    let mut hunks = 0;
     let mut lines = Vec::new();
+    let mut removed: Vec<String> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
+    let flush =
+        |lines: &mut Vec<Line<'static>>, removed: &mut Vec<String>, added: &mut Vec<String>| {
+            let pairs = removed.len().min(added.len());
+            let marks: Vec<(Marked, Marked)> = (0..pairs)
+                .map(|index| word_diff(&removed[index], &added[index]))
+                .collect();
+            for (index, text) in removed.drain(..).enumerate() {
+                let parts = marks
+                    .get(index)
+                    .map_or_else(|| vec![(text.clone(), false)], |pair| pair.0.clone());
+                lines.push(diff_row(
+                    changed_spans('-', ERROR, REMOVED_WORD, parts),
+                    width,
+                ));
+            }
+            for (index, text) in added.drain(..).enumerate() {
+                let parts = marks
+                    .get(index)
+                    .map_or_else(|| vec![(text.clone(), false)], |pair| pair.1.clone());
+                lines.push(diff_row(
+                    changed_spans('+', SUCCESS, ADDED_WORD, parts),
+                    width,
+                ));
+            }
+        };
     for line in diff.lines() {
+        let in_hunk = hunks > 0;
         if line.starts_with("@@") {
-            in_hunk = true;
-        } else if !in_hunk && (line.starts_with("---") || line.starts_with("+++")) {
+            flush(&mut lines, &mut removed, &mut added);
+            if hunks > 0 {
+                lines.push(diff_row(vec![Span::styled("⋯", muted)], width));
+            }
+            hunks += 1;
+            continue;
+        }
+        if !in_hunk && (line.starts_with("---") || line.starts_with("+++")) {
             continue;
         }
         let line = markdown::printable(line);
-        let mut spans = match line.chars().next() {
-            Some('+') if in_hunk => vec![Span::styled("+", Style::default().fg(SUCCESS))],
-            Some('-') if in_hunk => vec![Span::styled("-", Style::default().fg(ERROR))],
-            Some(' ') if in_hunk => vec![Span::raw(" ")],
-            _ => {
-                lines.push(diff_row(vec![Span::styled(line.into_owned(), muted)], width));
-                continue;
+        match line.chars().next() {
+            Some('-') if in_hunk => {
+                if !added.is_empty() {
+                    flush(&mut lines, &mut removed, &mut added);
+                }
+                removed.push(line[1..].to_owned());
             }
-        };
-        spans.extend(code(&line[1..]));
-        lines.push(diff_row(spans, width));
+            Some('+') if in_hunk => added.push(line[1..].to_owned()),
+            Some(' ') if in_hunk => {
+                flush(&mut lines, &mut removed, &mut added);
+                let code = &line[1..];
+                let mut spans = vec![Span::raw(" ")];
+                spans.extend(
+                    syntax
+                        .and_then(|syntax| syntax.line(code))
+                        .unwrap_or_else(|| vec![Span::raw(code.to_owned())]),
+                );
+                lines.push(diff_row(spans, width));
+            }
+            _ => {
+                flush(&mut lines, &mut removed, &mut added);
+                lines.push(diff_row(
+                    vec![Span::styled(line.into_owned(), muted)],
+                    width,
+                ));
+            }
+        }
     }
+    flush(&mut lines, &mut removed, &mut added);
     lines
+}
+
+/// One removed or added line: its marker and text in `color`, and the parts
+/// marked as changed also on the `word` background.
+fn changed_spans(marker: char, color: Color, word: Color, parts: Marked) -> Vec<Span<'static>> {
+    let plain = Style::default().fg(color);
+    let mut spans = vec![Span::styled(marker.to_string(), plain)];
+    spans.extend(
+        parts.into_iter().map(|(text, changed)| {
+            Span::styled(text, if changed { plain.bg(word) } else { plain })
+        }),
+    );
+    spans
+}
+
+/// The words of `old` and `new` that differ, as runs of text flagged
+/// changed or not. Lines with no word in common are left unmarked, since
+/// marking all of them says nothing the color does not.
+fn word_diff(old: &str, new: &str) -> (Marked, Marked) {
+    const MAX_TOKENS: usize = 400;
+    let unmarked = || (vec![(old.to_owned(), false)], vec![(new.to_owned(), false)]);
+    let (a, b) = (tokens(old), tokens(new));
+    if a.len() > MAX_TOKENS || b.len() > MAX_TOKENS {
+        return unmarked();
+    }
+    // Longest common subsequence of the tokens, filled from the end.
+    let mut table = vec![vec![0u16; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            table[i][j] = if a[i] == b[j] {
+                table[i + 1][j + 1] + 1
+            } else {
+                table[i + 1][j].max(table[i][j + 1])
+            };
+        }
+    }
+    let (mut kept_a, mut kept_b) = (vec![false; a.len()], vec![false; b.len()]);
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            kept_a[i] = true;
+            kept_b[j] = true;
+            i += 1;
+            j += 1;
+        } else if table[i + 1][j] >= table[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    let shared_word = a
+        .iter()
+        .zip(&kept_a)
+        .any(|(token, kept)| *kept && !token.trim().is_empty());
+    if !shared_word || (kept_a.iter().all(|kept| *kept) && kept_b.iter().all(|kept| *kept)) {
+        return unmarked();
+    }
+    (runs(&a, &kept_a), runs(&b, &kept_b))
+}
+
+/// `text` split into words, runs of spaces, and single other characters.
+fn tokens(text: &str) -> Vec<&str> {
+    let kind = |c: char| {
+        if c.is_alphanumeric() || c == '_' {
+            0
+        } else if c.is_whitespace() {
+            1
+        } else {
+            2
+        }
+    };
+    let mut tokens = Vec::new();
+    let mut start = 0;
+    let mut last = None;
+    for (index, c) in text.char_indices() {
+        let current = kind(c);
+        if index > start && (current == 2 || last != Some(current)) {
+            tokens.push(&text[start..index]);
+            start = index;
+        }
+        last = Some(current);
+    }
+    if start < text.len() {
+        tokens.push(&text[start..]);
+    }
+    tokens
+}
+
+/// Tokens joined into runs that are all kept or all changed. A space
+/// between two changed tokens counts as changed, so a changed phrase reads
+/// as one mark.
+fn runs(tokens: &[&str], kept: &[bool]) -> Marked {
+    let changed: Vec<bool> = (0..tokens.len())
+        .map(|index| {
+            !kept[index]
+                || (tokens[index].trim().is_empty()
+                    && index > 0
+                    && index + 1 < tokens.len()
+                    && !kept[index - 1]
+                    && !kept[index + 1])
+        })
+        .collect();
+    let mut runs: Marked = Vec::new();
+    for (token, changed) in tokens.iter().zip(changed) {
+        match runs.last_mut() {
+            Some((text, flag)) if *flag == changed => text.push_str(token),
+            _ => runs.push(((*token).to_owned(), changed)),
+        }
+    }
+    runs
 }
 
 /// One diff line behind its `│ ` bar, cut to `width` with a `…` when it
@@ -566,6 +869,16 @@ fn split_input(input: Option<&Value>) -> (Fields, Fields) {
     (short, long)
 }
 
+/// What a collapsed call previews: a program's output, or its errors when
+/// it printed nothing else, and otherwise the call's text.
+fn preview_text(entry: &Entry) -> &str {
+    match entry.output.as_ref().and_then(run_output) {
+        Some(run) if !run.stdout.trim().is_empty() => run.stdout,
+        Some(run) if !run.stderr.trim().is_empty() => run.stderr,
+        _ => &entry.body,
+    }
+}
+
 /// The first lines of a collapsed call's text, muted and cut to one row each.
 fn output_preview(body: &str, width: usize, rows: usize) -> Vec<Line<'static>> {
     body.lines()
@@ -601,6 +914,17 @@ pub(in crate::tui) fn max_scroll(app: &App, screen: Rect) -> usize {
 }
 
 pub(in crate::tui) fn tool_at(app: &App, screen: Rect, x: u16, y: u16) -> Option<ToolRow> {
+    clickable_at(app, screen, x, y).map(|(_, row)| row)
+}
+
+/// The clickable row at a screen cell: its conversation line, and what
+/// clicking it opens.
+pub(in crate::tui) fn clickable_at(
+    app: &App,
+    screen: Rect,
+    x: u16,
+    y: u16,
+) -> Option<(usize, ToolRow)> {
     let inner = conversation_inner(screen_rows(screen, app)[1]);
     if x < inner.x || x >= inner.right() || y < inner.y || y >= inner.bottom() {
         return None;
@@ -610,7 +934,29 @@ pub(in crate::tui) fn tool_at(app: &App, screen: Rect, x: u16, y: u16) -> Option
     conversation
         .tool_headers
         .into_iter()
-        .find_map(|(header, row)| (line == header).then_some(row))
+        .find(|(header, _)| line == *header)
+}
+
+/// Marks a clickable row as under the mouse: its title underlined up to the
+/// open or closed marker, which takes the primary color. A changed file's
+/// line has no marker, so its path is underlined.
+fn hovered(line: &mut Line<'static>) {
+    let mut started = false;
+    for span in &mut line.spans {
+        let text = span.content.trim();
+        if matches!(text, "▸" | "▾") {
+            span.style = span.style.fg(PRIMARY);
+            return;
+        }
+        if text.is_empty() || (!started && matches!(text, "✦" | "±")) {
+            if started {
+                return;
+            }
+            continue;
+        }
+        started = true;
+        span.style = span.style.add_modifier(Modifier::UNDERLINED);
+    }
 }
 
 /// Open or close a tool row, or a run of them, and keep it in view.
@@ -961,13 +1307,17 @@ mod tests {
         };
         let order = [
             position("± src/a.rs  +2 -1"),
-            position("│ @@ -1 +1,2 @@"),
             position("│ -a"),
             position("│ +b"),
             position("│ +c"),
-            position("│ Patched"),
         ];
         assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{lines:?}");
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("@@") || line.contains("Patched")),
+            "hunk headers and the receipt are left out: {lines:?}"
+        );
         assert!(
             !lines.iter().any(|line| line.contains("+++")),
             "file headers are left out: {lines:?}"
@@ -998,11 +1348,10 @@ mod tests {
         let added = after_bar(&diff_line(&app, 60, "│ +b"));
         assert_eq!(added[0].content, "+");
         assert_eq!(added[0].style.fg, Some(SUCCESS));
+        assert!(added.iter().all(|span| span.style.fg == Some(SUCCESS)));
         let removed = after_bar(&diff_line(&app, 60, "│ -a"));
         assert_eq!(removed[0].content, "-");
-        assert_eq!(removed[0].style.fg, Some(ERROR));
-        let hunk = after_bar(&diff_line(&app, 60, "│ @@ -1 +1,2 @@"));
-        assert!(hunk.iter().all(|span| span.style.fg == Some(MUTED)));
+        assert!(removed.iter().all(|span| span.style.fg == Some(ERROR)));
     }
 
     #[test]
@@ -1012,14 +1361,12 @@ mod tests {
         app.entries[0].set_changes(vec![change(
             "x.rs",
             "modified",
-            Some("@@ -1 +1 @@\n-fn e() {}\n+fn f() {}\n"),
+            Some("@@ -1,2 +1,2 @@\n fn keep() {}\n-fn e() {}\n+fn f() {}\n"),
         )]);
         app.entries[0].set_expanded(true);
-        let spans = after_bar(&diff_line(&app, 60, "│ +fn f() {}"));
+        let spans = after_bar(&diff_line(&app, 60, "│  fn keep() {}"));
         assert!(
-            spans[1..]
-                .iter()
-                .any(|span| span.style.fg.is_some_and(|fg| fg != SUCCESS)),
+            spans[1..].iter().any(|span| span.style.fg.is_some()),
             "{spans:?}"
         );
     }
@@ -1060,8 +1407,6 @@ mod tests {
         let line = diff_line(&app, 30, "…");
         assert_eq!(line.width(), 30, "{line}");
         assert!(line.to_string().contains("│ +xxx"), "{line}");
-        let short = diff_line(&app, 30, "@@ -1 +1 @@");
-        assert!(!short.to_string().contains('…'));
     }
 
     #[test]
@@ -1203,10 +1548,16 @@ mod tests {
     }
 
     #[test]
-    fn expanded_changed_calls_do_not_repeat_content() {
+    fn expanded_changed_calls_show_only_the_diff() {
         let mut app = App::new("http://127.0.0.1:7777", 1000, None);
         app.push_tool("fs.write", "Done");
-        app.entries[0].input = Some(json!({ "path": "a.txt", "content": "one\ntwo\nthree" }));
+        app.entries[0].input = Some(json!({
+            "path": "a.txt",
+            "content": "one\ntwo\nthree",
+            "old": "zero\none",
+            "new": "one\ntwo",
+        }));
+        app.entries[0].output = Some(json!({ "path": "a.txt", "revision": 4 }));
         app.entries[0].set_changes(vec![change(
             "a.txt",
             "created",
@@ -1224,11 +1575,15 @@ mod tests {
             "{lines:?}"
         );
         assert!(
-            !lines.iter().any(|line| line.trim() == "result"),
+            !lines
+                .iter()
+                .any(|line| ["result", "new", "old", "content"].contains(&line.trim())),
             "{lines:?}"
         );
         assert!(
-            lines.iter().any(|line| line.ends_with("│ Done")),
+            !lines
+                .iter()
+                .any(|line| line.ends_with("│ Done") || line.contains("Revision")),
             "{lines:?}"
         );
     }
@@ -1502,10 +1857,16 @@ mod tests {
     fn screen(app: &App, width: u16, height: u16) -> (Vec<Vec<String>>, ratatui::buffer::Buffer) {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| super::super::draw(frame, app)).unwrap();
+        terminal
+            .draw(|frame| super::super::draw(frame, app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let cells = (0..height)
-            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol().to_owned()).collect())
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect()
+            })
             .collect();
         (cells, buffer)
     }
@@ -1529,7 +1890,10 @@ mod tests {
         app.entries[1].input = Some(json!({ "path": "demo.sh", "old": old, "new": file }));
         let diff = format!(
             "@@ -4 +4 @@\n-echo \"Hi from a throwaway script! \u{1F44B}\"\n+echo \"Hello from a\tthrowaway script! \u{1F44B}\"\n{}",
-            numbered.lines().map(|line| format!(" {line}\n")).collect::<String>()
+            numbered
+                .lines()
+                .map(|line| format!(" {line}\n"))
+                .collect::<String>()
         );
         app.entries[1].set_changes(vec![change("demo.sh", "modified", Some(&diff))]);
         app.entries[1].set_expanded(true);
@@ -1551,7 +1915,11 @@ mod tests {
             }
             let text_width = conversation_inner(Rect::new(0, 0, width, 60)).width as usize - 1;
             for line in conversation_lines(&app, text_width).lines {
-                assert!(line.width() <= text_width, "{} > {text_width}: {line}", line.width());
+                assert!(
+                    line.width() <= text_width,
+                    "{} > {text_width}: {line}",
+                    line.width()
+                );
                 assert!(!line.to_string().contains(char::is_control), "{line:?}");
             }
         }
@@ -1570,14 +1938,19 @@ mod tests {
         assert!(steps > 4, "the conversation should scroll: {steps}");
         for scroll in (0..=steps).chain((0..=steps).rev()) {
             app.scroll = scroll;
-            terminal.draw(|frame| super::super::draw(frame, &app)).unwrap();
+            terminal
+                .draw(|frame| super::super::draw(frame, &app))
+                .unwrap();
             // The terminal kept only the cells each draw changed; they must
             // add up to what a fresh draw of the same state shows.
             let (_, fresh) = screen(&app, width, height);
             let kept = terminal.backend().buffer();
             for y in 0..height {
                 let last = &kept[(width - 1, y)];
-                assert!(last.symbol().width() <= 1, "wide cell on the edge at row {y}");
+                assert!(
+                    last.symbol().width() <= 1,
+                    "wide cell on the edge at row {y}"
+                );
                 for x in 0..width {
                     // A terminal draws a wide character over the next cell
                     // too, which the test backend leaves as it was.
@@ -1593,7 +1966,9 @@ mod tests {
             }
         }
         app.entries[1].set_expanded(false);
-        terminal.draw(|frame| super::super::draw(frame, &app)).unwrap();
+        terminal
+            .draw(|frame| super::super::draw(frame, &app))
+            .unwrap();
         let (fresh, _) = screen(&app, width, height);
         let kept = terminal.backend().buffer();
         for (y, row) in fresh.iter().enumerate() {
@@ -1604,5 +1979,93 @@ mod tests {
                 assert_eq!(kept[(x as u16, y as u16)].symbol(), cell, "({x}, {y})");
             }
         }
+    }
+
+    #[test]
+    fn paired_lines_mark_only_the_changed_words() {
+        let app = expanded_diff(
+            "x.txt",
+            "@@ -1 +1 @@\n-let total = price * count;\n+let total = cost * count;\n",
+        );
+        let marked = |needle: &str, word: Color| -> Vec<String> {
+            after_bar(&diff_line(&app, 60, needle))
+                .iter()
+                .filter(|span| span.style.bg == Some(word))
+                .map(|span| span.content.to_string())
+                .collect()
+        };
+        assert_eq!(
+            marked("│ -let total = price * count;", REMOVED_WORD),
+            ["price"]
+        );
+        assert_eq!(marked("│ +let total = cost * count;", ADDED_WORD), ["cost"]);
+        let unpaired = expanded_diff("x.txt", "@@ -0,0 +1 @@\n+fresh line\n");
+        let spans = after_bar(&diff_line(&unpaired, 60, "│ +fresh line"));
+        assert!(
+            spans.iter().all(|span| span.style.bg.is_none()),
+            "{spans:?}"
+        );
+    }
+
+    #[test]
+    fn program_runs_show_problems_first_and_output_last() {
+        let run = |output: Value| {
+            let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+            app.push_tool("shell", "flat text");
+            app.entries[0].output = Some(output);
+            app.entries[0].set_expanded(true);
+            plain_lines(&app, 60)
+                .into_iter()
+                .map(|line| line.trim().to_owned())
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+        };
+        let clean = run(json!({
+            "stdout": "hello\nworld\n",
+            "stderr": "",
+            "exit_code": 0,
+            "timed_out": false,
+            "truncated": false,
+        }));
+        assert_eq!(clean[1..], ["output", "│ hello", "│ world"], "{clean:?}");
+
+        let failed = run(json!({
+            "stdout": "partial\n",
+            "stderr": "boom\n",
+            "exit_code": 2,
+            "timed_out": true,
+            "truncated": true,
+        }));
+        assert_eq!(
+            failed[1..],
+            [
+                "exit code 2",
+                "stopped: ran too long",
+                "output cut",
+                "errors",
+                "│ boom",
+                "output",
+                "│ partial",
+            ],
+            "{failed:?}"
+        );
+    }
+
+    #[test]
+    fn other_results_mute_their_labels() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push_tool("kv.get", "Key: a");
+        app.entries[0].output = Some(json!({ "key": "a", "found": true }));
+        app.entries[0].set_expanded(true);
+        let line = diff_line(&app, 60, "│ Key  a");
+        let label = line
+            .spans
+            .iter()
+            .find(|span| span.content == "Key")
+            .unwrap();
+        assert_eq!(label.style.fg, Some(MUTED));
+        let value = line.spans.iter().find(|span| span.content == "a").unwrap();
+        assert_eq!(value.style.fg, None);
+        diff_line(&app, 60, "│ Found  Yes");
     }
 }
