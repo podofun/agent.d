@@ -75,6 +75,28 @@ pub(super) fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'s
     lines
 }
 
+/// `spans` cut to `width` columns by grapheme, keeping each span's style.
+pub(super) fn cut_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let mut used = 0;
+    let mut cut = Vec::new();
+    for span in spans {
+        let mut body = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = grapheme.width();
+            if used + grapheme_width > width {
+                if !body.is_empty() {
+                    cut.push(Span::styled(body, span.style));
+                }
+                return cut;
+            }
+            body.push_str(grapheme);
+            used += grapheme_width;
+        }
+        cut.push(Span::styled(body, span.style));
+    }
+    cut
+}
+
 /// Column widths within `room`: each column its natural width when all fit.
 /// Otherwise every column first gets its longest word, so words stay whole,
 /// and the rest is shared. When even the words do not fit, narrow columns
@@ -531,26 +553,12 @@ impl Renderer {
     /// by grapheme, never wrapped.
     fn push_code_spans(&mut self, spans: Vec<Span<'static>>) {
         let prefix = format!("{}│ ", self.indent());
-        let mut used = prefix.width();
+        let room = self.width.saturating_sub(prefix.width());
         let mut line = vec![Span::styled(
             prefix,
             Style::default().fg(self.palette.muted),
         )];
-        'spans: for span in spans {
-            let mut body = String::new();
-            for grapheme in span.content.graphemes(true) {
-                let grapheme_width = grapheme.width();
-                if used + grapheme_width > self.width {
-                    if !body.is_empty() {
-                        line.push(Span::styled(body, span.style));
-                    }
-                    break 'spans;
-                }
-                body.push_str(grapheme);
-                used += grapheme_width;
-            }
-            line.push(Span::styled(body, span.style));
-        }
+        line.extend(cut_spans(spans, room));
         if line.len() == 1 {
             line.push(Span::raw(String::new()));
         }

@@ -7,12 +7,12 @@ use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::super::app::{App, Entry, EntryKind, ToolRow};
+use super::super::app::{App, Entry, EntryKind, FileChange, ToolRow};
 use super::super::commands;
 use super::super::presentation;
 use super::{
-    ERROR, MUTED, PRIMARY, SECONDARY, SUCCESS, WARNING, markdown, palette, screen_rows, selection,
-    spinner_frame,
+    ERROR, MUTED, PRIMARY, SECONDARY, SUCCESS, WARNING, highlight, markdown, palette, screen_rows,
+    selection, spinner_frame,
 };
 
 pub(super) fn draw_conversation(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -109,11 +109,14 @@ fn conversation_lines(app: &App, width: usize) -> Conversation {
             selectable.push(GUTTER.min(width)..header.width().min(width));
             lines.push(header);
             if open {
+                // Calls in an open group sit one gutter further in.
+                let call_width = body_width.saturating_sub(GUTTER).max(1);
                 for (offset, call) in calls.iter().enumerate() {
-                    if call.is_expandable_tool() {
-                        tool_headers.push((lines.len(), ToolRow::Entry(run.start + offset)));
-                    }
-                    let block = call.lines(body_width, || entry_lines(call, body_width));
+                    let block = call.lines(call_width, || entry_lines(call, call_width));
+                    tool_headers.extend(
+                        toggle_rows(call, &block)
+                            .map(|row| (lines.len() + row, ToolRow::Entry(run.start + offset))),
+                    );
                     selectable.extend(
                         block
                             .iter()
@@ -125,10 +128,10 @@ fn conversation_lines(app: &App, width: usize) -> Conversation {
                 }
             }
         } else {
-            if entry.is_expandable_tool() {
-                tool_headers.push((lines.len(), ToolRow::Entry(index)));
-            }
             let block = entry.lines(body_width, || entry_lines(entry, body_width));
+            tool_headers.extend(
+                toggle_rows(entry, &block).map(|row| (lines.len() + row, ToolRow::Entry(index))),
+            );
             selectable.extend(
                 block
                     .iter()
@@ -182,6 +185,27 @@ fn conversation_lines(app: &App, width: usize) -> Conversation {
         selectable,
         tool_headers,
     }
+}
+
+/// Rows of an entry's block that open or close it when clicked: a tool
+/// row's header, and the first line of each changed file under it.
+fn toggle_rows<'a>(
+    entry: &'a Entry,
+    block: &'a [Line<'static>],
+) -> impl Iterator<Item = usize> + 'a {
+    let expandable = entry.is_expandable_tool();
+    block
+        .iter()
+        .enumerate()
+        .filter(move |(row, line)| {
+            expandable
+                && (*row == 0
+                    || line
+                        .spans
+                        .get(2)
+                        .is_some_and(|span| span.content == CHANGE_MARK.trim_end()))
+        })
+        .map(|(row, _)| row)
 }
 
 /// "Used 14 actions and 1 tool": a call is an action when its name is a
@@ -275,9 +299,19 @@ fn emphasized(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// A call's row: its name, then each short argument (paths, patterns,
-/// commands) in full. Collapsed, it previews the first lines of the long
-/// argument it carries (such as content being written), or else of its
+/// Changed files listed on a collapsed row, and diffs shown on an expanded
+/// one, before the rest are counted instead.
+const COLLAPSED_FILES: usize = 8;
+const EXPANDED_FILES: usize = 20;
+/// Arguments that carry what a call wrote, left out of an expanded row that
+/// shows the diff instead.
+const SHOWN_BY_DIFF: [&str; 3] = ["content", "patch", "diff"];
+/// Starts the line of each file a call changed.
+const CHANGE_MARK: &str = "± ";
+
+/// A call's row: its name, each short argument (paths, patterns, commands)
+/// in full, the size of each long one, and the files the call changed.
+/// Collapsed, a call that changed no files previews the first lines of its
 /// output. Expanded, it shows every long argument and the whole output.
 fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
     let (short, long) = split_input(entry.input.as_ref());
@@ -295,13 +329,53 @@ fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
         spans.push(Span::styled(format!("{key} "), Style::default().fg(MUTED)));
         spans.push(Span::raw(value));
     }
+    for (key, text) in &long {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("{key}  {}", size_of(text)),
+            Style::default().fg(MUTED),
+        ));
+    }
     let mut lines = with_gutter("✦", WARNING, markdown::wrap_spans(spans, width));
     let inner = width.saturating_sub(2);
     if !entry.expanded {
-        let preview = long.first().map_or(entry.body.as_str(), |(_, text)| text);
-        lines.extend(output_preview(preview, inner));
+        if entry.changes.is_empty() {
+            lines.extend(output_preview(&entry.body, inner, 3));
+            return lines;
+        }
+        if entry.failed {
+            lines.extend(output_preview(&entry.body, inner, 1));
+        }
+    }
+    let shown = if entry.expanded {
+        EXPANDED_FILES
+    } else {
+        COLLAPSED_FILES
+    };
+    for change in entry.changes.iter().take(shown) {
+        lines.extend(change_summary(change, inner));
+        if entry.expanded {
+            lines.extend(diff_lines(change, inner));
+        }
+    }
+    if let Some(more) = entry.changes.len().checked_sub(shown).filter(|n| *n > 0) {
+        let files = if more == 1 { "file" } else { "files" };
+        lines.push(indented(Line::styled(
+            format!("  and {more} more {files}"),
+            Style::default().fg(MUTED),
+        )));
+    }
+    if !entry.expanded {
         return lines;
     }
+    // The diff already shows what was written.
+    let long: Fields = if entry.changes.is_empty() {
+        long
+    } else {
+        long.into_iter()
+            .filter(|(key, _)| !SHOWN_BY_DIFF.contains(&key.as_str()))
+            .collect()
+    };
     let block = |lines: &mut Vec<Line<'static>>, label: &str, text: &str, bar: Color| {
         if !label.is_empty() {
             lines.push(indented(Line::styled(
@@ -323,6 +397,127 @@ fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
         block(&mut lines, label, &entry.body, WARNING);
     }
     lines
+}
+
+/// A change's diff, one `│ ` line per diff line, cut to `width` and never
+/// wrapped. Hunk headers are muted, the `+` and `-` markers colored, and
+/// the code after them highlighted by the file's type. The `---` and `+++`
+/// file headers are left out, since the summary line names the file. Lines
+/// skip the highlight memo, since the row keeps its rendered lines.
+fn diff_lines(change: &FileChange, width: usize) -> Vec<Line<'static>> {
+    let Some(diff) = &change.diff else {
+        return Vec::new();
+    };
+    let syntax = highlight::Syntax::find(highlight::language_for_path(&change.path));
+    let muted = Style::default().fg(MUTED);
+    let code = |text: &str| -> Vec<Span<'static>> {
+        syntax
+            .and_then(|syntax| syntax.line(text))
+            .unwrap_or_else(|| vec![Span::raw(text.to_owned())])
+    };
+    let mut in_hunk = false;
+    let mut lines = Vec::new();
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            in_hunk = true;
+        } else if !in_hunk && (line.starts_with("---") || line.starts_with("+++")) {
+            continue;
+        }
+        // The terminal drops control characters, so tabs would vanish.
+        let line = line.replace('\t', "    ");
+        let mut spans = match line.chars().next() {
+            Some('+') if in_hunk => vec![Span::styled("+", Style::default().fg(SUCCESS))],
+            Some('-') if in_hunk => vec![Span::styled("-", Style::default().fg(ERROR))],
+            Some(' ') if in_hunk => vec![Span::raw(" ")],
+            _ => {
+                lines.push(diff_row(vec![Span::styled(line, muted)], width));
+                continue;
+            }
+        };
+        spans.extend(code(&line[1..]));
+        lines.push(diff_row(spans, width));
+    }
+    lines
+}
+
+/// One diff line behind its `│ ` bar, cut to `width` with a `…` when it
+/// does not fit.
+fn diff_row(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let mut line = vec![Span::styled("│ ", Style::default().fg(MUTED))];
+    if spans.iter().map(Span::width).sum::<usize>() > width {
+        line.extend(markdown::cut_spans(spans, width.saturating_sub(1)));
+        line.push(Span::styled("…", Style::default().fg(MUTED)));
+    } else {
+        line.extend(spans);
+    }
+    indented(Line::from(line))
+}
+
+/// "3 lines" for multi-line text, "250 chars" for a single long line.
+fn size_of(text: &str) -> String {
+    match text.lines().count() {
+        0 | 1 => format!("{} chars", text.chars().count()),
+        lines => format!("{lines} lines"),
+    }
+}
+
+/// `± path  +12 -3`: one file a call changed, and how. Created and removed
+/// files say so, and a change with no diff says why.
+fn change_summary(change: &FileChange, width: usize) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(MUTED);
+    let created = change.operation == "created";
+    let removed = change.operation == "removed";
+    let mut spans = vec![
+        Span::styled(CHANGE_MARK, muted),
+        Span::raw(change.path.clone()),
+    ];
+    let note = if change.binary {
+        Some(if created {
+            "new binary file"
+        } else if removed {
+            "removed"
+        } else {
+            "binary file changed"
+        })
+    } else if created {
+        Some("new")
+    } else if removed {
+        Some("removed")
+    } else {
+        None
+    };
+    if let Some(note) = note {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(note, muted));
+    }
+    if !change.binary && change.diff.is_none() && !removed {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("too large to show", muted));
+    } else if !change.binary && change.diff.is_some() {
+        spans.push(Span::raw("  "));
+        if !removed {
+            spans.push(Span::styled(
+                format!("+{}", change.added),
+                Style::default().fg(SUCCESS),
+            ));
+        }
+        if !created && !removed {
+            spans.push(Span::raw(" "));
+        }
+        if !created {
+            spans.push(Span::styled(
+                format!("-{}", change.removed),
+                Style::default().fg(ERROR),
+            ));
+        }
+    }
+    markdown::wrap_spans(spans, width)
+        .into_iter()
+        .map(|mut line| {
+            line.spans.insert(0, Span::raw("  "));
+            indented(line)
+        })
+        .collect()
 }
 
 /// Named argument values, in the order the call gave them.
@@ -373,12 +568,11 @@ fn split_input(input: Option<&Value>) -> (Fields, Fields) {
 }
 
 /// The first lines of a collapsed call's text, muted and cut to one row each.
-fn output_preview(body: &str, width: usize) -> Vec<Line<'static>> {
-    const ROWS: usize = 3;
+fn output_preview(body: &str, width: usize, rows: usize) -> Vec<Line<'static>> {
     body.lines()
         .map(str::trim_end)
         .skip_while(|line| line.trim().is_empty())
-        .take(ROWS)
+        .take(rows)
         .map(|line| {
             let mut text: String = line.graphemes(true).take(width).collect();
             if text.width() < line.width() {
@@ -640,9 +834,10 @@ mod tests {
         assert!(text.contains("path"), "{text}");
         assert!(text.contains("/home/me/project/crates"), "{text}");
         assert!(text.contains("versation.rs"), "{text}");
+        assert!(text.contains("content  3 lines"), "{text}");
         assert!(
-            text.contains("fn main() {"),
-            "collapsed shows what is written"
+            !text.contains("fn main() {"),
+            "collapsed rows do not preview long arguments"
         );
         assert!(!text.contains("result"));
 
@@ -654,9 +849,507 @@ mod tests {
         assert!(text.contains("│ Done"));
     }
 
+    fn change(path: &str, operation: &str, diff: Option<&str>) -> FileChange {
+        FileChange {
+            path: path.to_owned(),
+            operation: operation.to_owned(),
+            diff: diff.map(str::to_owned),
+            binary: false,
+            added: 2,
+            removed: 1,
+        }
+    }
+
+    fn plain_lines(app: &App, width: usize) -> Vec<String> {
+        conversation_lines(app, width)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect()
+    }
+
+    fn changed_call() -> App {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push_tool("fs.patch", "Patched");
+        app.entries[0].input = Some(json!({ "path": "src/a.rs" }));
+        app.entries[0].set_changes(vec![change(
+            "src/a.rs",
+            "modified",
+            Some("--- src/a.rs\n+++ src/a.rs\n@@ -1 +1,2 @@\n-a\n+b\n+c\n"),
+        )]);
+        app
+    }
+
+    #[test]
+    fn collapsed_rows_summarize_changes() {
+        let app = changed_call();
+        let lines = plain_lines(&app, 60);
+        assert!(
+            lines.iter().any(|line| line.contains("± src/a.rs  +2 -1")),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|line| line.contains("+b")), "{lines:?}");
+        assert!(
+            !lines.iter().any(|line| line.contains("Patched")),
+            "the change replaces the output preview: {lines:?}"
+        );
+        let summary = conversation_lines(&app, 60)
+            .lines
+            .into_iter()
+            .find(|line| line.to_string().contains("± src/a.rs"))
+            .unwrap();
+        let fg = |text: &str| {
+            summary
+                .spans
+                .iter()
+                .find(|span| span.content == text)
+                .and_then(|span| span.style.fg)
+        };
+        assert_eq!(fg("+2"), Some(SUCCESS));
+        assert_eq!(fg("-1"), Some(ERROR));
+    }
+
+    #[test]
+    fn created_and_removed_files_say_so() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push_tool("shell", "");
+        app.entries[0].set_changes(vec![
+            change("new.rs", "created", Some("@@ -0,0 +1,2 @@\n+a\n+b\n")),
+            change("old.rs", "removed", Some("@@ -1 +0,0 @@\n-a\n")),
+        ]);
+        let lines = plain_lines(&app, 60);
+        assert!(
+            lines.iter().any(|line| line.contains("± new.rs  new  +2")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("± old.rs  removed  -1")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn long_arguments_are_summarized_not_previewed() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push_tool("fs.write", "");
+        app.entries[0].input = Some(json!({ "path": "a.rs", "content": "x\ny\nz" }));
+        app.entries[0].set_expanded(false);
+        let lines = plain_lines(&app, 60);
+        assert!(lines[0].contains("content  3 lines"), "{lines:?}");
+        assert!(!lines.iter().any(|line| line.trim() == "x"), "{lines:?}");
+
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push_tool("fs.write", "");
+        app.entries[0].input = Some(json!({ "content": "y".repeat(250) }));
+        let lines = plain_lines(&app, 60);
+        assert!(lines[0].contains("content  250 chars"), "{lines:?}");
+    }
+
+    #[test]
+    fn expanded_rows_show_the_diff() {
+        let mut app = changed_call();
+        app.entries[0].set_expanded(true);
+        let lines = plain_lines(&app, 60);
+        let position = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.trim_end().ends_with(needle))
+                .unwrap_or_else(|| panic!("no {needle:?} in {lines:?}"))
+        };
+        let order = [
+            position("± src/a.rs  +2 -1"),
+            position("│ @@ -1 +1,2 @@"),
+            position("│ -a"),
+            position("│ +b"),
+            position("│ +c"),
+            position("│ Patched"),
+        ];
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{lines:?}");
+        assert!(
+            !lines.iter().any(|line| line.contains("+++")),
+            "file headers are left out: {lines:?}"
+        );
+    }
+
+    fn diff_line(app: &App, width: usize, needle: &str) -> Line<'static> {
+        conversation_lines(app, width)
+            .lines
+            .into_iter()
+            .find(|line| line.to_string().trim_end().ends_with(needle))
+            .unwrap_or_else(|| panic!("no {needle:?}"))
+    }
+
+    fn after_bar(line: &Line<'static>) -> Vec<Span<'static>> {
+        let bar = line
+            .spans
+            .iter()
+            .position(|span| span.content == "│ ")
+            .unwrap();
+        line.spans[bar + 1..].to_vec()
+    }
+
+    #[test]
+    fn diff_markers_are_colored() {
+        let mut app = changed_call();
+        app.entries[0].set_expanded(true);
+        let added = after_bar(&diff_line(&app, 60, "│ +b"));
+        assert_eq!(added[0].content, "+");
+        assert_eq!(added[0].style.fg, Some(SUCCESS));
+        let removed = after_bar(&diff_line(&app, 60, "│ -a"));
+        assert_eq!(removed[0].content, "-");
+        assert_eq!(removed[0].style.fg, Some(ERROR));
+        let hunk = after_bar(&diff_line(&app, 60, "│ @@ -1 +1,2 @@"));
+        assert!(hunk.iter().all(|span| span.style.fg == Some(MUTED)));
+    }
+
+    #[test]
+    fn diff_code_is_highlighted_by_file_type() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push_tool("fs.write", "");
+        app.entries[0].set_changes(vec![change(
+            "x.rs",
+            "modified",
+            Some("@@ -1 +1 @@\n-fn e() {}\n+fn f() {}\n"),
+        )]);
+        app.entries[0].set_expanded(true);
+        let spans = after_bar(&diff_line(&app, 60, "│ +fn f() {}"));
+        assert!(
+            spans[1..]
+                .iter()
+                .any(|span| span.style.fg.is_some_and(|fg| fg != SUCCESS)),
+            "{spans:?}"
+        );
+    }
+
+    #[test]
+    fn diff_lines_are_cut_not_wrapped() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push_tool("fs.write", "");
+        let long = format!("@@ -0,0 +1 @@\n+let s = \"{}\";\n", "日本語".repeat(10));
+        app.entries[0].set_changes(vec![change("x.rs", "created", Some(&long))]);
+        app.entries[0].set_expanded(true);
+        let lines = conversation_lines(&app, 30).lines;
+        let cut = lines
+            .iter()
+            .find(|line| line.to_string().contains("│ +let s"))
+            .unwrap();
+        assert!(cut.width() <= 30, "{}", cut.width());
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.to_string().contains("日本"))
+                .count(),
+            1
+        );
+    }
+
+    fn expanded_diff(path: &str, diff: &str) -> App {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push_tool("fs.write", "");
+        app.entries[0].set_changes(vec![change(path, "modified", Some(diff))]);
+        app.entries[0].set_expanded(true);
+        app
+    }
+
+    #[test]
+    fn cut_diff_lines_end_with_an_ellipsis() {
+        let app = expanded_diff("x.txt", &format!("@@ -1 +1 @@\n+{}\n", "x".repeat(80)));
+        let line = diff_line(&app, 30, "…");
+        assert_eq!(line.width(), 30, "{line}");
+        assert!(line.to_string().contains("│ +xxx"), "{line}");
+        let short = diff_line(&app, 30, "@@ -1 +1 @@");
+        assert!(!short.to_string().contains('…'));
+    }
+
+    #[test]
+    fn collapsed_rows_cap_the_file_list() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push_tool("shell", "");
+        app.entries[0].set_changes(
+            (0..11)
+                .map(|n| {
+                    change(
+                        &format!("f{n}.rs"),
+                        "modified",
+                        Some("@@ -1 +1 @@\n-a\n+b\n"),
+                    )
+                })
+                .collect(),
+        );
+        let lines = plain_lines(&app, 60);
+        assert_eq!(lines.iter().filter(|line| line.contains('±')).count(), 8);
+        let more = lines
+            .iter()
+            .position(|line| line.trim_end().ends_with("and 3 more files"))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(lines[more - 1].contains("± f7.rs"), "{lines:?}");
+    }
+
+    #[test]
+    fn expanded_rows_cap_the_diffs() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push_tool("shell", "");
+        app.entries[0].set_changes(
+            (0..21)
+                .map(|n| {
+                    change(
+                        &format!("f{n}.rs"),
+                        "modified",
+                        Some("@@ -1 +1 @@\n-a\n+b\n"),
+                    )
+                })
+                .collect(),
+        );
+        app.entries[0].set_expanded(true);
+        let lines = plain_lines(&app, 60);
+        assert_eq!(lines.iter().filter(|line| line.contains('±')).count(), 20);
+        assert_eq!(
+            lines.iter().filter(|line| line.ends_with("│ +b")).count(),
+            20
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.trim_end().ends_with("and 1 more file")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn open_groups_fit_their_rows_in_the_width() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        let path = format!("crates/{}/main.rs", "deep".repeat(15));
+        app.push_tool("fs.write", "");
+        app.entries[0].input = Some(json!({ "path": path }));
+        app.entries[0].set_changes(vec![change(
+            &path,
+            "modified",
+            Some(&format!("@@ -1 +1 @@\n-a\n+{}\n", "y".repeat(80))),
+        )]);
+        app.entries[0].set_expanded(true);
+        app.push_tool("git.status", "clean");
+        app.entries[0].group_open = true;
+        let conversation = conversation_lines(&app, 40);
+        for line in &conversation.lines {
+            assert!(line.width() <= 40, "{} wide: {line}", line.width());
+        }
+        assert!(
+            conversation
+                .lines
+                .iter()
+                .any(|line| line.to_string().contains("crates/deepdeep"))
+        );
+    }
+
+    #[test]
+    fn tabs_in_diffs_become_spaces() {
+        let app = expanded_diff("x.py", "@@ -1 +1 @@\n-\tx = 0\n+\tx = 1\n");
+        let lines = plain_lines(&app, 60);
+        assert!(
+            lines.iter().any(|line| line.ends_with("│ +    x = 1")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.ends_with("│ -    x = 0")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn diff_lines_leave_reply_code_in_the_memo() {
+        let diff: String = std::iter::once("@@ -0,0 +1,100 @@".to_owned())
+            .chain((0..100).map(|n| format!("+let diff_memo_{n} = {n};")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let app = expanded_diff("x.rs", &diff);
+        // Each memo entry the diff added could push out a block of a reply.
+        let before = highlight::MISSES.with(|misses| misses.get());
+        assert!(
+            plain_lines(&app, 60)
+                .iter()
+                .any(|line| line.contains("diff_memo_99"))
+        );
+        assert_eq!(highlight::MISSES.with(|misses| misses.get()), before);
+    }
+
+    #[test]
+    fn failed_calls_keep_their_output_above_the_files() {
+        let result = |output: Value, error: Option<&str>| {
+            let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+            app.apply(super::super::super::app::Update::Delta(json!({
+                "type": "tool_result", "name": "shell", "output": output, "error": error,
+                "changes": [{ "path": "a.txt", "operation": "created", "diff": "@@ -0,0 +1 @@\n+a\n", "added": 1 }]
+            })));
+            plain_lines(&app, 60)
+        };
+        let failed = result(json!({ "exit_code": 2, "stderr": "boom" }), None);
+        assert!(!failed[1].contains('±'), "{failed:?}");
+        assert!(failed[2].contains("± a.txt"), "{failed:?}");
+        let failed = result(
+            json!({ "exit_code": 2, "stderr": "boom" })
+                .to_string()
+                .into(),
+            None,
+        );
+        assert!(failed[2].contains("± a.txt"), "{failed:?}");
+        let errored = result(Value::Null, Some("denied"));
+        assert!(errored[1].contains("failed: denied"), "{errored:?}");
+        assert!(errored[2].contains("± a.txt"), "{errored:?}");
+        let passed = result(json!({ "exit_code": 0, "stdout": "fine" }), None);
+        assert!(passed[1].contains("± a.txt"), "{passed:?}");
+    }
+
+    #[test]
+    fn expanded_changed_calls_do_not_repeat_content() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push_tool("fs.write", "Done");
+        app.entries[0].input = Some(json!({ "path": "a.txt", "content": "one\ntwo\nthree" }));
+        app.entries[0].set_changes(vec![change(
+            "a.txt",
+            "created",
+            Some("@@ -0,0 +1,3 @@\n+one\n+two\n+three\n"),
+        )]);
+        app.entries[0].set_expanded(true);
+        let lines = plain_lines(&app, 60);
+        assert!(lines[0].contains("content  3 lines"), "{lines:?}");
+        assert!(
+            lines.iter().any(|line| line.ends_with("│ +two")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.ends_with("│ two")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.trim() == "result"),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.ends_with("│ Done")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn summary_lines_toggle_the_row() {
+        let mut app = changed_call();
+        for expanded in [false, true] {
+            app.entries[0].set_expanded(expanded);
+            let conversation = conversation_lines(&app, 60);
+            let summary = conversation
+                .lines
+                .iter()
+                .position(|line| line.to_string().contains("± src/a.rs"))
+                .unwrap();
+            assert!(
+                conversation
+                    .tool_headers
+                    .contains(&(summary, ToolRow::Entry(0))),
+                "{:?}",
+                conversation.tool_headers
+            );
+            assert!(
+                !conversation
+                    .tool_headers
+                    .iter()
+                    .any(|(line, _)| conversation.lines[*line].to_string().contains("│ +b"))
+            );
+        }
+    }
+
+    #[test]
+    fn crlf_diffs_render_without_carriage_returns() {
+        let app = expanded_diff("a.txt", "@@ -1 +1 @@\r\n-a\r\n+b\r\n");
+        let lines = plain_lines(&app, 60);
+        assert!(lines.iter().any(|line| line.ends_with("│ +b")), "{lines:?}");
+        assert!(!lines.iter().any(|line| line.contains('\r')), "{lines:?}");
+    }
+
+    #[test]
+    fn diff_notes_are_muted() {
+        let app = expanded_diff(
+            "a.txt",
+            "@@ -1 +1 @@\n-a\n+b\n\\ No newline at end of file\n... 5 more lines\n",
+        );
+        for note in ["\\ No newline at end of file", "... 5 more lines"] {
+            let spans = after_bar(&diff_line(&app, 60, note));
+            assert!(
+                spans.iter().all(|span| span.style.fg == Some(MUTED)),
+                "{spans:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_lines_that_look_like_file_headers_stay() {
+        let app = expanded_diff("a.txt", "--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n--- x\n+++ y\n");
+        let lines = plain_lines(&app, 60);
+        assert!(
+            !lines.iter().any(|line| line.ends_with("--- a.txt")),
+            "{lines:?}"
+        );
+        let removed = after_bar(&diff_line(&app, 60, "│ --- x"));
+        assert_eq!(removed[0].content, "-");
+        assert_eq!(removed[0].style.fg, Some(ERROR));
+        assert!(
+            lines.iter().any(|line| line.ends_with("│ +++ y")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn binary_and_missing_diffs_say_so() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push_tool("shell", "");
+        let mut binary = change("logo.png", "modified", None);
+        binary.binary = true;
+        app.entries[0].set_changes(vec![binary, change("big.log", "modified", None)]);
+        let lines = plain_lines(&app, 60);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("± logo.png  binary file changed")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("± big.log  too large to show")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn older_results_without_changes_render_as_before() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.apply(super::super::super::app::Update::Delta(json!({
+            "type": "tool_result", "name": "git.status",
+            "output": "yes it worked\ndiff:\nmodified: README.md"
+        })));
+        assert!(app.entries[0].changes.is_empty());
+        let lines = plain_lines(&app, 60);
+        assert!(lines[0].contains("✦  git.status ▸"), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("modified: README.md"))
+        );
+        assert!(!lines.iter().any(|line| line.contains("│ modified")));
+        assert!(!lines.iter().any(|line| line.contains('±')));
+        app.entries[0].set_expanded(true);
+        let lines = plain_lines(&app, 60);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("│ modified: README.md"))
+        );
+    }
+
     #[test]
     fn long_preview_lines_are_cut_with_an_ellipsis() {
-        let lines = output_preview(&format!("\n{}\nb\nc\nd", "x".repeat(50)), 10);
+        let lines = output_preview(&format!("\n{}\nb\nc\nd", "x".repeat(50)), 10, 3);
         let text: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
         assert_eq!(text.len(), 3);
         assert!(text[0].ends_with("xxxxxxxxx…"), "{}", text[0]);

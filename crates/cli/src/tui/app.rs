@@ -78,7 +78,29 @@ pub(super) struct Entry {
     pub(super) group_open: bool,
     /// On a tool row: the arguments the call was given.
     pub(super) input: Option<Value>,
+    /// On a tool row: the files the call changed.
+    pub(super) changes: Vec<FileChange>,
+    /// On a tool row: the call failed, or ran a program that exited nonzero.
+    pub(super) failed: bool,
     rendered: RefCell<Option<(usize, Vec<Line<'static>>)>>,
+}
+
+/// One file a tool call changed, as the daemon reports it on `tool_result`.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub(super) struct FileChange {
+    pub(super) path: String,
+    /// `created`, `modified`, or `removed`.
+    #[serde(default)]
+    pub(super) operation: String,
+    /// The unified diff, absent when the file is binary or too large.
+    #[serde(default)]
+    pub(super) diff: Option<String>,
+    #[serde(default)]
+    pub(super) binary: bool,
+    #[serde(default)]
+    pub(super) added: usize,
+    #[serde(default)]
+    pub(super) removed: usize,
 }
 
 /// A clickable tool row: one call, or a run of calls shown as one row,
@@ -131,7 +153,7 @@ const HELP: &str = "\
 - `/` lists commands. `/runner`, `/call`, and `/open` open searchable lists
 - `/rename NAME` labels the current chat
 - `Ctrl+N`, `/new`, or `/clear` starts a new chat, `F5` refreshes daemon state
-- `Ctrl+E` or a click expands the latest tool output or group of calls
+- `Ctrl+E` expands the latest tool call, or click a row. An expanded call shows the diff of each file it changed
 - `Shift+Tab` or `/approval` chooses who answers approvals: you, the classifier, or nobody
 - Drag with the mouse to select text; `Ctrl+C` copies it
 - `PageUp`, `PageDown`, or the mouse wheel scroll
@@ -326,8 +348,20 @@ impl App {
             (_, output) => presentation::value(output),
         };
         let entry = &mut self.entries[index];
+        entry.failed = call_failed(value);
         set_input(entry, &value["input"]);
         append_output(entry, &output);
+        let changes = value["changes"]
+            .as_array()
+            .map_or_else(Vec::new, |changes| {
+                changes
+                    .iter()
+                    .filter_map(|change| serde_json::from_value(change.clone()).ok())
+                    .collect()
+            });
+        if !changes.is_empty() {
+            entry.set_changes(changes);
+        }
     }
 
     fn content_arrived(&mut self) {
@@ -1128,12 +1162,20 @@ impl Entry {
             expanded: false,
             group_open: false,
             input: None,
+            changes: Vec::new(),
+            failed: false,
             rendered: RefCell::new(None),
         }
     }
 
     pub(super) fn is_expandable_tool(&self) -> bool {
-        matches!(self.kind, EntryKind::Tool) && (!self.body.is_empty() || self.input.is_some())
+        matches!(self.kind, EntryKind::Tool)
+            && (!self.body.is_empty() || self.input.is_some() || !self.changes.is_empty())
+    }
+
+    pub(super) fn set_changes(&mut self, changes: Vec<FileChange>) {
+        self.changes = changes;
+        self.rendered.get_mut().take();
     }
 
     pub(super) fn set_expanded(&mut self, expanded: bool) {
@@ -1157,6 +1199,23 @@ impl Entry {
             }
         }
     }
+}
+
+/// A `tool_result` that carries an error, or output with a nonzero
+/// `exit_code`, whether as an object or as JSON text.
+fn call_failed(value: &Value) -> bool {
+    if value["error"].is_string() {
+        return true;
+    }
+    let parsed;
+    let output = match &value["output"] {
+        Value::String(text) => {
+            parsed = serde_json::from_str(text).unwrap_or(Value::Null);
+            &parsed
+        }
+        output => output,
+    };
+    output["exit_code"].as_i64().is_some_and(|code| code != 0)
 }
 
 /// Keep a call's arguments, unless it had none.
@@ -1505,6 +1564,41 @@ mod tests {
         assert_eq!(app.entries[1].body, "first");
         assert_eq!(app.entries[2].input, Some(json!({ "path": "/b.rs" })));
         assert_eq!(app.entries[2].body, "failed: denied");
+    }
+
+    #[test]
+    fn tool_result_changes_are_kept() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push(EntryKind::User, "go");
+        app.apply(delta(json!({ "type": "tool_call", "name": "fs.write" })));
+        app.apply(delta(json!({
+            "type": "tool_result", "name": "fs.write",
+            "input": { "path": "src/a.rs" }, "output": "ok",
+            "changes": [{
+                "path": "src/a.rs", "operation": "modified", "revision": 3,
+                "diff": "@@ -1 +1,2 @@\n-a\n+b\n+c\n",
+                "binary": false, "added": 2, "removed": 1
+            }]
+        })));
+        let entry = &app.entries[1];
+        assert_eq!(entry.changes.len(), 1);
+        assert_eq!(entry.changes[0].path, "src/a.rs");
+        assert_eq!(entry.changes[0].operation, "modified");
+        assert_eq!(entry.changes[0].added, 2);
+        assert_eq!(entry.changes[0].removed, 1);
+    }
+
+    #[test]
+    fn a_call_that_only_changed_files_can_be_opened() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.apply(delta(json!({
+            "type": "tool_result", "name": "shell",
+            "changes": [{ "path": "a.txt", "operation": "created" }, { "bad": true }]
+        })));
+        let entry = &app.entries[0];
+        assert_eq!(entry.changes.len(), 1, "a malformed change is skipped");
+        assert_eq!(entry.changes[0].operation, "created");
+        assert!(entry.is_expandable_tool());
     }
 
     #[test]
