@@ -797,6 +797,7 @@ fn build_and_store_ctx(lua: &Lua) -> mlua::Result<()> {
     let fs = build_fs_table(lua)?;
     wrap_table_fns(lua, &fs)?;
     ctx.set("fs", fs)?;
+    ctx.set("diff", build_diff_table(lua)?)?;
     ctx.set("http", build_http_table(lua)?)?;
     let secret = build_secret_table(lua)?;
     wrap_table_fns(lua, &secret)?;
@@ -2380,6 +2381,88 @@ fn parse_shell_args(_lua: &Lua, args: MultiValue) -> mlua::Result<ExecRequest> {
 }
 
 // ---------- context.fs ----------
+
+/// `ctx.diff`: unified diffs as text and as tables. Pure string work, so no
+/// permission applies; changing files goes through `ctx.fs`.
+fn build_diff_table(lua: &Lua) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    t.set(
+        "create",
+        lua.create_function(|_, (old, new, opts): (String, String, Option<Table>)| {
+            let path = match &opts {
+                Some(opts) => opts.get::<Option<String>>("path")?,
+                None => None,
+            }
+            .unwrap_or_else(|| "file".to_owned());
+            let context = match &opts {
+                Some(opts) => opts.get::<Option<usize>>("context")?,
+                None => None,
+            }
+            .unwrap_or(3);
+            Ok(fs::create_diff(&old, &new, &path, &path, context))
+        })?,
+    )?;
+    t.set(
+        "parse",
+        lua.create_function(|lua, text: String| {
+            let files = fs::parse_patch(&text).map_err(mlua::Error::external)?;
+            patches_to_lua(lua, &files)
+        })?,
+    )?;
+    t.set(
+        "format",
+        lua.create_function(|lua, files: Value| {
+            let files: Vec<fs::FilePatch> = lua.from_value(files).map_err(|e| {
+                mlua::Error::external(format!(
+                    "format takes the list ctx.diff.parse returns ({e})"
+                ))
+            })?;
+            Ok(fs::format_patch(&files))
+        })?,
+    )?;
+    t.set(
+        "apply",
+        lua.create_function(|lua, (text, patch): (String, Value)| {
+            let patch = one_file_patch(lua, patch)?;
+            fs::apply_patch(&text, &patch).map_err(mlua::Error::external)
+        })?,
+    )?;
+    Ok(t)
+}
+
+/// File patches as Lua tables, with `/dev/null` paths as `nil`.
+fn patches_to_lua(lua: &Lua, files: &[fs::FilePatch]) -> mlua::Result<Value> {
+    lua.to_value_with(
+        files,
+        mlua::SerializeOptions::new()
+            .serialize_none_to_null(false)
+            .serialize_unit_to_null(false),
+    )
+}
+
+/// A patch for one file, given as diff text or as one parsed file table.
+fn one_file_patch(lua: &Lua, patch: Value) -> mlua::Result<fs::FilePatch> {
+    match patch {
+        Value::String(text) => {
+            let mut files = fs::parse_patch(&text.to_str()?).map_err(mlua::Error::external)?;
+            if files.len() != 1 {
+                return Err(mlua::Error::external(
+                    "apply takes a patch for one file; use ctx.fs.patch for several",
+                ));
+            }
+            Ok(files.remove(0))
+        }
+        Value::Table(_) => lua.from_value(patch).map_err(|e| {
+            mlua::Error::external(format!(
+                "apply takes diff text or one file from ctx.diff.parse ({e})"
+            ))
+        }),
+        other => Err(mlua::Error::external(format!(
+            "apply takes diff text or one file from ctx.diff.parse, but got a {} value",
+            other.type_name()
+        ))),
+    }
+}
 
 fn build_fs_table(lua: &Lua) -> mlua::Result<Table> {
     let t = lua.create_table()?;
