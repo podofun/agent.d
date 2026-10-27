@@ -1155,7 +1155,7 @@ fn tip_for(code: &str) -> Option<String> {
             "Run `agentctl session ls` to list sessions, or `agentctl session new` to start one"
         }
         "runner_turn_limit" => {
-            "Send another message to let it continue, or raise `max_turns` under `[runtime]` in `config.toml`. https://docs.podo.fun/agentd/v0/reference/configuration"
+            "Run it in a session to let it continue without a limit, or raise `max_turns` under `[runtime]` in `config.toml`. https://docs.podo.fun/agentd/v0/reference/configuration"
         }
         "session_busy" => "Wait for the in-flight run on this session to finish, then retry",
         "session_label_taken" => {

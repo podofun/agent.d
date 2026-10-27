@@ -178,42 +178,67 @@ async fn session_history_is_loaded_and_appended() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn turn_limit_keeps_the_work_so_far_in_the_session() {
-    let looping = MockProvider::new().with_script(vec![
+async fn session_runs_are_not_capped_by_max_turns() {
+    let steps = vec![
         MockProvider::tool_call("c1", "notes.lookup", serde_json::json!({})),
         MockProvider::tool_call("c2", "notes.lookup", serde_json::json!({})),
-        MockProvider::text_only("picked up where I left off"),
-    ]);
+        MockProvider::tool_call("c3", "notes.lookup", serde_json::json!({})),
+        MockProvider::text_only("all done"),
+    ];
+    let looping = MockProvider::new().with_script(
+        steps
+            .into_iter()
+            .map(|mut step| {
+                step.usage = Some(agentd_ai::types::Usage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    ..Default::default()
+                });
+                step
+            })
+            .collect(),
+    );
     let (exec, store) = build_with_turns(Arc::new(looping), None, 2);
     let s = store.create(ws_session()).unwrap();
 
-    let err = exec
+    let out = exec
         .run_runner_with_options(caller(), "chat", opts(&s.id, "dig in"), None)
+        .await
+        .unwrap();
+    assert_eq!(out.text, "all done");
+    let usage = store.get(&s.id).unwrap().unwrap().usage;
+    assert_eq!((usage.input_tokens, usage.output_tokens), (400, 40));
+
+    let stored = store.turns(&s.id).unwrap();
+    assert_eq!(stored.first().unwrap().content, "dig in");
+    assert_eq!(
+        stored.iter().filter(|m| m.tool_call_id.is_some()).count(),
+        3,
+        "every tool result is kept"
+    );
+    assert_eq!(stored.last().unwrap().content, "all done");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_outside_a_session_still_stop_at_max_turns() {
+    let looping = MockProvider::new().with_script(vec![
+        MockProvider::tool_call("c1", "notes.lookup", serde_json::json!({})),
+        MockProvider::tool_call("c2", "notes.lookup", serde_json::json!({})),
+        MockProvider::text_only("never reached"),
+    ]);
+    let (exec, _store) = build_with_turns(Arc::new(looping), None, 2);
+    let options = RunOptions {
+        prompt: Some("dig in".into()),
+        ..Default::default()
+    };
+    let err = exec
+        .run_runner_with_options(caller(), "chat", options, None)
         .await
         .unwrap_err();
     assert!(
         matches!(err, RunnerError::TurnLimit { limit: 2, .. }),
         "{err}"
     );
-    assert_eq!(
-        err.to_string(),
-        "the runner used all 2 turns without finishing"
-    );
-
-    let stored = store.turns(&s.id).unwrap();
-    assert_eq!(stored.first().unwrap().content, "dig in");
-    assert_eq!(
-        stored.iter().filter(|m| m.tool_call_id.is_some()).count(),
-        2,
-        "both tool results are kept"
-    );
-    assert_eq!(stored.last().unwrap().role, agentd_ai::Role::Assistant);
-
-    let out = exec
-        .run_runner_with_options(caller(), "chat", opts(&s.id, "continue"), None)
-        .await
-        .unwrap();
-    assert_eq!(out.text, "picked up where I left off");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -321,7 +346,7 @@ async fn compaction_runs_automatically_with_default_policy() {
             }
         })
         .collect();
-    store.append(&s.id, &seed).unwrap();
+    store.append(&s.id, &seed, &Default::default()).unwrap();
 
     exec.run_runner_with_options(caller(), "chat", opts(&s.id, "now"), None)
         .await
@@ -359,7 +384,7 @@ async fn compaction_can_be_disabled_per_runner() {
     let seed: Vec<agentd_ai::Message> = (0..80)
         .map(|i| agentd_ai::Message::user(format!("u{i}")))
         .collect();
-    store.append(&s.id, &seed).unwrap();
+    store.append(&s.id, &seed, &Default::default()).unwrap();
     exec.run_runner_with_options(caller(), "chat", opts(&s.id, "now"), None)
         .await
         .unwrap();
@@ -402,6 +427,7 @@ async fn compaction_never_splits_a_tool_call_group() {
                 agentd_ai::Message::tool_result("c1", "{}"),
                 agentd_ai::Message::assistant("a5"),
             ],
+            &Default::default(),
         )
         .unwrap();
     exec.run_runner_with_options(caller(), "chat", opts(&s.id, "now"), None)
@@ -432,7 +458,7 @@ async fn summary_failure_falls_back_to_full_history() {
     let seed: Vec<agentd_ai::Message> = (0..4)
         .map(|i| agentd_ai::Message::user(format!("u{i}")))
         .collect();
-    store.append(&s.id, &seed).unwrap();
+    store.append(&s.id, &seed, &Default::default()).unwrap();
     let out = exec
         .run_runner_with_options(caller(), "chat", opts(&s.id, "now"), None)
         .await
