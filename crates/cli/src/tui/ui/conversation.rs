@@ -25,17 +25,16 @@ pub(super) fn draw_conversation(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if let Some(selection) = app.selection.as_ref().filter(|s| !s.is_click()) {
         selection::highlight(&mut conversation.lines, &conversation.selectable, selection);
     }
-    // Every line of the row under the mouse lights up together.
+    // The whole row is clickable, but only its header reacts to the mouse:
+    // what the row holds keeps its own colors.
     if let Some((_, row)) = app.hover
-        && conversation.tool_headers.contains(&app.hover.unwrap())
+        && let Some(&(header, _)) = conversation
+            .tool_headers
+            .iter()
+            .find(|(_, target)| *target == row)
+        && let Some(line) = conversation.lines.get_mut(header)
     {
-        for (line, target) in &conversation.tool_headers {
-            if *target == row
-                && let Some(line) = conversation.lines.get_mut(*line)
-            {
-                hovered(line);
-            }
-        }
+        hovered(line);
     }
     let offset = conversation.offset(inner.height, app.scroll);
     frame.render_widget(
@@ -1060,11 +1059,17 @@ fn hovered(line: &mut Line<'static>) {
     active(line);
 }
 
-/// The whole row in the active color: everything but its gutter marks.
+/// A row's title and its open or closed marker in the active color. The
+/// argument names and values after them keep their own colors.
 fn active(line: &mut Line<'static>) {
     for span in &mut line.spans {
-        if !matches!(span.content.trim(), "" | "✦" | "•" | "│") {
-            span.style = span.style.fg(ACTIVE);
+        let text = span.content.trim();
+        if matches!(text, "" | "✦" | "•" | "│") {
+            continue;
+        }
+        span.style = span.style.fg(ACTIVE);
+        if matches!(text, OPEN | CLOSED) {
+            return;
         }
     }
 }
