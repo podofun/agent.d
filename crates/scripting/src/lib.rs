@@ -991,7 +991,13 @@ fn register_runner(lua: &Lua, t: Table) -> mlua::Result<handles::Handle> {
 /// 40, keep_recent = 10, prompt = "..." }` overrides any subset of the
 /// defaults; absent = daemon defaults.
 fn read_compact_policy(lua: &Lua, t: &Table) -> mlua::Result<Option<CompactPolicy>> {
-    match t.get::<Value>("compact")? {
+    compact_policy(lua, t.get::<Value>("compact")?)
+}
+
+/// A runner's `compact` value: `nil`/`true` for the defaults, `false` to turn
+/// compaction off, or a table overriding the defaults.
+fn compact_policy(lua: &Lua, value: Value) -> mlua::Result<Option<CompactPolicy>> {
+    match value {
         Value::Nil => Ok(None),
         Value::Boolean(true) => Ok(None),
         Value::Boolean(false) => Ok(Some(CompactPolicy {

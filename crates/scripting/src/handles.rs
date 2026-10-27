@@ -4,10 +4,15 @@
 
 use std::collections::HashMap;
 
+use agentd_runners::RunnerDef;
 use agentd_runners::RunnerRegistry;
+use agentd_services::ServiceDef;
 use agentd_services::ServiceRegistry;
+use agentd_skills::SkillDef;
 use agentd_skills::SkillRegistry;
-use mlua::{Function, Lua, MetaMethod, UserData, UserDataMethods, Value};
+use mlua::{Function, Lua, LuaSerdeExt, MetaMethod, UserData, UserDataMethods, Value};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use super::SharedCatalog;
 
@@ -119,6 +124,14 @@ impl Handles {
     fn live_id(&self, kind: Kind, name: &str) -> Option<u64> {
         self.live.get(&(kind, name.to_owned())).copied()
     }
+
+    fn rename(&mut self, id: u64, new_name: &str) {
+        if let Some(slot) = self.slots.get_mut(&id) {
+            self.live.remove(&(slot.0, slot.1.clone()));
+            self.live.insert((slot.0, new_name.to_owned()), id);
+            slot.1 = new_name.to_owned();
+        }
+    }
 }
 
 /// A live handle on one registered item.
@@ -214,6 +227,409 @@ impl Handle {
         let value = field(lua, self.kind, &name, property)?;
         super::json_to_lua_value(lua, &value, &lua.create_table()?, true)
     }
+
+    fn write(&self, lua: &Lua, key: &str, value: Value) -> mlua::Result<()> {
+        let property = self.property(lua, key)?;
+        let name = self.name(lua)?;
+        match (self.kind, property) {
+            (_, "name") => self.rename(lua, &name, value),
+            (_, "handler") => set_handler(lua, self.kind, &name, value),
+            (Kind::Runner, "compact") => {
+                let compact = super::compact_policy(lua, value)?;
+                update::<RunnerDef>(lua, self.kind, &name, |def| {
+                    def.compact = compact;
+                    Ok(())
+                })
+            }
+            (Kind::Action, "input" | "output") => set_schema(lua, &name, property, value),
+            _ if self.kind.is_list(property) => {
+                let items = list_items(lua, self.kind, &name, property, value)?;
+                self.set_list(lua, &name, property, items)
+            }
+            _ => {
+                let json: serde_json::Value = lua.from_value(value)?;
+                set_field(lua, self.kind, &name, property, json)
+            }
+        }
+    }
+
+    fn set_list(
+        &self,
+        lua: &Lua,
+        name: &str,
+        property: &str,
+        items: Vec<String>,
+    ) -> mlua::Result<()> {
+        let items = match (self.kind, property) {
+            // Inside a package, unqualified action names are scoped the way
+            // registration scopes them.
+            (Kind::Runner, "allowed_actions" | "actions") => {
+                let package = super::active_package(lua);
+                items
+                    .iter()
+                    .map(|item| super::scoped(package.as_deref(), item))
+                    .collect()
+            }
+            _ => items,
+        };
+        set_field(lua, self.kind, name, property, serde_json::json!(items))
+    }
+
+    fn rename(&self, lua: &Lua, old: &str, value: Value) -> mlua::Result<()> {
+        let noun = self.kind.noun();
+        let new = match value {
+            Value::String(text) if !text.to_str()?.is_empty() => text.to_str()?.to_owned(),
+            _ => {
+                return Err(mlua::Error::external(format!(
+                    "the {noun} `{old}` needs a non-empty string as its name"
+                )));
+            }
+        };
+        if new == old {
+            return Ok(());
+        }
+        if definition(lua, self.kind, &new)?.is_some() {
+            return Err(mlua::Error::external(format!(
+                "the {noun} `{old}` cannot take the name `{new}` because a {noun} by that name already exists"
+            )));
+        }
+        refuse_if_used(lua, self.kind, old, "renamed")?;
+        move_item(lua, self.kind, old, &new)?;
+        lua.app_data_mut::<Handles>()
+            .ok_or_else(missing)?
+            .rename(self.id, &new);
+        Ok(())
+    }
+}
+
+/// Fail when other registered items still refer to `name`, naming them.
+pub(crate) fn refuse_if_used(lua: &Lua, kind: Kind, name: &str, verb: &str) -> mlua::Result<()> {
+    let users = users_of(lua, kind, name)?;
+    if users.is_empty() {
+        return Ok(());
+    }
+    let them = if users.len() == 1 { "it" } else { "them" };
+    Err(mlua::Error::external(format!(
+        "the {} `{name}` cannot be {verb} while {}, update or remove {them} first",
+        kind.noun(),
+        users.join(" and ")
+    )))
+}
+
+/// What still refers to `name`, as clauses such as "the runner `coder` still lists `x`".
+fn users_of(lua: &Lua, kind: Kind, name: &str) -> mlua::Result<Vec<String>> {
+    let mut users = Vec::new();
+    match kind {
+        Kind::Action => {
+            for runner in registry::<agentd_runners::RunnerRegistry>(lua)?.list() {
+                if runner.allowed_actions.iter().any(|action| action == name) {
+                    users.push(format!("the runner `{}` still lists `{name}`", runner.name));
+                }
+            }
+            for skill in registry::<agentd_skills::SkillRegistry>(lua)?.list() {
+                if skill.actions.iter().any(|action| action == name) {
+                    users.push(format!("the skill `{}` still lists `{name}`", skill.name));
+                }
+            }
+        }
+        Kind::Skill => {
+            for runner in registry::<agentd_runners::RunnerRegistry>(lua)?.list() {
+                if runner.skills.iter().any(|skill| skill == name) {
+                    users.push(format!("the runner `{}` still lists `{name}`", runner.name));
+                }
+            }
+        }
+        Kind::Tool => {
+            let catalog = registry::<SharedCatalog>(lua)?;
+            let guard = catalog.read().map_err(lock)?;
+            let mut actions: Vec<&String> = guard
+                .action_meta
+                .iter()
+                .filter(|(_, meta)| meta.tool.as_deref() == Some(name))
+                .map(|(action, _)| action)
+                .collect();
+            actions.sort();
+            for action in actions {
+                users.push(format!("the action `{action}` still uses `{name}`"));
+            }
+        }
+        Kind::Runner | Kind::Service => {}
+    }
+    Ok(users)
+}
+
+/// Re-register the item under a new name, keeping everything else.
+fn move_item(lua: &Lua, kind: Kind, old: &str, new: &str) -> mlua::Result<()> {
+    match kind {
+        Kind::Runner => {
+            let runners = registry::<agentd_runners::RunnerRegistry>(lua)?;
+            if let Some(mut def) = runners.remove(old) {
+                def.name = new.to_owned();
+                runners.insert(def);
+            }
+        }
+        Kind::Skill => {
+            let skills = registry::<agentd_skills::SkillRegistry>(lua)?;
+            if let Some(mut def) = skills.remove(old) {
+                def.name = new.to_owned();
+                skills.insert(def);
+            }
+        }
+        Kind::Service => {
+            let services = registry::<agentd_services::ServiceRegistry>(lua)?;
+            if let Some(mut def) = services.remove(old) {
+                def.name = new.to_owned();
+                services.insert(def);
+            }
+            let catalog = registry::<SharedCatalog>(lua)?;
+            let mut guard = catalog.write().map_err(lock)?;
+            if let Some(key) = guard.services.remove(old) {
+                guard.services.insert(new.to_owned(), key);
+            }
+        }
+        Kind::Action => {
+            let catalog = registry::<SharedCatalog>(lua)?;
+            let mut guard = catalog.write().map_err(lock)?;
+            if let Some(key) = guard.actions.remove(old) {
+                guard.actions.insert(new.to_owned(), key);
+            }
+            if let Some(meta) = guard.action_meta.remove(old) {
+                guard.action_meta.insert(new.to_owned(), meta);
+            }
+        }
+        Kind::Tool => {
+            let catalog = registry::<SharedCatalog>(lua)?;
+            let mut guard = catalog.write().map_err(lock)?;
+            if let Some(meta) = guard.tools.remove(old) {
+                guard.tools.insert(new.to_owned(), meta);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply `change` to a copy of a registry definition and store it.
+fn update<D: Clone + Serialize + DeserializeOwned + Named>(
+    lua: &Lua,
+    kind: Kind,
+    name: &str,
+    change: impl FnOnce(&mut D) -> mlua::Result<()>,
+) -> mlua::Result<()> {
+    let mut def = D::get(lua, name)?.ok_or_else(|| removed(kind, name))?;
+    change(&mut def)?;
+    D::put(lua, def)
+}
+
+/// Registry access shared by the definition types handles can change.
+trait Named: Sized {
+    fn get(lua: &Lua, name: &str) -> mlua::Result<Option<Self>>;
+    fn put(lua: &Lua, def: Self) -> mlua::Result<()>;
+}
+
+impl Named for RunnerDef {
+    fn get(lua: &Lua, name: &str) -> mlua::Result<Option<Self>> {
+        Ok(registry::<agentd_runners::RunnerRegistry>(lua)?.get(name))
+    }
+    fn put(lua: &Lua, def: Self) -> mlua::Result<()> {
+        registry::<agentd_runners::RunnerRegistry>(lua)?.insert(def);
+        Ok(())
+    }
+}
+
+impl Named for SkillDef {
+    fn get(lua: &Lua, name: &str) -> mlua::Result<Option<Self>> {
+        Ok(registry::<agentd_skills::SkillRegistry>(lua)?.get(name))
+    }
+    fn put(lua: &Lua, def: Self) -> mlua::Result<()> {
+        registry::<agentd_skills::SkillRegistry>(lua)?.insert(def);
+        Ok(())
+    }
+}
+
+impl Named for ServiceDef {
+    fn get(lua: &Lua, name: &str) -> mlua::Result<Option<Self>> {
+        Ok(registry::<agentd_services::ServiceRegistry>(lua)?.get(name))
+    }
+    fn put(lua: &Lua, def: Self) -> mlua::Result<()> {
+        registry::<agentd_services::ServiceRegistry>(lua)?.insert(def);
+        Ok(())
+    }
+}
+
+/// Replace one serde field of a definition, checking the new value the way
+/// deserializing a definition does.
+fn replace<D: Serialize + DeserializeOwned>(
+    kind: Kind,
+    name: &str,
+    def: &mut D,
+    property: &str,
+    value: serde_json::Value,
+) -> mlua::Result<()> {
+    let mut object = serde_json::to_value(&*def).map_err(external)?;
+    if let Some(fields) = object.as_object_mut() {
+        fields.insert(property.to_owned(), value);
+    }
+    *def = serde_json::from_value(object).map_err(|error| {
+        mlua::Error::external(format!(
+            "the {} `{name}` cannot take that value for `{property}` ({error})",
+            kind.noun()
+        ))
+    })?;
+    Ok(())
+}
+
+fn set_field(
+    lua: &Lua,
+    kind: Kind,
+    name: &str,
+    property: &str,
+    value: serde_json::Value,
+) -> mlua::Result<()> {
+    let property = match (kind, property) {
+        (Kind::Runner, "actions") => "allowed_actions",
+        (_, other) => other,
+    };
+    match kind {
+        Kind::Runner => update::<RunnerDef>(lua, kind, name, |def| {
+            replace(kind, name, def, property, value)
+        }),
+        Kind::Skill => update::<SkillDef>(lua, kind, name, |def| {
+            replace(kind, name, def, property, value)
+        }),
+        Kind::Service => update::<ServiceDef>(lua, kind, name, |def| {
+            replace(kind, name, def, property, value)?;
+            match def.restart.as_deref() {
+                None | Some("always" | "on_failure" | "never") => Ok(()),
+                Some(other) => Err(mlua::Error::external(format!(
+                    "the service `{name}` cannot use the restart policy `{other}`, use `always`, `on_failure` or `never`"
+                ))),
+            }
+        }),
+        Kind::Action => {
+            let catalog = registry::<SharedCatalog>(lua)?;
+            let mut guard = catalog.write().map_err(lock)?;
+            let meta = guard
+                .action_meta
+                .get_mut(name)
+                .ok_or_else(|| removed(kind, name))?;
+            let invalid = |error: serde_json::Error| {
+                mlua::Error::external(format!(
+                    "the action `{name}` cannot take that value for `{property}` ({error})"
+                ))
+            };
+            match property {
+                "tool" => meta.tool = serde_json::from_value(value).map_err(invalid)?,
+                "requires" => meta.requires = serde_json::from_value(value).map_err(invalid)?,
+                "confirm" => meta.confirm = serde_json::from_value(value).map_err(invalid)?,
+                "cwd" => meta.cwd = serde_json::from_value(value).map_err(invalid)?,
+                _ => unreachable!("every action property is handled"),
+            }
+            Ok(())
+        }
+        Kind::Tool => {
+            let catalog = registry::<SharedCatalog>(lua)?;
+            let mut guard = catalog.write().map_err(lock)?;
+            let meta = guard
+                .tools
+                .get_mut(name)
+                .ok_or_else(|| removed(kind, name))?;
+            meta.requires = serde_json::from_value(value).map_err(|error| {
+                mlua::Error::external(format!(
+                    "the tool `{name}` cannot take that value for `requires` ({error})"
+                ))
+            })?;
+            Ok(())
+        }
+    }
+}
+
+fn set_handler(lua: &Lua, kind: Kind, name: &str, value: Value) -> mlua::Result<()> {
+    let Value::Function(function) = value else {
+        return Err(mlua::Error::external(format!(
+            "the {} `{name}` needs a function as its handler",
+            kind.noun()
+        )));
+    };
+    let key = lua.create_registry_value(function)?;
+    let catalog = registry::<SharedCatalog>(lua)?;
+    let mut guard = catalog.write().map_err(lock)?;
+    let slot = match kind {
+        Kind::Action => guard.actions.get_mut(name),
+        _ => guard.services.get_mut(name),
+    }
+    .ok_or_else(|| removed(kind, name))?;
+    let old = std::mem::replace(slot, key);
+    drop(guard);
+    lua.remove_registry_value(old)
+}
+
+fn set_schema(lua: &Lua, name: &str, property: &str, value: Value) -> mlua::Result<()> {
+    let schema = match value {
+        Value::Nil => None,
+        Value::Table(props) => Some(super::compile_object_schema(&props, property == "input")?),
+        other => {
+            return Err(mlua::Error::external(format!(
+                "the action `{name}` needs a table of fields for `{property}`, but got a {} value",
+                other.type_name()
+            )));
+        }
+    };
+    let catalog = registry::<SharedCatalog>(lua)?;
+    let mut guard = catalog.write().map_err(lock)?;
+    let meta = guard
+        .action_meta
+        .get_mut(name)
+        .ok_or_else(|| removed(Kind::Action, name))?;
+    if property == "input" {
+        meta.input_schema = schema;
+    } else {
+        meta.output_schema = schema;
+    }
+    Ok(())
+}
+
+/// The strings of a value assigned to a list property: a Lua list, another
+/// live list, or `nil` for an empty list.
+fn list_items(
+    lua: &Lua,
+    kind: Kind,
+    name: &str,
+    property: &str,
+    value: Value,
+) -> mlua::Result<Vec<String>> {
+    let not_strings = || {
+        mlua::Error::external(format!(
+            "the {} `{name}` needs a list of strings for `{property}`",
+            kind.noun()
+        ))
+    };
+    match value {
+        Value::Nil => Ok(Vec::new()),
+        Value::Table(table) => table
+            .sequence_values::<Value>()
+            .map(|item| match item? {
+                Value::String(text) => Ok(text.to_str()?.to_owned()),
+                _ => Err(not_strings()),
+            })
+            .collect(),
+        Value::UserData(data) => data
+            .borrow::<ListHandle>()
+            .map_err(|_| not_strings())
+            .and_then(|list| list.items(lua)),
+        _ => Err(not_strings()),
+    }
+}
+
+fn removed(kind: Kind, name: &str) -> mlua::Error {
+    mlua::Error::external(format!("the {} `{name}` was removed", kind.noun()))
+}
+
+fn lock<T>(error: std::sync::PoisonError<T>) -> mlua::Error {
+    mlua::Error::external(error.to_string())
+}
+
+fn external(error: serde_json::Error) -> mlua::Error {
+    mlua::Error::external(error.to_string())
 }
 
 impl UserData for Handle {
@@ -221,6 +637,10 @@ impl UserData for Handle {
         methods.add_meta_method(MetaMethod::Index, |lua, this, key: String| {
             this.read(lua, &key)
         });
+        methods.add_meta_method(
+            MetaMethod::NewIndex,
+            |lua, this, (key, value): (String, Value)| this.write(lua, &key, value),
+        );
         methods.add_meta_method(MetaMethod::ToString, |lua, this, ()| {
             Ok(format!("{} {}", this.kind.noun(), this.name(lua)?))
         });
@@ -246,6 +666,45 @@ impl ListHandle {
     }
 }
 
+impl ListHandle {
+    /// `list[index] = value`: set an item, append at `#list + 1`, or with
+    /// `nil` remove the item and shift the rest down, as `table.remove` does.
+    fn set(&self, lua: &Lua, index: i64, value: Value) -> mlua::Result<()> {
+        let name = self.owner.name(lua)?;
+        let mut items = self.items(lua)?;
+        let len = items.len() as i64;
+        let noun = self.owner.kind.noun();
+        let property = self.property;
+        if !(1..=len + 1).contains(&index) {
+            return Err(mlua::Error::external(format!(
+                "the {noun} `{name}` list `{property}` has no index {index}, it has {len} items"
+            )));
+        }
+        let at = (index - 1) as usize;
+        match value {
+            Value::Nil if index <= len => {
+                items.remove(at);
+            }
+            Value::Nil => return Ok(()),
+            Value::String(text) => {
+                let text = text.to_str()?.to_owned();
+                if index == len + 1 {
+                    items.push(text);
+                } else {
+                    items[at] = text;
+                }
+            }
+            other => {
+                return Err(mlua::Error::external(format!(
+                    "the {noun} `{name}` list `{property}` holds strings, but got a {} value",
+                    other.type_name()
+                )));
+            }
+        }
+        self.owner.set_list(lua, &name, property, items)
+    }
+}
+
 impl UserData for ListHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(MetaMethod::Index, |lua, this, index: i64| {
@@ -255,6 +714,10 @@ impl UserData for ListHandle {
                 .and_then(|at| items.get(at).cloned()))
         });
         methods.add_meta_method(MetaMethod::Len, |lua, this, ()| Ok(this.items(lua)?.len()));
+        methods.add_meta_method(
+            MetaMethod::NewIndex,
+            |lua, this, (index, value): (i64, Value)| this.set(lua, index, value),
+        );
         methods.add_meta_method(MetaMethod::ToString, |lua, this, ()| {
             Ok(format!("{{{}}}", this.items(lua)?.join(", ")))
         });
@@ -263,9 +726,7 @@ impl UserData for ListHandle {
 
 /// One property of a registered item as JSON, `Null` when unset.
 fn field(lua: &Lua, kind: Kind, name: &str, property: &str) -> mlua::Result<serde_json::Value> {
-    let definition = definition(lua, kind, name)?.ok_or_else(|| {
-        mlua::Error::external(format!("the {} `{name}` was removed", kind.noun()))
-    })?;
+    let definition = definition(lua, kind, name)?.ok_or_else(|| removed(kind, name))?;
     let property = match (kind, property) {
         (Kind::Runner, "actions") => "allowed_actions",
         (_, other) => other,

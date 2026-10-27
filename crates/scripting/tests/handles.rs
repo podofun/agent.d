@@ -189,3 +189,143 @@ fn package_names_are_scoped() {
     host.set_packages_root(root.path());
     host.load_file(&init).unwrap();
 }
+
+#[test]
+fn assignment_changes_the_registered_item() {
+    let host = load(
+        r##"
+        local r = agentd.runner{ name = "coder", model = "mock/a" }
+        r.model = "mock/b"
+        r.system = "Be careful."
+        r.cwd = nil
+        "##,
+    );
+    let runner = host.runners().get("coder").unwrap();
+    assert_eq!(runner.model.as_deref(), Some("mock/b"));
+    assert_eq!(runner.system.as_deref(), Some("Be careful."));
+}
+
+#[test]
+fn lists_are_live() {
+    let host = load(
+        r##"
+        local r = agentd.runner{ name = "coder", skills = { "s" } }
+        table.insert(r.skills, "tdd")
+        assert(r.skills[2] == "tdd" and #r.skills == 2, "insert")
+        r.skills[1] = "debug"
+        assert(r.skills[1] == "debug", "set")
+        table.remove(r.skills, 1)
+        assert(#r.skills == 1 and r.skills[1] == "tdd", "remove")
+        local other = agentd.runner{ name = "other", skills = { "x", "y" } }
+        r.skills = other.skills
+        assert(r.skills[2] == "y", "copy from another list")
+        r.skills = { "a", "b", "c" }
+        local ok, err = pcall(function() r.skills[9] = "far" end)
+        assert(not ok and tostring(err):find("index 9", 1, true), tostring(err))
+        local ok2, err2 = pcall(function() r.skills[1] = 5 end)
+        assert(not ok2 and tostring(err2):find("string", 1, true), tostring(err2))
+        "##,
+    );
+    assert_eq!(host.runners().get("coder").unwrap().skills, ["a", "b", "c"]);
+}
+
+#[test]
+fn bad_assignments_fail_and_change_nothing() {
+    let host = load(
+        r##"
+        local r = agentd.runner{ name = "coder", model = "mock/a" }
+        local ok, err = pcall(function() r.modle = "x" end)
+        assert(not ok and tostring(err):find("the runner `coder` has no property `modle`", 1, true), tostring(err))
+        ok, err = pcall(function() r.model = 5 end)
+        assert(not ok and tostring(err):find("`model`", 1, true), tostring(err))
+        ok, err = pcall(function() r.compact = { keep_recent = 99, after_turns = 10 } end)
+        assert(not ok and tostring(err):find("keep_recent", 1, true), tostring(err))
+        assert(r.model == "mock/a", "unchanged after failures")
+        r.compact = false
+        assert(r.compact.enabled == false, "compact off")
+        "##,
+    );
+    assert_eq!(
+        host.runners().get("coder").unwrap().model.as_deref(),
+        Some("mock/a")
+    );
+}
+
+#[test]
+fn rename_keeps_the_handle_and_guards_references() {
+    let host = load(
+        r##"
+        local r = agentd.runner{ name = "coder", actions = { "x" }, skills = { "k" } }
+        r.name = "coder2"
+        assert(agentd.runners.get("coder2") == r, "same handle")
+        assert(agentd.runners.get("coder") == nil, "old name gone")
+        assert(tostring(r) == "runner coder2", tostring(r))
+
+        local x = agentd.action("x", function() end)
+        local ok, err = pcall(function() x.name = "y" end)
+        assert(not ok and tostring(err):find("`coder2`", 1, true), tostring(err))
+
+        local k = agentd.skill{ name = "k" }
+        ok, err = pcall(function() k.name = "k2" end)
+        assert(not ok and tostring(err):find("`coder2`", 1, true), tostring(err))
+
+        agentd.tool{ name = "git" }
+        agentd.action("git.status", function() end)
+        ok, err = pcall(function() agentd.tools.get("git").name = "vcs" end)
+        assert(not ok and tostring(err):find("`git.status`", 1, true), tostring(err))
+
+        agentd.runner{ name = "taken" }
+        ok, err = pcall(function() r.name = "taken" end)
+        assert(not ok and tostring(err):find("already", 1, true), tostring(err))
+
+        local free = agentd.action("free", function() return 7 end)
+        free.name = "freed"
+        assert(agentd.actions.get("freed") == free and agentd.actions.get("free") == nil, "action rename")
+        "##,
+    );
+    assert!(host.runners().get("coder").is_none());
+    assert!(host.list().iter().any(|name| name == "freed"));
+}
+
+#[tokio::test]
+async fn action_handler_and_schema_can_change() {
+    let host = load(
+        r##"
+        local a = agentd.action{ name = "x", handler = function() return 1 end }
+        a.handler = function() return 2 end
+        a.confirm = true
+        assert(a.confirm == true, "confirm")
+        local s = agentd.service("svc", function() end)
+        local replacement = function() end
+        s.handler = replacement
+        assert(s.handler == replacement, "service handler")
+        "##,
+    );
+    assert_eq!(call(&host, "x").await, 2);
+
+    let host = load(
+        r##"
+        local a = agentd.action{ name = "x", handler = function() return 1 end }
+        a.input = { n = { type = "integer", required = true } }
+        "##,
+    );
+    let error = host
+        .call(
+            CallContext {
+                caller: Caller::interface("test"),
+                effective_grants: PermissionSet::default(),
+                call_chain: vec!["x".into()],
+                cwd: None,
+            },
+            ActionCall {
+                action: "x".into(),
+                args: serde_json::json!({}),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("the required field `/n` is missing"),
+        "{error}"
+    );
+}
