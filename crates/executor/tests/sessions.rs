@@ -282,7 +282,7 @@ async fn session_and_messages_are_mutually_exclusive() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn failed_run_leaves_session_untouched() {
+async fn a_failed_run_keeps_the_prompt_and_says_it_stopped() {
     struct Failing;
     #[async_trait]
     impl agentd_ai::Provider for Failing {
@@ -328,7 +328,41 @@ async fn failed_run_leaves_session_untouched() {
     exec.run_runner_with_options(caller(), "chat", opts(&s.id, "hi"), None)
         .await
         .unwrap_err();
-    assert!(store.turns(&s.id).unwrap().is_empty());
+    assert_eq!(
+        contents(&store.turns(&s.id).unwrap()),
+        vec!["hi", "(This reply was stopped before it finished.)"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_run_keeps_the_prompt() {
+    struct Hanging;
+    #[async_trait]
+    impl agentd_ai::Provider for Hanging {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn complete(
+            &self,
+            _req: agentd_ai::CompletionRequest,
+        ) -> Result<agentd_ai::CompletionResponse, agentd_ai::ProviderError> {
+            std::future::pending().await
+        }
+    }
+    let (exec, store) = build(Arc::new(Hanging), None);
+    let s = store.create(ws_session()).unwrap();
+    let id = s.id.clone();
+    let run = tokio::spawn(async move {
+        exec.run_runner_with_options(caller(), "chat", opts(&id, "keep this"), None)
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    run.abort();
+    let _ = run.await;
+    assert_eq!(
+        contents(&store.turns(&s.id).unwrap()),
+        vec!["keep this", "(This reply was stopped before it finished.)"]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

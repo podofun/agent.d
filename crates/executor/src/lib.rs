@@ -1857,7 +1857,9 @@ impl Executor {
     ) -> Result<RunnerOutcome, RunnerError> {
         let Some(session_id) = options.session_id.take() else {
             let (caller, _run) = self.start_run(caller, runner_name, &options, None)?;
-            let (out, _) = self.run_model(caller, runner_name, options, sink).await?;
+            let (out, _) = self
+                .run_model(caller, runner_name, options, sink, None)
+                .await?;
             return Ok(out);
         };
         let store = self.sessions.clone().ok_or_else(|| {
@@ -1917,7 +1919,16 @@ impl Executor {
             }
         }
         options.messages = Some(history);
-        let (mut out, new_turns) = self.run_model(caller, runner_name, options, sink).await?;
+        let mut partial = KeepPartial {
+            store: store.clone(),
+            session_id: session_id.clone(),
+            progress: Progress::default(),
+            finished: false,
+        };
+        let (mut out, new_turns) = self
+            .run_model(caller, runner_name, options, sink, Some(&partial.progress))
+            .await?;
+        partial.finished = true;
         store
             .append(
                 &session_id,
@@ -2078,6 +2089,7 @@ impl Executor {
         runner_name: &str,
         options: RunOptions,
         sink: Option<agentd_ai::StreamSink>,
+        progress: Option<&Progress>,
     ) -> Result<(RunnerOutcome, Vec<agentd_ai::Message>), RunnerError> {
         let RunOptions {
             prompt,
@@ -2143,6 +2155,9 @@ impl Executor {
             && !p.is_empty()
         {
             req.messages.push(agentd_ai::Message::user(p));
+        }
+        if let Some(progress) = progress {
+            *progress.lock().unwrap() = req.messages[base_len..].to_vec();
         }
         if req.messages.is_empty() {
             return Err(RunnerError::Provider {
@@ -2327,8 +2342,49 @@ impl Executor {
                             ..agentd_ai::Message::tool_result(id, text)
                         });
                     }
+                    // Every call of this step has its result, so the history
+                    // up to here stays valid if the run stops now.
+                    if let Some(progress) = progress {
+                        *progress.lock().unwrap() = req.messages[base_len..].to_vec();
+                    }
                 }
             }
+        }
+    }
+}
+
+/// The messages of a run so far, kept at each point where the history is
+/// valid: after the prompt, and after every step whose calls all returned.
+type Progress = std::sync::Mutex<Vec<agentd_ai::Message>>;
+
+/// Saves what a session run did when it stops before finishing: cancelled,
+/// failed, or dropped when the daemon shuts down. The prompt and every
+/// finished step are kept, closed by a note, so the next message starts
+/// from what really happened.
+struct KeepPartial {
+    store: Arc<dyn SessionStore>,
+    session_id: String,
+    progress: Progress,
+    finished: bool,
+}
+
+impl Drop for KeepPartial {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut turns = std::mem::take(&mut *self.progress.lock().unwrap());
+        if turns.is_empty() {
+            return;
+        }
+        turns.push(agentd_ai::Message::assistant(
+            "(This reply was stopped before it finished.)",
+        ));
+        if let Err(e) = self
+            .store
+            .append(&self.session_id, &turns, &Default::default())
+        {
+            tracing::warn!(session = %self.session_id, error = %e, "could not keep a stopped run's progress");
         }
     }
 }
