@@ -30,8 +30,42 @@ Every call needs a matching grant in `grants.toml`. Reads need `fs.read:<path>`;
 | `ctx.fs.undo(path)` | `fs.write:<path>` | `integer` | Restore the current revision's parent. |
 | `ctx.fs.redo(path)` | `fs.write:<path>` | `integer` | Reapply the most recently undone revision. |
 | `ctx.fs.restore(path, revision)` | `fs.write:<path>` | `integer` | Restore any retained revision, including zero. |
+| `ctx.fs.edit(path, old, new, opts?)` | `fs.write:<path>` | `integer` | Replace exact text in a file you have read. See [Changing part of a file](#changing-part-of-a-file). |
+| `ctx.fs.patch(patch, opts?)` | `fs.read` and `fs.write` for each file | `table[]` | Apply a unified diff to the files it names, all or nothing. |
 
 A missing file makes `read`, `stat`, and `list_dir` throw an error. It's advised that you guard with `exists` first if the file might not be there.
+
+## Changing part of a file
+
+Often you want to change a few lines rather than rewrite a whole file. `ctx.fs.edit` replaces one piece of text, and `ctx.fs.patch` applies a unified diff, the format `git diff` prints and models write.
+
+```lua
+-- Requires fs.read:src/** and fs.write:src/**.
+local source = ctx.fs.read("src/main.rs")
+ctx.fs.edit("src/main.rs", "println!(\"hi\")", "println!(\"hello\")")
+```
+
+Both follow one rule: **you can only change what you have seen.** The file must have been read in the same chat session (or the same run, outside a session) and must not have changed since. That way an edit is always based on what is really on disk, never on an older copy or a guess. If something else changed the file in between, such as your editor or a shell command, the call stops with a message asking you to read it again. Writing a file with `ctx.fs.write` counts as having read it, so you can write a file and then edit it. A plain `ctx.fs.write` never needs a read, because it replaces the file outright.
+
+`edit` replaces `old` with `new`. Without `{ replace_all = true }`, `old` must appear exactly once, and if it appears more than once the error tells you how many times, so you can include more surrounding text. Files with Windows line endings keep them.
+
+`patch` takes diff text and returns `{ { path = ..., revision = ... }, ... }` for the files it changed:
+
+```lua
+local changed = ctx.fs.patch([[
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,3 @@
+ fn main() {
+-    println!("hi");
++    println!("hello");
+ }
+]])
+```
+
+A patch is applied **all or nothing**. Every file is checked and every change is worked out before anything is written, so if one part does not apply, no file changes, and the error names the file, the hunk, and the line that differs. A patch can create files (`--- /dev/null`) and remove them (`+++ /dev/null`). Renames, permission changes and binary files are refused rather than skipped, so a patch is never applied in part. To apply a one-file diff to a different path, pass `{ path = "other.rs" }`.
+
+Edits and patches are recorded in the file's history like any write, so `undo` and `restore` cover them. To build or inspect diffs without touching files, use [`ctx.diff`](/v0/reference/ctx/diff).
 
 ## Binary diffs and undo/redo
 
@@ -54,7 +88,7 @@ local change = ctx.fs.diff("images/sample.bin", second)
 
 `history(path)` returns `{ current = id, revisions = { ... } }`. Each revision has `id`, `parent`, `operation` (`write`, `append`, or `remove`), `timestamp_ms`, `offset`, `removed_bytes`, `added_bytes`, `before_size`, and `after_size`. An absent size means that the file did not exist on that side of the diff. `diff(path, id)` returns `{ revision = metadata, removed = bytes, added = bytes }`. Replace `removed` bytes at the zero-based `offset` with `added` to apply the splice; reverse them to undo it. File existence is recorded separately in the sizes.
 
-Undo and redo follow the current branch. Writing after undo clears the redo stack but retains every earlier revision, so `restore` can still reach the old branch. Explicit `restore` clears the redo stack. Unknown revision IDs and exhausted undo/redo stacks raise errors. Revision IDs are scoped to the resolved absolute file path; there is no atomic multi-file checkpoint.
+Undo and redo follow the current branch. Writing after undo clears the redo stack but retains every earlier revision, so `restore` can still reach the old branch. Explicit `restore` clears the redo stack. Unknown revision IDs and exhausted undo/redo stacks raise errors. Revision IDs are scoped to the resolved absolute file path. `ctx.fs.patch` is the only multi-file change, and it is all or nothing.
 
 History is shared by actions, runners, and services for the daemon's lifetime and survives hot reloads. Restarting the daemon discards it. Only mutations through `ctx.fs` are recorded; shell commands and external programs are not intercepted. If current bytes or permissions differ from the tracked state, mutation and replay fail with a conflict instead of overwriting the outside change. Coordinate outside writers: conflict checks are not an operating-system lock against other processes.
 

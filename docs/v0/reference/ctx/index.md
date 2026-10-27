@@ -9,6 +9,7 @@
 | [`ctx.log`](/v0/reference/ctx/logging) | Structured log/trace output | none |
 | [`ctx.shell`](/v0/reference/ctx/shell) | Run child processes (argv-only) | `shell.exec[:<bin>]` |
 | [`ctx.fs`](/v0/reference/ctx/fs) | Read, write, and inspect files | `fs.read:<path>` / `fs.write:<path>` |
+| [`ctx.diff`](/v0/reference/ctx/diff) | Create, read and apply unified diffs | none |
 | [`ctx.http`](/v0/reference/ctx/http) | HTTP requests and persistent clients | `net:<host>` |
 | [`ctx.ws`](/v0/reference/ctx/websocket) | WebSocket connections | `net:<host>` |
 | [`ctx.mailer`](/v0/reference/ctx/mailer) | Send email over SMTP | `net:<host>` |
