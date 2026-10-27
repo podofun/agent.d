@@ -397,9 +397,11 @@ pub struct Executor {
     /// File history and the folder baseline used to capture what each
     /// action call changes. `None` captures nothing.
     capture: Option<capture::Capture>,
-    /// The folder a call works in when neither its runner nor its session
-    /// names one.
-    workspace_root: Option<std::path::PathBuf>,
+    /// The configuration folder (the one holding `init.lua`). A runner's
+    /// relative `cwd` resolves against it. It is never a working folder by
+    /// itself, so a call with no session folder and no runner `cwd`
+    /// captures nothing.
+    config_folder: Option<std::path::PathBuf>,
 }
 
 /// Removes the session id from the in-flight set when the run ends.
@@ -445,7 +447,7 @@ impl Executor {
             runs: Arc::new(runs::Runs::default()),
             classifier_slots: tokio::sync::Semaphore::new(classifier::CLASSIFIER_SLOTS),
             capture: None,
-            workspace_root: None,
+            config_folder: None,
         }
     }
 
@@ -456,10 +458,10 @@ impl Executor {
         self.capture = Some(capture::Capture { history, baseline });
     }
 
-    /// The folder a call works in when neither its runner nor its session
-    /// names one.
-    pub fn set_workspace_root(&mut self, root: std::path::PathBuf) {
-        self.workspace_root = Some(root);
+    /// The configuration folder, which a runner's relative `cwd` resolves
+    /// against. File changes are never captured in it on its own account.
+    pub fn set_config_folder(&mut self, folder: std::path::PathBuf) {
+        self.config_folder = Some(folder);
     }
 
     /// Wire the durable session store. `RedbSessionStore` in production,
@@ -699,9 +701,7 @@ impl Executor {
             .await;
         let mut call_caller = caller.clone();
         if let Some(capturing) = &capturing {
-            call_caller
-                .capturing
-                .extend(capturing.roots.iter().cloned());
+            capturing.enclose(&mut call_caller);
         }
         let ctx = CallContext {
             caller: call_caller,
@@ -748,9 +748,12 @@ impl Executor {
         }
     }
 
-    /// Hold and scan the folders this call may change, unless no capture is
-    /// set up, the call has no `fs.write` grant in its working folder, or an
-    /// enclosing call is already capturing those folders.
+    /// Start capturing the folders this call may change. Nothing is captured
+    /// when no capture is set up, the call has no working folder (a session
+    /// folder or a runner `cwd`), or it has no `fs.write` grant there. A
+    /// nested call never waits for a folder: it leaves its enclosing call's
+    /// folders to that call, and only scans them itself when the enclosing
+    /// call does not scan and this one may run programs.
     async fn begin_capture(
         &self,
         caller: &Caller,
@@ -758,26 +761,53 @@ impl Executor {
         grants: &PermissionSet,
     ) -> Option<capture::Started> {
         let capture = self.capture.as_ref()?;
-        let working = match inherited_cwd.map(std::path::Path::new) {
-            Some(cwd) if cwd.is_absolute() => cwd.to_path_buf(),
-            Some(cwd) => self.workspace_root.as_ref()?.join(cwd),
-            None => self.workspace_root.clone()?,
+        let working = match inherited_cwd.map(std::path::Path::new)? {
+            cwd if cwd.is_absolute() => cwd.to_path_buf(),
+            cwd => self.config_folder.as_ref()?.join(cwd),
         };
         let working = capture::canonical(&working);
         let grants = capture::with_cwd(grants, caller.cwd.as_deref());
-        let roots: Vec<_> = capture::capture_roots(&working, &grants)
-            .into_iter()
-            .filter(|root| {
-                !caller
-                    .capturing
-                    .iter()
-                    .any(|held| root.starts_with(held) || held.starts_with(root))
-            })
-            .collect();
-        if roots.is_empty() {
+        let roots = capture::capture_roots(&working, &grants);
+        let scans = capture::runs_programs(caller, &grants);
+        if caller.capturing.is_empty() {
+            if roots.is_empty() {
+                return None;
+            }
+            return Some(capture.begin(working, roots, scans, true).await);
+        }
+        if caller.capturing_scans || !scans {
             return None;
         }
-        Some(capture.begin(working, roots).await)
+        let held: Vec<_> = roots
+            .into_iter()
+            .filter(|root| caller.capturing.iter().any(|h| root.starts_with(h)))
+            .collect();
+        if held.is_empty() {
+            return None;
+        }
+        Some(capture.begin(working, held, true, false).await)
+    }
+
+    /// `changes` with every secret the run read replaced by its name in each
+    /// diff, as tool inputs and outputs are.
+    fn redact_changes(
+        &self,
+        run_id: Option<&str>,
+        changes: &[agentd_ai::FileChange],
+    ) -> Vec<agentd_ai::FileChange> {
+        changes
+            .iter()
+            .cloned()
+            .map(|mut change| {
+                if let Some(diff) = change.diff.take() {
+                    let redacted = self
+                        .runs
+                        .redact_secrets(run_id, &serde_json::Value::String(diff));
+                    change.diff = redacted.as_str().map(str::to_owned);
+                }
+                change
+            })
+            .collect()
     }
 
     // ---------- approval escalation ----------
@@ -2223,7 +2253,7 @@ impl Executor {
                                 Ok((res, _, changes)) => (
                                     self.runs.redact_secrets(run_id, &res.value),
                                     None,
-                                    changes.clone(),
+                                    self.redact_changes(run_id, changes),
                                 ),
                                 Err((e, _)) => {
                                     (serde_json::Value::Null, Some(e.to_string()), Vec::new())

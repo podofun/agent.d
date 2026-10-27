@@ -12,7 +12,7 @@ mod patch;
 mod verified;
 
 pub use baseline::{Baseline, FolderLock, ScanChange, ScanLimits, Snapshot};
-pub use history::{Actor, FileDiff, FileHistory, History, Operation, Revision};
+pub use history::{Actor, FileDiff, FileHistory, History, Moved, Operation, Revision};
 pub use patch::{FilePatch, Hunk, PatchError, apply_patch, create_diff, format_patch, parse_patch};
 pub use verified::{open_verified, read_bytes_verified, real_path};
 

@@ -3,12 +3,16 @@
 //! `.gitignore`, `.ignore` and global git excludes without needing git, and
 //! always skips `.git`, `target` and `node_modules`. A file whose size and
 //! modification time are unchanged is not read again.
+//!
+//! File content is kept once per hash in a store shared by every folder, up
+//! to a total size. Past it only hashes are kept. A folder's snapshot is
+//! dropped after it goes unused for a while.
 
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
@@ -18,12 +22,19 @@ use crate::FsError;
 pub const MAX_CONTENT_BYTES: u64 = 1024 * 1024;
 /// A folder with more files than this is not snapshotted.
 pub const MAX_FILES: usize = 50_000;
+/// Content kept across all folders stops growing at this many bytes.
+pub const MAX_STORED_BYTES: u64 = 256 * 1024 * 1024;
+/// A folder found too large is not walked again for this long.
+const TOO_LARGE_FOR: Duration = Duration::from_secs(5 * 60);
+/// A folder's snapshot is dropped after going this long without a scan.
+const IDLE_FOR: Duration = Duration::from_secs(30 * 60);
 
 /// How much a scan keeps and how far it goes.
 #[derive(Clone, Copy, Debug)]
 pub struct ScanLimits {
     pub max_content_bytes: u64,
     pub max_files: usize,
+    pub max_stored_bytes: u64,
 }
 
 impl Default for ScanLimits {
@@ -31,12 +42,13 @@ impl Default for ScanLimits {
         Self {
             max_content_bytes: MAX_CONTENT_BYTES,
             max_files: MAX_FILES,
+            max_stored_bytes: MAX_STORED_BYTES,
         }
     }
 }
 
 /// One file as a scan saw it. `content` is `None` when the file is too large
-/// or binary.
+/// or binary, or when the content store was full.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub size: u64,
@@ -60,16 +72,65 @@ pub struct Baseline {
 
 #[derive(Default)]
 struct Inner {
-    roots: Mutex<HashMap<PathBuf, Arc<Files>>>,
+    roots: Mutex<HashMap<PathBuf, Folder>>,
+    /// Folders found too large, and when.
+    too_large: Mutex<HashMap<PathBuf, Instant>>,
+    store: Mutex<Store>,
     /// Folders locked by a call that is capturing its changes.
     held: Mutex<Vec<PathBuf>>,
     released: tokio::sync::Notify,
     scans: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     hashes: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    walks: std::sync::atomic::AtomicUsize,
+}
+
+struct Folder {
+    files: Arc<Files>,
+    used: Instant,
 }
 
 type Files = HashMap<PathBuf, Entry>;
+
+/// File content by hash, shared by every folder.
+#[derive(Default)]
+struct Store {
+    blobs: HashMap<[u8; 32], Arc<[u8]>>,
+    bytes: u64,
+}
+
+impl Store {
+    /// The stored copy of `bytes`, or `None` when the store is full.
+    fn keep(&mut self, digest: [u8; 32], bytes: Vec<u8>, cap: u64) -> Option<Arc<[u8]>> {
+        if let Some(blob) = self.blobs.get(&digest) {
+            return Some(blob.clone());
+        }
+        let size = bytes.len() as u64;
+        if self.bytes + size > cap {
+            self.purge();
+            if self.bytes + size > cap {
+                return None;
+            }
+        }
+        let blob: Arc<[u8]> = Arc::from(bytes);
+        self.blobs.insert(digest, blob.clone());
+        self.bytes += size;
+        Some(blob)
+    }
+
+    /// Drop content no snapshot uses any more.
+    fn purge(&mut self) {
+        self.blobs.retain(|_, blob| Arc::strong_count(blob) > 1);
+        self.bytes = self.blobs.values().map(|b| b.len() as u64).sum();
+    }
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Folders a scan never enters, whatever the ignore files say.
 const ALWAYS_IGNORED: [&str; 3] = [".git", "target", "node_modules"];
@@ -104,9 +165,17 @@ pub struct FolderLock {
     roots: Vec<PathBuf>,
 }
 
+impl FolderLock {
+    /// The folders this lock holds.
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+}
+
 impl Drop for FolderLock {
     fn drop(&mut self) {
-        if let Ok(mut held) = self.inner.held.lock() {
+        {
+            let mut held = locked(&self.inner.held);
             for root in &self.roots {
                 if let Some(at) = held.iter().position(|h| h == root) {
                     held.swap_remove(at);
@@ -121,34 +190,80 @@ fn overlaps(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
+/// Whether a file can be read safely as itself: a regular file with one link.
+fn trackable(metadata: &std::fs::Metadata) -> bool {
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() > 1 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Open `path` without following a symlink, and only when it is still the
+/// file `seen` describes.
+fn open_seen(path: &Path, seen: &std::fs::Metadata) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let opened = file.metadata()?;
+        if !trackable(&opened) || opened.dev() != seen.dev() || opened.ino() != seen.ino() {
+            return Err(std::io::Error::other(
+                "the file changed while it was opened",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = seen;
+        std::fs::File::open(path)
+    }
+}
+
 impl Baseline {
-    /// Wait until no other holder has any of `roots`, a folder inside one of
-    /// them, or a folder containing one, then hold them until the returned
-    /// lock is dropped. Calls that change files in the same folder take
-    /// turns this way, so each one's changes are told apart.
-    pub async fn lock(&self, roots: Vec<PathBuf>) -> FolderLock {
+    /// Hold `roots` until the returned lock is dropped, waiting at most
+    /// `wait` for a root another holder has (or a folder inside or around
+    /// it). Returns the lock on the roots it got and the roots it did not.
+    /// Calls that change files in the same folder take turns this way, so
+    /// each one's changes are told apart.
+    pub async fn lock(&self, roots: Vec<PathBuf>, wait: Duration) -> (FolderLock, Vec<PathBuf>) {
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut got = FolderLock {
+            inner: self.inner.clone(),
+            roots: Vec::new(),
+        };
+        let mut pending = roots;
         loop {
             let released = self.inner.released.notified();
             tokio::pin!(released);
             released.as_mut().enable();
             {
-                let mut held = self
-                    .inner
-                    .held
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if !roots
-                    .iter()
-                    .any(|root| held.iter().any(|h| overlaps(h, root)))
-                {
-                    held.extend(roots.iter().cloned());
-                    return FolderLock {
-                        inner: self.inner.clone(),
-                        roots,
-                    };
-                }
+                let mut held = locked(&self.inner.held);
+                pending.retain(|root| {
+                    if held.iter().any(|h| overlaps(h, root)) {
+                        return true;
+                    }
+                    held.push(root.clone());
+                    got.roots.push(root.clone());
+                    false
+                });
             }
-            released.await;
+            if pending.is_empty() {
+                return (got, pending);
+            }
+            if tokio::time::timeout_at(deadline, released).await.is_err() {
+                return (got, pending);
+            }
         }
     }
 
@@ -159,24 +274,43 @@ impl Baseline {
 
     /// Scan `root`, keep what it holds, and return what changed since the
     /// last scan of the same root. The first scan of a root returns nothing.
+    /// A root found too large is not walked again for a few minutes.
     pub fn refresh(&self, root: &Path, limits: ScanLimits) -> Result<Vec<ScanChange>, FsError> {
         self.inner
             .scans
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let previous = self
-            .inner
-            .roots
-            .lock()
-            .map_err(|_| FsError::HistoryPoisoned)?
+        self.evict_idle(IDLE_FOR);
+        let too_large = FsError::TooManyFiles {
+            root: root.to_path_buf(),
+            limit: limits.max_files,
+        };
+        if locked(&self.inner.too_large)
             .get(root)
-            .cloned();
+            .is_some_and(|at| at.elapsed() < TOO_LARGE_FOR)
+        {
+            return Err(too_large);
+        }
+        #[cfg(test)]
+        self.inner
+            .walks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let paths = match walk(root, limits.max_files) {
+            Ok(paths) => paths,
+            Err(FsError::TooManyFiles { .. }) => {
+                locked(&self.inner.too_large).insert(root.to_path_buf(), Instant::now());
+                return Err(too_large);
+            }
+            Err(other) => return Err(other),
+        };
+        locked(&self.inner.too_large).remove(root);
+        let previous = locked(&self.inner.roots).get(root).map(|f| f.files.clone());
         let started = SystemTime::now();
         let mut files = Files::new();
-        for path in walk(root, limits.max_files)? {
+        for path in paths {
             let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                 continue;
             };
-            if !metadata.is_file() {
+            if !trackable(&metadata) {
                 continue;
             }
             let (size, modified) = (metadata.len(), metadata.modified().ok());
@@ -185,9 +319,9 @@ impl Baseline {
                 Some(entry) if !entry.racy && entry.size == size && entry.modified == modified => {
                     entry.clone()
                 }
-                _ => match self.read(&path, size, modified, started, limits) {
+                _ => match self.read(&path, &metadata, started, limits) {
                     Ok(entry) => entry,
-                    // Gone or unreadable since the walk listed it.
+                    // Gone, replaced or unreadable since the walk listed it.
                     Err(_) => continue,
                 },
             };
@@ -197,19 +331,36 @@ impl Baseline {
             Some(previous) => compare(previous, &files),
             None => Vec::new(),
         };
-        self.inner
-            .roots
-            .lock()
-            .map_err(|_| FsError::HistoryPoisoned)?
-            .insert(root.to_path_buf(), Arc::new(files));
+        drop(previous);
+        locked(&self.inner.roots).insert(
+            root.to_path_buf(),
+            Folder {
+                files: Arc::new(files),
+                used: Instant::now(),
+            },
+        );
+        locked(&self.inner.store).purge();
         Ok(changes)
+    }
+
+    /// Drop the snapshots of folders not scanned for `idle`, and the content
+    /// only they used.
+    fn evict_idle(&self, idle: Duration) {
+        let evicted = {
+            let mut roots = locked(&self.inner.roots);
+            let before = roots.len();
+            roots.retain(|_, folder| folder.used.elapsed() < idle);
+            roots.len() != before
+        };
+        if evicted {
+            locked(&self.inner.store).purge();
+        }
     }
 
     fn read(
         &self,
         path: &Path,
-        size: u64,
-        modified: Option<SystemTime>,
+        metadata: &std::fs::Metadata,
         started: SystemTime,
         limits: ScanLimits,
     ) -> std::io::Result<Entry> {
@@ -217,18 +368,25 @@ impl Baseline {
         self.inner
             .hashes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let modified = metadata.modified().ok();
         let racy = modified.is_none_or(|m| m + RACY_WINDOW >= started);
-        let mut file = std::fs::File::open(path)?;
-        if size <= limits.max_content_bytes {
-            let mut bytes = Vec::with_capacity(size as usize);
+        let mut file = open_seen(path, metadata)?;
+        if metadata.len() <= limits.max_content_bytes {
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
             file.read_to_end(&mut bytes)?;
-            let digest = Sha256::digest(&bytes).into();
+            let digest: [u8; 32] = Sha256::digest(&bytes).into();
             let binary = bytes[..bytes.len().min(BINARY_PROBE)].contains(&0);
+            let size = bytes.len() as u64;
+            let content = if binary {
+                None
+            } else {
+                locked(&self.inner.store).keep(digest, bytes, limits.max_stored_bytes)
+            };
             return Ok(Entry {
-                size: bytes.len() as u64,
+                size,
                 modified,
                 digest,
-                content: (!binary).then(|| Arc::from(bytes)),
+                content,
                 racy,
             });
         }
@@ -326,23 +484,130 @@ mod tests {
             .unwrap();
     }
 
+    const LONG: Duration = Duration::from_secs(60);
+
     #[tokio::test]
     async fn overlapping_folders_take_turns() {
         let baseline = Baseline::default();
-        let outer = baseline.lock(vec![PathBuf::from("/w")]).await;
+        let (outer, _) = baseline.lock(vec![PathBuf::from("/w")], LONG).await;
         // A sibling folder is not held up.
-        let _sibling = baseline.lock(vec![PathBuf::from("/x")]).await;
+        let (sibling, missed) = baseline.lock(vec![PathBuf::from("/x")], LONG).await;
+        assert!(missed.is_empty());
+        assert_eq!(sibling.roots(), [PathBuf::from("/x")]);
         let waiting = {
             let baseline = baseline.clone();
-            tokio::spawn(async move { baseline.lock(vec![PathBuf::from("/w/sub")]).await })
+            tokio::spawn(async move { baseline.lock(vec![PathBuf::from("/w/sub")], LONG).await })
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!waiting.is_finished());
         drop(outer);
-        tokio::time::timeout(Duration::from_secs(5), waiting)
+        let (inner, missed) = tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
             .unwrap()
             .unwrap();
+        assert!(missed.is_empty());
+        assert_eq!(inner.roots(), [PathBuf::from("/w/sub")]);
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_held_folder_is_bounded() {
+        let baseline = Baseline::default();
+        let (_outer, _) = baseline.lock(vec![PathBuf::from("/w")], LONG).await;
+        let started = Instant::now();
+        let (got, missed) = baseline
+            .lock(
+                vec![PathBuf::from("/w/sub"), PathBuf::from("/y")],
+                Duration::from_millis(100),
+            )
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(got.roots(), [PathBuf::from("/y")]);
+        assert_eq!(missed, [PathBuf::from("/w/sub")]);
+        let (_, missed) = baseline
+            .lock(vec![PathBuf::from("/w")], Duration::ZERO)
+            .await;
+        assert_eq!(missed, [PathBuf::from("/w")]);
+    }
+
+    #[test]
+    fn a_folder_found_too_large_is_not_walked_again_soon() {
+        let (_dir, root) = folder();
+        for i in 0..5 {
+            std::fs::write(root.join(format!("{i}.txt")), "x").unwrap();
+        }
+        let limits = ScanLimits {
+            max_files: 3,
+            ..Default::default()
+        };
+        let baseline = Baseline::default();
+        assert!(baseline.refresh(&root, limits).is_err());
+        assert!(baseline.refresh(&root, limits).is_err());
+        assert_eq!(baseline.inner.walks.load(Ordering::SeqCst), 1);
+        assert_eq!(baseline.scans(), 2);
+    }
+
+    #[test]
+    fn content_is_stored_once_and_capped() {
+        let (_one, first) = folder();
+        let (_two, second) = folder();
+        std::fs::write(first.join("a.txt"), "same").unwrap();
+        std::fs::write(second.join("b.txt"), "same").unwrap();
+        let baseline = Baseline::default();
+        baseline.refresh(&first, ScanLimits::default()).unwrap();
+        baseline.refresh(&second, ScanLimits::default()).unwrap();
+        let store = locked(&baseline.inner.store);
+        assert_eq!((store.blobs.len(), store.bytes), (1, 4));
+        drop(store);
+
+        let (_three, third) = folder();
+        let baseline = Baseline::default();
+        let limits = ScanLimits {
+            max_stored_bytes: 4,
+            ..Default::default()
+        };
+        baseline.refresh(&third, limits).unwrap();
+        std::fs::write(third.join("small"), "abc").unwrap();
+        std::fs::write(third.join("over"), "0123456789").unwrap();
+        let changes = baseline.refresh(&third, limits).unwrap();
+        let over = changes.iter().find(|c| c.path.ends_with("over")).unwrap();
+        assert!(content(&over.after).is_none());
+        assert_eq!(over.after.as_ref().unwrap().size, 10);
+        let small = changes.iter().find(|c| c.path.ends_with("small")).unwrap();
+        assert_eq!(content(&small.after), Some(&b"abc"[..]));
+    }
+
+    #[test]
+    fn idle_folders_are_evicted() {
+        let (_dir, root) = folder();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        let baseline = Baseline::default();
+        baseline.refresh(&root, ScanLimits::default()).unwrap();
+        baseline.evict_idle(Duration::ZERO);
+        assert!(locked(&baseline.inner.roots).is_empty());
+        assert_eq!(locked(&baseline.inner.store).bytes, 0);
+        std::fs::write(root.join("a.txt"), "b").unwrap();
+        // Evicted, so this is a first scan again.
+        assert!(
+            baseline
+                .refresh(&root, ScanLimits::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_are_not_tracked() {
+        let (_dir, root) = folder();
+        let baseline = Baseline::default();
+        baseline.refresh(&root, ScanLimits::default()).unwrap();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        std::fs::hard_link(root.join("a.txt"), root.join("b.txt")).unwrap();
+        std::os::unix::fs::symlink(root.join("plain.txt"), root.join("link.txt")).unwrap();
+        std::fs::write(root.join("plain.txt"), "p").unwrap();
+        let changes = baseline.refresh(&root, ScanLimits::default()).unwrap();
+        let paths: Vec<_> = changes.iter().map(|c| c.path.clone()).collect();
+        assert_eq!(paths, vec![root.join("plain.txt")]);
     }
 
     #[test]

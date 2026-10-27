@@ -240,6 +240,29 @@ struct Timeline {
     changes: Vec<Change>,
     current: usize,
     redo: Vec<usize>,
+    /// Every move of `current`, as its order among all changes and the
+    /// revision it moved from, so a caller can see where a file was at a
+    /// given moment.
+    moves: Vec<(u64, usize)>,
+}
+
+/// A file whose history moved after a mark: the revision it is at now, and
+/// its content then and now. `None` means absent; a side whose content could
+/// not be rebuilt has `content: None`.
+#[derive(Clone, Debug)]
+pub struct Moved {
+    pub path: PathBuf,
+    pub revision: usize,
+    pub before: Option<Snapshot>,
+    pub after: Option<Snapshot>,
+}
+
+fn snapshot_of(bytes: Vec<u8>) -> Snapshot {
+    Snapshot {
+        size: bytes.len() as u64,
+        digest: Sha256::digest(&bytes).into(),
+        content: Some(bytes),
+    }
 }
 
 impl Timeline {
@@ -310,6 +333,8 @@ impl Timeline {
         };
         let created_dirs = commit(path, &mut after)?;
         let id = revision.id;
+        let seq = next_seq();
+        self.moves.push((seq, self.current));
         self.changes.push(Change {
             diff: FileDiff {
                 revision,
@@ -319,7 +344,7 @@ impl Timeline {
             before: before_stamp,
             after: after.stamp(),
             created_dirs,
-            seq: next_seq(),
+            seq,
         });
         self.current = id;
         self.redo.clear();
@@ -331,6 +356,24 @@ impl Timeline {
     }
 
     fn restore(&mut self, path: &Path, target: usize) -> Result<usize, FsError> {
+        let (mut image, backward) = self.image_at(path, target)?;
+        if self.current != target {
+            commit(path, &mut image)?;
+            // Only remove directories this history created, and only if empty.
+            for id in backward {
+                for dir in &self.changes[id - 1].created_dirs {
+                    let _ = fs::remove_dir(dir);
+                }
+            }
+            self.moves.push((next_seq(), self.current));
+            self.current = target;
+        }
+        Ok(target)
+    }
+
+    /// The file as it would be at revision `target`, built in memory from
+    /// the file on disk, and the revisions walked back to get there.
+    fn image_at(&self, path: &Path, target: usize) -> Result<(Image, Vec<usize>), FsError> {
         if target > self.changes.len() {
             return Err(FsError::UnknownRevision(target));
         }
@@ -363,17 +406,49 @@ impl Timeline {
         for &id in forward.iter().rev() {
             apply(&mut image, &self.changes[id - 1], true);
         }
-        if self.current != target {
-            commit(path, &mut image)?;
-            // Only remove directories this history created, and only if empty.
-            for id in backward {
-                for dir in &self.changes[id - 1].created_dirs {
-                    let _ = fs::remove_dir(dir);
-                }
-            }
-            self.current = target;
+        Ok((image, backward))
+    }
+
+    /// The state the file has at revision `id`: `None` when unknown.
+    fn stamp_at(&self, id: usize) -> Option<&Option<Stamp>> {
+        match id {
+            0 => self.changes.first().map(|c| &c.before),
+            id => self.changes.get(id - 1).map(|c| &c.after),
         }
-        Ok(target)
+    }
+
+    /// Where the file moved after `mark`, with its content then and now,
+    /// when the file on disk is where this history left it.
+    fn moved_since(&self, path: &Path, mark: u64) -> Option<Moved> {
+        let &(_, from) = self.moves.iter().find(|(seq, _)| *seq > mark)?;
+        if from == self.current {
+            return None;
+        }
+        let now = Image::read(path).ok()?;
+        if Some(&now.stamp()) != self.expected() {
+            return None;
+        }
+        let before = match self.image_at(path, from) {
+            Ok((image, _)) => image.bytes.map(snapshot_of),
+            Err(_) => self.stamp_at(from)?.as_ref().map(|stamp| Snapshot {
+                size: 0,
+                digest: stamp.digest,
+                content: None,
+            }),
+        };
+        Some(Moved {
+            path: path.to_path_buf(),
+            revision: self.current,
+            before,
+            after: now.bytes.map(snapshot_of),
+        })
+    }
+
+    /// The current revision when the file's expected state has `digest`
+    /// (`None` for absent), so a change found on disk is already recorded.
+    fn expected_revision(&self, digest: Option<[u8; 32]>) -> Option<usize> {
+        let expected = self.expected()?;
+        (expected.as_ref().map(|s| s.digest) == digest).then_some(self.current)
     }
 }
 
@@ -539,20 +614,11 @@ impl Timeline {
 
     fn push(&mut self, change: Change) -> usize {
         let id = change.diff.revision.id;
+        self.moves.push((change.seq, self.current));
         self.changes.push(change);
         self.current = id;
         self.redo.clear();
         id
-    }
-
-    /// The current revision, when it was made after `mark` and left the file
-    /// with `digest` (`None` for absent).
-    fn recorded_since(&self, mark: u64, digest: Option<[u8; 32]>) -> Option<usize> {
-        let change = self.changes.get(self.current.checked_sub(1)?)?;
-        (change.seq > mark
-            && change.diff.revision.operation != Operation::Outside
-            && change.after.as_ref().map(|s| s.digest) == digest)
-            .then_some(self.current)
     }
 }
 
@@ -946,16 +1012,56 @@ impl History {
         SEQ.load(Ordering::SeqCst)
     }
 
-    /// The current revision of `path` when it was made after `mark` and left
-    /// the file with `digest` (`None` for absent).
-    pub async fn recorded_since(
+    /// The current revision of `path` when the file history expects it to
+    /// hold content with `digest` (`None` for absent). A change found on disk
+    /// that matches is already recorded, whether by a write, an undo, a redo
+    /// or a restore.
+    pub async fn expected_revision(
         &self,
         path: &Path,
-        mark: u64,
         digest: Option<[u8; 32]>,
     ) -> Result<Option<usize>, FsError> {
-        self.with_file(path, move |t, _| Ok(t.recorded_since(mark, digest)))
+        self.with_file(path, move |t, _| Ok(t.expected_revision(digest)))
             .await
+    }
+
+    /// Every file under `roots` whose history moved after `mark`, with its
+    /// content then and now. Files that changed on disk since are left out.
+    pub async fn moved_since(&self, mark: u64, roots: &[PathBuf]) -> Vec<Moved> {
+        let timelines = self.timelines_in(roots);
+        tokio::task::spawn_blocking(move || {
+            timelines
+                .into_iter()
+                .filter_map(|(path, timeline)| timeline.lock().ok()?.moved_since(&path, mark))
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// Accept every file under `roots` that changed outside agent.d, as
+    /// [`History::acknowledge_outside`] does for one file.
+    pub async fn acknowledge_outside_in(&self, roots: &[PathBuf]) {
+        let timelines = self.timelines_in(roots);
+        let _ = tokio::task::spawn_blocking(move || {
+            for (path, timeline) in timelines {
+                if let Ok(mut timeline) = timeline.lock() {
+                    let _ = timeline.acknowledge_outside(&path);
+                }
+            }
+        })
+        .await;
+    }
+
+    fn timelines_in(&self, roots: &[PathBuf]) -> Vec<(PathBuf, Arc<Mutex<Timeline>>)> {
+        let Ok(files) = self.files.lock() else {
+            return Vec::new();
+        };
+        files
+            .iter()
+            .filter(|(path, _)| roots.iter().any(|root| path.starts_with(root)))
+            .map(|(path, timeline)| (path.clone(), timeline.clone()))
+            .collect()
     }
 
     pub async fn history(&self, path: &Path) -> Result<FileHistory, FsError> {
@@ -1737,26 +1843,92 @@ mod tests {
         assert_eq!(actor.run_id.as_deref(), Some("run-1"));
     }
 
+    fn digest(bytes: &[u8]) -> Option<[u8; 32]> {
+        Some(Sha256::digest(bytes).into())
+    }
+
     #[tokio::test]
-    async fn recorded_since_finds_a_change_that_matches_the_file() {
+    async fn the_expected_state_names_the_current_revision() {
         let (_dir, path) = temp();
         let history = History::default();
+        assert_eq!(history.expected_revision(&path, None).await.unwrap(), None);
         history.write(&path, b"a", None).await.unwrap();
-        let mark = history.mark();
-        let digest = Some(Sha256::digest(b"b").into());
-        assert_eq!(
-            history.recorded_since(&path, mark, digest).await.unwrap(),
-            None
-        );
         history.write(&path, b"b", None).await.unwrap();
         assert_eq!(
-            history.recorded_since(&path, mark, digest).await.unwrap(),
+            history
+                .expected_revision(&path, digest(b"b"))
+                .await
+                .unwrap(),
             Some(2)
         );
-        let other = Some(Sha256::digest(b"c").into());
+        history.undo(&path).await.unwrap();
         assert_eq!(
-            history.recorded_since(&path, mark, other).await.unwrap(),
+            history
+                .expected_revision(&path, digest(b"a"))
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            history
+                .expected_revision(&path, digest(b"b"))
+                .await
+                .unwrap(),
             None
         );
+        history.undo(&path).await.unwrap();
+        assert_eq!(
+            history.expected_revision(&path, None).await.unwrap(),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn moves_since_a_mark_carry_both_sides() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (path, other) = (root.join("a.txt"), root.join("b.txt"));
+        let history = History::default();
+        history.write(&path, b"one", None).await.unwrap();
+        history.write(&other, b"other", None).await.unwrap();
+        let mark = history.mark();
+        history.write(&path, b"two", None).await.unwrap();
+        history.write(&path, b"three", None).await.unwrap();
+        let moved = history.moved_since(mark, &[root.clone()]).await;
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(moved[0].path, path);
+        assert_eq!(moved[0].revision, 3);
+        let content = |s: &Option<Snapshot>| s.as_ref().and_then(|s| s.content.clone());
+        assert_eq!(content(&moved[0].before), Some(b"one".to_vec()));
+        assert_eq!(content(&moved[0].after), Some(b"three".to_vec()));
+
+        let mark = history.mark();
+        history.undo(&path).await.unwrap();
+        let moved = history.moved_since(mark, &[root.clone()]).await;
+        assert_eq!(content(&moved[0].before), Some(b"three".to_vec()));
+        assert_eq!(content(&moved[0].after), Some(b"two".to_vec()));
+
+        let mark = history.mark();
+        history.undo(&path).await.unwrap();
+        history.redo(&path).await.unwrap();
+        assert!(history.moved_since(mark, &[root.clone()]).await.is_empty());
+        assert!(
+            history
+                .moved_since(0, &[root.join("elsewhere")])
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn outside_edits_under_folders_are_accepted_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("a.txt");
+        let history = History::default();
+        history.write(&path, b"a", None).await.unwrap();
+        fs::write(&path, b"edited").unwrap();
+        history.acknowledge_outside_in(&[root.clone()]).await;
+        history.write(&path, b"c", None).await.unwrap();
     }
 }

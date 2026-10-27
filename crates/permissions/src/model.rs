@@ -250,6 +250,11 @@ pub struct Caller {
     /// executor only, never read from or written to the wire.
     #[serde(skip)]
     pub capturing: Vec<std::path::PathBuf>,
+    /// Whether the enclosing capture scans those folders. When it does not,
+    /// a nested call that runs programs scans them itself. Set by the
+    /// executor only.
+    #[serde(skip)]
+    pub capturing_scans: bool,
 }
 
 /// Who answers a run's questions. Ordered from strict to loose, so the

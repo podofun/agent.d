@@ -120,7 +120,7 @@ pub fn build_runtime(cfg: &Config, shared: &Shared) -> Result<BuiltRuntime> {
     );
     executor.set_max_runner_turns(cfg.max_turns);
     executor.set_sessions(shared.sessions.clone());
-    executor.set_workspace_root(cfg.workspace_root.clone());
+    executor.set_config_folder(cfg.workspace_root.clone());
     executor.set_file_capture(shared.file_history.clone(), shared.file_baseline.clone());
 
     // "allow forever" reload pipeline: rebuild the engine from grants.toml,
