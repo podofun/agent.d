@@ -684,13 +684,25 @@ fn build_collection_table(lua: &Lua, kind: ListKind) -> mlua::Result<Table> {
         ListKind::Runners => handles::Kind::Runner,
         ListKind::Services => handles::Kind::Service,
     };
-    t.set("get", get_function(lua, kind)?)?;
+    add_handle_functions(lua, &t, kind)?;
     Ok(t)
 }
 
-/// `agentd.<collection>.get(name)`: the live handle for `name`, or `nil`.
-fn get_function(lua: &Lua, kind: handles::Kind) -> mlua::Result<Function> {
-    lua.create_function(move |lua, name: String| handles::handle_for(lua, kind, &name))
+/// `get`, `find` and `remove` on an `agentd.<collection>` table.
+fn add_handle_functions(lua: &Lua, t: &Table, kind: handles::Kind) -> mlua::Result<()> {
+    t.set(
+        "get",
+        lua.create_function(move |lua, name: String| handles::handle_for(lua, kind, &name))?,
+    )?;
+    t.set(
+        "find",
+        lua.create_function(move |lua, query: Value| handles::find(lua, kind, query))?,
+    )?;
+    t.set(
+        "remove",
+        lua.create_function(move |lua, name: String| handles::remove(lua, kind, &name))?,
+    )?;
+    Ok(())
 }
 
 /// Registry key under which the single `ctx` facade table is stored.
@@ -1224,7 +1236,7 @@ fn build_skills_table(lua: &Lua) -> mlua::Result<Table> {
     t.set("load", lua.create_function(skills_load_binding)?)?;
     t.set("dir", lua.create_function(skills_load_dir_binding)?)?;
     t.set("list", lua.create_function(skills_list_binding)?)?;
-    t.set("get", get_function(lua, handles::Kind::Skill)?)?;
+    add_handle_functions(lua, &t, handles::Kind::Skill)?;
     Ok(t)
 }
 

@@ -125,6 +125,14 @@ impl Handles {
         self.live.get(&(kind, name.to_owned())).copied()
     }
 
+    fn retire(&mut self, kind: Kind, name: &str) {
+        if let Some(id) = self.live.remove(&(kind, name.to_owned()))
+            && let Some(slot) = self.slots.get_mut(&id)
+        {
+            slot.2 = Slot::Gone(HandleState::Removed);
+        }
+    }
+
     fn rename(&mut self, id: u64, new_name: &str) {
         if let Some(slot) = self.slots.get_mut(&id) {
             self.live.remove(&(slot.0, slot.1.clone()));
@@ -211,6 +219,14 @@ impl Handle {
     }
 
     fn read(&self, lua: &Lua, key: &str) -> mlua::Result<Value> {
+        if key == "remove" {
+            let handle = *self;
+            return lua
+                .create_function(move |lua, _: mlua::MultiValue| {
+                    remove(lua, handle.kind, &handle.name(lua)?)
+                })
+                .map(Value::Function);
+        }
         let property = self.property(lua, key)?;
         let name = self.name(lua)?;
         if property == "handler" {
@@ -300,6 +316,164 @@ impl Handle {
             .rename(self.id, &new);
         Ok(())
     }
+}
+
+/// Every registered name of `kind`, sorted.
+fn names(lua: &Lua, kind: Kind) -> mlua::Result<Vec<String>> {
+    let mut names = match kind {
+        Kind::Runner => registry::<agentd_runners::RunnerRegistry>(lua)?.names(),
+        Kind::Skill => registry::<agentd_skills::SkillRegistry>(lua)?.names(),
+        Kind::Service => registry::<agentd_services::ServiceRegistry>(lua)?.names(),
+        Kind::Action => {
+            let catalog = registry::<SharedCatalog>(lua)?;
+            let guard = catalog.read().map_err(lock)?;
+            guard.action_meta.keys().cloned().collect()
+        }
+        Kind::Tool => {
+            let catalog = registry::<SharedCatalog>(lua)?;
+            let guard = catalog.read().map_err(lock)?;
+            guard.tools.keys().cloned().collect()
+        }
+    };
+    names.sort();
+    Ok(names)
+}
+
+/// `agentd.<collection>.find(query)`: handles whose item matches `query`,
+/// sorted by name. A function query keeps the handles it returns truthy for;
+/// a table query keeps items where every key matches (see [`matches`]).
+pub(crate) fn find(lua: &Lua, kind: Kind, query: Value) -> mlua::Result<Vec<Handle>> {
+    let fields = match &query {
+        Value::Function(_) => None,
+        Value::Table(table) => {
+            let mut fields = Vec::new();
+            for pair in table.pairs::<String, Value>() {
+                let (key, value) = pair?;
+                if !kind.properties().contains(&key.as_str()) || key == "handler" {
+                    return Err(mlua::Error::external(format!(
+                        "a {} has no property `{key}` to search by",
+                        kind.noun()
+                    )));
+                }
+                fields.push((key, value));
+            }
+            Some(fields)
+        }
+        other => {
+            return Err(mlua::Error::external(format!(
+                "`find` takes a table of fields or a function, but got a {} value",
+                other.type_name()
+            )));
+        }
+    };
+    let mut found = Vec::new();
+    for name in names(lua, kind)? {
+        let Some(handle) = handle_for(lua, kind, &name)? else {
+            continue;
+        };
+        let keep = match (&query, &fields) {
+            (Value::Function(predicate), _) => !matches!(
+                predicate.call::<Value>(handle)?,
+                Value::Nil | Value::Boolean(false)
+            ),
+            (_, Some(fields)) => {
+                let mut all = true;
+                for (key, wanted) in fields {
+                    let actual = field(lua, kind, &name, key)?;
+                    if !matches(lua, &actual, wanted)? {
+                        all = false;
+                        break;
+                    }
+                }
+                all
+            }
+            _ => false,
+        };
+        if keep {
+            found.push(handle);
+        }
+    }
+    Ok(found)
+}
+
+/// Whether a property value matches a query value: strings match with `*`
+/// wildcards, a string matches a list when any item matches, and anything
+/// else matches by equality.
+fn matches(lua: &Lua, actual: &serde_json::Value, wanted: &Value) -> mlua::Result<bool> {
+    if let Value::String(pattern) = wanted {
+        let pattern = pattern.to_str()?;
+        return Ok(match actual {
+            serde_json::Value::String(text) => wildcard(&pattern, text),
+            serde_json::Value::Array(items) => items
+                .iter()
+                .any(|item| item.as_str().is_some_and(|text| wildcard(&pattern, text))),
+            _ => false,
+        });
+    }
+    let wanted: serde_json::Value = lua.from_value(wanted.clone())?;
+    Ok(*actual == wanted)
+}
+
+/// `*` matches any run of characters; everything else matches itself.
+fn wildcard(pattern: &str, text: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == text;
+    }
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if !text.starts_with(first) || !text[first.len()..].ends_with(last) {
+        return false;
+    }
+    let mut rest = &text[first.len()..text.len() - last.len()];
+    for part in &parts[1..parts.len() - 1] {
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// `agentd.<collection>.remove(name)` and `handle:remove()`.
+pub(crate) fn remove(lua: &Lua, kind: Kind, name: &str) -> mlua::Result<()> {
+    if definition(lua, kind, name)?.is_none() {
+        return Err(mlua::Error::external(format!(
+            "there is no {} named `{name}`",
+            kind.noun()
+        )));
+    }
+    refuse_if_used(lua, kind, name, "removed")?;
+    let mut stale = Vec::new();
+    match kind {
+        Kind::Runner => {
+            registry::<agentd_runners::RunnerRegistry>(lua)?.remove(name);
+        }
+        Kind::Skill => {
+            registry::<agentd_skills::SkillRegistry>(lua)?.remove(name);
+        }
+        Kind::Service => {
+            registry::<agentd_services::ServiceRegistry>(lua)?.remove(name);
+            let catalog = registry::<SharedCatalog>(lua)?;
+            stale.extend(catalog.write().map_err(lock)?.services.remove(name));
+        }
+        Kind::Action => {
+            let catalog = registry::<SharedCatalog>(lua)?;
+            let mut guard = catalog.write().map_err(lock)?;
+            guard.action_meta.remove(name);
+            stale.extend(guard.actions.remove(name));
+        }
+        Kind::Tool => {
+            let catalog = registry::<SharedCatalog>(lua)?;
+            catalog.write().map_err(lock)?.tools.remove(name);
+        }
+    }
+    for key in stale {
+        lua.remove_registry_value(key)?;
+    }
+    lua.app_data_mut::<Handles>()
+        .ok_or_else(missing)?
+        .retire(kind, name);
+    Ok(())
 }
 
 /// Fail when other registered items still refer to `name`, naming them.
@@ -809,4 +983,22 @@ fn registry<T: Clone + 'static>(lua: &Lua) -> mlua::Result<T> {
             "a registry is not available in this Lua state, this is a bug in agentd, please report it",
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wildcard;
+
+    #[test]
+    fn wildcard_cases() {
+        assert!(wildcard("git.*", "git.status"));
+        assert!(wildcard("*", ""));
+        assert!(wildcard("a*c", "abc"));
+        assert!(wildcard("a*b*c", "a-b-c"));
+        assert!(wildcard("exact", "exact"));
+        assert!(!wildcard("git.*", "fs.read"));
+        assert!(!wildcard("a*c", "ab"));
+        assert!(!wildcard("a*a", "a"));
+        assert!(!wildcard("exact", "exactly"));
+    }
 }

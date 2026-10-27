@@ -325,7 +325,76 @@ async fn action_handler_and_schema_can_change() {
         .await
         .unwrap_err();
     assert!(
-        error.to_string().contains("the required field `/n` is missing"),
+        error
+            .to_string()
+            .contains("the required field `/n` is missing"),
         "{error}"
+    );
+}
+
+#[test]
+fn find_by_table_and_function() {
+    load(
+        r##"
+        agentd.action("git.status", function() end)
+        agentd.action("git.diff", function() end)
+        agentd.action("fs.read", function() end)
+        local git = agentd.actions.find({ name = "git.*" })
+        assert(#git == 2 and git[1].name == "git.diff" and git[2].name == "git.status", "glob, sorted")
+        local read = agentd.actions.find(function(a) return a.name == "fs.read" end)
+        assert(#read == 1 and read[1] == agentd.actions.get("fs.read"), "predicate returns handles")
+        agentd.runner{ name = "a", model = "mock/x", skills = { "debug", "tdd" } }
+        agentd.runner{ name = "b", model = "mock/y", skills = { "debug" } }
+        assert(#agentd.runners.find({ skills = "tdd" }) == 1, "list field")
+        assert(#agentd.runners.find({ skills = "debug", model = "mock/y" }) == 1, "all keys must match")
+        assert(#agentd.runners.find({ model = "mock/*" }) == 2, "glob on another field")
+        assert(#agentd.runners.find({}) == 2, "empty query matches all")
+        local ok, err = pcall(agentd.runners.find, { modle = "x" })
+        assert(not ok and tostring(err):find("`modle`", 1, true), tostring(err))
+        assert(#agentd.skills.find({ name = "*" }) == 0, "no skills")
+        "##,
+    );
+}
+
+#[test]
+fn remove_unregisters_and_retires() {
+    let host = load(
+        r##"
+        local s = agentd.skill{ name = "k", system = "x" }
+        s:remove()
+        assert(agentd.skills.get("k") == nil, "skill gone")
+        local ok, err = pcall(function() return s.system end)
+        assert(not ok and tostring(err):find("the skill `k` was removed", 1, true), tostring(err))
+        agentd.tool{ name = "t" }
+        agentd.tools.remove("t")
+        assert(agentd.tools.get("t") == nil, "tool gone")
+        agentd.runner{ name = "r" }
+        agentd.runners.remove("r")
+        local svc = agentd.service("svc", function() end)
+        svc:remove()
+        agentd.action("x", function() end)
+        agentd.actions.remove("x")
+        assert(#agentd.actions.list() == 0, "action gone")
+        ok, err = pcall(agentd.skills.remove, "ghost")
+        assert(not ok and tostring(err):find("there is no skill named `ghost`", 1, true), tostring(err))
+        "##,
+    );
+    assert!(host.runners().get("r").is_none());
+    assert!(host.services().get("svc").is_none());
+    assert!(host.skills().get("k").is_none());
+}
+
+#[test]
+fn remove_refuses_while_referenced() {
+    load(
+        r##"
+        agentd.runner{ name = "coder", actions = { "x" } }
+        agentd.action("x", function() end)
+        local ok, err = pcall(agentd.actions.remove, "x")
+        assert(not ok and tostring(err):find("`coder` still lists `x`", 1, true), tostring(err))
+        table.remove(agentd.runners.get("coder").allowed_actions, 1)
+        agentd.actions.remove("x")
+        assert(agentd.actions.get("x") == nil, "removed after the runner let go")
+        "##,
     );
 }
