@@ -863,14 +863,17 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(screen.width, screen.height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
-        let underlined = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+        let highlighted = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
             (0..screen.width).any(|column| {
-                terminal.backend().buffer()[(column, header)]
-                    .modifier
-                    .contains(ratatui::style::Modifier::UNDERLINED)
+                let cell = &terminal.backend().buffer()[(column, header)];
+                assert!(
+                    !cell.modifier.contains(ratatui::style::Modifier::UNDERLINED),
+                    "hover never underlines"
+                );
+                cell.symbol() == "g" && cell.fg == ui::PRIMARY
             })
         };
-        assert!(underlined(&terminal));
+        assert!(highlighted(&terminal));
 
         let handled = handle_event(&mut app, moved(x + 5, header), screen)
             .await
@@ -884,7 +887,7 @@ mod tests {
             .unwrap();
         assert_eq!(app.hover, None);
         terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
-        assert!(!underlined(&terminal));
+        assert!(!highlighted(&terminal));
     }
 
     #[tokio::test]

@@ -977,9 +977,9 @@ pub(in crate::tui) fn clickable_at(
         .find(|(header, _)| line == *header)
 }
 
-/// Marks a clickable row as under the mouse: its title underlined up to the
-/// open or closed marker, which takes the primary color. A changed file's
-/// line has no marker, so its path is underlined.
+/// Marks a clickable row as under the mouse: its title and its open or
+/// closed marker take the primary color. A changed file's line has no
+/// marker, so its path does.
 fn hovered(line: &mut Line<'static>) {
     let mut started = false;
     for span in &mut line.spans {
@@ -995,7 +995,7 @@ fn hovered(line: &mut Line<'static>) {
             continue;
         }
         started = true;
-        span.style = span.style.add_modifier(Modifier::UNDERLINED);
+        span.style = span.style.fg(PRIMARY);
     }
 }
 
