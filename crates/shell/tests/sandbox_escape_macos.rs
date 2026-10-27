@@ -27,6 +27,7 @@ fn sh(script: String, policy: SandboxPolicy) -> ExecRequest {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: Some(policy),
     }
 }
@@ -133,6 +134,7 @@ async fn net_denied_blocks_outbound() {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: Some(write_policy(dir.path())),
     })
     .await

@@ -43,6 +43,7 @@ async fn raw_tcp_allowed_ip_reaches_server() {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: None,
     };
     req.sandbox = Some(policy(vec!["net:1.1.1.1"]));
@@ -68,6 +69,7 @@ async fn raw_tcp_denied_ip_is_blocked() {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: None,
     };
     req.sandbox = Some(policy(vec!["net:203.0.113.77"]));
@@ -94,6 +96,7 @@ async fn dns_denied_name_does_not_resolve() {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: None,
     };
     req.sandbox = Some(policy(vec!["net:allowed.example.com"]));
@@ -123,6 +126,7 @@ async fn name_grant_reaches_host_and_exchanges_data() {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: None,
     };
     req.sandbox = Some(policy(vec!["net:one.one.one.one"]));
@@ -150,6 +154,7 @@ async fn wildcard_grant_resolves_like_linux() {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: None,
     };
     req.sandbox = Some(policy(vec!["net:one.one.one.*"]));

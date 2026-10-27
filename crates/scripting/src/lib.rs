@@ -2330,6 +2330,7 @@ fn parse_shell_args(_lua: &Lua, args: MultiValue) -> mlua::Result<ExecRequest> {
                 cwd: cwd.map(Into::into),
                 stdin,
                 separate_stderr,
+                timeout_ms: None,
                 sandbox: None,
             })
         }
@@ -2369,6 +2370,7 @@ fn parse_shell_args(_lua: &Lua, args: MultiValue) -> mlua::Result<ExecRequest> {
                 cwd: cwd.map(Into::into),
                 stdin,
                 separate_stderr,
+                timeout_ms: None,
                 sandbox: None,
             })
         }

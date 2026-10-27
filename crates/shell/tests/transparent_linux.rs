@@ -92,6 +92,7 @@ fn raw_tcp_req(dst: SocketAddr) -> ExecRequest {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: None,
     }
 }
@@ -163,6 +164,7 @@ async fn dns_denied_name_does_not_resolve() {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: None,
     };
     req.sandbox = Some(policy(vec!["net:allowed.example.com"]));
@@ -180,6 +182,7 @@ fn sh_req(script: &str, net_hosts: Vec<&str>) -> ExecRequest {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: Some(policy(net_hosts)),
     }
 }
@@ -244,6 +247,7 @@ fn udp_echo_req(dst: SocketAddr, net_hosts: Vec<&str>) -> ExecRequest {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: Some(policy(net_hosts)),
     }
 }

@@ -30,6 +30,7 @@ fn sh(script: String, policy: SandboxPolicy) -> ExecRequest {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: Some(policy),
     }
 }
@@ -41,6 +42,7 @@ fn py(code: String, policy: SandboxPolicy) -> ExecRequest {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: Some(policy),
     }
 }

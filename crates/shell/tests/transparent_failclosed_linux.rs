@@ -26,6 +26,7 @@ fn marker_req(marker: &std::path::Path) -> ExecRequest {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: Some(SandboxPolicy {
             read_paths: vec![],
             write_paths: vec![marker.parent().unwrap().to_path_buf()],
