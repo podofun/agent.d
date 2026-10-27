@@ -144,7 +144,7 @@ A `path` can be absolute or relative.
 - **Absolute** (`/home/me/data.txt`, `C:\data\x.txt`) is used as-is.
 - **Relative** (`notes/todo.md`) is joined onto the current **working directory**.
 
-By default, the working directory is the folder that contains `init.lua`. Thus, `ctx.fs.read("notes/todo.md")` reads `<configuration-directory>/notes/todo.md`. You can use an absolute path to read a file outside the configuration directory, such as a system log.
+By default, the working directory is the folder that contains `init.lua`. This is your configuration folder, the one agent.d reads its settings from. So `ctx.fs.read("notes/todo.md")` reads `notes/todo.md` in that folder. Use an absolute path to read a file somewhere else, such as a system log.
 
 ### Setting the working directory
 
@@ -154,23 +154,23 @@ The working directory is decided per call, using the first of these that applies
 2. `cwd` on the runner that called the action
 3. the folder of the chat session the run belongs to, if it has one
 4. the working directory it inherited from the action that called it
-5. the workspace root (the default)
+5. the configuration folder (the default)
 
-A relative `cwd` is joined onto the workspace root, even when the action inherited a different working directory. An action that inherits `<workspace>/a` and declares `cwd = "b"` runs in `<workspace>/b`. An absolute `cwd` is used as written.
+A relative `cwd` is joined onto the configuration folder, even when the action inherited a different working directory. An action that inherits `<config>/a` and declares `cwd = "b"` runs in `<config>/b`. An absolute `cwd` is used as written.
 
 ```lua
--- Every relative path in this action is rooted at <workspace>/reports.
+-- Every relative path in this action is rooted at <config>/reports.
 agentd.action{
   name = "report.write",
   cwd = "reports",
   requires = { "fs.write:reports/**" },
   handler = function(args, ctx)
-    ctx.fs.write("today.md", args.body)   -- writes <workspace>/reports/today.md
+    ctx.fs.write("today.md", args.body)   -- writes <config>/reports/today.md
   end,
 }
 ```
 
-Nested calls inherit the caller's working directory unless they set their own. A runner with `cwd = "workspace/acme"` runs all its tools rooted there, and a single tool can override just itself with its own `cwd`.
+Nested calls inherit the caller's working directory unless they set their own. A runner with `cwd = "projects/acme"` runs all its tools rooted there, and a single tool can override just itself with its own `cwd`.
 
 ### Changing it at runtime
 
@@ -197,7 +197,7 @@ Because grants are checked against the final absolute path, a **relative grant r
 
 ```toml
 [tool.notes]
-# Rooted at the workspace — works on any machine.
+# Rooted at the configuration folder, so it works on any machine.
 granted = ["fs.read:notes/**", "fs.write:notes/**"]
 ```
 
@@ -226,7 +226,7 @@ ctx.fs.read("/data/../etc/passwd")   -- resolves to /etc/passwd → denied
 ## More examples
 
 ```lua
--- Read JSON config relative to the workspace
+-- Read JSON settings from the configuration folder
 agentd.action{
   name = "config.load",
   requires = { "fs.read:config/**" },

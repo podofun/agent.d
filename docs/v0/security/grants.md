@@ -8,7 +8,7 @@ Read this page when you add a tool, a runner, or a service, or when a call fails
 
 The default path is `$XDG_CONFIG_HOME/agentd/grants.toml`. To use a different file, pass `--grants <path>` or set `AGENTD_GRANTS`. The old `--grants-file` and `AGENTD_GRANTS_FILE` names still work, but they are deprecated.
 
-`init.lua` and `grants.toml` live in the same folder. That folder is the **workspace root**. If you give agent.d one of the two files, it finds the other one next to it. Use both flags only when the files are in different folders.
+`init.lua` and `grants.toml` live in the same folder. That folder is your **configuration folder**. If you give agent.d one of the two files, it finds the other one next to it. Use both flags only when the files are in different folders.
 
 When you run the daemon with `--watch`, it loads the file again each time you save it.
 
@@ -210,7 +210,7 @@ skip       = []
 - A component's own entry takes priority over a package grant.
 - For interfaces and services, an empty `allowed_actions` list means "no limit". For runners, an action that is not on the list causes a question.
 - agent.d resolves file paths before it compares them. It follows symlinks and removes `..` segments, so an alias cannot get around a grant or a denial. On macOS and Windows, uppercase and lowercase letters in paths are the same.
-- A relative `fs.read` or `fs.write` grant starts from the component's working directory: in a chat session with a folder, that folder, and otherwise the workspace root. So `fs.read:notes/**` works on every machine. An absolute grant stays as you wrote it.
+- A relative `fs.read` or `fs.write` grant starts from the component's working directory: in a chat session with a folder, that folder, and otherwise the configuration folder. So `fs.read:notes/**` works on every machine. An absolute grant stays as you wrote it.
 - A `shell.exec` value is a program name or a path. agent.d finds the program file that the value names, so `shell.exec:python3` and `/usr/bin/python3` are the same program.
 
 ## See also
