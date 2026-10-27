@@ -134,8 +134,9 @@ The working directory is decided per call, using the first of these that applies
 
 1. `cwd` on the action itself — `agentd.action{ cwd = "..." }`
 2. `cwd` on the runner that called the action
-3. the working directory it inherited from the action that called it
-4. the workspace root (the default)
+3. the folder of the chat session the run belongs to, if it has one
+4. the working directory it inherited from the action that called it
+5. the workspace root (the default)
 
 A relative `cwd` is always joined onto the workspace root, so even when the action inherited a working directory, it does not stack on top of it. An action that inherits `<workspace>/a` and declares `cwd = "b"` runs in `<workspace>/b`, not `<workspace>/a/b`. An absolute `cwd` is used as-is.
 
