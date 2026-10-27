@@ -423,15 +423,22 @@ fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
         return lines;
     }
     let long = if changes.is_empty() { long } else { Vec::new() };
+    let input = entry.input.as_ref().and_then(Value::as_object);
     for (key, text) in &long {
-        block(&mut lines, inner, key, text, MUTED);
+        match input
+            .and_then(|fields| fields.get(key))
+            .and_then(|value| checklist(value))
+        {
+            Some(items) => lines.extend(items),
+            None => block(&mut lines, inner, key, text, MUTED),
+        }
     }
     match entry.output.as_ref() {
         Some(output) if run_output(output).is_some() => {
             lines.extend(run_lines(output, inner));
         }
         Some(Value::Object(fields)) if !entry.failed => {
-            lines.extend(field_lines(fields, &short, inner));
+            lines.extend(field_lines(fields, input, inner));
         }
         _ if !entry.body.is_empty() => {
             let label = if long.is_empty() { "" } else { "result" };
@@ -579,16 +586,23 @@ fn run_lines(output: &Value, width: usize) -> Vec<Line<'static>> {
 /// both are left out.
 fn field_lines(
     fields: &serde_json::Map<String, Value>,
-    arguments: &[(String, String)],
+    input: Option<&serde_json::Map<String, Value>>,
     width: usize,
 ) -> Vec<Line<'static>> {
     let label = Style::default().fg(MUTED);
     let mut lines = Vec::new();
     for (key, value) in fields {
-        let repeats = value
-            .as_str()
-            .is_some_and(|text| arguments.iter().any(|(_, argument)| argument == text));
+        let repeats = input.is_some_and(|input| {
+            input.get(key) == Some(value)
+                || value
+                    .as_str()
+                    .is_some_and(|text| input.values().any(|v| v.as_str() == Some(text)))
+        });
         if key == "revision" || repeats {
+            continue;
+        }
+        if let Some(items) = checklist(value) {
+            lines.extend(items);
             continue;
         }
         let name = presentation::field_label(key);
@@ -623,6 +637,33 @@ fn field_lines(
         }
     }
     lines
+}
+
+/// A list of `{ text, status }` items, such as an agent's todo list, as a
+/// checklist: done items ticked and muted, the current one marked.
+fn checklist(value: &Value) -> Option<Vec<Line<'static>>> {
+    let items = value.as_array().filter(|items| !items.is_empty())?;
+    items
+        .iter()
+        .map(|item| {
+            let text = item.get("text")?.as_str()?;
+            let status = item.get("status")?.as_str()?;
+            let (mark, mark_style, text_style) = match status {
+                "done" | "completed" => (
+                    "✓",
+                    Style::default().fg(SUCCESS),
+                    Style::default().fg(MUTED),
+                ),
+                "in_progress" => ("●", Style::default().fg(WARNING), Style::default()),
+                _ => ("○", Style::default().fg(MUTED), Style::default()),
+            };
+            Some(indented(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{mark} "), mark_style),
+                Span::styled(markdown::printable(text).into_owned(), text_style),
+            ])))
+        })
+        .collect()
 }
 
 /// A line's text as runs, each flagged when it changed.
