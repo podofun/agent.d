@@ -88,7 +88,35 @@ fn collect(value: &Value, depth: usize, lines: &mut Vec<String>) {
     }
 }
 
-fn field_label(key: &str) -> String {
+/// How long ago a Unix timestamp in seconds was, such as "5m ago".
+pub(super) fn ago(seconds: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let elapsed = now.saturating_sub(seconds);
+    match elapsed {
+        0..60 => "just now".into(),
+        60..3_600 => format!("{}m ago", elapsed / 60),
+        3_600..86_400 => format!("{}h ago", elapsed / 3_600),
+        86_400..2_592_000 => format!("{}d ago", elapsed / 86_400),
+        _ => format!("{}mo ago", elapsed / 2_592_000),
+    }
+}
+
+/// A token count shortened for reading, such as "950", "12.4k", or "1.2M".
+pub(super) fn tokens(count: u64) -> String {
+    // One decimal place means the shortened value rounds up, so switch units
+    // early: 999_950 would otherwise read as "1000.0k" instead of "1.0M".
+    if count < 1_000 {
+        count.to_string()
+    } else if count < 999_950 {
+        format!("{:.1}k", count as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    }
+}
+
+pub(super) fn field_label(key: &str) -> String {
     let mut label = key.replace('_', " ");
     if let Some(first) = label.get_mut(..1) {
         first.make_ascii_uppercase();
@@ -102,7 +130,7 @@ fn indent(depth: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{action_result, tool_output, value};
+    use super::{action_result, tokens, tool_output, value};
     use serde_json::json;
 
     #[test]
@@ -136,5 +164,17 @@ mod tests {
             tool_output("\"On branch main\\nnothing to commit\""),
             "On branch main\nnothing to commit"
         );
+    }
+
+    #[test]
+    fn token_counts_switch_unit_before_rounding_overflows() {
+        assert_eq!(tokens(0), "0");
+        assert_eq!(tokens(950), "950");
+        assert_eq!(tokens(1_000), "1.0k");
+        assert_eq!(tokens(12_400), "12.4k");
+        assert_eq!(tokens(999_949), "999.9k");
+        assert_eq!(tokens(999_950), "1.0M");
+        assert_eq!(tokens(1_000_000), "1.0M");
+        assert_eq!(tokens(1_234_567), "1.2M");
     }
 }

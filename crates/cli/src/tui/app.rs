@@ -20,34 +20,38 @@ use ratatui::layout::Rect;
 pub(super) enum Tab {
     Chat,
     All,
-    Runners,
     Sessions,
+    Runners,
+    Skills,
     Actions,
     Services,
-    Skills,
 }
 
 impl Tab {
     pub(super) const ALL: [Self; 7] = [
         Self::Chat,
         Self::All,
-        Self::Runners,
         Self::Sessions,
+        Self::Runners,
+        Self::Skills,
         Self::Actions,
         Self::Services,
-        Self::Skills,
     ];
 
     pub(super) fn index(self) -> usize {
         Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0)
     }
 
+    /// The browser tab after this one, wrapping around without leaving the browser.
     pub(super) fn next(self) -> Self {
-        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+        let tabs = &Self::ALL[1..];
+        tabs[(self.index().max(1)) % tabs.len()]
     }
 
+    /// The browser tab before this one, wrapping around without leaving the browser.
     pub(super) fn previous(self) -> Self {
-        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+        let tabs = &Self::ALL[1..];
+        tabs[(self.index().max(1) + tabs.len() - 2) % tabs.len()]
     }
 }
 
@@ -119,7 +123,8 @@ const HELP: &str = "\
 
 ## Browse
 - `Ctrl+P` opens the browser; type to search everywhere
-- `Tab` changes section, `Enter` opens a row, `Esc` clears the search, then returns
+- `←`/`→` or `Tab` cycle sections, `↑`/`↓` move and wrap around, `PageUp`/`PageDown`/`Home`/`End` jump
+- `Enter` opens a row, `Esc` clears the search, then returns
 
 ## Editing
 - `Shift+arrows` select, `Ctrl+V` pastes, `Ctrl+X` cuts
@@ -499,14 +504,22 @@ impl App {
         self.selected = [0; 7];
     }
 
-    pub(super) fn select_previous(&mut self) {
+    /// Move the browser selection by `delta` rows. With `wrap`, stepping
+    /// past either end continues from the other; otherwise it stops there.
+    pub(super) fn move_selection(&mut self, delta: isize, wrap: bool) {
+        let count = self.rows().len();
         let index = self.tab.index();
-        self.selected[index] = self.selected[index].saturating_sub(1);
-    }
-
-    pub(super) fn select_next(&mut self) {
-        let index = self.tab.index();
-        self.selected[index] = (self.selected[index] + 1).min(self.rows().len().saturating_sub(1));
+        if count == 0 {
+            self.selected[index] = 0;
+            return;
+        }
+        let current = self.selected[index].min(count - 1) as isize;
+        let target = current + delta;
+        self.selected[index] = if wrap && (target < 0 || target >= count as isize) {
+            target.rem_euclid(count as isize) as usize
+        } else {
+            target.clamp(0, count as isize - 1) as usize
+        };
     }
 
     pub(super) async fn activate_selected(&mut self) {
