@@ -423,14 +423,13 @@ fn diff_lines(change: &FileChange, width: usize) -> Vec<Line<'static>> {
         } else if !in_hunk && (line.starts_with("---") || line.starts_with("+++")) {
             continue;
         }
-        // The terminal drops control characters, so tabs would vanish.
-        let line = line.replace('\t', "    ");
+        let line = markdown::printable(line);
         let mut spans = match line.chars().next() {
             Some('+') if in_hunk => vec![Span::styled("+", Style::default().fg(SUCCESS))],
             Some('-') if in_hunk => vec![Span::styled("-", Style::default().fg(ERROR))],
             Some(' ') if in_hunk => vec![Span::raw(" ")],
             _ => {
-                lines.push(diff_row(vec![Span::styled(line, muted)], width));
+                lines.push(diff_row(vec![Span::styled(line.into_owned(), muted)], width));
                 continue;
             }
         };
@@ -574,6 +573,8 @@ fn output_preview(body: &str, width: usize, rows: usize) -> Vec<Line<'static>> {
         .skip_while(|line| line.trim().is_empty())
         .take(rows)
         .map(|line| {
+            let line = markdown::printable(line);
+            let line = line.as_ref();
             let mut text: String = line.graphemes(true).take(width).collect();
             if text.width() < line.width() {
                 text = text
@@ -1495,5 +1496,113 @@ mod tests {
             .join("\n");
         assert!(text.contains("working"), "{text}");
         assert!(text.contains("second  queued"), "{text}");
+    }
+
+    /// Every cell the conversation draws, row by row.
+    fn screen(app: &App, width: u16, height: u16) -> (Vec<Vec<String>>, ratatui::buffer::Buffer) {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| super::super::draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let cells = (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol().to_owned()).collect())
+            .collect();
+        (cells, buffer)
+    }
+
+    /// A read whose output has `cat -n` tabs and a carriage return, then an
+    /// expanded edit whose text has an emoji and an em dash.
+    fn tabbed_and_wide() -> App {
+        let file = "#!/usr/bin/env bash\n# Throwaway demo script #2 \u{2014} prints a greeting, then exits.\nset -euo pipefail\necho \"Hello from a throwaway script! \u{1F44B}\"\necho \"This file is temporary \u{2014} run it once.\"\necho \"Today is $(date -u +%A).\"\n";
+        let numbered: String = file
+            .lines()
+            .enumerate()
+            .map(|(row, line)| format!("{:>6}\t{line}\r\n", row + 1))
+            .collect();
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.connected = true;
+        app.push_tool("fs.read", numbered.clone());
+        app.entries[0].input = Some(json!({ "path": "demo.sh" }));
+        app.entries[0].set_expanded(true);
+        app.push_tool("edit.replace", "ok");
+        let old = file.replace("Hello", "Hi");
+        app.entries[1].input = Some(json!({ "path": "demo.sh", "old": old, "new": file }));
+        let diff = format!(
+            "@@ -4 +4 @@\n-echo \"Hi from a throwaway script! \u{1F44B}\"\n+echo \"Hello from a\tthrowaway script! \u{1F44B}\"\n{}",
+            numbered.lines().map(|line| format!(" {line}\n")).collect::<String>()
+        );
+        app.entries[1].set_changes(vec![change("demo.sh", "modified", Some(&diff))]);
+        app.entries[1].set_expanded(true);
+        // Two calls in a row read as one group row until it is opened.
+        app.entries[0].group_open = true;
+        app
+    }
+
+    #[test]
+    fn control_characters_never_reach_the_screen() {
+        let app = tabbed_and_wide();
+        for width in [40, 61, 80] {
+            let (cells, _) = screen(&app, width, 60);
+            for (y, row) in cells.iter().enumerate() {
+                assert!(
+                    row.iter().all(|cell| !cell.contains(char::is_control)),
+                    "row {y} at width {width}: {row:?}"
+                );
+            }
+            let text_width = conversation_inner(Rect::new(0, 0, width, 60)).width as usize - 1;
+            for line in conversation_lines(&app, text_width).lines {
+                assert!(line.width() <= text_width, "{} > {text_width}: {line}", line.width());
+                assert!(!line.to_string().contains(char::is_control), "{line:?}");
+            }
+        }
+        let preview = output_preview("     1\tfirst\r", 30, 1);
+        assert_eq!(preview[0].to_string().trim(), "1    first");
+    }
+
+    #[test]
+    fn redraws_leave_no_stale_cells() {
+        let mut app = tabbed_and_wide();
+        let (width, height) = (61, 24);
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let screen_rect = Rect::new(0, 0, width, height);
+        let steps = max_scroll(&app, screen_rect);
+        assert!(steps > 4, "the conversation should scroll: {steps}");
+        for scroll in (0..=steps).chain((0..=steps).rev()) {
+            app.scroll = scroll;
+            terminal.draw(|frame| super::super::draw(frame, &app)).unwrap();
+            // The terminal kept only the cells each draw changed; they must
+            // add up to what a fresh draw of the same state shows.
+            let (_, fresh) = screen(&app, width, height);
+            let kept = terminal.backend().buffer();
+            for y in 0..height {
+                let last = &kept[(width - 1, y)];
+                assert!(last.symbol().width() <= 1, "wide cell on the edge at row {y}");
+                for x in 0..width {
+                    // A terminal draws a wide character over the next cell
+                    // too, which the test backend leaves as it was.
+                    if x > 0 && fresh[(x - 1, y)].symbol().width() > 1 {
+                        continue;
+                    }
+                    assert_eq!(
+                        kept[(x, y)].symbol(),
+                        fresh[(x, y)].symbol(),
+                        "stale cell at ({x}, {y}) after scrolling to {scroll}"
+                    );
+                }
+            }
+        }
+        app.entries[1].set_expanded(false);
+        terminal.draw(|frame| super::super::draw(frame, &app)).unwrap();
+        let (fresh, _) = screen(&app, width, height);
+        let kept = terminal.backend().buffer();
+        for (y, row) in fresh.iter().enumerate() {
+            for (x, cell) in row.iter().enumerate() {
+                if x > 0 && row[x - 1].width() > 1 {
+                    continue;
+                }
+                assert_eq!(kept[(x as u16, y as u16)].symbol(), cell, "({x}, {y})");
+            }
+        }
     }
 }
