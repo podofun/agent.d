@@ -18,7 +18,7 @@ my-reviewer/
 └── grants.toml
 ```
 
-## Step 1 — The git tool
+## Step 1: The git tool
 
 **Required permission:** `shell.exec:git`
 
@@ -64,9 +64,9 @@ agentd.action({
 })
 ```
 
-`ctx.shell(bin, args, opts)` takes an argv array — no shell string, no injection surface. `separate_stderr = false` merges stderr into stdout so the diff output is complete.
+`ctx.shell(bin, args, opts)` takes the program and its arguments as a list, with no shell string, so arguments cannot inject shell commands. `separate_stderr = false` merges stderr into stdout so the diff output is complete.
 
-## Step 2 — The reviewer skill
+## Step 2: The reviewer skill
 
 Skills are Markdown files with YAML frontmatter. The `name` field must match the string you pass to `skills` in the runner.
 
@@ -85,7 +85,7 @@ hand-waving.
 
 Save this as `skills/reviewer.md`.
 
-## Step 3 — The runner
+## Step 3: The runner
 
 **Required permission:** `ai:<provider>` (here `ai:anthropic`)
 
@@ -100,9 +100,9 @@ agentd.runner({
 })
 ```
 
-`model` is `"<provider>/<model_id>"`. The `actions` list is an advisory allowlist — the grants file is still the authoritative source of truth for what the runner may call.
+`model` is `"<provider>/<model_id>"`. The `actions` list sets which actions the model can see. `grants.toml` decides which of them the runner may call without a question.
 
-## Step 4 — The entry point
+## Step 4: The entry point
 
 ```lua
 -- init.lua
@@ -113,7 +113,7 @@ agentd.skills.load("skills/reviewer.md")
 
 `import()` resolves relative to `init.lua`. `agentd.skills.load()` loads a single skill file and returns the skill, which you can keep if you want to change it later.
 
-## Step 5 — grants.toml
+## Step 5: grants.toml
 
 ```toml
 [tool.git]
@@ -124,10 +124,10 @@ granted = ["ai:anthropic"]
 allowed_actions = ["git.diff", "git.status"]
 ```
 
-`[tool.git]` grants the `shell.exec:git` slug to every action under that tool. `[runner.backend_reviewer]` grants `ai:anthropic` so the runner can make model calls, and restricts which actions the runner may invoke at layer 3 of the permission engine.
+`[tool.git]` grants the `shell.exec:git` slug to every action under that tool. `[runner.backend_reviewer]` grants `ai:anthropic` so the runner can make model calls, and lists the actions the runner may call without a question.
 
 ::: tip Provider credentials
-The `anthropic` provider reads your API key from the secret store. Seed it once with `agentctl secret set`:
+The `anthropic` provider reads your API key from the secret store. Store it once with `agentctl secret set`:
 ```bash
 echo "$ANTHROPIC_API_KEY" | agentctl secret set anthropic_api_key
 ```
@@ -159,7 +159,7 @@ agentctl runner ls
 agentctl runner run backend_reviewer "Review my staged changes. Be terse."
 ```
 
-Add `--text-only` to strip the metadata envelope and get just the review text.
+Add `--text-only` to print only the review text, without the surrounding metadata.
 
 You can also call the underlying actions directly to test them in isolation:
 

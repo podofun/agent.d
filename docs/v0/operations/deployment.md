@@ -1,6 +1,6 @@
 # Deployment
 
-How to build and run the agent.d daemon in production: binary paths, configuration knobs, token management, and a sample systemd unit.
+This page shows how to build and run the agent.d daemon in production: where the binaries go, how to point the daemon at your files, how to manage tokens, and how to run it under systemd or in a container.
 
 ## Build a release binary
 
@@ -17,11 +17,11 @@ This produces two binaries:
 | `agentd` | `target/release/agentd` |
 | `agentctl` | `target/release/agentctl` |
 
-Copy them to a directory on your `PATH` (e.g. `/usr/local/bin`).
+Copy them to a directory on your `PATH` (for example `/usr/local/bin`).
 
 ## Pointing at real paths
 
-The daemon resolves configuration in this order for each knob: **CLI flag > env var > config.toml > built-in default**.
+For each setting, the daemon uses the first value it finds in this order: command-line flag, environment variable, `config.toml`, built-in default.
 
 | Flag | Env var | XDG default |
 |---|---|---|
@@ -29,12 +29,12 @@ The daemon resolves configuration in this order for each knob: **CLI flag > env 
 | `--init <path>` | `AGENTD_INIT` | `$XDG_CONFIG_HOME/agentd/init.lua` |
 | `--grants <path>` | `AGENTD_GRANTS` | `$XDG_CONFIG_HOME/agentd/grants.toml` |
 
-The pre-rename `--grants-file` / `AGENTD_GRANTS_FILE` (and `--trace-file` / `AGENTD_TRACE_FILE`) remain deprecated aliases for one release.
+The old names `--grants-file` and `AGENTD_GRANTS_FILE` (and `--trace-file` and `AGENTD_TRACE_FILE`) still work for one more release, but they are deprecated.
 
-On most Linux systems `$XDG_CONFIG_HOME` resolves to `~/.config`. The defaults work when you place your files there; override with flags or env vars when deploying to non-standard locations.
+On most Linux systems `$XDG_CONFIG_HOME` is `~/.config`. If you place your files there, the defaults work. For other locations, use the flags or environment variables.
 
 ::: warning
-A malformed `config.toml` is a **hard error** — the daemon will not start. Validate TOML syntax before deploying a config change. Similarly, a bad `--init` path or a Lua syntax error in the entry file aborts startup.
+A malformed `config.toml` stops the daemon from starting, so check the TOML syntax before you deploy a config change. A bad `--init` path or a Lua syntax error in the entry file also stops startup.
 :::
 
 ## Bind address
@@ -58,18 +58,18 @@ addr = "127.0.0.1:8080"
 
 ## Token management
 
-The daemon authenticates `/ws` (client data plane) and `/control` (operator/approval plane) separately via bearer tokens.
+The daemon checks a bearer token on `/ws`, where clients connect, and a separate one on `/control`, where approvers and administrators connect.
 
-**Auto-minted tokens (default):** if you do not set a token, the daemon mints one on first run and writes it to:
+**Generated tokens (default):** if you do not set a token, the daemon creates one on first run and writes it to:
 
 | Endpoint | Token file |
 |---|---|
 | `/ws` | `$XDG_STATE_HOME/agentd/token` |
 | `/control` | `$XDG_STATE_HOME/agentd/admin-token` |
 
-Both files are written with mode `0600`. `agentctl` reads these files automatically for local use.
+Both files are written with mode `0600`. `agentctl` reads them on its own for local use.
 
-**Explicit tokens:** set the token via flag or env var to use a fixed value — useful when you inject secrets from a vault:
+**Fixed tokens:** set the token with a flag or environment variable. This helps when you inject secrets from a vault:
 
 ```bash
 agentd \
@@ -85,10 +85,10 @@ export AGENTD_ADMIN_TOKEN=<ctrl-token>
 ```
 
 ::: warning
-Do **not** use `--no-auth` / `AGENTD_NO_AUTH` in production unless the socket is fully isolated. With auth disabled, any process that can reach the port can call any action. It is also an [admin connection](/v0/security/approvals#admin-connections), so it can make approval looser for its runs and see admin sessions.
+Keep `--no-auth` and `AGENTD_NO_AUTH` off in production unless the socket is fully isolated. With auth disabled, any process that can reach the port can call any action. It is also an [admin connection](/v0/security/approvals#admin-connections), so it can make approval looser for its runs and see admin sessions.
 :::
 
-`/health` (`GET /health` → `ok`) is always open and requires no token. Use it as a liveness probe.
+`GET /health` returns `ok` and needs no token. Use it as a liveness probe.
 
 ## Sample systemd unit
 
@@ -129,11 +129,11 @@ docker compose up --build
 
 This command builds the image, mounts the example userland from `examples/docker/`, and serves the daemon on port 7777. To deploy your own agent, replace the mounted directory with your own `config.toml`, `init.lua`, and `grants.toml`.
 
-The image makes two decisions:
+The image differs from a host install in two ways.
 
-**It binds to all interfaces.** On a host, the daemon defaults to `127.0.0.1:7777`. Inside a container, that address is not reachable from outside. The image therefore sets `AGENTD_ADDR=0.0.0.0:7777`. The container boundary now does the job of localhost. Publish the port with care. Keep `/ws` and `/control` behind your proxy, as in the section below.
+**It listens on all interfaces.** On a host, the daemon defaults to `127.0.0.1:7777`, which is not reachable from outside a container. The image sets `AGENTD_ADDR=0.0.0.0:7777`, and the container boundary takes the place of localhost. Publish the port with care, and keep `/ws` and `/control` behind your proxy, as in the section below.
 
-**Secrets come from the environment, not the OS keyring.** Containers have no keyring service, so the image sets `AGENTD_SECRETS=env`. A variable named `AGENTD_SECRET_ANTHROPIC_API_KEY` becomes the secret `anthropic_api_key`. To keep values out of `docker inspect`, set `AGENTD_SECRETS=dir:/run/secrets` instead. The daemon then reads one file per secret. Docker secrets and Kubernetes secret volume mounts have this same shape. Both backends are read-only. `agentctl secret set` applies to the keyring on a host.
+**It reads secrets from the environment.** Containers have no keyring service, so the image sets `AGENTD_SECRETS=env`. A variable named `AGENTD_SECRET_ANTHROPIC_API_KEY` becomes the secret `anthropic_api_key`. To keep values out of `docker inspect`, set `AGENTD_SECRETS=dir:/run/secrets`, and the daemon reads one file per secret. Docker secrets and Kubernetes secret volume mounts have this same shape. Both backends are read-only. `agentctl secret set` applies to the keyring on a host.
 
 State lives on one volume at `/var/lib/agentd`. This volume holds the memory database, the trace log, and the generated tokens. The memory database accepts one writer at a time. Give each container its own volume. A second daemon on the same volume will refuse to start.
 
@@ -141,19 +141,19 @@ The image contains a health check. It probes `GET /health`, and Docker reports t
 
 ## Reverse proxy / TLS
 
-The daemon speaks plain HTTP and WebSocket on localhost. It does **not** terminate TLS itself. Place a reverse proxy (nginx, Caddy, etc.) in front when you need `wss://` or `https://` from external clients.
+The daemon speaks plain HTTP and WebSocket on localhost, without TLS. When external clients need `wss://` or `https://`, put a reverse proxy (nginx, Caddy, or similar) in front of it.
 
 Proxy only the paths the deployment uses:
 
 | Path | Protocol | Notes |
 |---|---|---|
 | `/health` | HTTP GET | Liveness probe, no auth |
-| `/ws` | WebSocket | Client data plane |
-| `/control` | WebSocket | Operator/approval plane |
+| `/ws` | WebSocket | Client connections |
+| `/control` | WebSocket | Approvers and administrators |
 | `/webhooks/<name>` | HTTP POST | Configured signed webhook route |
 
 ::: warning
-Expose `/control` only to trusted networks or behind additional auth at the proxy layer. The control plane allows approving or denying privileged actions.
+Expose `/control` only to trusted networks, or add authentication at the proxy. A client on `/control` can approve or deny privileged actions.
 :::
 
 Example nginx snippet (proxying to the local daemon):
@@ -184,7 +184,7 @@ location /webhooks/ {
 
 ## See also
 
-- [Observability](/v0/operations/observability) — trace log and log-level configuration
-- [Troubleshooting](/v0/operations/troubleshooting) — common startup and runtime issues
-- [Reference: configuration](/v0/reference/configuration) — full config.toml schema
-- [Security: grants](/v0/security/grants) — grants.toml reference
+- [Observability](/v0/operations/observability): trace log and log-level configuration
+- [Troubleshooting](/v0/operations/troubleshooting): common startup and runtime issues
+- [Reference: configuration](/v0/reference/configuration): full config.toml schema
+- [Security: grants](/v0/security/grants): grants.toml reference

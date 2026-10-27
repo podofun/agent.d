@@ -1,8 +1,8 @@
-# ctx.http — HTTP
+# ctx.http: HTTP
 
 `ctx.http` makes outbound HTTP requests. You can call URLs directly or create a persistent `Client` pre-configured with a base URL, default headers, and a timeout.
 
-**Required permission:** `net:<host>` — e.g. `net:api.github.com` or `net:*`.
+**Required permission:** `net:<host>`, for example `net:api.github.com` or `net:*`.
 
 ## Signatures
 
@@ -65,7 +65,7 @@ granted = ["net:api.github.com"]
 
 `ctx.http` follows redirects, and it checks each one. A redirect to a host that is not granted, or that is denied, stops the request with an error. `ctx.http` follows at most 10 redirects.
 
-`ctx.http` also checks the address that it connects to. If the host name points to an IP address in `[denial]`, the request is refused. `ctx.http` ignores proxy settings in the environment, so the connection always goes to the host that agent.d checked. See [Hosts](/v0/security/denials#hosts).
+`ctx.http` also checks the address that it connects to. If the host name points to an IP address in `[denial]`, the request is refused. `ctx.http` ignores proxy settings in the environment, so the connection goes to the host that agent.d checked. See [Hosts](/v0/security/denials#hosts).
 
 ## Examples
 

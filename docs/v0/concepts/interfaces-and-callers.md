@@ -1,35 +1,35 @@
 # Interfaces and Callers
 
-An interface is a client surface connected to the daemon. Every call that arrives through an interface carries a Caller identity that the permission engine uses when making access decisions.
+An interface is a way for a client to connect to the daemon, such as your own web backend or a chat bridge. Every call carries a caller identity that says who made it, and agent.d uses that identity when it decides whether the call may run.
 
 ## Interfaces
 
-The only interface type supported today is WebSocket. Clients connect to `/ws` with a bearer token and then send JSON-envelope requests:
+The only interface type supported today is WebSocket. Clients connect to `/ws` with a bearer token and then send requests as JSON messages:
 
 ```json
 { "id": 1, "method": "actions.call", "params": { "name": "git.status", "args": {} } }
 ```
 
-Each WebSocket connection receives an auto-generated session id (`ws-1`, `ws-2`, …).
+Each WebSocket connection gets a generated session id (`ws-1`, `ws-2`, and so on).
 
-The connection's token determines its interface identity. The daemon token identifies interface `ws`; a token configured under `[interfaces.<name>]` identifies interface `<name>`. This lets the daemon apply separate `[interface.<name>]` grants and session ownership to clients that use the same WebSocket protocol. See [`[interfaces.<name>]`](/v0/reference/configuration#interfaces-name-sections).
+The connection's token decides which interface it is. The daemon token identifies interface `ws`, and a token configured under `[interfaces.<name>]` identifies interface `<name>`. Clients that speak the same WebSocket protocol can then have their own `[interface.<name>]` grants and their own sessions. See [`[interfaces.<name>]`](/v0/reference/configuration#interfaces-name-sections).
 
-You can restrict which actions a given interface may invoke by adding an `allowed_actions` entry to `grants.toml`:
+To limit which actions an interface may call, add an `allowed_actions` entry to `grants.toml`:
 
 ```toml
 [interface.telegram]
 allowed_actions = ["git.status"]
 ```
 
-This adds an interface-level allowlist — permission layer 4. Only calls that pass this layer (and all other layers) are dispatched.
+A call from this interface to any other action is refused. The call still has to pass every other check. See [Permissions](/v0/concepts/permissions).
 
 ::: info
-The full WebSocket protocol — methods, envelopes, auth, and error codes — is documented in the [Protocol reference](/v0/reference/protocol).
+The [Protocol reference](/v0/reference/protocol) documents the full WebSocket protocol: methods, message format, authentication and error codes.
 :::
 
 ## Callers
 
-Every inbound call — whether from a WebSocket client, a runner tool-use step, a service, or another action — carries a Caller struct that identifies who triggered it:
+Every call, whether it comes from a WebSocket client, a runner's tool call, a service or another action, carries a caller that identifies who made it:
 
 ```lua
 -- Available in any handler or service body (no permission required)
@@ -42,14 +42,15 @@ local c = ctx.caller
 -- c.execution  string|nil  -- unique id for this invocation
 ```
 
-The permission engine consults `ctx.caller` to determine which allowlist layers to apply:
-- A call from a runner adds the runner's `allowed_actions` as layer 3.
-- A call from a WebSocket interface adds the interface's `allowed_actions` as layer 4.
-- A call from a service uses the service's `granted` capabilities and optional `allowed_actions`.
+agent.d uses the caller to decide which allowlists apply:
+
+- A call from a runner is checked against the runner's `allowed_actions`. A missing action leads to a question.
+- A call from an interface is checked against the interface's `allowed_actions`. A missing action is refused.
+- A call from a service uses the service's `granted` capabilities and its optional `allowed_actions`.
 
 ## Session and user overrides
 
-When a client bridges an external identity space (e.g. a Telegram bot mapping chat users to agent sessions), it can pass `session` and `user` parameters in the call:
+A client that serves its own users, such as a Telegram bot that maps chat users to agent sessions, can pass `session` and `user` parameters in the call:
 
 ```json
 { "id": 1, "method": "actions.call", "params": {
@@ -71,14 +72,14 @@ end
 
 `runners.run` accepts the same `session` and `user` params on the wire.
 
-## Caller types and permission layers
+## Caller types and allowlists
 
-| Caller type | Layer 3 (runner allow) | Layer 4 (interface allow) | Capability source |
+| Caller type | Runner allowlist | Interface allowlist | Capability source |
 |---|---|---|---|
-| WebSocket client | — | `[interface.<id>].allowed_actions` | — |
-| Runner tool-use step | `[runner.<name>].allowed_actions` | inherited from interface | — |
-| Service | — | — | `[service.<name>].granted` + `allowed_actions` |
-| `ctx.call` (action-to-action) | inherited | inherited | tool grants |
+| WebSocket client | Not used | `[interface.<id>].allowed_actions` | Not used |
+| Runner tool call | `[runner.<name>].allowed_actions` | Inherited from the interface | Not used |
+| Service | Not used | Not used | `[service.<name>].granted` + `allowed_actions` |
+| `ctx.call` (action to action) | Inherited | Inherited | Tool grants |
 
 ## See also
 

@@ -4,8 +4,8 @@ A complete Discord chatbot backed by two long-running services, per-channel dura
 
 The architecture uses two services:
 
-- **`discord_gateway`** — connects to Discord's WebSocket gateway, identifies, sends heartbeats via `timer.every`, and pushes `MESSAGE_CREATE` events onto a named `channel()`.
-- **`discord_handler`** — pops events from the channel, invokes the `discord_chat` runner with channel history, and posts replies via `ctx.call("discord.send")`.
+- **`discord_gateway`** connects to Discord's WebSocket gateway, identifies itself, sends heartbeats with `timer.every`, and puts `MESSAGE_CREATE` events on a named `channel()`.
+- **`discord_handler`** takes events from the channel, runs the `discord_chat` runner with the channel's history, and posts replies with `ctx.call("discord.send")`.
 
 ## Configuration layout
 
@@ -228,18 +228,18 @@ granted = ["ai:openai"]
 allowed_actions = []
 ```
 
-Each section explains itself:
+What each section does:
 
-- `[tool.discord]` — grants the tool's declared `requires` so actions under it can run.
-- `[service.discord_gateway]` — the gateway service gets `net:` grants for both the gateway WebSocket host and the REST API host, plus `secret:discord_token` to read the token.
-- `[service.discord_handler]` — gets `ai:openai` to call the runner, `net:discord.com` to send messages, and `memory.read/write:discord/**` for durable history. `allowed_actions = ["discord.send"]` is the layer-3 action allowlist for this service.
-- `[runner.discord_chat]` grants model access through `ai:openai`; its empty `allowed_actions` adds no action constraint (the runner has no tools of its own).
+- `[tool.discord]` grants the tool's declared `requires` so its actions can run.
+- `[service.discord_gateway]` gives the gateway service `net:` grants for both the gateway WebSocket host and the REST API host, plus `secret:discord_token` to read the token.
+- `[service.discord_handler]` gives the handler `ai:openai` to call the runner, `net:discord.com` to send messages, and `memory.read/write:discord/**` for durable history. `allowed_actions = ["discord.send"]` limits the service to that one action.
+- `[runner.discord_chat]` grants model access through `ai:openai`. The runner calls no actions, so its `allowed_actions` list is empty.
 
 ## Key patterns explained
 
 ### Named channel between services
 
-`channel("discord_events")` returns a process-wide named channel. Both services call `channel("discord_events")` with the same name and get the same channel object — the gateway writes to it, the handler reads from it.
+`channel("discord_events")` returns a named channel shared across the daemon. Both services call it with the same name and get the same channel: the gateway writes to it, and the handler reads from it.
 
 ```lua
 -- in discord_gateway:
@@ -336,7 +336,7 @@ The token is stored in the secret store under the key `discord_token`. You only 
 agentctl services ls
 ```
 
-You should see both `discord_gateway` and `discord_handler` with state `running`. Then mention your bot in a Discord channel — it should reply within a few seconds.
+You should see both `discord_gateway` and `discord_handler` with state `running`. Then mention your bot in a Discord channel. It should reply within a few seconds.
 
 ```bash
 agentctl trace -n 20 --follow

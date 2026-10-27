@@ -1,12 +1,12 @@
 # WebSocket Protocol Reference
 
-This page documents the JSON envelope format and every method available on the `/ws` and `/control` WebSocket endpoints. If you are calling agent.d from code rather than `agentctl`, this is your primary reference.
+This page documents the JSON envelope format and every method available on the `/ws` and `/control` WebSocket endpoints. Use it when you call agent.d from your own code. For the command line, see [agentctl](/v0/reference/cli).
 
 ## Endpoints
 
 | Endpoint | Transport | Auth | Purpose |
 |---|---|---|---|
-| `GET /health` | HTTP | none | Liveness probe — always open |
+| `GET /health` | HTTP | none | Liveness probe, open without a token |
 | `GET /ready` | HTTP | none | Admission readiness; returns 503 while draining |
 | `/ws` | WebSocket | bearer token | Client data plane |
 | `/control` | WebSocket | admin bearer token | Operator / approval plane |
@@ -15,7 +15,7 @@ This page documents the JSON envelope format and every method available on the `
 
 ## Envelope format
 
-Every `/ws` exchange is a request/response pair of JSON objects. Requests execute concurrently and responses may arrive out of order. Match responses and streaming events by `id`. Keep IDs unique until the final response arrives; reusing an active ID closes the connection because its responses would be ambiguous. A connection accepts at most 32 in-flight requests and rejects additional work with `busy`. WebSocket messages and frames are limited to 1,100,000 bytes.
+Every `/ws` exchange is a request/response pair of JSON objects. Requests execute concurrently and responses may arrive out of order. Match responses and streaming events by `id`. Keep each ID unique until its final response arrives. Reusing an ID that is still active closes the connection, because the responses could not be told apart. A connection accepts at most 32 in-flight requests and rejects additional work with `busy`. WebSocket messages and frames are limited to 1,100,000 bytes.
 
 ### Request (client → server)
 
@@ -55,7 +55,7 @@ Every `/ws` exchange is a request/response pair of JSON objects. Requests execut
 }
 ```
 
-A failure raised from inside a Lua script additionally carries a cleaned traceback:
+A failure raised inside a Lua script also carries a cleaned traceback:
 
 ```json
 {
@@ -74,7 +74,7 @@ A failure raised from inside a Lua script additionally carries a cleaned traceba
 | `ok` | boolean | `true` on success, `false` on error |
 | `result` | any | Present when `ok: true` |
 | `code` | string | Machine-readable error class; present when `ok: false` |
-| `error` | string | Human-readable error message; present when `ok: false`. Always the innermost cause — no `invocation failed:` / `lua:` prefix chains |
+| `error` | string | Human-readable error message; present when `ok: false`. It states the innermost cause, without `invocation failed:` or `lua:` prefixes |
 | `tip` | string | Optional actionable hint for the error code; present only when the code has one |
 | `trace` | array of strings | Optional cleaned Lua traceback frames (`file.lua:line  in fn`); present only for script failures |
 
@@ -97,7 +97,7 @@ Authorization: Bearer <token>
 3. `$XDG_STATE_HOME/agentd/token`, the public token file that the daemon writes at startup.
 4. If none exists, the daemon must be running with `--no-auth`.
 
-`/health` is always open and requires no token.
+`/health` requires no token.
 
 ### Admin token on `/ws`
 
@@ -106,7 +106,7 @@ Authorization: Bearer <token>
 - It can make a run's approval setting looser. See [Where the setting comes from](/v0/security/approvals#where-the-setting-comes-from).
 - Its sessions belong to admin connections only (`owner` is `admin:ws`). Other connections cannot see or use them.
 
-With `--no-auth` there are no tokens, so every `ws` connection is an admin connection. A connection with an interface token is never an admin connection.
+With `--no-auth` there are no tokens, so every `ws` connection is an admin connection. A connection with an interface token is an ordinary connection of that interface.
 
 ### Interface tokens
 
@@ -114,7 +114,7 @@ Besides the daemon token, `config.toml` can declare `[interfaces.<name>]` entrie
 
 ### `/control` token
 
-The control plane uses a **separate** admin token so a public `/ws` token can never reach it.
+The control plane accepts only the admin token, which is separate from the public `/ws` token. `agentctl` reads it from:
 
 1. `AGENTD_ADMIN_TOKEN` environment variable
 2. `$XDG_STATE_HOME/agentd/admin-token`
@@ -123,7 +123,7 @@ The control plane uses a **separate** admin token so a public `/ws` token can ne
 
 ## Caller identity
 
-Every `/ws` connection receives a session id `ws-<n>` that is visible inside Lua handlers as `ctx.caller.session`. Bridging interfaces (Telegram, Discord, …) can override this per-request by passing `session` and `user` params on `actions.call` and `runners.run`. The resulting identity surface in Lua is:
+Each `/ws` connection gets a session id of the form `ws-<n>`, which Lua handlers see as `ctx.caller.session`. A bridge, such as a Telegram or Discord interface, can set its own `session` and `user` on each `actions.call` and `runners.run` request. Handlers see the identity as:
 
 ```lua
 ctx.caller.interface   -- always "ws" for WebSocket connections
@@ -139,7 +139,7 @@ ctx.caller.execution   -- unique per top-level request (exec-<n>)
 
 ### `health`
 
-Parameterless liveness check over the WebSocket.
+Liveness check over the WebSocket. It takes no parameters.
 
 **Params:** none
 
@@ -242,8 +242,8 @@ Run a runner with a prompt, an explicit message history, or a stored session. Th
 | `session_id` | string | no | A session from `sessions.create`. Its turns become the history and the exchange is stored afterwards. Requires `prompt`; the session must be visible to this caller's interface and `user` |
 | `system` | string | no | Additional system instructions appended to the runner composition |
 | `model` | string | no | Per-call model override; its provider must be granted to the runner |
-| `max_tokens` | integer | no | Output token limit, 1–32768; provider support varies |
-| `timeout_ms` | integer | no | Whole-run deadline, 1–600000 milliseconds. Defaults to 120000 for a run without `session_id`. A session run has no deadline unless you set one, and keeps going until it finishes or is cancelled with `runners.cancel` |
+| `max_tokens` | integer | no | Output token limit, from 1 to 32768; provider support varies |
+| `timeout_ms` | integer | no | Whole-run deadline, from 1 to 600000 milliseconds. Defaults to 120000 for a run without `session_id`. A session run has no deadline unless you set one, and keeps going until it finishes or is cancelled with `runners.cancel` |
 | `session` | string | no | Override session id |
 | `user` | string | no | Caller-supplied user id |
 | `stream` | bool | no | Push `runner.delta` event frames while the run is in flight |
@@ -253,11 +253,15 @@ Run a runner with a prompt, an explicit message history, or a stored session. Th
 
 History messages require a valid `role` (`system`, `user`, `assistant`, or `tool`) and string `content`. Assistant messages may contain `tool_calls` (`id`, `name`, object `arguments`); tool results require the matching `tool_call_id`. Every tool call must receive exactly one result before another non-tool message. Unknown options, invalid histories, more than 256 history messages, or input text and tool-call data exceeding 1 MiB return `bad_params` before provider access.
 
-`session` and `user` describe the caller for permission purposes; they do not store or restore conversation history. To have the daemon keep history, create a session with `sessions.create` and pass its id as `session_id`. A run on a session that is already mid-run returns `session_busy`; a failed model run does not append the exchange, but any compaction completed before it remains stored. The runtime admits up to 32 concurrent runner invocations across connections and nested Lua calls; excess invocations return `busy` without queueing.
+`session` and `user` describe the caller for permission checks. To have the daemon keep conversation history, create a session with `sessions.create` and pass its id as `session_id`.
 
-When every model turn reports token usage, the result also contains `usage` with cumulative `input_tokens`, `output_tokens`, `cache_read_input_tokens`, and `cache_creation_input_tokens`. Input tokens exclude the separately reported cache tokens. Missing usage is omitted rather than reported as zero; failed or cancelled runs do not return an accounting total. This is token reporting, not billing or quota enforcement.
+A session runs one run at a time, and a second run on a busy session returns `session_busy`. When a model run fails, the exchange is not added to the session, and a compaction that finished before the failure stays stored.
 
-Provider HTTP failures include `provider_status` and, when a numeric Retry-After header is present, `retry_after_ms`. These describe the provider response, not permission to replay the whole run: earlier tool calls may already have changed external state. agent.d does not automatically retry runs.
+The daemon runs up to 32 runners at once, counting all connections and nested Lua calls. A run over that limit returns `busy` immediately, without waiting in a queue.
+
+When every model turn reports token usage, the result also contains `usage` with cumulative `input_tokens`, `output_tokens`, `cache_read_input_tokens`, and `cache_creation_input_tokens`. Input tokens exclude the separately reported cache tokens. When a turn does not report usage, the `usage` field is left out. Failed and cancelled runs return no total. These numbers report tokens and do not enforce billing or quotas.
+
+Provider HTTP failures include `provider_status` and, when the provider sent a numeric Retry-After header, `retry_after_ms`. These describe the provider's response. Before you replay a whole run, keep in mind that earlier tool calls may already have changed external state. agent.d does not retry runs automatically.
 
 
 ```json
@@ -276,7 +280,7 @@ Provider HTTP failures include `provider_status` and, when a numeric Retry-After
 { "id": 6, "ok": true, "result": { "text": "LGTM.", "provider": "anthropic", "model": "claude-opus-4-7", "stop_reason": "end_turn" } }
 ```
 
-Delta types: `text_delta` (a chunk of assistant text, in order), `tool_call` (the model asked for a tool), `turn_end` (one provider turn finished). Event frames carry the request `id`, so a client multiplexing requests can route them. Providers without incremental output send no deltas; the final envelope arrives either way.
+Delta types are `text_delta` (a chunk of assistant text, in order), `tool_call` (the model asked for a tool) and `turn_end` (one provider turn finished). Event frames carry the request `id`, so a client with several requests in flight can route them. Providers without incremental output send no deltas, and the final envelope still arrives.
 
 Streaming buffers are bounded. If a consumer cannot keep up, the run fails with `slow_consumer`; socket writes have a five-second deadline. Disconnecting drops in-flight runner futures and stops further model turns. Cancellation and disconnect do not undo tools already dispatched or external side effects.
 
@@ -290,7 +294,7 @@ Request cancellation of an in-flight runner on the same connection:
 
 The cancellation request returns `{ "cancelled": true }` when delivered, or `false` if the target is absent, finished, or already being cancelled. The target request receives its own final response, normally with `code: "cancelled"`; completion can win a race with cancellation. Wait for that final response before reusing its ID. A whole-run deadline returns `timeout`.
 
-These are connection-local requests, not durable jobs. IDs do not deduplicate work after reconnecting. Integrations that retry side-effecting work need their own durable event IDs, result storage, and idempotent actions. Signed webhooks likewise authenticate payloads without providing deduplication or replay protection.
+Requests live only as long as their connection. After a reconnect, a request ID does not prevent the same work from running twice. Integrations that retry work with side effects need their own durable event IDs, result storage and idempotent actions. Signed webhooks authenticate payloads and also leave deduplication and replay protection to you.
 
 On SIGINT or SIGTERM the daemon stops admitting work and allows up to 30 seconds for active requests to drain. `/ready` returns 503 while `/health` remains a liveness check. Readiness does not make a paid provider request or verify remote credentials.
 
@@ -298,13 +302,17 @@ On SIGINT or SIGTERM the daemon stops admitting work and allows up to 30 seconds
 
 ### `sessions.create`
 
-Create a chat session to store conversation history. The result contains session metadata; pass its `id` as `session_id` in `runners.run`.
+Creates a chat session, which stores conversation history in the daemon. The result contains the session metadata. Pass its `id` as `session_id` in `runners.run`.
 
-The optional parameters are `label`, `runner`, `approval`, `cwd`, `session` and `user`, all strings. A label is a name you choose, such as a chat id or ticket number. Labels are unique per interface, including across users; an existing label returns `session_label_taken`. The `runner` field is informational and does not restrict which runner can use the session. The `approval` field sets who answers questions for runs in the session (`human`, `classifier`, or `nobody`); see [`sessions.set_approval`](#sessions-set-approval). The `session` and `user` fields set the caller identity, as they do for `actions.call` and `runners.run`.
+The optional parameters are `label`, `runner`, `approval`, `cwd`, `session` and `user`, all strings. A label is a name you choose, such as a chat id or ticket number. Labels are unique per interface across all users, and a label that is already in use returns `session_label_taken`. The `runner` field is for your own reference; any runner can use the session. The `approval` field sets who answers questions for runs in the session (`human`, `classifier`, or `nobody`); see [`sessions.set_approval`](#sessions-set-approval). The `session` and `user` fields set the caller identity, as they do for `actions.call` and `runners.run`.
 
-The `cwd` field is the folder the session's runs work in, as an absolute path. Only connections that use the daemon token or the admin token may set it, so a bot on an interface token never can. agent.d resolves the folder to its real path and accepts it when it is listed under [`[folders]`](/v0/security/grants#folders) in grants.toml, or a folder inside one. For any other folder it asks a person through the [approval channel](#control-plane) with the kind `folder`, and the request waits for the answer. A refused folder returns `session_folder_denied`; a folder this connection may not choose, or one that is missing, relative, not a folder or the root of the disk, returns `session_folder_not_allowed`. A taken label is reported before anyone is asked.
+The `cwd` field is the folder the session's runs work in, as an absolute path. Only connections that use the daemon token or the admin token can set it; a connection with an interface token cannot.
 
-The session belongs to the connection's interface (`interface:ws` for the daemon token, `interface:<name>` for an [interface token](#interface-tokens), or `admin:ws` for an [admin connection](#admin-token-on-ws)). If you pass `user`, later requests must carry the same user to access it. Without `user`, the session is visible to all callers from that interface.
+agent.d resolves the folder to its real path. It accepts the folder when it, or a folder above it, is listed under [`[folders]`](/v0/security/grants#folders) in grants.toml. For any other folder, it asks a person through the [approval channel](#control-plane) with the kind `folder`, and the request waits for the answer.
+
+A refused folder returns `session_folder_denied`. A folder this connection may not choose, or one that is missing, relative, not a folder or the root of the disk, returns `session_folder_not_allowed`. A taken label is reported before anyone is asked about the folder.
+
+The session belongs to the connection's interface (`interface:ws` for the daemon token, `interface:<name>` for an [interface token](#interface-tokens), or `admin:ws` for an [admin connection](#admin-token-on-ws)). If you pass `user`, later requests reach the session only when they carry the same user. Without `user`, the session is visible to all callers from that interface.
 
 Send this request over `/ws`:
 
@@ -316,7 +324,7 @@ A successful response has `ok: true` and the session metadata in `result`, inclu
 
 ### `sessions.get`
 
-Get a session and its stored messages by `id` or `label`. Pass the same `user` used when creating the session. A missing session or one outside the caller's scope returns `session_not_found`.
+Gets a session and its stored messages by `id` or `label`. Pass the same `user` used when creating the session. A missing session or one outside the caller's scope returns `session_not_found`.
 
 ```json
 { "id": 11, "method": "sessions.get", "params": { "label": "telegram-42", "user": "alice" } }
@@ -326,7 +334,7 @@ The result contains the session metadata and a `turns` array, ordered from oldes
 
 ### `sessions.list`
 
-List visible sessions from newest to oldest. The optional parameters are `limit` (an integer, default 50, capped at 500), `session` and `user` (strings). Without `user`, the list contains only sessions that have no user attached.
+Lists visible sessions from newest to oldest. The optional parameters are `limit` (an integer, default 50, capped at 500), `session` and `user` (strings). Without `user`, the list contains only sessions that have no user attached.
 
 ```json
 { "id": 12, "method": "sessions.list", "params": { "limit": 50, "user": "alice" } }
@@ -334,7 +342,7 @@ List visible sessions from newest to oldest. The optional parameters are `limit`
 
 ### `sessions.rename`
 
-Change a session's label. Pass the required string `id`, the new `label` (omit it or send `null` to clear the label), and if needed the string parameters `session` and `user`. Labels stay unique per owner, so a label another session already uses returns `session_label_taken`. A session outside the caller's scope returns `session_not_found`. The result is the updated session metadata.
+Changes a session's label. Pass the required string `id`, the new `label` (omit it or send `null` to clear the label), and if needed the string parameters `session` and `user`. Labels stay unique per owner, so a label another session already uses returns `session_label_taken`. A session outside the caller's scope returns `session_not_found`. The result is the updated session metadata.
 
 ```json
 { "id": 13, "method": "sessions.rename", "params": { "id": "8f3a1c2d-…", "label": "bugfix", "user": "alice" } }
@@ -342,9 +350,9 @@ Change a session's label. Pass the required string `id`, the new `label` (omit i
 
 ### `sessions.set_approval`
 
-Change who answers questions for runs in a session. Pass the required string `id`, and `approval` as `human`, `classifier`, or `nobody`. Send `null` to clear the setting. You can also pass the string parameters `session` and `user`. The result is the updated session metadata.
+Changes who answers questions for runs in a session. Pass the required string `id`, and `approval` as `human`, `classifier`, or `nobody`. Send `null` to clear the setting. You can also pass the string parameters `session` and `user`. The result is the updated session metadata.
 
-Any caller that can see a session can change its setting. agent.d decides at each run whether the value applies: a stricter value always applies, and a looser value applies only to runs that an admin connection starts. A change applies to the next run, not to a run that is busy. `classifier` returns `classifier_not_configured` when `[approval].classifier` in `grants.toml` names no runner.
+Any caller that can see a session can change its setting. agent.d checks the value each time a run starts. A stricter value takes effect for every run, and a looser value takes effect only for runs that an admin connection starts. A change applies from the next run; a run already in progress keeps its setting. `classifier` returns `classifier_not_configured` when `[approval].classifier` in `grants.toml` names no runner.
 
 ```json
 { "id": 14, "method": "sessions.set_approval", "params": { "id": "8f3a1c2d-…", "approval": "nobody" } }
@@ -352,7 +360,7 @@ Any caller that can see a session can change its setting. agent.d decides at eac
 
 ### `sessions.delete`
 
-Delete a session and its stored messages. Pass the required string `id` and, if needed, the string parameters `session` and `user`. The result is `{ "deleted": true }` if the session was deleted, or `{ "deleted": false }` if no visible session matched.
+Deletes a session and its stored messages. Pass the required string `id` and, if needed, the string parameters `session` and `user`. The result is `{ "deleted": true }` if the session was deleted, or `{ "deleted": false }` if no visible session matched.
 
 ### `skills.list`
 
@@ -394,25 +402,25 @@ List background services with their current state.
 
 | Code | Meaning | Tip |
 |---|---|---|
-| `invalid_envelope` | Request JSON could not be parsed | — |
+| `invalid_envelope` | Request JSON could not be parsed | |
 | `not_found` | Action or skill does not exist | Run `agentctl tools` to list registered actions |
-| `unknown_method` | The `method` field is not a known method | — |
+| `unknown_method` | The `method` field is not a known method | |
 | `bad_params` | Params failed to deserialize against the expected shape | Pass args with `-d key=value` or `--json '<json>'` |
 | `denied` | The permission engine denied the call | Adjust `grants.toml`, or approve live via `agentctl grants listen` |
 | `needs_confirmation` | Action requires interactive approval; escalate via `/control` | Adjust `grants.toml`, or approve live via `agentctl grants listen` |
-| `lua_error` | A Lua script raised an error; `trace` carries the cleaned traceback | — |
-| `invocation_failed` | The action failed outside the script itself (e.g. join errors, output validation) | — |
+| `lua_error` | A Lua script raised an error; `trace` carries the cleaned traceback | |
+| `invocation_failed` | The action failed outside the script itself, for example in output validation | |
 | `runner_not_found` | Named runner does not exist | Run `agentctl runner ls` to list runners |
 | `session_not_found` | The session does not exist or is not visible to this caller | Run `agentctl session ls` to list sessions, or `agentctl session new` to start one |
 | `session_busy` | Another run is using that session | Wait for it to finish, then retry |
-| `session_label_taken` | `sessions.create` reused a label | Fetch the existing one with `sessions.get { label }` instead |
+| `session_label_taken` | `sessions.create` reused a label | Fetch the existing one with `sessions.get { label }` |
 | `session_folder_not_allowed` | `sessions.create` asked for a folder this connection may not choose, or one that cannot be used | Start the chat on this machine, in an existing project folder |
 | `session_folder_denied` | Nobody trusted the folder `sessions.create` asked for | Start the chat from a folder you trust, or add it under `[folders] trusted` in grants.toml |
-| `sessions_unavailable` | No session store is configured | — |
+| `sessions_unavailable` | No session store is configured | |
 | `unknown_skill` | Runner references a skill that is not registered | Run `agentctl skills ls` to list skills |
 | `no_provider` | The runner could not resolve a provider for its model | You can configure new providers in your `config.toml` |
 | `runner_turn_limit` | The runner used all `runtime.max_turns` turns without finishing. Only runs outside a session have this limit | Run it in a session to let it continue without a limit, or raise `max_turns` under `[runtime]` in `config.toml` |
-| `provider_upstream` | AI provider returned an error | — |
+| `provider_upstream` | AI provider returned an error | |
 | `approval_forbidden` | A run asked for an approval setting looser than its runner or session allows, from a connection that is not an admin connection | Connect with the admin token, or use a stricter setting |
 | `classifier_not_configured` | A session was set to `classifier`, but `[approval].classifier` names no runner | Name a classifier runner in `[approval].classifier` in grants.toml, or use `human` or `nobody` |
 
@@ -420,11 +428,11 @@ List background services with their current state.
 
 ## `/control` plane
 
-The control plane is a privileged WebSocket endpoint for operators. Connecting with a valid admin token automatically subscribes you as an approver — you do not need to send a subscribe message first, though `approvals.subscribe` is accepted as an idempotent ack.
+The control plane is where a person answers permission requests. It is a privileged WebSocket endpoint for operators, and `agentctl grants listen` and `agentctl chat` use it.
 
 ### Subscribe-on-connect
 
-Connecting to `/control` with a valid admin token immediately registers the connection as an approver. The server will push `approval.request` frames for every pending permission escalation.
+A connection to `/control` with a valid admin token becomes an approver as soon as it opens. The server then pushes an `approval.request` frame for each request that needs a person. You can send `approvals.subscribe`, but it is not required.
 
 ### Push frame: `approval.request`
 
@@ -472,7 +480,7 @@ Questions that the classifier answers, or that `nobody` refuses, are not pushed.
 
 ### `approvals.subscribe`
 
-Idempotent ack. Returns `{ "subscribed": true }`.
+Confirms the subscription. Calling it again has no further effect. Returns `{ "subscribed": true }`.
 
 ```json
 { "id": 0, "method": "approvals.subscribe" }
@@ -493,10 +501,10 @@ Send a verdict for a pending approval request.
 | Verdict | Effect |
 |---|---|
 | `allow_once` | Permit this single invocation |
-| `allow_forever` | Permanently grant (stored in grants) |
+| `allow_forever` | Grant the permission permanently (saved in grants) |
 | `deny` | Reject the invocation |
 
-If no verdict arrives within `approval_timeout_ms` (default 120 000 ms) the request fails closed with a `deny`.
+If no verdict arrives within `approval_timeout_ms` (default 120 000 ms), the request is denied.
 
 ---
 

@@ -1,10 +1,10 @@
 # The ctx Handle
 
-`ctx` is the per-invocation capability handle the runtime passes to every
-handler. It gates every privileged operation — no capability is available without
-both a `requires` declaration and a matching grant in `grants.toml`.
+`ctx` is the handle the runtime passes to every handler, and it is how your Lua code reaches the outside world: programs, files, the network, secrets, memory and models. Each `ctx` call is checked against your grants in `grants.toml` when it happens. If the tool lacks the grant, agent.d asks before the call goes ahead, as described in [Interactive approvals](/v0/security/approvals).
 
 ## Where ctx appears
+
+Actions receive `ctx` as their second argument, and services as their only argument:
 
 ```lua
 -- action handler: ctx is the second argument
@@ -23,10 +23,7 @@ agentd.service("my_service", function(ctx)
 end)
 ```
 
-Capabilities on `ctx` are **invocation-scoped**: a service cannot hand its `ctx`
-to an action handler and have that handler inherit the service's grants. Each
-invocation gets its own `ctx` bound to the calling identity and its permitted
-capabilities.
+Each call gets its own `ctx`, tied to the caller and the capabilities it is allowed. A service that passes its `ctx` to an action handler does not pass on its grants: the handler keeps the grants of its own call.
 
 ## Capability namespaces
 
@@ -50,7 +47,7 @@ capabilities.
 
 ### Logging
 
-No permission required. Use structured levels to write to the trace log.
+No permission required. Write messages to the trace log at the level that fits:
 
 ```lua
 ctx.log.info("handling request")
@@ -59,7 +56,7 @@ ctx.log.warn("retrying after error: " .. err)
 
 ### Shell
 
-Permission: `shell.exec` or `shell.exec:<bin>` (scoped to one binary).
+Permission: `shell.exec`, or `shell.exec:<bin>` for one program.
 
 ```lua
 -- permission: shell.exec:git
@@ -114,8 +111,7 @@ local token = ctx.secret.get("discord_token")
 
 ### Memory
 
-Durable (survives restarts): permission `memory.read:<ns>` / `memory.write:<ns>`.
-Ephemeral: no permission.
+Durable memory, which survives restarts, needs `memory.read:<ns>` or `memory.write:<ns>`. Short-lived state needs no permission.
 
 ```lua
 -- permission: memory.read:discord/**, memory.write:discord/**
@@ -143,9 +139,7 @@ local reply = ctx.ai.ask("Summarise this diff.", {
 
 ### Cross-component calls
 
-`ctx.call` and `ctx.run` invoke registered actions and runners. The called
-action's own `requires` are still enforced — calling through `ctx.call` does not
-bypass any permission layer. `ctx.call` cannot invoke `confirm`-gated actions.
+`ctx.call` and `ctx.run` call registered actions and runners. The called action's own `requires` still apply, and so does every other permission check. `ctx.call` cannot call `confirm` actions.
 
 ```lua
 -- no extra permission on the caller; inner action's requires apply
@@ -165,8 +159,7 @@ ctx.log.info("called by session " .. (ctx.caller.session or "?"))
 
 ## Helper globals
 
-These functions are available everywhere in Lua without going through `ctx`. They
-require no permission.
+These functions are available everywhere in Lua, outside `ctx`. They need no permission.
 
 | Global | Description | Reference |
 |---|---|---|

@@ -8,10 +8,10 @@ Every capability in agent.d is identified by a **permission slug** of the form `
 domain[:specifier]
 ```
 
-- **`domain`**: the capability class (e.g. `shell.exec`, `net`, `fs.read`).
+- **`domain`**: the kind of capability (for example `shell.exec`, `net`, `fs.read`).
 - **`specifier`**: an optional qualifier that narrows the grant to a specific target. A `*` at the end of a specifier matches more values. See [Wildcard rules](#wildcard-rules).
 
-A grant without a specifier covers the whole domain only when the domain does not define a specifier. For domains that do define specifiers (such as `net` and `fs.*`), you must include a specifier in the grant for it to be useful.
+A grant without a specifier covers the whole domain only when the domain has no specifiers. For domains that use specifiers (such as `net` and `fs.*`), include a specifier in the grant.
 
 ## Domains
 
@@ -19,7 +19,7 @@ A grant without a specifier covers the whole domain only when the domain does no
 
 Run a child process via `ctx.shell`. The specifier is a **program name or path**, such as `git` or `/usr/local/bin/deploy`.
 
-agent.d finds the program file that a denial names and compares files, not text. So a denial of `shell.exec:python3` also stops `/usr/bin/python3` and a link to it. See [What a denial guarantees](/v0/security/denials#programs).
+agent.d finds the program file that a denial names and compares the files themselves. A denial of `shell.exec:python3` therefore also stops `/usr/bin/python3` and a link to it. See [What a denial guarantees](/v0/security/denials#programs).
 
 | Slug | Meaning |
 |---|---|
@@ -33,7 +33,7 @@ granted = ["shell.exec:git"]
 ```
 
 ::: tip
-Prefer `shell.exec:<bin>` over the bare `shell.exec`. Scoping to a specific binary is one of the most effective least-privilege controls available.
+Grant `shell.exec:<bin>` for the programs a tool needs, and avoid the bare `shell.exec`. Naming the program is one of the most effective ways to keep a tool's access small.
 :::
 
 ### `net`
@@ -67,7 +67,7 @@ granted = ["fs.write:/tmp/agentd-smoke/site/**"]
 ```
 
 ::: warning
-Filesystem path grants are **resolved** (symlinks and `..` segments expanded) before matching. A symlink or `../` traversal cannot be used to escape a glob restriction.
+File paths are **resolved** (symlinks followed and `..` segments removed) before they are matched. A symlink or `../` path reaches only what the resolved path is granted.
 :::
 
 ### `secret`
@@ -114,8 +114,7 @@ For direct `ctx.ai` calls, the executing tool or service holds the `ai:` grant. 
 granted = ["ai:openai"]
 ```
 
-The specifier must match the prefix exactly — `ai:anthropic` does **not** grant
-`anthropic-cli/…`. Each backend is its own slug:
+The specifier must match the prefix exactly: `ai:anthropic` does **not** grant `anthropic-cli/…`. Each backend has its own slug:
 
 | Slug | Grants the prefix |
 |---|---|
@@ -148,9 +147,9 @@ A `*` is supported only at the end of a specifier:
 - A value that ends with `*` matches every value that starts the same way. `net:api.example.*` matches `api.example.com` and `api.example.org`.
 - In paths, `/**` matches the folder and everything under it, and `/*` matches only the files directly in the folder. `fs.read:/data/**` covers `/data/a/b.txt`, and `fs.read:/data/*` covers `/data/b.txt` only.
 
-agent.d refuses to load a `grants.toml` with a pattern that can never match, such as `net:*.example.com` or `fs.read:/srv/*/logs`. It also refuses an IPv6 address prefix such as `net:2001:db8:*`, because agent.d compares IPv6 addresses in their shortest form. Grant or deny full addresses instead.
+agent.d refuses to load a `grants.toml` with a pattern that cannot match anything, such as `net:*.example.com` or `fs.read:/srv/*/logs`. It also refuses an IPv6 address prefix such as `net:2001:db8:*`, because agent.d compares IPv6 addresses in their shortest form. Grant or deny full addresses.
 
-agent.d always resolves file paths before it compares them, so an alias or a `..` segment cannot get around a rule.
+agent.d resolves file paths before it compares them, so a rule applies to the real file whatever path reaches it.
 
 ## See also
 

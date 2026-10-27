@@ -24,9 +24,9 @@ Alphabetical definitions for every core term in agent.d.
 
 **Grant**: An explicit permission award in `grants.toml` that unlocks one or more permission slugs for a tool, runner, service, interface, or package. See [Permissions & grants](/v0/security/grants).
 
-**Interface**: A client surface that connects to the daemon. Today the only interface is WebSocket (`/ws`). Interfaces have their own allowlist layer in the permission engine. See [Interfaces and callers](/v0/concepts/interfaces-and-callers).
+**Interface**: A client surface that connects to the daemon, such as a WebSocket client on `/ws` or a webhook route. Each interface has its own allowlist layer in the permission engine. See [Interfaces and callers](/v0/concepts/interfaces-and-callers).
 
-**Memory**: Durable, namespaced key/value storage backed by `redb` (`memory.redb`). Survives daemon restarts and hot reloads. Accessed via `ctx.memory`. Permission slugs: `memory.read:<ns-glob>` / `memory.write:<ns-glob>`. See [Memory and state](/v0/concepts/memory-and-state).
+**Memory**: Durable, namespaced key/value storage, kept in `memory.redb`. Survives daemon restarts and hot reloads. Accessed via `ctx.memory`. Permission slugs: `memory.read:<ns-glob>` / `memory.write:<ns-glob>`. See [Memory and state](/v0/concepts/memory-and-state).
 
 **Package**: A bundle of agent.d components (tools, runners, skills, services) distributed via git, with a `package.toml` manifest that declares its required permission slugs. Installed and managed with `agentctl packages`. See [Managing packages](/v0/packages/managing).
 

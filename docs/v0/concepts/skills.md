@@ -1,6 +1,6 @@
 # Skills
 
-A skill is a reusable instruction fragment that shapes how a runner behaves. Skills are composed into the runner's system prompt at startup, so the model always has the right context without you repeating it in every runner definition.
+A skill is a reusable block of instructions that shapes how a runner behaves. A runner's skills are added to its system prompt, so you can write shared instructions once and use them in many runners.
 
 ## Defining a skill
 
@@ -26,8 +26,8 @@ The frontmatter fields:
 | Field | Meaning |
 |---|---|
 | `name` | Unique skill identifier. |
-| `description` | Optional human-readable summary; surfaced by `agentctl skills inspect`. |
-| `actions` | Optional list of action names relevant to this skill (informational, not a grant). |
+| `description` | Optional short summary, shown by `agentctl skills inspect`. |
+| `actions` | Optional list of actions this skill uses. See [The `actions` field](#the-actions-field). |
 
 Load skills from `init.lua`:
 
@@ -41,7 +41,7 @@ agentd.skills.dir("skills")
 
 ### Inline skill
 
-When you don't need a separate file:
+When the skill is short enough to live in your Lua code:
 
 ```lua
 agentd.skill({
@@ -53,7 +53,7 @@ agentd.skill({
 
 ## Composing skills into a runner
 
-List skills by name in the runner's `skills` array. They are appended to the system prompt in the order listed:
+List skills by name in the runner's `skills` array. They are added to the system prompt in the order listed:
 
 ```lua
 agentd.runner({
@@ -64,11 +64,11 @@ agentd.runner({
 })
 ```
 
-Skill bodies are composed first, in the order listed; the runner's own `system` text is appended last.
+The skill texts come first, in the order listed, and the runner's own `system` text comes last.
 
 ## The `actions` field
 
-The `actions` list in a skill's frontmatter is informational metadata — it does not constrain or grant anything. It surfaces in `agentctl skills inspect` so you can see which actions a skill is intended to be used with. The actual permission decisions happen in `grants.toml` and the runner's `allowed_actions`.
+The `actions` list names the actions a skill is meant to use. A runner that includes the skill can see and call these actions, in addition to its own `actions`. The list grants no permissions: those decisions happen in `grants.toml` and the runner's `allowed_actions`. `agentctl skills inspect` shows the list.
 
 ## Listing skills
 

@@ -1,8 +1,8 @@
 # Recipe: HTTP tool
 
-Call an external JSON API from an action using `ctx.http.client`, parse the response with `:json()`, and expose the result to callers. Covers the `net:<host>` grant and how to invoke the action from the terminal.
+This recipe shows how to call an external JSON API from an action with `ctx.http.client`, parse the response with `:json()`, and return the result to callers. It also covers the `net:<host>` grant and how to call the action from the terminal.
 
-This recipe uses a public weather API as the example target — replace the URL and fields with any JSON API you need.
+The example calls a public weather API. Replace the URL and fields with any JSON API you need.
 
 ## Configuration layout
 
@@ -67,9 +67,9 @@ agentd.action({
 |---|---|---|
 | `ctx.http.client({ base_url, headers })` | Creates a reusable client pinned to a base URL with default headers | `net:<host>` |
 | `client:get(path)` | Issues a GET; returns a `Response` | (same as client) |
-| `res.status` | HTTP status code (integer) | — |
-| `res.body` | Raw response body string | — |
-| `res:json()` | Parses `res.body` as JSON; returns a Lua table | — |
+| `res.status` | HTTP status code (integer) | None |
+| `res.body` | Raw response body string | None |
+| `res:json()` | Parses `res.body` as JSON and returns a Lua table | None |
 
 ::: tip Header auth
 For APIs that require a token, add it in the `headers` table:
@@ -143,7 +143,7 @@ agentctl call weather.current -d latitude=48.85 -d longitude=2.35 --result-only
 
 ## Adapting to other APIs
 
-- **POST with a JSON body:** use `client:post(path, { field = value })` — the body table is JSON-encoded automatically.
+- **POST with a JSON body:** use `client:post(path, { field = value })`. The body table is encoded as JSON for you.
 - **Custom method or full control:** use `client:request({ method = "PATCH", url = "/…", json = {…} })`.
 - **Timeout:** pass `timeout_ms` to `ctx.http.client` or to individual call options.
 

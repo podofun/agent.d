@@ -1,8 +1,10 @@
 # Managing packages
 
-Use `agentctl packages` to install, update, and remove packages. Package operations are local filesystem and git operations — they do not require the daemon to be running.
+Use `agentctl packages` to install, update, and remove packages. These commands work on local files and git, so the daemon does not need to be running.
 
 ## Listing installed packages
+
+To see what is installed, run:
 
 ```bash
 agentctl packages ls
@@ -17,7 +19,7 @@ agentctl packages install <git-url>
 agentctl packages install <git-url> --ref <ref>
 ```
 
-`--ref` accepts any git ref (branch, tag, or commit SHA). When omitted, the default branch is used.
+`--ref` accepts any git ref (branch, tag, or commit SHA). Without it, agentctl uses the default branch.
 
 ```bash
 # Install from the default branch
@@ -30,7 +32,7 @@ agentctl packages install https://github.com/example/acme-agentd --ref v0.2.0
 After cloning, `agentctl` reads `package.toml` and **prints the declared `permissions`** so you can review them before approving.
 
 ::: warning
-Installing does not trust. The package has zero permissions until you add `[package.<name>] trusted = true` to `grants.toml`. Review the printed permission list before doing so.
+A newly installed package has no permissions until you add `[package.<name>] trusted = true` to `grants.toml`. Review the printed permission list first.
 :::
 
 ## Approving after install
@@ -50,7 +52,7 @@ Then restart the daemon (or trigger a hot reload with `--watch`) to load the pac
 agentctl packages update <name>
 ```
 
-Pulls the latest commit on the currently-tracked ref and updates the local copy. Review the package changelog and any permission changes before restarting the daemon.
+Pulls the latest commit on the ref the package tracks and updates the local copy. Review the package changelog and any permission changes before you restart the daemon.
 
 ## Removing a package
 
@@ -58,7 +60,7 @@ Pulls the latest commit on the currently-tracked ref and updates the local copy.
 agentctl packages remove <name>
 ```
 
-Deletes the package directory and removes its entry from `index.toml`. Remember to also remove the corresponding `[package.<name>]` entry from `grants.toml`.
+Deletes the package directory and removes its entry from `index.toml`. Remove the matching `[package.<name>]` entry from `grants.toml` as well.
 
 ## Storage layout
 

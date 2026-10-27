@@ -1,16 +1,16 @@
 # Configuration Reference
 
-This page covers every knob you can turn to configure the `agentd` binary: command-line flags, environment variables, and `config.toml` fields.
+This page lists every setting of the `agentd` daemon: its command-line flags, environment variables and `config.toml` fields.
 
 ## Resolution precedence
 
-For every configuration knob the daemon applies this priority order — highest wins:
+When a setting is given in more than one place, the daemon uses the first source in this order:
 
 ```
 CLI flag  >  environment variable  >  config.toml  >  built-in default
 ```
 
-`log_level` has one additional fallback between `config.toml` and the built-in default: `RUST_LOG`. This lets existing dev workflows that already export `RUST_LOG` keep working without touching `config.toml`.
+`log_level` also reads `RUST_LOG`, between `config.toml` and the built-in default, so a development setup that already exports `RUST_LOG` keeps working.
 
 ---
 
@@ -22,26 +22,26 @@ CLI flag  >  environment variable  >  config.toml  >  built-in default
 | `--init <path>` | `-i` | `AGENTD_INIT` | `$XDG_CONFIG_HOME/agentd/init.lua` | Lua entry point |
 | `--grants <path>` | `-g` | `AGENTD_GRANTS` | `$XDG_CONFIG_HOME/agentd/grants.toml` | grants.toml path |
 | `--addr <addr>` | `-a` | `AGENTD_ADDR` | `127.0.0.1:7777` | HTTP + WebSocket bind address |
-| `--trace <path>` | — | `AGENTD_TRACE` | `$XDG_STATE_HOME/agentd/trace.jsonl` | JSONL trace sink |
-| `--log <filter>` | `-l` | `AGENTD_LOG` | `warn` | tracing-subscriber filter string |
+| `--trace <path>` | | `AGENTD_TRACE` | `$XDG_STATE_HOME/agentd/trace.jsonl` | JSONL trace sink |
+| `--log <filter>` | `-l` | `AGENTD_LOG` | `warn` | Log filter, for example `info` or `debug` |
 | `--token <s>` | `-t` | `AGENTD_TOKEN` | auto-minted | `/ws` bearer token |
-| `--admin-token <s>` | — | `AGENTD_ADMIN_TOKEN` | auto-minted | `/control` bearer token |
-| `--no-auth` | — | `AGENTD_NO_AUTH` | `false` | Disable `/ws` and `/control` auth. Every `ws` client becomes an [admin connection](/v0/security/approvals#admin-connections) |
-| `--approval-timeout <n>` | — | `AGENTD_APPROVAL_TIMEOUT_MS` | `120000` | Approval wait budget (ms) |
-| `--secrets <backend>` | — | `AGENTD_SECRETS` | `keyring` | Secrets backend: `keyring`, `env`, or `dir:<path>` |
+| `--admin-token <s>` | | `AGENTD_ADMIN_TOKEN` | auto-minted | `/control` bearer token |
+| `--no-auth` | | `AGENTD_NO_AUTH` | `false` | Disable `/ws` and `/control` auth. Every `ws` client becomes an [admin connection](/v0/security/approvals#admin-connections) |
+| `--approval-timeout <n>` | | `AGENTD_APPROVAL_TIMEOUT_MS` | `120000` | Approval wait budget (ms) |
+| `--secrets <backend>` | | `AGENTD_SECRETS` | `keyring` | Secrets backend: `keyring`, `env`, or `dir:<path>` |
 | `--watch` | `-w` | `AGENTD_WATCH` | `false` | Dev hot reload |
-| `--install-sandbox` | — | — | — | Windows only: one-time setup for sandboxed networking, then exit. See [Shell sandbox](/v0/security/sandbox#one-time-setup) |
-| `--uninstall-sandbox` | — | — | — | Reverse `--install-sandbox` (macOS/Windows), then exit |
+| `--install-sandbox` | | | | Windows only: one-time setup for sandboxed networking, then exit. See [Shell sandbox](/v0/security/sandbox#one-time-setup) |
+| `--uninstall-sandbox` | | | | Reverse `--install-sandbox` (macOS/Windows), then exit |
 
 ::: info Deprecated aliases
-The pre-rename long flags `--grants-file`, `--trace-file`, and `--approval-timeout-ms` still work as hidden aliases of `--grants`, `--trace`, and `--approval-timeout` for one release, after which they will be removed. Likewise the env vars `AGENTD_GRANTS_FILE` and `AGENTD_TRACE_FILE` remain deprecated aliases of `AGENTD_GRANTS` and `AGENTD_TRACE`.
+The older flags `--grants-file`, `--trace-file` and `--approval-timeout-ms` still work as hidden aliases of `--grants`, `--trace` and `--approval-timeout` for one more release, and will then be removed. The environment variables `AGENTD_GRANTS_FILE` and `AGENTD_TRACE_FILE` are deprecated aliases of `AGENTD_GRANTS` and `AGENTD_TRACE`.
 :::
 
 ---
 
 ## config.toml
 
-When `--config` is not given, the daemon reads `$XDG_CONFIG_HOME/agentd/config.toml`. A missing file is treated as an empty file (all fields fall through to defaults). A malformed file is a hard error.
+When `--config` is not given, the daemon reads `$XDG_CONFIG_HOME/agentd/config.toml`. If the file is missing, every field uses its default. If the file cannot be parsed, the daemon stops with an error.
 
 ### `[daemon]` section
 
@@ -61,11 +61,11 @@ approval_timeout_ms = 120000
 |---|---|---|---|
 | `addr` | string | `"127.0.0.1:7777"` | Bind address for HTTP and WebSocket |
 | `trace_file` | string | `~/.local/state/agentd/trace.jsonl` | JSONL trace output path; `~/` is expanded |
-| `log_level` | string | `"warn"` | tracing-subscriber filter; also falls back to `RUST_LOG` |
-| `token` | string | — | Fixed `/ws` bearer token; omit to auto-mint |
+| `log_level` | string | `"warn"` | Log filter; falls back to `RUST_LOG` |
+| `token` | string | | Fixed `/ws` bearer token; leave it out to have one generated |
 | `no_auth` | bool | `false` | Disable authentication on both `/ws` and `/control` |
-| `admin_token` | string | — | Fixed `/control` bearer token; omit to auto-mint |
-| `approval_timeout_ms` | integer | `120000` | How long (ms) to wait for an operator verdict before failing closed |
+| `admin_token` | string | | Fixed `/control` bearer token; leave it out to have one generated |
+| `approval_timeout_ms` | integer | `120000` | How long (ms) to wait for an operator's answer before denying the request |
 | `secrets` | string | `"keyring"` | Secrets backend: `keyring` (OS keyring), `env` (`AGENTD_SECRET_<NAME>` variables), or `dir:<path>` (one file per secret, for example Docker or Kubernetes secret mounts). `env` and `dir` are read-only |
 
 ### `[runtime]` section
@@ -89,9 +89,7 @@ yolo      = false   # RESERVED — emits a warning and has no other effect
 
 ### `[providers.<name>]` sections
 
-Each `[providers.<name>]` table registers an extra model provider under the
-prefix `<name>` — any OpenAI-compatible endpoint (OpenRouter, Groq, Together,
-vLLM, Ollama, LM Studio, GitHub Models, …) or Anthropic-compatible gateway:
+Each `[providers.<name>]` table adds a model provider under the prefix `<name>`. It can point at any OpenAI-compatible endpoint, such as OpenRouter, Groq, Together, vLLM, Ollama, LM Studio or GitHub Models, or at an Anthropic-compatible gateway:
 
 ```toml
 [providers.openrouter]
@@ -112,20 +110,16 @@ default_model = "qwen3:14b"
 | `kind` | `"openai"` \| `"anthropic"` | yes | Which API shape the endpoint speaks |
 | `base_url` | string | yes | Endpoint base; with or without the trailing API path, both work |
 | `api_key_secret` | string | one of these two | Secret-store key holding the API key (see [Credentials](/v0/providers/credentials)) |
-| `auth` | `"none"` | one of these two | Send no auth header — for local servers without authentication |
+| `auth` | `"none"` | one of these two | Send no auth header, for local servers without authentication |
 | `default_model` | string | no | Model used when a call passes no model id |
 
-Names must not collide with the reserved built-in prefixes (`anthropic`,
-`anthropic-cli`, `openai`, `codex`, `openai-cli`, `mock`). Exactly one of
-`api_key_secret` or `auth = "none"` is required — pointing at a remote host
-without credentials must be an explicit choice. The daemon refuses to start on
-any invalid `[providers]` entry and names the offending provider in the error.
+A name cannot reuse a built-in prefix: `anthropic`, `anthropic-cli`, `openai`, `codex`, `openai-cli` or `mock`. Each entry needs exactly one of `api_key_secret` or `auth = "none"`, so connecting to a host without credentials is a choice you make on purpose. If a `[providers]` entry is invalid, the daemon does not start, and the error names the provider.
 
 See [Custom providers](/v0/providers/custom) for a usage-focused walkthrough.
 
 ### `[webhooks.<name>]` sections
 
-Each entry creates `POST /webhooks/<name>`. The route verifies the HMAC-SHA256 signature and calls one action.
+Use a webhook route to let another service, such as GitHub or a payment provider, call one of your actions over HTTP. Each entry creates `POST /webhooks/<name>`, which checks the request's HMAC-SHA256 signature and then calls one action.
 
 ```toml
 [webhooks.events]
@@ -150,19 +144,11 @@ Store the secret before starting the daemon:
 echo "$WEBHOOK_SECRET" | agentctl secret set webhook_secret
 ```
 
-Webhook names can contain letters, numbers, hyphens, and underscores.
+Webhook names can contain letters, numbers, hyphens and underscores. At startup, agent.d checks each route, its target action and its secret, and does not start if any of them is invalid.
 
-agent.d does not start if a route value is invalid. agent.d also checks the target action and the secret.
+The route computes the HMAC-SHA256 value over the exact request body. Every request must carry a valid signature. The action receives `headers` and `payload`. Header names are lowercase, and the authentication and signature headers are left out.
 
-The route calculates the HMAC-SHA256 value from the exact request body. The action receives `headers` and `payload`.
-
-Header names use lowercase characters. The action does not receive authentication headers or the signature header.
-
-The caller interface is `webhook.<name>`. The request ID is the caller session.
-
-If `id_header` is not set, agent.d creates a request ID. If `id_header` is set, the request must contain it.
-
-The permission engine checks the action. Signature verification is always required.
+The action runs with the caller interface `webhook.<name>`, and its grants are checked like any other call. The request ID becomes `ctx.caller.session`. When `id_header` is set, each request must include that header, and its value is the request ID. Without `id_header`, agent.d generates an ID.
 
 Restart agent.d after you change a route or its secret.
 
@@ -172,7 +158,7 @@ See [Receive a signed webhook](/v0/recipes/webhook) for the setup procedure.
 
 ### `[interfaces.<name>]` sections
 
-Give each client its own token so the daemon can identify it. This lets you apply separate `[interface.<name>]` grants in `grants.toml` to a web backend, a Telegram bridge or a Discord bot. Each client can access only the chat sessions owned by its interface.
+Give each client its own token so the daemon can tell clients apart. You can then give a web backend, a Telegram bridge and a Discord bot separate `[interface.<name>]` grants in `grants.toml`, and each client sees only the chat sessions its interface owns.
 
 ```toml
 [interfaces.webapp]
@@ -185,13 +171,13 @@ token = "a-literal-token"          # fine for local development
 | Field | Description |
 |---|---|
 | `token` | Literal bearer token the client presents on `/ws`. |
-| `token_secret` | Name of a secret holding the token. Exactly one of `token` / `token_secret` is required. |
+| `token_secret` | Name of a secret holding the token. Each entry needs exactly one of `token` or `token_secret`. |
 
-When a client connects with an interface token, `ctx.caller.interface` reports its name. A connection presenting the daemon token (`daemon.token`) is interface `ws`, which is why `ws` cannot be used as an interface name. The daemon refuses to start if two interfaces share a token or an interface uses the daemon token.
+When a client connects with an interface token, `ctx.caller.interface` reports its name. A connection presenting the daemon token (`daemon.token`) is interface `ws`, so `ws` is reserved and cannot be an interface name. The daemon refuses to start if two interfaces share a token or an interface uses the daemon token.
 
 ## Auto-minted tokens
 
-When auth is enabled and no explicit token is configured, the daemon generates random tokens at startup and persists them to the state directory (mode `0600`) so that local `agentctl` can find them automatically:
+When authentication is on and you have not set a token, the daemon generates random tokens at startup. It saves them in the state directory with mode `0600`, where `agentctl` on the same machine finds them:
 
 | File | Used by |
 |---|---|
@@ -202,27 +188,25 @@ When auth is enabled and no explicit token is configured, the daemon generates r
 
 ## `--watch` hot reload
 
-`--watch` (or `AGENTD_WATCH=1` / `watch = true` in `[runtime]`) enables dev hot reload. When active the daemon watches:
+Hot reload applies your changes to Lua files, skills and grants while the daemon keeps running, which is what you want during development. Turn it on with `--watch`, `AGENTD_WATCH=1` or `watch = true` in `[runtime]`. The daemon then watches:
 
 - `init.lua` and every file loaded via `import()`
 - All skill `.md` files loaded via `agentd.skills.load()` or `agentd.skills.dir()`
 - `grants.toml`
 
-On any change it rebuilds the Lua runtime in place. In-flight requests drain on the old runtime (the executor is swapped via `ArcSwap` so ongoing requests keep their reference until they complete). After reload it also regenerates `.luals/` type stubs, identical to running `agentctl types`.
+When one of these files changes, the daemon rebuilds the Lua runtime. Requests already in progress finish on the old runtime, and new requests use the new one. After a reload, the daemon also regenerates the `.luals/` type stubs, as `agentctl types` does.
 
 Durable memory (`memory.redb`) and any connected approval operator on `/control` survive reloads.
 
 ::: tip Dev workflow
-Run `agentd --watch` during development so you never need to restart after editing Lua files or skills.
+Run `agentd --watch` during development to pick up edits to Lua files and skills without a restart.
 :::
 
 ---
 
 ## Directory locations
 
-The daemon resolves three per-user base directories — **config**, **state**,
-and **data** — using the platform-native convention for each OS. Any individual path can be
-overridden with the matching flag or environment variable in the tables above.
+The daemon keeps its files in three per-user base directories, config, state and data, placed where each operating system expects them. You can override any single path with the matching flag or environment variable from the tables above.
 
 | Base | Holds | Linux | macOS | Windows |
 |---|---|---|---|---|
@@ -230,11 +214,7 @@ overridden with the matching flag or environment variable in the tables above.
 | **State** | `token`, `admin-token`, `trace.jsonl` | `$XDG_STATE_HOME/agentd/` (`~/.local/state/agentd/`) | `~/Library/Application Support/agentd/` | `%LOCALAPPDATA%\agentd\` |
 | **Data** | `packages/`, `memory.redb` | `$XDG_DATA_HOME/agentd/` (`~/.local/share/agentd/`) | `~/Library/Application Support/agentd/` | `%APPDATA%\agentd\` |
 
-On Linux, `$XDG_CONFIG_HOME` defaults to `~/.config`, `$XDG_STATE_HOME` to
-`~/.local/state`, and `$XDG_DATA_HOME` to `~/.local/share`; if `$XDG_STATE_HOME`
-is unset the state directory falls back to the local data directory. Examples
-throughout these docs use the Linux/XDG form — substitute the matching column
-on macOS or Windows.
+On Linux, `$XDG_CONFIG_HOME` defaults to `~/.config`, `$XDG_STATE_HOME` to `~/.local/state` and `$XDG_DATA_HOME` to `~/.local/share`. If `$XDG_STATE_HOME` is unset, the state directory falls back to the local data directory. Examples in these docs use the Linux paths; on macOS or Windows, use the matching column.
 
 ---
 

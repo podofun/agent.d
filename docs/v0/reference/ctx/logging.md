@@ -1,4 +1,4 @@
-# ctx.log — Logging
+# ctx.log: Logging
 
 `ctx.log` writes structured messages to the agent.d trace/log sink. No permission is required; all handlers and services can use it freely.
 
@@ -64,7 +64,7 @@ end)
 
 ## See also
 
-- [ctx — overview](/v0/reference/ctx/)
+- [ctx overview](/v0/reference/ctx/)
 - [Operations: observability](/v0/operations/observability)
 - [Concurrency](/v0/reference/ctx/concurrency)
 - [ctx.shell](/v0/reference/ctx/shell)

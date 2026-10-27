@@ -1,8 +1,8 @@
-# ctx.ws — WebSocket
+# ctx.ws: WebSocket
 
 `ctx.ws` opens outbound WebSocket connections. It is the natural fit for streaming protocols, real-time gateways, and long-lived integrations such as Discord or Slack bots.
 
-**Required permission:** `net:<host>` — same slug as HTTP.
+**Required permission:** `net:<host>`, the same slug as HTTP.
 
 ## Signatures
 
@@ -46,12 +46,12 @@ conn:url() -> string
 
 | Method | Returns | Description |
 |---|---|---|
-| `:send(text)` | — | Send a text frame. |
-| `:send_binary(bytes)` | — | Send a binary frame. |
+| `:send(text)` | | Send a text frame. |
+| `:send_binary(bytes)` | | Send a binary frame. |
 | `:recv(timeout_ms?)` | `Frame \| nil` | Receive the next frame; returns `nil` on timeout or close. |
 | `:recv_text(timeout_ms?)` | `string \| nil` | Receive the next frame and return its text; returns `nil` on timeout or close. |
-| `:each(fn)` | — | Iterate frames until the connection closes; calls `fn(frame)` for each. |
-| `:close()` | — | Send a close frame and shut down the connection. |
+| `:each(fn)` | | Iterate frames until the connection closes; calls `fn(frame)` for each. |
+| `:close()` | | Send a close frame and shut down the connection. |
 | `:is_closed()` | `boolean` | `true` if the connection has been closed. |
 | `:url()` | `string` | The URL this connection was opened against. |
 

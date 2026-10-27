@@ -1,8 +1,8 @@
-# ctx.ai — Model Calls
+# ctx.ai: Model Calls
 
 `ctx.ai` makes calls to language models through any registered provider. Use it when you need an inline model response without spinning up a full runner.
 
-**Required permission:** `ai:<provider>` — e.g. `ai:anthropic` or `ai:*`.
+**Required permission:** `ai:<provider>`, for example `ai:anthropic` or `ai:*`.
 
 ## Signatures
 
@@ -39,7 +39,7 @@ A convenience wrapper that sends `prompt` to a model and returns the response as
 | `max_tokens` | `integer` | Maximum tokens in the response. |
 | `system` | `string` | System prompt to prepend. |
 
-**Returns:** `string` — the model's text response.
+**Returns:** `string`, the model's text response.
 
 ### `ctx.ai.complete`
 
@@ -53,7 +53,7 @@ Lower-level call that accepts a full message list and returns the raw response t
 | `max_tokens` | `integer` | Maximum response tokens. |
 | `messages` | `table[]` | Prior conversation turns as `{ role, content }` pairs. |
 
-**Returns:** `table` — the raw provider response.
+**Returns:** `table`, the raw provider response.
 
 ### `ctx.ai.providers`
 
@@ -121,7 +121,7 @@ end)
 
 ## See also
 
-- [ctx.call — runners](/v0/reference/ctx/calls)
+- [ctx.call: runners](/v0/reference/ctx/calls)
 - [Providers](/v0/providers/)
 - [Concepts: runners](/v0/concepts/runners)
 - [Security: permission slugs](/v0/security/permission-slugs)

@@ -1,6 +1,6 @@
-# ctx.secret — Secrets
+# ctx.secret: Secrets
 
-`ctx.secret` stores and retrieves sensitive values using the OS keyring. Values never appear in logs, memory snapshots, or the trace file.
+`ctx.secret` stores and retrieves sensitive values using the OS keyring. Values are kept out of logs, memory snapshots and the trace file.
 
 **Required permission:** `secret:<key>` or `secret:*`.
 
@@ -51,7 +51,7 @@ Secrets are typically seeded at setup time with [`agentctl secret set`](/v0/refe
 echo "$DISCORD_TOKEN" | agentctl secret set discord_token
 ```
 
-No Lua action or grant is needed for this — reserve `ctx.secret.set` for secrets your tools and services manage at runtime.
+This needs no Lua action or grant. Use `ctx.secret.set` for secrets your tools and services manage at runtime.
 
 ## Examples
 

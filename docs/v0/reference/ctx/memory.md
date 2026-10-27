@@ -1,4 +1,4 @@
-# ctx.memory / ctx.state — Memory and State
+# ctx.memory / ctx.state: Memory and State
 
 agent.d provides two key/value stores: **durable memory** (`ctx.memory`) that survives restarts and hot reloads, and **ephemeral state** (`ctx.state`) that exists only for the lifetime of the current runtime process.
 
@@ -6,9 +6,9 @@ agent.d provides two key/value stores: **durable memory** (`ctx.memory`) that su
 For a runner's conversation history use [`ctx.sessions`](/v0/reference/ctx/sessions): the daemon loads, stores and compacts it for you. `ctx.memory` is for everything else you want to keep.
 :::
 
-## Durable memory — `ctx.memory`
+## Durable memory: `ctx.memory`
 
-`ctx.memory` is backed by an embedded [redb](https://github.com/cberner/redb) database stored at `$XDG_DATA_HOME/agentd/memory.redb`. Values are JSON-serialized automatically.
+`ctx.memory` stores its data in an embedded database file at `$XDG_DATA_HOME/agentd/memory.redb`. Values are JSON-serialized automatically.
 
 **Required permissions:** `memory.read:<ns-glob>` for reads; `memory.write:<ns-glob>` for writes and deletes.
 
@@ -69,7 +69,7 @@ end)
 
 ---
 
-## Ephemeral state — `ctx.state`
+## Ephemeral state: `ctx.state`
 
 `ctx.state` is an in-process key/value map shared across all calls in the current runtime lifetime. It is **lost** on daemon restart or hot reload (`--watch`). Use it for caches, counters, or coordination data that can be rebuilt on startup.
 

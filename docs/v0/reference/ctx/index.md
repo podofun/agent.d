@@ -1,4 +1,4 @@
-# ctx — Capability Handle
+# ctx: Capability Handle
 
 `ctx` is the per-invocation capability handle passed as the second argument to action handlers and as the first argument to service bodies. Every I/O operation goes through `ctx`; the runtime enforces the [permission engine](/v0/concepts/permissions) on each call.
 
@@ -14,7 +14,7 @@
 | [`ctx.ws`](/v0/reference/ctx/websocket) | WebSocket connections | `net:<host>` |
 | [`ctx.mailer`](/v0/reference/ctx/mailer) | Send email over SMTP | `net:<host>` |
 | [`ctx.secret`](/v0/reference/ctx/secrets) | OS keyring get/set/delete | `secret:<key>` |
-| [`ctx.memory`](/v0/reference/ctx/memory) | Durable namespaced key/value (redb) | `memory.read:<ns>` / `memory.write:<ns>` |
+| [`ctx.memory`](/v0/reference/ctx/memory) | Durable namespaced key/value | `memory.read:<ns>` / `memory.write:<ns>` |
 | [`ctx.state`](/v0/reference/ctx/memory) | Ephemeral in-process key/value | none |
 | [`ctx.sessions`](/v0/reference/ctx/sessions) | Stored chat history for `ctx.run` | `sessions.read` / `sessions.write` |
 | [`ctx.ai`](/v0/reference/ctx/ai) | Model calls through registered providers | `ai:<provider>` |
@@ -23,7 +23,7 @@
 
 ## Helper globals
 
-Several capabilities are exposed as **globals** rather than `ctx.*` methods because they are general-purpose coroutine and data utilities, not gated by the permission engine:
+A few general-purpose helpers for coroutines and data are **globals** outside `ctx`. They need no permission:
 
 | Global | Page |
 |---|---|

@@ -1,10 +1,10 @@
 # Security best practices
 
-This page collects operator guidance for running agent.d securely. The permission engine is default-deny, but a misconfigured `grants.toml` can still expose more capability than intended.
+This page collects advice for running agent.d securely. agent.d is default-deny, but a careless `grants.toml` can still give an agent more than you meant to.
 
 ## Grant the minimum necessary
 
-Prefer narrow slugs over broad ones. Every slug you broaden is a larger attack surface if a tool or action is exploited.
+Grant the narrowest slug that does the job. The broader a grant, the more an attacker gains if a tool or action is misused.
 
 ```toml
 # Too broad — lets the git tool run any binary
@@ -16,7 +16,7 @@ granted = ["shell.exec"]
 granted = ["shell.exec:git"]
 ```
 
-Apply the same principle to all domains:
+Apply the same rule to every domain:
 
 | Domain | Broad (avoid) | Narrow (prefer) |
 |---|---|---|
@@ -29,27 +29,25 @@ Apply the same principle to all domains:
 
 ## Keep secrets in the keyring
 
-Never put tokens, API keys, or passwords in `grants.toml`, `init.lua`, or any source file. Store them with `agentctl call` (or a dedicated `set_token` action), then retrieve them at runtime with `ctx.secret.get`:
+Keep tokens, API keys and passwords out of `grants.toml`, `init.lua` and every other source file. Store them with `agentctl secret set`, then read them at runtime with `ctx.secret.get`:
 
 ```lua
 local token = ctx.secret.get("discord_token")
 -- permission: secret:discord_token
 ```
 
-The keyring is backed by the OS credential store and is not persisted in files checked into version control.
+The keyring is your operating system's credential store, so the values stay out of the files you check into version control.
 
 ## Use separate tokens for `/ws` and `/control`
 
-The `/ws` and `/control` endpoints accept different bearer tokens (`AGENTD_TOKEN` and `AGENTD_ADMIN_TOKEN` respectively). Issue distinct tokens for each surface:
+The `/ws` and `/control` endpoints accept different bearer tokens: `AGENTD_TOKEN` and `AGENTD_ADMIN_TOKEN`. Give each a distinct value:
 
 - Give clients the `/ws` token only.
-- Keep the admin token restricted to operators. It answers approval requests on `/control`, and on `/ws` it can make approval looser for a run. See [Admin connections](/v0/security/approvals#admin-connections).
-
-Never share the admin token with untrusted clients.
+- Give the admin token only to the people who run the daemon. It answers approval requests on `/control`, and on `/ws` it can make approval looser for a run. See [Admin connections](/v0/security/approvals#admin-connections).
 
 ## Bind to localhost
 
-The daemon defaults to `127.0.0.1:7777`. Do not bind to `0.0.0.0` or a public interface unless you have a reverse proxy with TLS and authentication in front of it.
+The daemon listens on `127.0.0.1:7777` by default, which only your machine can reach. Bind to `0.0.0.0` or a public interface only behind a reverse proxy with TLS and authentication.
 
 ```toml
 [daemon]
@@ -58,7 +56,7 @@ addr = "127.0.0.1:7777"   # default; keep it
 
 ## Use `confirm = true` for dangerous actions
 
-Mark actions that modify critical state, call external APIs with side effects, or run privileged commands with `confirm = true`. This requires an operator to explicitly approve each call:
+Mark actions that change critical state, call external APIs with side effects, or run privileged commands with `confirm = true`. Each call then needs an approval:
 
 ```lua
 agentd.action({
@@ -69,11 +67,11 @@ agentd.action({
 })
 ```
 
-Pre-approve an action only after you are sure it is safe in your environment. To do that, add it to `[approval].skip`.
+To let a confirm action run without a question, add it to `[approval].skip`. Do this only once you are sure the action is safe in your environment.
 
 ## Use `[denial]` for permanent blocks
 
-If an action or a permission must *never* be used, whatever `grants.toml` grants, add it to `[denial]`:
+To block an action or a permission for everyone, whatever `grants.toml` grants, add it to `[denial]`:
 
 ```toml
 [denial]
@@ -81,14 +79,14 @@ actions     = ["pkg.publish"]                   # never publish a package
 permissions = ["fs.read:/home/me/project/.env"] # never read this file
 ```
 
-Nobody is asked about a denial, and nobody can approve it. Keep denied files outside the folders that you grant to shell commands. Otherwise, agent.d must refuse those commands, because a sandbox cannot hide one file in a folder that it opens. See [What a denial guarantees](/v0/security/denials).
+A denied call is refused without a question, so nobody can approve it. Keep denied files outside the folders that you grant to shell commands. A sandbox cannot hide one file inside a folder it opens, so agent.d refuses any shell command whose folders contain a denied file. See [What a denial guarantees](/v0/security/denials).
 
 ## Choose who answers for each runner
 
 Set `approval` for each runner in `grants.toml`:
 
-- Use `"nobody"` for bots and other runs that nobody watches. The run can use only what you granted, and it never waits for an answer.
-- Use `"classifier"` when an agent must continue without you, but each new step needs a check. Give the classifier clear instructions about what to allow.
+- Use `"nobody"` for bots and other runs that nobody watches. The run can use only what you granted, and anything else is refused at once.
+- Use `"classifier"` when an agent should keep working without you and each ungranted step still needs a check. Give the classifier clear instructions about what to allow.
 - Keep `"human"` when you want to decide each step yourself.
 
 ```toml
@@ -97,11 +95,11 @@ granted  = ["ai:openai"]
 approval = "nobody"
 ```
 
-A client can make a run stricter, but only an admin connection can make it looser. So a runner set to `"nobody"` stays safe even when a client asks for more. See [Interactive approvals](/v0/security/approvals#who-answers).
+Any client can make a run stricter. Only an admin connection can make it looser, so a runner set to `"nobody"` stays `"nobody"` when a client asks for more. See [Interactive approvals](/v0/security/approvals#who-answers).
 
 ## Review package permission sets before trusting
 
-When you install a package, agent.d reports its declared `permissions` from `package.toml`. Read that list carefully before adding `trusted = true` in `grants.toml`. If the package needs more than you expect, investigate before approving.
+When you install a package, agent.d shows the `permissions` it declares in `package.toml`. Read that list before you add `trusted = true` in `grants.toml`. If the package asks for more than you expect, find out why before you trust it.
 
 ```toml
 # Only add this after reviewing the declared permissions
@@ -109,7 +107,7 @@ When you install a package, agent.d reports its declared `permissions` from `pac
 trusted = true
 ```
 
-You can also narrow a specific component within a trusted package by adding an explicit entry that overrides the inherited grant:
+To narrow one component of a trusted package, give it its own entry. That entry replaces the package grant for the component:
 
 ```toml
 [package.acme]

@@ -15,7 +15,7 @@ The CLI providers use the authentication data of their terminal applications.
 
 ## Store a key
 
-Use `agentctl secret set` to store a key, and send the value through standard input instead of the command line.
+Use `agentctl secret set` to store a key. Send the value through standard input, so it stays off the command line.
 
 ```bash
 echo "$ANTHROPIC_API_KEY" | agentctl secret set anthropic_api_key
@@ -79,7 +79,7 @@ The next model call uses the new value.
 
 ## Store a key for a custom provider
 
-The `api_key_secret` field contains the keyring name, not the API key.
+The `api_key_secret` field contains the name of the keyring entry that holds the API key.
 
 The following provider reads the `gateway_api_key` secret:
 

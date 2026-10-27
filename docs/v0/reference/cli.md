@@ -7,9 +7,9 @@
 | Flag | Env | Default | Description |
 |---|---|---|---|
 | `--url <URL>` (`-u`) | `AGENTD_URL` | `http://127.0.0.1:7777` | Daemon base URL |
-| `--timeout <ms>` | — | `30000` | Connect timeout in milliseconds |
+| `--timeout <ms>` | | `30000` | Connect timeout in milliseconds |
 
-**Token resolution.** For `/ws` commands, `agentctl` uses the first token it finds, in this order: `AGENTD_TOKEN`, then the admin token (`AGENTD_ADMIN_TOKEN` or `$XDG_STATE_HOME/agentd/admin-token`), then `$XDG_STATE_HOME/agentd/token`. The daemon writes both files at startup. So on your own machine, every command connects as an [admin connection](/v0/security/approvals#admin-connections) and sees the same chats. Set `AGENTD_TOKEN` to connect as an ordinary client instead. If no token exists, the daemon must be running with `--no-auth`. For `grants listen` the same logic applies to `AGENTD_ADMIN_TOKEN` / `$XDG_STATE_HOME/agentd/admin-token` on the `/control` plane.
+**Token resolution.** For `/ws` commands, `agentctl` uses the first token it finds, in this order: `AGENTD_TOKEN`, then the admin token (`AGENTD_ADMIN_TOKEN` or `$XDG_STATE_HOME/agentd/admin-token`), then `$XDG_STATE_HOME/agentd/token`. The daemon writes both files at startup. On your own machine, every command therefore connects as an [admin connection](/v0/security/approvals#admin-connections) and sees the same chats. To connect as an ordinary client, set `AGENTD_TOKEN`. If no token exists, the daemon must be running with `--no-auth`. `grants listen` connects to the `/control` plane with `AGENTD_ADMIN_TOKEN` or `$XDG_STATE_HOME/agentd/admin-token`.
 
 **Transport.** Every command except `health` opens a WebSocket connection to `/ws`, sends one JSON envelope, and exits when the response arrives. `health` uses `GET /health` (HTTP).
 
@@ -31,29 +31,21 @@
 
 ### `agentctl chat`
 
-Chat with your agents right in your terminal.
+`agentctl chat` opens a chat with your runners in the terminal. Use it to talk to an agent, answer its permission requests and pick up earlier conversations.
 
 ```bash
 agentctl chat
 ```
 
-If you have one runner, chat selects it for you. Otherwise pick one with `/runner`, and switch runners or reopen past chats the same way at any time. To start with a choice already made, pass `--runner <name>` or `--session <id>`.
+If you have one runner, chat selects it for you. Otherwise, pick one with `/runner`. You can use `/runner` and `/open` at any time to switch runners or reopen a past chat. To start with a choice already made, pass `--runner <name>` or `--session <id>`.
 
-When a runner needs permission for something, chat asks you on the spot, and you allow or deny it without leaving the conversation.
+#### Typing and sending
 
-You choose who answers these requests for each chat. Press Shift+Tab to switch between three modes, or use `/approval`:
+Enter sends your message and Shift+Enter adds a new line. You can keep typing while the agent works: when you press Enter, your message waits in the conversation, marked "queued", and chat sends it when the current reply finishes. If the reply fails or you cancel it, queued messages go back into your draft. Ctrl+C stops a running reply. When nothing is running and the draft is empty, press Ctrl+C twice to leave chat.
 
-| Mode | What happens |
-|---|---|
-| `human` (ask me) | Chat asks you about each request. |
-| `classifier` (auto) | The classifier answers each request, and asks you only when it is unsure. You need a classifier in `grants.toml`. See [The classifier](/v0/security/approvals#the-classifier). |
-| `nobody` (no approvals) | Anything that is not granted is refused, and nobody is asked. |
+When an agent calls several actions in a row, chat shows them as one line, for example "Used 14 actions and 1 tool". Click it, or press Ctrl+E, to see each call.
 
-The header shows the current mode. The chat keeps its mode when you reopen it. `/approval default` returns to the runner's default.
-
-You can keep typing while the agent works. Press Enter, and your message waits in the conversation, marked "queued". Chat sends it when the reply finishes. If the reply fails or you cancel it, queued messages go back into your draft.
-
-When an agent calls several actions in a row, chat shows one line, for example "Used 14 actions and 1 tool". Click it, or press Ctrl+E, to see each call.
+Code in replies is highlighted by language with your terminal's own colors, so it reads well on light and dark themes. To copy text from the conversation, drag with the mouse to select it and press Ctrl+C.
 
 Type `/` to see what you can do:
 
@@ -68,13 +60,27 @@ Type `/` to see what you can do:
 | `/help` | Show every command and shortcut |
 | `/quit` | Leave chat |
 
-Code in replies is highlighted by language, using your terminal's own colors, so it reads well on light and dark themes.
+#### Approving requests
 
-Enter sends your message, Shift+Enter adds a new line, Shift+Tab switches the approval mode, and Ctrl+C stops a reply or leaves chat.
+When a runner needs a permission it has not been granted, chat shows the request in the conversation, and you allow or deny it there.
 
-A chat works in the folder you start `agentctl chat` from. The first time you use a folder, agent.d asks whether to trust it: "Allow once" trusts it for this chat, and "Always trust" remembers it in `grants.toml`. If you say no, the chat starts without a folder and tells you so.
+Each chat has an approval mode that decides who answers these requests. Press Shift+Tab to cycle through the three modes, or use `/approval`:
 
-Ctrl+P opens the browser, a search across your chats, runners, skills, actions, and services. Start typing to filter. The left and right arrows (or Tab) move between sections, the up and down arrows move through the results, and Enter opens the one you picked: it resumes a chat, switches to a runner, shows a skill, or puts an action in the composer. The panel beside the list shows the details of the selected item, including how many tokens a chat has used. Esc clears the search, and pressing it again goes back to the chat. Drag with the mouse to select text in the conversation and press Ctrl+C to copy it.
+| Mode | What happens |
+|---|---|
+| `human` (ask me) | Chat asks you about each request. |
+| `classifier` (auto) | The classifier answers each request, and asks you only when it is unsure. You need a classifier in `grants.toml`. See [The classifier](/v0/security/approvals#the-classifier). |
+| `nobody` (no approvals) | Anything that is not granted is refused, and nobody is asked. |
+
+The header shows the current mode. A chat keeps its mode when you reopen it, and `/approval default` goes back to the runner's default.
+
+#### Folders
+
+A chat works in the folder you start `agentctl chat` from. The first time you use a folder, agent.d asks whether to trust it. "Allow once" trusts it for this chat, and "Always trust" saves it in `grants.toml`. If you decline, the chat starts without a folder and tells you so.
+
+#### Finding chats, runners and actions
+
+Press Ctrl+P to open the browser, a search across your chats, runners, skills, actions and services. Start typing to filter the list. The left and right arrows (or Tab) move between sections, and the up and down arrows move through the results. Enter opens the selected item: it resumes a chat, switches to a runner, shows a skill or puts an action in the composer. The panel beside the list shows details of the selected item, including how many tokens a chat has used. Esc clears the search, and a second Esc returns to the chat.
 
 ---
 
@@ -112,8 +118,8 @@ agentctl call <action> [-j '<json>'] [-d key=value]... [-r] [--compact]
 |---|---|
 | `--json '<json>'` (`-j`) | Pass arguments as a raw JSON string |
 | `-d key=value` (`--data`) | Pass a single argument; value is parsed as JSON, falls back to string |
-| `--result-only` (`-r`) | Print only the `result` field, not the full envelope |
-| `--compact` | Print JSON on one line instead of pretty-printed |
+| `--result-only` (`-r`) | Print only the `result` field of the envelope |
+| `--compact` | Print JSON on one line |
 
 ::: warning Mutually exclusive
 `--json` and `-d` cannot be used together.
@@ -207,7 +213,7 @@ agentctl runner run backend_reviewer "Review the latest diff" --text-only
 
 ### `agentctl session new`
 
-Create a chat session and print its id. Use `--label` to give it a name, such as a chat id or ticket number, that you can use to find it later. Labels are unique per interface, including across users.
+Creates a chat session and prints its id. A session keeps a conversation's history in the daemon, so later runs in it remember earlier messages. Use `--label` to give it a name you can find it by later, such as a chat id or ticket number. Labels are unique per interface across all users.
 
 ```text
 agentctl session new [--label <label>] [--user <user>] [--cwd <folder>]
@@ -222,25 +228,25 @@ agentctl runner run support "What is my name?" --session "$SID" --user fathi --t
 
 First register the `support` runner and configure its provider and grants as shown in [Running a session](/v0/reference/ctx/sessions#running-a-session). Use a new label each time you run this example.
 
-Sessions belong to the interface whose token `agentctl` connects with (`AGENTD_TOKEN`), and to the `--user` they were created with. Every later command must carry the same `--user`, or the daemon treats the session as missing. See [who can see a session](/v0/reference/ctx/sessions#who-can-see-a-session).
+A session belongs to the interface whose token `agentctl` connects with (`AGENTD_TOKEN`), and to the `--user` it was created with. Pass the same `--user` on every later command; with a different user, or none, the daemon treats the session as missing. See [who can see a session](/v0/reference/ctx/sessions#who-can-see-a-session).
 
 ---
 
 ### `agentctl session ls [--user <user>] [--limit <n>]`
 
-List sessions from newest to oldest, with one line showing each session's id, label, runner and stored message count; `--limit` defaults to 50. Only sessions visible to your token and `--user` appear.
+Lists sessions from newest to oldest, one line each, with the session's id, label, runner and stored message count. `--limit` defaults to 50. The list shows only sessions visible to your token and `--user`.
 
 ---
 
 ### `agentctl session show <id-or-label> [--user <user>]`
 
-Print a session with every stored turn. A 36-character UUID is looked up by id; anything else is treated as a label.
+Prints a session with every stored turn. A 36-character UUID is looked up as an id, and anything else as a label.
 
 ---
 
 ### `agentctl session rm <id> [--user <user>]`
 
-Delete a session and its turns.
+Deletes a session and its turns.
 
 ---
 
@@ -280,25 +286,25 @@ Output is tab-separated `name<TAB>state[<TAB>last_error]` lines.
 
 ### `agentctl grants listen`
 
-Connect to the `/control` plane and interactively answer permission-approval requests. Runs until the connection closes or Ctrl-C. On each request you are prompted to allow once (`o`), allow forever (`f`), or deny (`d`); anything else or EOF defaults to `deny`.
+Use `grants listen` to answer permission requests from a terminal while agents run elsewhere. It connects to the `/control` plane and prompts you for each request: allow once (`o`), allow forever (`f`) or deny (`d`). Any other answer, or end of input, denies the request. It runs until the connection closes or you press Ctrl+C.
 
 ```bash
 agentctl grants listen
 ```
 
-Uses `AGENTD_ADMIN_TOKEN` / `$XDG_STATE_HOME/agentd/admin-token` for authentication.
+It authenticates with `AGENTD_ADMIN_TOKEN` or `$XDG_STATE_HOME/agentd/admin-token`.
 
 ---
 
 ### `agentctl secret set`
 
-Store a provider API key (or any secret) in the OS keyring, under the same `agentd` service the daemon reads. A running daemon sees the change immediately — providers read the keyring at call time, so no restart is needed.
+Store a provider API key (or any secret) in the OS keyring, under the same `agentd` service the daemon reads. Providers read the keyring at call time, so a running daemon uses the new value on its next call without a restart.
 
 ```bash
 agentctl secret set <name> [value]
 ```
 
-The value is optional. When omitted, it is read from stdin — the recommended form, since it keeps keys out of shell history:
+The value is optional. When you leave it off, `agentctl` reads it from stdin. This keeps the key out of your shell history, and is the form we recommend:
 
 ```bash
 echo "$ANTHROPIC_API_KEY" | agentctl secret set anthropic_api_key
@@ -311,7 +317,7 @@ stored `anthropic_api_key` — available to the daemon immediately
 ```
 
 ::: info Local operation
-`secret` commands write to the OS keyring directly — they do not talk to a running daemon, and no daemon needs to be up.
+`secret` commands write to the OS keyring directly. They work whether or not the daemon is running.
 :::
 
 ---
@@ -329,14 +335,14 @@ agentctl secrets rm anthropic_api_key
 
 ### `agentctl secret peek <name>`
 
-Print a half-obfuscated preview of a stored secret — enough to confirm which key is stored, without exposing it:
+Prints a partly masked preview of a stored secret, enough to confirm which key is stored:
 
 ```bash
 agentctl secret peek my_key
 # sk-t************ef (24 chars)
 ```
 
-Short values are fully masked. The full value is never printed.
+Short values are fully masked. `peek` shows only this preview.
 
 ::: info No `ls` subcommand
 OS keyrings cannot enumerate their entries portably, so there is no `secret ls`. Use `peek` to check whether a specific key is stored.
@@ -353,7 +359,7 @@ agentctl package ls
 ```
 
 ::: info Local operation
-`package` commands are local filesystem + git operations — they do not talk to a running daemon.
+`package` commands work on local files and git. They do not need a running daemon.
 :::
 
 ---
@@ -463,8 +469,8 @@ Stack trace:
 ```
 
 - The trailing `(code)` suffix is dimmed on a TTY.
-- The `Tip:` line and the `Stack trace:` section only appear when the daemon supplies them — tips are attached per error code, and stack traces accompany failures raised from inside a Lua script.
-- With `call --compact`, errors are printed as one-line JSON instead: `{"code":...,"error":...,"tip":...,"trace":[...]}`.
+- The `Tip:` line appears when the error code has a tip, and the `Stack trace:` section appears when the failure was raised inside a Lua script.
+- With `call --compact`, errors are printed as one-line JSON: `{"code":...,"error":...,"tip":...,"trace":[...]}`.
 
 See the [error codes table](/v0/reference/protocol#error-codes) for the full code and tip catalog.
 

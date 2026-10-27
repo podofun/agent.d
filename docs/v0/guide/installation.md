@@ -1,6 +1,6 @@
 # Installation
 
-There are four ways to install. npm is the quickest if you already have Node, a release archive needs nothing at all, the container image suits servers, and building from source is for when you want to change the runtime itself. Every option gives you the same two programs, `agentd` and `agentctl`.
+There are four ways to install. npm is the quickest if you already have Node. A release archive has no other requirements. The container image suits servers, and building from source is for when you want to change the runtime itself. Every option gives you the same two programs, `agentd` and `agentctl`.
 
 ## Install with npm
 
@@ -46,7 +46,7 @@ On Windows, add that folder to your `PATH` afterwards. The Windows archive conta
 
 ## Run it in a container
 
-For servers, a container image is published with every release at `ghcr.io/podofun/agent.d`. The repository's `docker-compose.yml` is a working starting point: it mounts a config folder into the container and serves on port 7777. Containers have no system keychain, so API keys are passed in as environment variables instead. [Running in a container](/v0/operations/deployment#running-in-a-container) covers both.
+For servers, a container image is published with every release at `ghcr.io/podofun/agent.d`. The repository's `docker-compose.yml` is a working starting point: it mounts a config folder into the container and serves on port 7777. Containers have no system keychain, so API keys are passed in as environment variables. [Running in a container](/v0/operations/deployment#running-in-a-container) covers both.
 
 ## Build from source
 
@@ -68,15 +68,15 @@ agentd --version
 agentctl --version
 ```
 
-## Windows only: turn on network sandboxing
+## Windows and macOS: turn on network sandboxing
 
-If your agents will run commands that need network access, run this once from a terminal opened as Administrator:
+If your agents will run commands that need network access, run this once with administrator rights. On Windows, use a terminal opened as Administrator. On macOS, put `sudo` in front:
 
 ```powershell
 agentd --install-sandbox
 ```
 
-It sets up the part of the sandbox that confines those commands to the hosts you grant. After that, the runtime itself runs as a normal user. Linux and macOS need no setup. [The shell sandbox](/v0/security/sandbox) explains what gets confined.
+It sets up the part of the sandbox that limits those commands to the hosts you grant. After that, the runtime itself runs as a normal user. Linux needs no setup. [The shell sandbox](/v0/security/sandbox) explains what gets confined.
 
 ## Where your files live
 
@@ -90,9 +90,9 @@ The runtime uses the standard places for each operating system. You create the s
 
 On Linux these follow your `XDG_*` variables when you have set them. Examples elsewhere in these docs use the Linux paths, so substitute the matching folder on other systems. Any location can also be changed with a flag or environment variable, listed in the [configuration reference](/v0/reference/configuration).
 
-On first start the runtime creates its own access tokens and saves them in the state folder, readable only by you. `agentctl` picks them up automatically, so on your own machine there is nothing to configure before you connect.
+On first start the runtime creates its own access tokens and saves them in the state folder, readable only by you. `agentctl` reads them from there, so on your own machine you can connect without any setup.
 
-API keys for model providers are stored in your operating system's keychain rather than in a config file. [Credentials](/v0/providers/credentials) shows how to add them.
+API keys for model providers are stored in your operating system's keychain. [Credentials](/v0/providers/credentials) shows how to add them.
 
 ## Next step
 

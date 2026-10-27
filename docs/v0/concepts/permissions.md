@@ -1,24 +1,24 @@
 # Permissions
 
-agent.d is default-deny. An action cannot touch your files, the network, your secrets, or an AI provider unless you allowed it. This page explains how agent.d decides, so you can predict a decision and find the cause when a call fails.
+agent.d is default-deny. An action can touch your files, the network, your secrets or an AI provider only after you allow it. This page explains how agent.d makes each decision, so you can predict the outcome of a call and find the cause when one fails.
 
 ## Two stages: denials, then questions
 
 agent.d checks each action call in two stages.
 
-**The denials come first.** A denial is a rule that nobody can override, and agent.d never asks about it. A call is refused immediately when:
+**The denials come first.** A denial is a rule that nobody can override, and a call it blocks is refused without a question. A call is refused at once when:
 
 - The action is in `[denial].actions`.
 - A permission that the action needs is in `[denial].permissions`.
 - The call comes from a service or an interface, and the action is not in its `allowed_actions` list.
 
-**The questions come next.** A question is something that you did not grant yet. agent.d asks about one question at a time, in this order:
+**The questions come next.** Each question is about something you have not granted yet. agent.d asks them one at a time, in this order:
 
 1. The call comes from a runner, and the action is not in the runner's `allowed_actions` list.
 2. The tool does not have every permission that the action needs.
 3. The action has `confirm = true`, and `[approval].skip` does not list it.
 
-When all checks pass, the call runs. When a question gets an allow, agent.d checks the call again from the start, so an allow never skips a later check. Who answers the questions depends on the run's approval setting: a human, a classifier, or nobody. See [Interactive approvals](/v0/security/approvals).
+When all checks pass, the call runs. When a question gets an allow, agent.d checks the call again from the start, and the remaining checks still apply. The run's approval setting decides who answers: a human, a classifier, or nobody. See [Interactive approvals](/v0/security/approvals).
 
 | Check | What it asks | Where you configure it |
 |---|---|---|
@@ -34,7 +34,7 @@ For interfaces and services, an empty `allowed_actions` list means "no limit". F
 
 ## grants.toml is the only source of grants
 
-A component says what it needs in its `requires` field. That field never gives access. Only `grants.toml` gives access:
+A component says what it needs in its `requires` field. Access itself comes from `grants.toml`:
 
 ```toml
 # The git tool can run the git program
@@ -91,15 +91,15 @@ File globs follow paths: `fs.write:/tmp/**` covers every file under `/tmp/`. See
 
 ## File paths are resolved first
 
-Before agent.d compares a file path with a grant or a denial, it resolves the path. It follows symlinks and removes `..` segments. So an alias cannot get around a rule. A grant of `fs.read:/workspace/**` does not cover `/etc/passwd`, even when a symlink inside `/workspace` points there.
+Before agent.d compares a file path with a grant or a denial, it resolves the path: it follows symlinks and removes `..` segments. A rule applies to the real file, whatever name reaches it. For example, a grant of `fs.read:/workspace/**` does not cover `/etc/passwd`, even when a symlink inside `/workspace` points there.
 
 ## Approvals inside a handler
 
-The checks above happen when an action starts. A handler then uses `ctx` to reach the outside world, and each `ctx` call is checked again when it happens. If the handler needs something that its tool was not granted, the handler pauses and agent.d asks. An allow covers only that request. It does not add to the handler's grants, so it never widens what the [shell sandbox](/v0/security/sandbox) opens.
+The checks above happen when an action starts. A handler then uses `ctx` to reach the outside world, and each `ctx` call is checked when it happens. If the handler needs something its tool was not granted, the handler pauses and agent.d asks. An allow covers only that request. The handler's grants, and what the [shell sandbox](/v0/security/sandbox) opens, stay the same.
 
 ## Packages declare, grants.toml grants
 
-A package's `package.toml` lists the permissions it needs. This tells you what you approve, but it gives nothing by itself. To give a package its declared permissions, trust it:
+A package's `package.toml` lists the permissions it needs, so you can see what you are approving. The list grants nothing by itself. To give a package its declared permissions, trust it:
 
 ```toml
 [package.acme]

@@ -1,10 +1,10 @@
 # Writing Runners
 
-A **runner** is a named AI worker: a model, an optional system prompt, a set of
-composed skills, and an advisory action allowlist. This page covers
-`agentd.runner` and how each field shapes the runner's behaviour.
+A **runner** is a named AI agent: a model, an optional system prompt, a set of skills, and the actions it can call. You register runners in Lua and then call them from the CLI, from another action, or from a chat. This page covers `agentd.runner` and how each field shapes the runner's behaviour.
 
 ## Registration
+
+Register a runner with `agentd.runner`:
 
 ```lua
 agentd.runner({
@@ -23,16 +23,15 @@ All fields except `name` and `model` are optional.
 | Field | Type | Description |
 |---|---|---|
 | `name` | `string` | Unique identifier. Used in `agentctl runner run <name>` and `ctx.run(name, …)`. |
-| `model` | `string` | Model selection string — see [Model selection](#model-selection). |
-| `system` | `string?` | Additional text prepended to the composed system prompt. |
-| `skills` | `string[]?` | Names of registered skills to compose into the system prompt. |
-| `actions` | `string[]?` | Advisory allowlist of actions the runner may call. |
-| `compact` | `table \| false?` | Session compaction policy — see [Compaction](#compaction). Leave it out for the defaults. |
+| `model` | `string` | Which provider and model to use. See [Model selection](#model-selection). |
+| `system` | `string?` | The runner's own instructions, added after its skills in the system prompt. |
+| `skills` | `string[]?` | Names of registered skills to include in the system prompt. |
+| `actions` | `string[]?` | The actions the model can see and call. See [The `actions` list](#the-actions-list). |
+| `compact` | `table \| false?` | How a long chat session is summarized. See [Compaction](#compaction). Leave it out for the defaults. |
 
 ## Model selection
 
-The `model` string has the form `"<provider>/<model_id>"`. The prefix routes to
-a provider registered in the daemon:
+The `model` string has the form `"<provider>/<model_id>"`. The prefix chooses the provider that runs the request:
 
 | Prefix | Backend |
 |---|---|
@@ -53,15 +52,12 @@ See [Providers](/v0/providers/) for setup and credential details.
 
 ## How skills and system compose
 
-When a runner is invoked, the daemon assembles the effective system prompt in
-this order:
+When a runner runs, the daemon builds its system prompt in this order:
 
 1. The body text of each skill listed in `skills` (in list order).
 2. The runner's own `system` string, if set.
 
-Skills are reusable instruction blocks — authored as Markdown files or inline
-tables (see [Writing skills](/v0/writing/skills)). Composing multiple skills lets
-you mix focused instruction sets without duplicating text.
+Skills are reusable blocks of instructions, written as Markdown files or inline Lua tables (see [Writing skills](/v0/writing/skills)). By combining several small skills, you can share instructions between runners and write each one once.
 
 ```lua
 agentd.runner({
@@ -74,13 +70,9 @@ agentd.runner({
 
 ## The `actions` list
 
-`actions` lists the tools that the model can see and call. The model cannot
-call an action that is not in this list, even if `grants.toml` would allow it.
+`actions` lists the tools that the model can see and call. The model can call only the actions in this list (plus any that its skills list), whatever `grants.toml` allows.
 
-The list does not give permissions. [grants.toml](/v0/security/grants) decides
-what the runner may do. If the model calls one of its actions that is not in
-`allowed_actions` for the runner, agent.d asks before the action runs. The
-action's tool still needs the permissions that the action requires.
+Permissions come from [grants.toml](/v0/security/grants). If the model calls one of its actions that is missing from the runner's `allowed_actions` there, agent.d asks before the action runs. The action's tool also needs every permission that the action requires.
 
 ```toml
 # grants.toml
@@ -90,8 +82,7 @@ allowed_actions = ["git.diff", "git.status"]
 ```
 
 ::: tip
-Keep `actions` and `allowed_actions` the same. Then the model sees exactly the
-actions that it may call without a question.
+Keep `actions` and `allowed_actions` the same, so the model sees exactly the actions it may call without a question.
 :::
 
 ## Calling a runner
@@ -119,13 +110,15 @@ From the CLI:
 agentctl runner run backend_reviewer "Review the staged changes."
 ```
 
-`runtime.max_turns` (default 16) caps the tool-use loop for executor-owned providers when a run is outside a session. A run in a session has no turn limit and keeps going until the model is done or the run is cancelled.
+Outside a session, `runtime.max_turns` (default 16) limits how many rounds of tool calls a run can make on providers that agent.d drives itself. A run in a session has no turn limit and keeps going until the model is done or the run is cancelled.
 
 ## Compaction
 
-Before a session run, the daemon checks whether at least 60 messages are stored. If so, it asks the model selected for that run to summarize the older messages and keeps at least the newest 20 unchanged. Each user message, assistant message and tool result counts as a turn. The daemon keeps more messages when needed to preserve a complete tool exchange, or skips compaction if there is no suitable boundary.
+A long chat session can outgrow the model's context. Compaction keeps it manageable by replacing older messages with a summary.
 
-Use `compact` to change these defaults or disable compaction:
+Before a session run, the daemon checks whether at least 60 messages are stored. If so, it asks the model selected for that run to summarize the older messages and keeps at least the newest 20 unchanged. Each user message, assistant message and tool result counts as a turn. The daemon keeps more messages when it needs to keep a tool call together with its result, and it skips compaction if it finds no suitable place to cut.
+
+Use `compact` to change these defaults or turn compaction off:
 
 ```lua
 agentd.runner({
@@ -141,7 +134,7 @@ agentd.runner({
 agentd.runner({ name = "oneshot", model = "anthropic/claude-sonnet-5", compact = false })
 ```
 
-The fields `after_turns`, `keep_recent` and `prompt` are optional; `keep_recent` must be smaller than `after_turns`. If the summary call fails, the daemon logs a warning and continues with the full history. A successful compaction is saved before the runner answers, so it remains stored even if the subsequent run fails.
+The fields `after_turns`, `keep_recent` and `prompt` are optional, and `keep_recent` must be smaller than `after_turns`. If the summary call fails, the daemon logs a warning and continues with the full history. A successful compaction is saved before the runner answers, so it stays stored even if the run then fails.
 
 ## See also
 

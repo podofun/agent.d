@@ -14,7 +14,7 @@
 
 agent.d runs AI agents as a local service. You define tools, agent behavior, and long-running services in Lua. You define permissions in TOML. The Rust runtime loads those definitions, connects them to model providers, and enforces access to the host.
 
-The main idea is simple: tools should not belong to one chat UI or one model SDK. Define them once, give them explicit permissions, and call them from the CLI, a WebSocket client, an integration, or another agent.
+Tools in agent.d are independent of any one chat UI or model SDK. You define them once, give them explicit permissions, and call them from the CLI, a WebSocket client, an integration, or another agent.
 
 agent.d is useful when an agent needs to do real work on a machine and you need clear answers to questions such as:
 
@@ -32,7 +32,7 @@ agent.d is useful when an agent needs to do real work on a machine and you need 
 - **Skills.** Keep reusable instructions in Markdown and load them into one or more runners.
 - **Services.** Run long-lived integrations and event loops in the same controlled runtime.
 - **Memory and state.** Store durable namespaced data or share short-lived state between components.
-- **Approvals.** Use a human-in-the-loop to allow a denied request once or persist a specific grant.
+- **Approvals.** Let a person, or a classifier runner, allow an ungranted request once or save it as a grant.
 - **Permissions and sandboxing.** Limit programs, files, network access, secrets, models, and component calls with default-deny grants and native OS confinement.
 - **Tracing.** Record action calls, runner activity, permission decisions, results, errors, and timings as JSONL.
 - **Provider routing.** Select Anthropic, OpenAI-compatible APIs, Claude CLI, or Codex backends per runner.
@@ -40,7 +40,7 @@ agent.d is useful when an agent needs to do real work on a machine and you need 
 
 ## A practical example
 
-The following defines a small code-review agent. It can read the staged Git diff and send it to a model. It is not granted general shell access or filesystem access.
+The following defines a small code-review agent. It can read the staged Git diff and send it to a model. Its only shell grant is the `git` program, and it has no filesystem grants.
 
 ```lua
 -- init.lua
@@ -65,7 +65,7 @@ agentd.runner({
 })
 ```
 
-The declarations above describe what the components need. They do not grant access. Grants live separately:
+The declarations above describe what the components need. Access is granted in a separate file:
 
 ```toml
 # grants.toml
@@ -104,11 +104,11 @@ cd agent.d
 cargo build --release
 ```
 
-This produces `target/release/agentd` and `target/release/agentctl`. Windows releases also include `agentd-netbroker.exe`; keep it beside `agentd.exe`. Follow the [installation guide](https://docs.podo.fun/agentd/v0/guide/installation) for PATH setup and the one-time Windows sandbox installation.
+This produces `target/release/agentd` and `target/release/agentctl`. Windows releases also include `agentd-netbroker.exe`; keep it beside `agentd.exe`. Follow the [installation guide](https://docs.podo.fun/agentd/v0/guide/installation) for PATH setup and the one-time sandbox installation on Windows and macOS.
 
 ## Quick start
 
-The bundled examples includes a small Git tool, sample skill files, and a basic code-review runner:
+The bundled examples include a small Git tool, sample skill files, and a basic code-review runner:
 
 ```bash
 agentd --init examples/init.lua --grants examples/grants.toml
