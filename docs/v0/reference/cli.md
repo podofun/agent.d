@@ -68,6 +68,8 @@ Type `/` to see what you can do:
 | `/help` | Show every command and shortcut |
 | `/quit` | Leave chat |
 
+Code in replies is highlighted by language, using your terminal's own colors, so it reads well on light and dark themes.
+
 Enter sends your message, Shift+Enter adds a new line, Shift+Tab switches the approval mode, and Ctrl+C stops a reply or leaves chat.
 
 Ctrl+P opens the browser, a search across your chats, runners, skills, actions, and services. Start typing to filter. The left and right arrows (or Tab) move between sections, the up and down arrows move through the results, and Enter opens the one you picked: it resumes a chat, switches to a runner, shows a skill, or puts an action in the composer. The panel beside the list shows the details of the selected item, including how many tokens a chat has used. Esc clears the search, and pressing it again goes back to the chat. Drag with the mouse to select text in the conversation and press Ctrl+C to copy it.
