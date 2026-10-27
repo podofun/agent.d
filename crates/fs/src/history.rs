@@ -17,6 +17,31 @@ use crate::FsError;
 #[derive(Clone, Default)]
 pub struct History {
     files: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<Timeline>>>>>,
+    /// What each scope (a session, a run, or a connection) last read of a
+    /// file, so an edit or a patch can prove it is based on what is there.
+    reads: Reads,
+}
+
+type Reads = Arc<Mutex<HashMap<(String, PathBuf), Option<Stamp>>>>;
+
+/// Fail unless `scope` read the file and it still matches that read.
+fn check_read(reads: &Reads, scope: &str, path: &Path, now: &Option<Stamp>) -> Result<(), FsError> {
+    let reads = reads.lock().map_err(|_| FsError::HistoryPoisoned)?;
+    match reads.get(&(scope.to_owned(), path.to_path_buf())) {
+        None => Err(FsError::NotRead(path.into())),
+        Some(read) if read != now => Err(FsError::ChangedSinceRead(path.into())),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Remember the file's current state as what `scope` has seen.
+fn note_read(reads: &Reads, scope: &str, path: &Path) -> Result<(), FsError> {
+    let stamp = Image::read(path)?.stamp();
+    reads
+        .lock()
+        .map_err(|_| FsError::HistoryPoisoned)?
+        .insert((scope.to_owned(), path.to_path_buf()), stamp);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -403,6 +428,55 @@ impl History {
         .map_err(|e| FsError::Io(std::io::Error::other(e)))?
     }
 
+    /// Record that `scope` has read the file as it is now.
+    pub async fn record_read(&self, scope: &str, path: &Path) -> Result<(), FsError> {
+        let (reads, scope) = (self.reads.clone(), scope.to_owned());
+        self.with_file(path, move |_, p| note_read(&reads, &scope, p))
+            .await
+    }
+
+    /// Replace `old` with `new` in a text file that `scope` has read and that
+    /// has not changed since. Without `replace_all`, `old` must appear once.
+    /// A CRLF file keeps its endings when `old` and `new` use plain newlines.
+    pub async fn edit(
+        &self,
+        scope: &str,
+        path: &Path,
+        old: &str,
+        new: &str,
+        replace_all: bool,
+    ) -> Result<usize, FsError> {
+        let (reads, scope) = (self.reads.clone(), scope.to_owned());
+        let (old, new) = (old.to_owned(), new.to_owned());
+        self.with_file(path, move |t, p| {
+            let image = Image::read(p)?;
+            check_read(&reads, &scope, p, &image.stamp())?;
+            let bytes = image.bytes.ok_or_else(|| FsError::NotFound(p.into()))?;
+            let text = String::from_utf8(bytes).map_err(|_| FsError::InvalidUtf8(p.into()))?;
+            let (old, new) = if text.contains("\r\n") && !old.contains('\r') {
+                (old.replace('\n', "\r\n"), new.replace('\n', "\r\n"))
+            } else {
+                (old, new)
+            };
+            let count = if old.is_empty() { 0 } else { text.matches(&old).count() };
+            if count == 0 || (count > 1 && !replace_all) {
+                return Err(FsError::EditNotFound {
+                    path: p.into(),
+                    count,
+                });
+            }
+            let changed = if replace_all {
+                text.replace(&old, &new)
+            } else {
+                text.replacen(&old, &new, 1)
+            };
+            let revision = t.mutate(p, Operation::Write, changed.into_bytes())?;
+            note_read(&reads, &scope, p)?;
+            Ok(revision)
+        })
+        .await
+    }
+
     pub async fn write(&self, path: &Path, bytes: &[u8]) -> Result<usize, FsError> {
         let bytes = bytes.to_vec();
         self.with_file(path, move |t, p| t.mutate(p, Operation::Write, bytes))
@@ -482,6 +556,78 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().canonicalize().unwrap().join("data.bin");
         (dir, path)
+    }
+
+    #[tokio::test]
+    async fn edit_requires_a_read() {
+        let (_dir, path) = temp();
+        std::fs::write(&path, "abc").unwrap();
+        let history = History::default();
+        let error = history.edit("session:s", &path, "b", "B", false).await.unwrap_err();
+        assert!(matches!(error, FsError::NotRead(_)), "{error:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "abc");
+    }
+
+    #[tokio::test]
+    async fn edit_after_read_changes_and_records_history() {
+        let (_dir, path) = temp();
+        std::fs::write(&path, "abc").unwrap();
+        let history = History::default();
+        history.record_read("session:s", &path).await.unwrap();
+        history.edit("session:s", &path, "b", "B", false).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "aBc");
+        history.edit("session:s", &path, "c", "C", false).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "aBC");
+        assert_eq!(history.history(&path).await.unwrap().revisions.len(), 2);
+        history.undo(&path).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "aBc");
+    }
+
+    #[tokio::test]
+    async fn edit_refuses_after_an_outside_change() {
+        let (_dir, path) = temp();
+        std::fs::write(&path, "abc").unwrap();
+        let history = History::default();
+        history.record_read("session:s", &path).await.unwrap();
+        std::fs::write(&path, "abcd").unwrap();
+        let error = history.edit("session:s", &path, "b", "B", false).await.unwrap_err();
+        assert!(matches!(error, FsError::ChangedSinceRead(_)), "{error:?}");
+        assert!(error.to_string().contains("read it again"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn edit_counts_matches() {
+        let (_dir, path) = temp();
+        std::fs::write(&path, "x x").unwrap();
+        let history = History::default();
+        history.record_read("session:s", &path).await.unwrap();
+        let error = history.edit("session:s", &path, "x", "y", false).await.unwrap_err();
+        assert!(matches!(error, FsError::EditNotFound { count: 2, .. }), "{error:?}");
+        assert!(error.to_string().contains("appears 2 times"), "{error}");
+        let error = history.edit("session:s", &path, "q", "y", false).await.unwrap_err();
+        assert!(matches!(error, FsError::EditNotFound { count: 0, .. }), "{error:?}");
+        history.edit("session:s", &path, "x", "y", true).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "y y");
+    }
+
+    #[tokio::test]
+    async fn edit_keeps_crlf_endings() {
+        let (_dir, path) = temp();
+        std::fs::write(&path, "a\r\nb\r\n").unwrap();
+        let history = History::default();
+        history.record_read("session:s", &path).await.unwrap();
+        history.edit("session:s", &path, "a\nb", "a\nc", false).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\r\nc\r\n");
+    }
+
+    #[tokio::test]
+    async fn scopes_do_not_share_reads() {
+        let (_dir, path) = temp();
+        std::fs::write(&path, "abc").unwrap();
+        let history = History::default();
+        history.record_read("session:a", &path).await.unwrap();
+        let error = history.edit("session:b", &path, "b", "B", false).await.unwrap_err();
+        assert!(matches!(error, FsError::NotRead(_)), "{error:?}");
     }
 
     #[tokio::test]

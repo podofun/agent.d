@@ -2468,6 +2468,7 @@ fn build_fs_table(lua: &Lua) -> mlua::Result<Table> {
     let t = lua.create_table()?;
     t.set("read", lua.create_function(fs_read_binding)?)?;
     t.set("write", lua.create_function(fs_write_binding)?)?;
+    t.set("edit", lua.create_function(fs_edit_binding)?)?;
     t.set("append", lua.create_function(fs_append_binding)?)?;
     t.set("exists", lua.create_function(fs_exists_binding)?)?;
     t.set("stat", lua.create_function(fs_stat_binding)?)?;
@@ -2619,7 +2620,52 @@ fn fs_read_binding(lua: &Lua, path: String) -> mlua::Result<mlua::String> {
     // Read through a handle confirmed to be the checked file, so a symlink
     // swapped in after the check cannot redirect the read.
     let bytes = block_on(fs::read_bytes_verified(&p))?.map_err(mlua::Error::external)?;
+    if let Some(scope) = read_scope(lua) {
+        block_on(file_history(lua).record_read(&scope, &p))?.map_err(mlua::Error::external)?;
+    }
     lua.create_string(bytes)
+}
+
+/// Who a read counts for when a later edit or patch checks it: the chat
+/// session, else the run, else the connection. `None` when the caller has
+/// none of these.
+fn read_scope(lua: &Lua) -> Option<String> {
+    let active = lua.app_data_ref::<ActiveContext>()?;
+    let caller = &active.caller;
+    if let Some(session) = &caller.session_id {
+        return Some(format!("session:{session}"));
+    }
+    if let Some(run) = &caller.run_id {
+        return Some(format!("run:{run}"));
+    }
+    caller
+        .session
+        .as_ref()
+        .map(|connection| format!("connection:{}", connection.as_str()))
+}
+
+/// The read scope an edit or a patch needs, or an error saying why there is none.
+fn required_read_scope(lua: &Lua) -> mlua::Result<String> {
+    read_scope(lua).ok_or_else(|| {
+        mlua::Error::external(
+            "changing a file with edit or patch needs a chat session or a run, so agent.d knows the file was read first",
+        )
+    })
+}
+
+fn fs_edit_binding(
+    lua: &Lua,
+    (path, old, new, opts): (String, String, String, Option<Table>),
+) -> mlua::Result<usize> {
+    let replace_all = match &opts {
+        Some(opts) => opts.get::<Option<bool>>("replace_all")?.unwrap_or(false),
+        None => false,
+    };
+    let p = resolve_path(lua, path);
+    check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
+    let scope = required_read_scope(lua)?;
+    block_on(file_history(lua).edit(&scope, &p, &old, &new, replace_all))?
+        .map_err(mlua::Error::external)
 }
 
 fn fs_write_binding(lua: &Lua, args: MultiValue) -> mlua::Result<usize> {
