@@ -80,6 +80,8 @@ pub(super) struct Entry {
     pub(super) input: Option<Value>,
     /// On a tool row: the files the call changed.
     pub(super) changes: Vec<FileChange>,
+    /// On a tool row: the call failed, or ran a program that exited nonzero.
+    pub(super) failed: bool,
     rendered: RefCell<Option<(usize, Vec<Line<'static>>)>>,
 }
 
@@ -151,7 +153,7 @@ const HELP: &str = "\
 - `/` lists commands. `/runner`, `/call`, and `/open` open searchable lists
 - `/rename NAME` labels the current chat
 - `Ctrl+N`, `/new`, or `/clear` starts a new chat, `F5` refreshes daemon state
-- `Ctrl+E` or a click expands the latest tool call or group of calls; an expanded call shows the diff of each file it changed
+- `Ctrl+E` expands the latest tool call, or click a row. An expanded call shows the diff of each file it changed
 - `Shift+Tab` or `/approval` chooses who answers approvals: you, the classifier, or nobody
 - Drag with the mouse to select text; `Ctrl+C` copies it
 - `PageUp`, `PageDown`, or the mouse wheel scroll
@@ -346,6 +348,7 @@ impl App {
             (_, output) => presentation::value(output),
         };
         let entry = &mut self.entries[index];
+        entry.failed = call_failed(value);
         set_input(entry, &value["input"]);
         append_output(entry, &output);
         let changes = value["changes"]
@@ -1160,6 +1163,7 @@ impl Entry {
             group_open: false,
             input: None,
             changes: Vec::new(),
+            failed: false,
             rendered: RefCell::new(None),
         }
     }
@@ -1195,6 +1199,23 @@ impl Entry {
             }
         }
     }
+}
+
+/// A `tool_result` that carries an error, or output with a nonzero
+/// `exit_code`, whether as an object or as JSON text.
+fn call_failed(value: &Value) -> bool {
+    if value["error"].is_string() {
+        return true;
+    }
+    let parsed;
+    let output = match &value["output"] {
+        Value::String(text) => {
+            parsed = serde_json::from_str(text).unwrap_or(Value::Null);
+            &parsed
+        }
+        output => output,
+    };
+    output["exit_code"].as_i64().is_some_and(|code| code != 0)
 }
 
 /// Keep a call's arguments, unless it had none.

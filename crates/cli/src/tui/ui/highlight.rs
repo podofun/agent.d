@@ -105,23 +105,48 @@ pub(super) fn highlight(code: &str, language: &str) -> Option<Lines> {
     #[cfg(test)]
     MISSES.with(|misses| misses.set(misses.get() + 1));
     let mut highlighter = HighlightLines::new(syntax, theme());
-    let mut lines = Vec::new();
-    for line in code.split('\n') {
-        // syntect wants each line with its newline, but the spans should not
-        // carry it.
-        let with_newline = format!("{line}\n");
-        let ranges = highlighter.highlight_line(&with_newline, syntaxes()).ok()?;
-        let spans = ranges
+    let lines = code
+        .split('\n')
+        .map(|line| highlight_line(&mut highlighter, line))
+        .collect::<Option<Lines>>()?;
+    memo().lock().ok()?.put(key, lines.clone());
+    Some(lines)
+}
+
+/// A file type's syntax, looked up once to highlight many single lines.
+#[derive(Clone, Copy)]
+pub(super) struct Syntax(&'static SyntaxReference);
+
+impl Syntax {
+    /// The syntax for a fence tag or file extension, if one is known.
+    pub(super) fn find(language: &str) -> Option<Self> {
+        syntax_for(language).map(Self)
+    }
+
+    /// One line highlighted on its own, outside the memo, for callers that
+    /// keep the result themselves. `None` for a line past the size limit.
+    pub(super) fn line(self, line: &str) -> Option<Vec<Span<'static>>> {
+        if line.len() > MAX_LINE_BYTES {
+            return None;
+        }
+        highlight_line(&mut HighlightLines::new(self.0, theme()), line)
+    }
+}
+
+fn highlight_line(highlighter: &mut HighlightLines<'_>, line: &str) -> Option<Vec<Span<'static>>> {
+    // syntect wants each line with its newline, but the spans should not
+    // carry it.
+    let with_newline = format!("{line}\n");
+    let ranges = highlighter.highlight_line(&with_newline, syntaxes()).ok()?;
+    Some(
+        ranges
             .into_iter()
             .filter_map(|(style, text)| {
                 let text = text.strip_suffix('\n').unwrap_or(text);
                 (!text.is_empty()).then(|| Span::styled(text.to_owned(), terminal_style(style)))
             })
-            .collect();
-        lines.push(spans);
-    }
-    memo().lock().ok()?.put(key, lines.clone());
-    Some(lines)
+            .collect(),
+    )
 }
 
 /// What to look a file's syntax up by: its extension, or its whole name when
