@@ -124,6 +124,16 @@ pub(super) fn highlight(code: &str, language: &str) -> Option<Lines> {
     Some(lines)
 }
 
+/// What to look a file's syntax up by: its extension, or its whole name when
+/// it has none (`Makefile`, `Dockerfile`).
+pub(super) fn language_for_path(path: &str) -> &str {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => extension,
+        _ => name,
+    }
+}
+
 /// The ANSI theme encodes a terminal palette index in `r` when alpha is 0,
 /// and the terminal's default color when alpha is 1. Indexes 0 to 15 become
 /// the named colors, which every terminal supports; this theme uses no others.
@@ -210,6 +220,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn language_for_path_uses_the_extension() {
+        assert_eq!(language_for_path("src/main.rs"), "rs");
+        assert_eq!(language_for_path("Makefile"), "Makefile");
+        assert_eq!(language_for_path(".bashrc"), ".bashrc");
+        assert_eq!(language_for_path("a/b"), "b");
+        assert_eq!(language_for_path(""), "");
     }
 
     #[test]

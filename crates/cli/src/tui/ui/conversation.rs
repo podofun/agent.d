@@ -11,8 +11,8 @@ use super::super::app::{App, Entry, EntryKind, FileChange, ToolRow};
 use super::super::commands;
 use super::super::presentation;
 use super::{
-    ERROR, MUTED, PRIMARY, SECONDARY, SUCCESS, WARNING, markdown, palette, screen_rows, selection,
-    spinner_frame,
+    ERROR, MUTED, PRIMARY, SECONDARY, SUCCESS, WARNING, highlight, markdown, palette, screen_rows,
+    selection, spinner_frame,
 };
 
 pub(super) fn draw_conversation(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -306,6 +306,9 @@ fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
     let inner = width.saturating_sub(2);
     for change in &entry.changes {
         lines.extend(change_summary(change, inner));
+        if entry.expanded {
+            lines.extend(diff_lines(change, inner));
+        }
     }
     if !entry.expanded {
         if entry.changes.is_empty() {
@@ -334,6 +337,50 @@ fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
         block(&mut lines, label, &entry.body, WARNING);
     }
     lines
+}
+
+/// A change's diff, one `│ ` line per diff line, cut to `width` and never
+/// wrapped. Hunk headers are muted, the `+` and `-` markers colored, and
+/// the code after them highlighted by the file's type. The `---` and `+++`
+/// file headers are left out, since the summary line names the file.
+fn diff_lines(change: &FileChange, width: usize) -> Vec<Line<'static>> {
+    let Some(diff) = &change.diff else {
+        return Vec::new();
+    };
+    let language = highlight::language_for_path(&change.path);
+    let muted = Style::default().fg(MUTED);
+    let code = |text: &str| -> Vec<Span<'static>> {
+        highlight::highlight(text, language)
+            .and_then(|lines| lines.into_iter().next())
+            .unwrap_or_else(|| vec![Span::raw(text.to_owned())])
+    };
+    let mut in_hunk = false;
+    let mut lines = Vec::new();
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            in_hunk = true;
+        } else if !in_hunk && (line.starts_with("---") || line.starts_with("+++")) {
+            continue;
+        }
+        let mut spans = match line.chars().next() {
+            Some('+') if in_hunk => vec![Span::styled("+", Style::default().fg(SUCCESS))],
+            Some('-') if in_hunk => vec![Span::styled("-", Style::default().fg(ERROR))],
+            Some(' ') if in_hunk => vec![Span::raw(" ")],
+            _ => {
+                lines.push(diff_row(vec![Span::styled(line.to_owned(), muted)], width));
+                continue;
+            }
+        };
+        spans.extend(code(&line[1..]));
+        lines.push(diff_row(spans, width));
+    }
+    lines
+}
+
+fn diff_row(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let mut line = vec![Span::styled("│ ", Style::default().fg(MUTED))];
+    line.extend(markdown::cut_spans(spans, width));
+    indented(Line::from(line))
 }
 
 /// "3 lines" for multi-line text, "250 chars" for a single long line.
@@ -826,6 +873,104 @@ mod tests {
         app.entries[0].input = Some(json!({ "content": "y".repeat(250) }));
         let lines = plain_lines(&app, 60);
         assert!(lines[0].contains("content  250 chars"), "{lines:?}");
+    }
+
+    #[test]
+    fn expanded_rows_show_the_diff() {
+        let mut app = changed_call();
+        app.entries[0].set_expanded(true);
+        let lines = plain_lines(&app, 60);
+        let position = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.trim_end().ends_with(needle))
+                .unwrap_or_else(|| panic!("no {needle:?} in {lines:?}"))
+        };
+        let order = [
+            position("± src/a.rs  +2 -1"),
+            position("│ @@ -1 +1,2 @@"),
+            position("│ -a"),
+            position("│ +b"),
+            position("│ +c"),
+            position("│ Patched"),
+        ];
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{lines:?}");
+        assert!(
+            !lines.iter().any(|line| line.contains("+++")),
+            "file headers are left out: {lines:?}"
+        );
+    }
+
+    fn diff_line(app: &App, width: usize, needle: &str) -> Line<'static> {
+        conversation_lines(app, width)
+            .lines
+            .into_iter()
+            .find(|line| line.to_string().trim_end().ends_with(needle))
+            .unwrap_or_else(|| panic!("no {needle:?}"))
+    }
+
+    fn after_bar(line: &Line<'static>) -> Vec<Span<'static>> {
+        let bar = line
+            .spans
+            .iter()
+            .position(|span| span.content == "│ ")
+            .unwrap();
+        line.spans[bar + 1..].to_vec()
+    }
+
+    #[test]
+    fn diff_markers_are_colored() {
+        let mut app = changed_call();
+        app.entries[0].set_expanded(true);
+        let added = after_bar(&diff_line(&app, 60, "│ +b"));
+        assert_eq!(added[0].content, "+");
+        assert_eq!(added[0].style.fg, Some(SUCCESS));
+        let removed = after_bar(&diff_line(&app, 60, "│ -a"));
+        assert_eq!(removed[0].content, "-");
+        assert_eq!(removed[0].style.fg, Some(ERROR));
+        let hunk = after_bar(&diff_line(&app, 60, "│ @@ -1 +1,2 @@"));
+        assert!(hunk.iter().all(|span| span.style.fg == Some(MUTED)));
+    }
+
+    #[test]
+    fn diff_code_is_highlighted_by_file_type() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push_tool("fs.write", "");
+        app.entries[0].set_changes(vec![change(
+            "x.rs",
+            "modified",
+            Some("@@ -1 +1 @@\n-fn e() {}\n+fn f() {}\n"),
+        )]);
+        app.entries[0].set_expanded(true);
+        let spans = after_bar(&diff_line(&app, 60, "│ +fn f() {}"));
+        assert!(
+            spans[1..]
+                .iter()
+                .any(|span| span.style.fg.is_some_and(|fg| fg != SUCCESS)),
+            "{spans:?}"
+        );
+    }
+
+    #[test]
+    fn diff_lines_are_cut_not_wrapped() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.push_tool("fs.write", "");
+        let long = format!("@@ -0,0 +1 @@\n+let s = \"{}\";\n", "日本語".repeat(10));
+        app.entries[0].set_changes(vec![change("x.rs", "created", Some(&long))]);
+        app.entries[0].set_expanded(true);
+        let lines = conversation_lines(&app, 30).lines;
+        let cut = lines
+            .iter()
+            .find(|line| line.to_string().contains("│ +let s"))
+            .unwrap();
+        assert!(cut.width() <= 30, "{}", cut.width());
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.to_string().contains("日本"))
+                .count(),
+            1
+        );
     }
 
     #[test]

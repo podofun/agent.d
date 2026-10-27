@@ -151,7 +151,7 @@ const HELP: &str = "\
 - `/` lists commands. `/runner`, `/call`, and `/open` open searchable lists
 - `/rename NAME` labels the current chat
 - `Ctrl+N`, `/new`, or `/clear` starts a new chat, `F5` refreshes daemon state
-- `Ctrl+E` or a click expands the latest tool output or group of calls
+- `Ctrl+E` or a click expands the latest tool call or group of calls; an expanded call shows the diff of each file it changed
 - `Shift+Tab` or `/approval` chooses who answers approvals: you, the classifier, or nobody
 - Drag with the mouse to select text; `Ctrl+C` copies it
 - `PageUp`, `PageDown`, or the mouse wheel scroll
