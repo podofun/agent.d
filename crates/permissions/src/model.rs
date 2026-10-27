@@ -236,6 +236,10 @@ pub struct Caller {
     /// never read from the wire. (`session` is the connection id.)
     #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The session's working folder, when it has one. Set by the executor
+    /// only, never read from the wire.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// Who answers this run's questions, resolved once when the run starts.
     /// Set by the executor only, never read from the wire. `None` (no run)
     /// behaves as [`ApprovalSetting::Human`].

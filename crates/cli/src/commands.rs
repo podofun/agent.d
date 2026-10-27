@@ -181,8 +181,15 @@ pub(crate) async fn cmd_runner(base: &str, timeout: u64, cmd: RunnerCmd) -> Resu
 
 pub(crate) async fn cmd_session(base: &str, timeout: u64, cmd: SessionCmd) -> Result<()> {
     match cmd {
-        SessionCmd::New { label, user } => {
+        SessionCmd::New { label, user, cwd } => {
             let mut params = serde_json::Map::new();
+            if let Some(cwd) = cwd {
+                let cwd = std::path::absolute(&cwd).unwrap_or_else(|_| cwd.into());
+                params.insert(
+                    "cwd".into(),
+                    Value::String(cwd.to_string_lossy().into_owned()),
+                );
+            }
             if let Some(l) = label {
                 params.insert("label".into(), Value::String(l));
             }

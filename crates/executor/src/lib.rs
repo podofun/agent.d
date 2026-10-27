@@ -649,14 +649,15 @@ impl Executor {
             effective_grants.insert(p.clone());
         }
 
-        // A runner-initiated call inherits the runner's cwd (the action's own
-        // `cwd`, if any, overrides it registry-side). Non-runner callers inherit
-        // nothing → the registry falls back to the workspace root.
+        // A call inherits the runner's cwd, else the session's folder (the
+        // action's own `cwd`, if any, overrides both registry-side). With
+        // neither, the registry falls back to the workspace root.
         let inherited_cwd = caller
             .runner
             .as_ref()
             .and_then(|r| self.runners.get(r.as_str()))
-            .and_then(|def| def.cwd);
+            .and_then(|def| def.cwd)
+            .or_else(|| caller.cwd.clone());
 
         let ctx = CallContext {
             caller: caller.clone(),
@@ -906,6 +907,53 @@ impl Executor {
         }
     }
 
+    /// Remember `folder` (an absolute real path) as trusted: append it to
+    /// `[folders].trusted` in grants.toml, once, and reload.
+    pub async fn trust_folder(&self, folder: &str) -> Result<(), String> {
+        self.apply_forever(agentd_types::ApprovalKind::Folder, None, None, folder, &[])
+            .await
+    }
+
+    /// Ask a person whether a chat session may work in `folder`. The run's
+    /// approval setting never applies: the classifier does not answer folder
+    /// questions, and with nobody to ask the answer is no.
+    pub async fn ask_folder(&self, folder: &str, caller: &Caller) -> agentd_types::Verdict {
+        let id = self
+            .approval_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let request = agentd_types::ApprovalRequest {
+            id,
+            kind: agentd_types::ApprovalKind::Folder,
+            action: folder.to_owned(),
+            tool: None,
+            requires: Vec::new(),
+            missing: Vec::new(),
+            reason: "Let agent.d work in this folder?".to_owned(),
+            caller: caller.clone(),
+            detail: Some(serde_json::json!({ "folder": folder })),
+            run_id: None,
+            session_id: None,
+            warning: None,
+        };
+        let verdict = match &self.broker {
+            Some(broker) => broker.request(request).await,
+            None => agentd_types::Verdict::Deny,
+        };
+        self.trace
+            .record(TraceEvent::decision(
+                "folder",
+                serde_json::json!({ "request_id": id, "folder": folder, "caller": caller }),
+                serde_json::json!({ "approval": format!("{verdict:?}"), "decided_by": "human" }),
+            ))
+            .await;
+        verdict
+    }
+
+    /// Whether the user trusts `folder` (an absolute real path).
+    pub fn trusts_folder(&self, folder: &std::path::Path) -> bool {
+        self.engine.load().grants().trusts_folder(folder)
+    }
+
     /// Persist an "allow forever" verdict to `grants.toml` and hot-reload the
     /// engine. Serialized against concurrent writers via `forever_write_lock`.
     async fn apply_forever(
@@ -983,6 +1031,20 @@ impl Executor {
                     .or_insert(toml_edit::value(toml_edit::Array::new()));
                 append_unique(
                     ensure_string_array(allowed),
+                    std::slice::from_ref(&action_name.to_string()),
+                );
+            }
+            agentd_types::ApprovalKind::Folder => {
+                let trusted = doc
+                    .as_table_mut()
+                    .entry("folders")
+                    .or_insert(toml_edit::table())
+                    .as_table_mut()
+                    .ok_or("the `folders` key in grants.toml is not a table. Remove or rename the conflicting `folders` entry")?
+                    .entry("trusted")
+                    .or_insert(toml_edit::value(toml_edit::Array::new()));
+                append_unique(
+                    ensure_string_array(trusted),
                     std::slice::from_ref(&action_name.to_string()),
                 );
             }
@@ -1622,6 +1684,12 @@ impl Executor {
         caller.approval = Some(approval);
         caller.run_id = Some(run_id);
         caller.session_id = session.map(|m| m.id.clone());
+        // A session's folder, else the folder of the run that started this
+        // one (a nested run without a session keeps its parent's folder).
+        caller.cwd = match session {
+            Some(meta) => meta.cwd.clone(),
+            None => caller.cwd,
+        };
         Ok((caller, guard))
     }
 

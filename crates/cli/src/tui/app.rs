@@ -98,6 +98,23 @@ pub(super) enum Update {
     },
     Approval(Box<ApprovalRequest>),
     ControlLost(String),
+    /// The daemon created the chat's session, with a note when it had to
+    /// start without the folder `agentctl` runs in.
+    SessionCreated {
+        id: String,
+        label: Option<String>,
+        notice: Option<String>,
+        /// The messages that started the chat, shown once it exists.
+        messages: Vec<String>,
+    },
+    /// The session could not be created, so `messages` go back to the queue
+    /// for the next message to carry.
+    SessionFailed {
+        error: anyhow::Error,
+        messages: Vec<String>,
+    },
+    /// A fresh session list for the browser.
+    Sessions(Vec<Value>),
 }
 
 pub(super) struct Decision {
@@ -388,7 +405,7 @@ impl App {
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
-        response_result(ws_call(&self.base, self.timeout, method, params).await?)
+        daemon_call(&self.base, self.timeout, method, params).await
     }
 
     /// Whether a second Ctrl+C now quits.
@@ -689,43 +706,41 @@ impl App {
         result
     }
 
+    /// What a new chat asks `sessions.create` for: its runner, the folder
+    /// `agentctl` runs in, an approval mode if one is chosen, and a name
+    /// taken from the first message.
+    pub(super) fn session_params(&self, runner: &str, input: &str) -> Value {
+        let mut params = json!({ "runner": runner, "label": self.title_for(input) });
+        if let Ok(cwd) = std::env::current_dir() {
+            params["cwd"] = json!(cwd.to_string_lossy());
+        }
+        if let Some(mode) = self.approval_mode {
+            params["approval"] = json!(mode);
+        }
+        params
+    }
+
     async fn start_run(&mut self, messages: &[String]) -> Result<()> {
         let input = messages.join("\n\n");
         let input = input.as_str();
         let runner = self.runner.clone().context("no runner")?;
-        if self.session.is_none() {
-            let mut params = json!({ "runner": runner });
-            if let Some(mode) = self.approval_mode {
-                params["approval"] = json!(mode);
-            }
-            // Name the chat after its first message. A taken name is not
-            // worth failing the message over, so fall back to no name.
-            params["label"] = json!(self.title_for(input));
-            let created = match self.call("sessions.create", params.clone()).await {
-                Ok(created) => created,
-                Err(error) if error.to_string().contains("already exists") => {
-                    params.as_object_mut().map(|map| map.remove("label"));
-                    self.call("sessions.create", params).await?
-                }
-                Err(error) => return Err(error),
-            };
-            self.session_label = created["label"].as_str().map(str::to_owned);
-            self.session = Some(
-                created["id"]
-                    .as_str()
-                    .context("session has no id")?
-                    .to_owned(),
-            );
-            self.refresh_sessions().await;
-        }
+        // A new chat's session is created in the background with the run, so
+        // the chat stays live while the daemon asks about the folder.
+        let new_session = self
+            .session
+            .is_none()
+            .then(|| self.session_params(&runner, input));
         let mut params =
             json!({ "name": runner, "prompt": input, "session_id": self.session, "stream": true });
         if let Some(mode) = self.approval_mode {
             params["approval"] = json!(mode);
         }
-        for message in messages {
-            self.push(EntryKind::User, message.as_str());
+        if new_session.is_none() {
+            for message in messages {
+                self.push(EntryKind::User, message.as_str());
+            }
         }
+        let first_messages = messages.to_vec();
         self.pending = true;
         self.started = Some(std::time::Instant::now());
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -735,6 +750,31 @@ impl App {
         let timeout = self.timeout;
         let tx = self.updates.clone();
         tokio::spawn(async move {
+            if let Some(session_params) = new_session {
+                match create_session(&base, timeout, session_params).await {
+                    Ok((id, label, notice)) => {
+                        params["session_id"] = json!(id);
+                        let _ = tx.send(Update::SessionCreated {
+                            id,
+                            label,
+                            notice,
+                            messages: first_messages,
+                        });
+                        if let Ok(Value::Array(items)) =
+                            daemon_call(&base, timeout, "sessions.list", json!({})).await
+                        {
+                            let _ = tx.send(Update::Sessions(items));
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Update::SessionFailed {
+                            error,
+                            messages: first_messages,
+                        });
+                        return;
+                    }
+                }
+            }
             let result = ws_call_streaming_cancelable(
                 &base,
                 timeout,
@@ -897,6 +937,30 @@ impl App {
                     }
                 }
             }
+            Update::SessionCreated {
+                id,
+                label,
+                notice,
+                messages,
+            } => {
+                self.session = Some(id);
+                self.session_label = label;
+                if notice.is_some() {
+                    self.notice = notice;
+                }
+                for message in &messages {
+                    self.push(EntryKind::User, message.as_str());
+                }
+            }
+            Update::SessionFailed { error, messages } => {
+                self.pending = false;
+                self.cancel = None;
+                self.started = None;
+                self.fail(error.to_string());
+                self.queue.extend(messages);
+                self.queue_held = true;
+            }
+            Update::Sessions(items) => self.sessions = items,
             Update::ActionFinished { name, result } => {
                 self.notice = None;
                 match result.and_then(response_result) {
@@ -1144,15 +1208,86 @@ async fn current_branch() -> Option<String> {
     (output.status.success() && !branch.is_empty()).then_some(branch)
 }
 
+/// One request to the daemon, with its refusal kept as a [`DaemonError`].
+async fn daemon_call(base: &str, timeout: u64, method: &str, params: Value) -> Result<Value> {
+    response_result(ws_call(base, timeout, method, params).await?)
+}
+
+/// Create a chat's session. A folder the daemon refuses, or a taken name, is
+/// not worth failing the message over, so it retries without them. Returns
+/// the id, the label, and a note when the chat works without its folder.
+async fn create_session(
+    base: &str,
+    timeout: u64,
+    mut params: Value,
+) -> Result<(String, Option<String>, Option<String>)> {
+    let mut notice = None;
+    let mut created = daemon_call(base, timeout, "sessions.create", params.clone()).await;
+    if let Err(error) = &created
+        && error.to_string().contains("already exists")
+    {
+        params.as_object_mut().map(|map| map.remove("label"));
+        created = daemon_call(base, timeout, "sessions.create", params.clone()).await;
+    }
+    if let Err(error) = &created
+        && folder_refused(error)
+    {
+        notice = Some(format!(
+            "Working without a folder: {}",
+            error.to_string().lines().next().unwrap_or_default()
+        ));
+        params.as_object_mut().map(|map| map.remove("cwd"));
+        created = daemon_call(base, timeout, "sessions.create", params).await;
+    }
+    let created = created?;
+    let id = created["id"]
+        .as_str()
+        .context("session has no id")?
+        .to_owned();
+    Ok((id, created["label"].as_str().map(str::to_owned), notice))
+}
+
+/// A refusal from the daemon, keeping its code so callers can react to a
+/// specific one. It reads the same as before: the message, then the tip.
+#[derive(Debug)]
+pub(super) struct DaemonError {
+    pub(super) code: Option<String>,
+    pub(super) message: String,
+    pub(super) tip: Option<String>,
+}
+
+impl std::fmt::Display for DaemonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.tip {
+            Some(tip) => write!(f, "{}\n{tip}", self.message),
+            None => write!(f, "{}", self.message),
+        }
+    }
+}
+
+impl std::error::Error for DaemonError {}
+
+/// Whether the daemon refused the folder a new chat asked to work in, so the
+/// chat can start without one.
+pub(super) fn folder_refused(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<DaemonError>().is_some_and(|error| {
+        matches!(
+            error.code.as_deref(),
+            Some("session_folder_denied" | "session_folder_not_allowed")
+        )
+    })
+}
+
 fn response_result(response: WsResponse) -> Result<Value> {
     if response.ok {
         Ok(response.result.unwrap_or(Value::Null))
     } else {
-        let message = response.error.as_deref().unwrap_or("unknown error");
-        match response.tip.as_deref() {
-            Some(tip) => Err(anyhow!("{message}\n{tip}")),
-            None => Err(anyhow!("{message}")),
+        Err(DaemonError {
+            code: response.code,
+            message: response.error.unwrap_or_else(|| "unknown error".into()),
+            tip: response.tip,
         }
+        .into())
     }
 }
 
@@ -1160,6 +1295,69 @@ fn response_result(response: WsResponse) -> Result<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn sending_a_message_never_waits_for_the_daemon() {
+        // A daemon that accepts the connection and never answers, like one
+        // waiting for the user to answer a folder question in this chat.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut app = App::new(&base, 30_000, Some("coder".into()));
+        let started = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            app.start_run(&["hello".into()]),
+        )
+        .await;
+        assert!(started.is_ok(), "start_run waited for the daemon");
+        assert!(app.pending);
+        drop(listener);
+    }
+
+    #[test]
+    fn a_created_session_is_adopted_with_its_notice() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, Some("coder".into()));
+        app.apply(Update::SessionCreated {
+            id: "s1".into(),
+            label: Some("hello".into()),
+            notice: Some("Working without a folder: no".into()),
+            messages: vec!["hello".into()],
+        });
+        assert!(
+            app.entries
+                .iter()
+                .any(|e| matches!(e.kind, EntryKind::User) && e.text == "hello")
+        );
+        assert_eq!(app.session.as_deref(), Some("s1"));
+        assert_eq!(app.session_label.as_deref(), Some("hello"));
+        assert_eq!(app.notice.as_deref(), Some("Working without a folder: no"));
+    }
+
+    #[test]
+    fn new_chats_send_their_folder() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, Some("coder".into()));
+        let params = app.session_params("coder", "hello");
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(params["cwd"], here.to_string_lossy().as_ref());
+        assert_eq!(params["runner"], "coder");
+        app.approval_mode = Some("human");
+        assert_eq!(app.session_params("coder", "hello")["approval"], "human");
+    }
+
+    #[test]
+    fn only_folder_refusals_fall_back_to_no_folder() {
+        let refused = |code: &str| {
+            anyhow::Error::new(DaemonError {
+                code: Some(code.into()),
+                message: "no".into(),
+                tip: None,
+            })
+        };
+        assert!(folder_refused(&refused("session_folder_denied")));
+        assert!(folder_refused(&refused("session_folder_not_allowed")));
+        assert!(!folder_refused(&refused("session_label_taken")));
+        assert!(!folder_refused(&anyhow::anyhow!("session folder")));
+        assert_eq!(refused("x").to_string(), "no");
+    }
 
     #[test]
     fn setting_changes_show_in_the_conversation_once_each() {
@@ -1421,6 +1619,9 @@ mod tests {
         let mut app = App::new("http://127.0.0.1:9", 1000, Some("coder".into()));
         app.queue.extend(["hey".to_owned(), "there".to_owned()]);
         app.send_queued().await;
+        // The session is created in the background; its failure arrives as an update.
+        let update = app.received.recv().await.unwrap();
+        app.apply(update);
         app.send_queued().await;
         let errors = app
             .entries
@@ -1432,7 +1633,9 @@ mod tests {
         assert!(app.input.is_empty(), "nothing goes back to the draft");
 
         // The next message carries them, and fails as one.
-        assert!(app.submit("again").await.is_err());
+        app.submit("again").await.unwrap();
+        let update = app.received.recv().await.unwrap();
+        app.apply(update);
         assert_eq!(app.queue, ["hey", "there", "again"]);
     }
 

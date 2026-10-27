@@ -330,6 +330,22 @@ mod tests {
     }
 
     #[test]
+    fn create_keeps_the_cwd_and_old_rows_have_none() {
+        let (_d, s) = store();
+        let m = s.create(new().cwd(Some("/w/project".into()))).unwrap();
+        assert_eq!(m.cwd.as_deref(), Some("/w/project"));
+        assert_eq!(
+            s.get(&m.id).unwrap().unwrap().cwd.as_deref(),
+            Some("/w/project")
+        );
+
+        let mut old = serde_json::to_value(&m).unwrap();
+        old.as_object_mut().unwrap().remove("cwd");
+        let old: SessionMeta = serde_json::from_value(old).unwrap();
+        assert_eq!(old.cwd, None);
+    }
+
+    #[test]
     fn usage_adds_up_across_runs_and_old_rows_start_at_zero() {
         let (_d, s) = store();
         let m = s.create(new()).unwrap();

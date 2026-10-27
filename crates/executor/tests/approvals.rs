@@ -594,3 +594,77 @@ async fn a_question_shows_the_action_arguments() {
     let req = seen.as_ref().unwrap();
     assert_eq!(req.detail, Some(serde_json::json!({ "branch": "main" })));
 }
+
+/// "Always trust" on a folder writes it to `[folders].trusted`, once.
+#[tokio::test]
+async fn trust_folder_appends_once_and_reloads() {
+    use std::io::Write;
+    let mut tf = tempfile::NamedTempFile::new().unwrap();
+    write!(tf, "[tool.tool]\ngranted = [\"cap:foo\"]\n").unwrap();
+    let path = tf.path().to_path_buf();
+
+    let mut exec = base_executor(&["cap:foo"], false, engine_with_tool_grant(&["cap:foo"]));
+    exec.set_grants_path(path.clone());
+    let reload_path = path.clone();
+    exec.set_reload_grants(Arc::new(move || {
+        let text = std::fs::read_to_string(&reload_path).map_err(|e| e.to_string())?;
+        let file = agentd_permissions::parse_grants(&text)?;
+        Ok(Engine::new(Grants::from_file(file)))
+    }));
+    exec.trust_folder("/w/project").await.unwrap();
+    exec.trust_folder("/w/project").await.unwrap();
+    let file = agentd_permissions::parse_grants(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(file.folders.trusted, ["/w/project"]);
+    assert!(exec.trusts_folder(std::path::Path::new("/w/project")));
+}
+
+#[test]
+fn folder_kind_serializes_as_folder() {
+    assert_eq!(
+        serde_json::to_value(agentd_types::ApprovalKind::Folder).unwrap(),
+        "folder"
+    );
+}
+
+#[derive(Default, Clone)]
+struct Recorded(Arc<std::sync::Mutex<Vec<agentd_trace::TraceEvent>>>);
+
+#[async_trait::async_trait]
+impl agentd_trace::TraceSink for Recorded {
+    async fn record(&self, event: agentd_trace::TraceEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+/// Every folder answer reaches the trace, like other approvals.
+#[tokio::test]
+async fn folder_answers_are_traced() {
+    let host = agentd_scripting::LuaHost::new().unwrap();
+    let (skills, runners, services) = (host.skills(), host.runners(), host.services());
+    let registry: Arc<dyn agentd_types::Registry> = Arc::new(host);
+    let recorded = Recorded::default();
+    let mut exec = Executor::new(
+        registry,
+        Arc::new(recorded.clone()),
+        Arc::new(engine_with_tool_grant(&[])),
+        runners,
+        services,
+        skills,
+        Arc::new(agentd_ai::ProviderRegistry::new()),
+    );
+    exec.set_broker(MockBroker::new(Verdict::AllowOnce));
+    let verdict = exec
+        .ask_folder("/w/project", &Caller::interface("ws"))
+        .await;
+    assert_eq!(verdict, Verdict::AllowOnce);
+    let events = recorded.0.lock().unwrap();
+    let event = events
+        .iter()
+        .find(|e| e.action == "folder")
+        .expect("a folder decision event");
+    let text = serde_json::to_string(event).unwrap();
+    assert!(
+        text.contains("\"folder\"") && text.contains("AllowOnce"),
+        "{text}"
+    );
+}
