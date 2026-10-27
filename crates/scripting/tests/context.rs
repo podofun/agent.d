@@ -449,3 +449,39 @@ async fn shell_child_confined_to_fs_write_grant() {
     );
     assert!(!outside_path.exists(), "file outside grant must NOT exist");
 }
+
+// Unix-only: spawns `/bin/pwd`.
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_exec_runs_in_the_inherited_folder() {
+    let dir = write_tools(&[(
+        "s.lua",
+        r#"
+            agentd.action{
+              name = "s.pwd",
+              handler = function(_, ctx)
+                return ctx.shell("/bin/pwd")
+              end,
+            }
+        "#,
+    )]);
+    let folder = tempfile::tempdir().unwrap();
+    let folder = folder.path().canonicalize().unwrap();
+    let host = LuaHost::new().unwrap();
+    host.load_dir(dir.path()).unwrap();
+    let res = host
+        .call(
+            CallContext {
+                cwd: Some(folder.to_string_lossy().into_owned()),
+                ..ctx(&["shell.exec"], &["s.pwd"])
+            },
+            ActionCall {
+                action: "s.pwd".into(),
+                args: serde_json::Value::Null,
+            },
+        )
+        .await
+        .unwrap();
+    let stdout = res.value.get("stdout").and_then(|v| v.as_str()).unwrap();
+    assert_eq!(stdout.trim(), folder.to_string_lossy());
+}

@@ -291,3 +291,26 @@ async fn udp_to_denied_ip_is_dropped() {
         "denied UDP must not arrive: {res:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_run_starts_in_the_requested_folder() {
+    if !netns_e2e_enabled() || !userns_net_supported() || !tooling_present() {
+        eprintln!("skip: set AGENTD_TEST_NETNS=1 (needs userns + nft/ip)");
+        return;
+    }
+    supervisor_env();
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().canonicalize().unwrap();
+    let mut sandbox = policy(vec!["net:example.com"]);
+    sandbox.read_paths = vec![folder.clone()];
+    let req = ExecRequest {
+        bin: "/bin/pwd".into(),
+        args: vec![],
+        cwd: Some(folder.clone()),
+        stdin: None,
+        separate_stderr: true,
+        sandbox: Some(sandbox),
+    };
+    let res = agentd_shell::exec(req).await.expect("exec");
+    assert_eq!(res.stdout.trim(), folder.to_string_lossy(), "{res:?}");
+}

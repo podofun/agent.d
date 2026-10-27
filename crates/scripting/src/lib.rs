@@ -2260,6 +2260,9 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
             .and_then(|active| active.cwd.clone())
     });
     refuse_if_program_denied(lua, &req.bin, cwd.as_deref())?;
+    // The program starts where the action works unless the call says otherwise,
+    // the same folder the checks above and any question use.
+    req.cwd = cwd.clone();
     // Confine the child to the execution's effective filesystem/network grants,
     // after refusing a reach that overlaps a denial and before asking anything.
     let mut policy = {
