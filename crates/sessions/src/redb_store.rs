@@ -334,7 +334,10 @@ mod tests {
         let (_d, s) = store();
         let m = s.create(new().cwd(Some("/w/project".into()))).unwrap();
         assert_eq!(m.cwd.as_deref(), Some("/w/project"));
-        assert_eq!(s.get(&m.id).unwrap().unwrap().cwd.as_deref(), Some("/w/project"));
+        assert_eq!(
+            s.get(&m.id).unwrap().unwrap().cwd.as_deref(),
+            Some("/w/project")
+        );
 
         let mut old = serde_json::to_value(&m).unwrap();
         old.as_object_mut().unwrap().remove("cwd");
