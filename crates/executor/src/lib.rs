@@ -1696,7 +1696,11 @@ impl Executor {
         options.messages = Some(history);
         let (mut out, new_turns) = self.run_model(caller, runner_name, options, sink).await?;
         store
-            .append(&session_id, &new_turns)
+            .append(
+                &session_id,
+                &new_turns,
+                out.usage.as_ref().unwrap_or(&Default::default()),
+            )
             .map_err(|e| RunnerError::Session(e.to_string()))?;
         out.session_id = Some(session_id);
         Ok(out)

@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use agentd_ai::Message;
+use agentd_ai::types::Usage;
 use agentd_memory::Database;
 use agentd_permissions::ApprovalSetting;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
@@ -153,7 +154,7 @@ impl SessionStore for RedbSessionStore {
         Ok(out)
     }
 
-    fn append(&self, id: &str, new_turns: &[Message]) -> Result<SessionMeta> {
+    fn append(&self, id: &str, new_turns: &[Message], usage: &Usage) -> Result<SessionMeta> {
         let wtx = self.db.begin_write().map_err(backend)?;
         let meta = {
             let mut sessions = wtx.open_table(SESSIONS).map_err(backend)?;
@@ -167,6 +168,7 @@ impl SessionStore for RedbSessionStore {
                 meta.next_seq += 1;
                 meta.turn_count += 1;
             }
+            meta.usage.add(usage);
             meta.updated_at = now_secs();
             sessions
                 .insert(id, encode(&meta)?.as_slice())
@@ -328,13 +330,40 @@ mod tests {
     }
 
     #[test]
+    fn usage_adds_up_across_runs_and_old_rows_start_at_zero() {
+        let (_d, s) = store();
+        let m = s.create(new()).unwrap();
+        let run = |input, output| Usage {
+            input_tokens: input,
+            output_tokens: output,
+            ..Default::default()
+        };
+        s.append(&m.id, &[Message::user("a")], &run(100, 20))
+            .unwrap();
+        let m = s.append(&m.id, &[Message::user("b")], &run(50, 5)).unwrap();
+        assert_eq!((m.usage.input_tokens, m.usage.output_tokens), (150, 25));
+        assert_eq!(s.get(&m.id).unwrap().unwrap().usage, m.usage);
+
+        let mut old = serde_json::to_value(&m).unwrap();
+        old.as_object_mut().unwrap().remove("usage");
+        let old: SessionMeta = serde_json::from_value(old).unwrap();
+        assert_eq!(old.usage, Usage::default());
+    }
+
+    #[test]
     fn create_append_turns_ordered() {
         let (_d, s) = store();
         let m = s.create(new()).unwrap();
         assert_eq!(m.turn_count, 0);
-        s.append(&m.id, &[Message::user("a"), Message::assistant("b")])
+        s.append(
+            &m.id,
+            &[Message::user("a"), Message::assistant("b")],
+            &Usage::default(),
+        )
+        .unwrap();
+        let m2 = s
+            .append(&m.id, &[Message::user("c")], &Usage::default())
             .unwrap();
-        let m2 = s.append(&m.id, &[Message::user("c")]).unwrap();
         assert_eq!(m2.turn_count, 3);
         assert_eq!(m2.next_seq, 3);
         let t: Vec<String> = s
@@ -399,7 +428,7 @@ mod tests {
                 }
             })
             .collect();
-        s.append(&m.id, &turns).unwrap();
+        s.append(&m.id, &turns, &Usage::default()).unwrap();
         let meta = s
             .compact(
                 &m.id,
@@ -419,7 +448,8 @@ mod tests {
             .collect();
         assert_eq!(t, ["[summary]", "u4", "a5"]);
         // Appending after compaction keeps ordering.
-        s.append(&m.id, &[Message::user("u6")]).unwrap();
+        s.append(&m.id, &[Message::user("u6")], &Usage::default())
+            .unwrap();
         let t: Vec<String> = s
             .turns(&m.id)
             .unwrap()
@@ -452,7 +482,8 @@ mod tests {
         assert_eq!(s.list(&ws(), 1).unwrap().len(), 1);
         // Touch `a` so it becomes newest (same-second ties fall back to id
         // order, so bump via append and check membership only).
-        s.append(&a.id, &[Message::user("x")]).unwrap();
+        s.append(&a.id, &[Message::user("x")], &Usage::default())
+            .unwrap();
         let ids: Vec<_> = s
             .list(&ws(), 10)
             .unwrap()

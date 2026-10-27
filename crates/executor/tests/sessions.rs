@@ -185,7 +185,19 @@ async fn session_runs_are_not_capped_by_max_turns() {
         MockProvider::tool_call("c3", "notes.lookup", serde_json::json!({})),
         MockProvider::text_only("all done"),
     ];
-    let looping = MockProvider::new().with_script(steps);
+    let looping = MockProvider::new().with_script(
+        steps
+            .into_iter()
+            .map(|mut step| {
+                step.usage = Some(agentd_ai::types::Usage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    ..Default::default()
+                });
+                step
+            })
+            .collect(),
+    );
     let (exec, store) = build_with_turns(Arc::new(looping), None, 2);
     let s = store.create(ws_session()).unwrap();
 
@@ -194,6 +206,8 @@ async fn session_runs_are_not_capped_by_max_turns() {
         .await
         .unwrap();
     assert_eq!(out.text, "all done");
+    let usage = store.get(&s.id).unwrap().unwrap().usage;
+    assert_eq!((usage.input_tokens, usage.output_tokens), (400, 40));
 
     let stored = store.turns(&s.id).unwrap();
     assert_eq!(stored.first().unwrap().content, "dig in");
@@ -332,7 +346,7 @@ async fn compaction_runs_automatically_with_default_policy() {
             }
         })
         .collect();
-    store.append(&s.id, &seed).unwrap();
+    store.append(&s.id, &seed, &Default::default()).unwrap();
 
     exec.run_runner_with_options(caller(), "chat", opts(&s.id, "now"), None)
         .await
@@ -370,7 +384,7 @@ async fn compaction_can_be_disabled_per_runner() {
     let seed: Vec<agentd_ai::Message> = (0..80)
         .map(|i| agentd_ai::Message::user(format!("u{i}")))
         .collect();
-    store.append(&s.id, &seed).unwrap();
+    store.append(&s.id, &seed, &Default::default()).unwrap();
     exec.run_runner_with_options(caller(), "chat", opts(&s.id, "now"), None)
         .await
         .unwrap();
@@ -413,6 +427,7 @@ async fn compaction_never_splits_a_tool_call_group() {
                 agentd_ai::Message::tool_result("c1", "{}"),
                 agentd_ai::Message::assistant("a5"),
             ],
+            &Default::default(),
         )
         .unwrap();
     exec.run_runner_with_options(caller(), "chat", opts(&s.id, "now"), None)
@@ -443,7 +458,7 @@ async fn summary_failure_falls_back_to_full_history() {
     let seed: Vec<agentd_ai::Message> = (0..4)
         .map(|i| agentd_ai::Message::user(format!("u{i}")))
         .collect();
-    store.append(&s.id, &seed).unwrap();
+    store.append(&s.id, &seed, &Default::default()).unwrap();
     let out = exec
         .run_runner_with_options(caller(), "chat", opts(&s.id, "now"), None)
         .await

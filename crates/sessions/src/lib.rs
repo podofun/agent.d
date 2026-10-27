@@ -19,6 +19,7 @@ use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentd_ai::Message;
+use agentd_ai::types::Usage;
 use agentd_permissions::ApprovalSetting;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -117,6 +118,10 @@ pub struct SessionMeta {
     /// Next sequence number to assign; never reused after compaction.
     pub next_seq: u64,
     pub compactions: u32,
+    /// Tokens every run in this session has used so far. Sessions stored
+    /// before this was tracked start from zero.
+    #[serde(default)]
+    pub usage: Usage,
 }
 
 /// Inputs for `create`. `owner` and `user` come from the caller's [`Scope`].
@@ -183,7 +188,7 @@ pub trait SessionStore: Send + Sync {
     /// Turns in conversation order.
     fn turns(&self, id: &str) -> Result<Vec<Message>>;
     /// Append turns atomically. `NotFound` if the session is gone.
-    fn append(&self, id: &str, turns: &[Message]) -> Result<SessionMeta>;
+    fn append(&self, id: &str, turns: &[Message], usage: &Usage) -> Result<SessionMeta>;
     /// Replace the oldest turns with a summary atomically.
     fn compact(&self, id: &str, compaction: Compaction) -> Result<SessionMeta>;
     /// Returns `false` if there was nothing to delete.
@@ -221,6 +226,7 @@ pub(crate) fn fresh_meta(new: NewSession) -> SessionMeta {
         turn_count: 0,
         next_seq: 0,
         compactions: 0,
+        usage: Usage::default(),
     }
 }
 
@@ -293,12 +299,13 @@ impl SessionStore for MemSessionStore {
             .cloned()
             .ok_or_else(|| SessionError::NotFound(id.to_string()))
     }
-    fn append(&self, id: &str, turns: &[Message]) -> Result<SessionMeta> {
+    fn append(&self, id: &str, turns: &[Message], usage: &Usage) -> Result<SessionMeta> {
         let mut g = self.inner.write().unwrap();
         let meta = g
             .metas
             .get_mut(id)
             .ok_or_else(|| SessionError::NotFound(id.to_string()))?;
+        meta.usage.add(usage);
         meta.turn_count += turns.len() as u64;
         meta.next_seq += turns.len() as u64;
         meta.updated_at = now_secs();
@@ -462,8 +469,12 @@ mod tests {
             .create(NewSession::in_scope(&sc).label(Some("tg-1".into())))
             .unwrap();
         assert_eq!(s.find_in(&sc, "tg-1").unwrap().unwrap().id, m.id);
-        s.append(&m.id, &[Message::user("hi"), Message::assistant("yo")])
-            .unwrap();
+        s.append(
+            &m.id,
+            &[Message::user("hi"), Message::assistant("yo")],
+            &Usage::default(),
+        )
+        .unwrap();
         assert_eq!(s.turns(&m.id).unwrap().len(), 2);
         let meta = s
             .compact(
