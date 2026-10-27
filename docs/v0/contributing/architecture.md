@@ -35,7 +35,7 @@ Lua code never touches the host directly. Every privileged operation goes throug
 | `luals` | LuaLS type-stub generator: writes `.luals/agentd.lua`, `.luals/project.lua`, `.luarc.json` |
 | `permissions` | Default-deny permission engine: checks `[denial]` and the service and interface allowlists first, then asks about the runner allowlist, tool grants, and confirm, one at a time |
 | `approvals` | Interactive approval plane: pushes `approval.request` events over `/control`, waits for `approvals.resolve`, handles timeout (deny on expiry) |
-| `runners` | Runner dispatch: builds system prompt from skills, drives the model tool-use loop up to `max_turns`, returns `RunResult` |
+| `runners` | Runner dispatch: builds system prompt from skills, drives the model tool-use loop (capped at `max_turns` outside a session), returns `RunResult` |
 | `skills` | Skill registry: loads `.md` skill files (YAML frontmatter + Markdown body) and provides lookup by name |
 | `services` | Service supervisor: starts Lua service bodies as tasks, applies restart/backoff policy, exposes state and `last_error` |
 | `shell` | `ctx.shell` implementation: argv-only process execution (no shell string), enforces `shell.exec[:<bin>]` grant |

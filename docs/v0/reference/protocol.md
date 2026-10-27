@@ -243,7 +243,7 @@ Run a runner with a prompt, an explicit message history, or a stored session. Th
 | `system` | string | no | Additional system instructions appended to the runner composition |
 | `model` | string | no | Per-call model override; its provider must be granted to the runner |
 | `max_tokens` | integer | no | Output token limit, 1–32768; provider support varies |
-| `timeout_ms` | integer | no | Whole-run deadline, 1–600000 milliseconds; default 120000 |
+| `timeout_ms` | integer | no | Whole-run deadline, 1–600000 milliseconds. Defaults to 120000 for a run without `session_id`. A session run has no deadline unless you set one, and keeps going until it finishes or is cancelled with `runners.cancel` |
 | `session` | string | no | Override session id |
 | `user` | string | no | Caller-supplied user id |
 | `stream` | bool | no | Push `runner.delta` event frames while the run is in flight |
@@ -310,7 +310,7 @@ Send this request over `/ws`:
 { "id": 10, "method": "sessions.create", "params": { "label": "telegram-42", "user": "alice" } }
 ```
 
-A successful response has `ok: true` and the session metadata in `result`, including its generated `id`, `owner`, `label`, `user`, `turn_count`, `next_seq`, `compactions`, `created_at` and `updated_at`. Timestamps are Unix seconds.
+A successful response has `ok: true` and the session metadata in `result`, including its generated `id`, `owner`, `label`, `user`, `turn_count`, `next_seq`, `compactions`, `usage`, `created_at` and `updated_at`. Timestamps are Unix seconds. The `usage` object adds up the tokens every run in the session has used, in `input_tokens`, `output_tokens`, `cache_read_input_tokens` and `cache_creation_input_tokens`. Sessions created before agent.d tracked usage count from zero.
 
 ### `sessions.get`
 
@@ -407,7 +407,7 @@ List background services with their current state.
 | `sessions_unavailable` | No session store is configured | — |
 | `unknown_skill` | Runner references a skill that is not registered | Run `agentctl skills ls` to list skills |
 | `no_provider` | The runner could not resolve a provider for its model | You can configure new providers in your `config.toml` |
-| `runner_turn_limit` | The runner used all `runtime.max_turns` turns without finishing. In a session, the work so far is kept | Send another message to let it continue, or raise `max_turns` under `[runtime]` in `config.toml` |
+| `runner_turn_limit` | The runner used all `runtime.max_turns` turns without finishing. Only runs outside a session have this limit | Run it in a session to let it continue without a limit, or raise `max_turns` under `[runtime]` in `config.toml` |
 | `provider_upstream` | AI provider returned an error | — |
 | `approval_forbidden` | A run asked for an approval setting looser than its runner or session allows, from a connection that is not an admin connection | Connect with the admin token, or use a stricter setting |
 | `classifier_not_configured` | A session was set to `classifier`, but `[approval].classifier` names no runner | Name a classifier runner in `[approval].classifier` in grants.toml, or use `human` or `nobody` |

@@ -32,6 +32,12 @@ local session = {
   turn_count = 4,
   next_seq = 4,
   compactions = 0,
+  usage = {               -- tokens used by every run in the session so far
+    input_tokens = 48213,
+    output_tokens = 3120,
+    cache_read_input_tokens = 0,
+    cache_creation_input_tokens = 0,
+  },
   created_at = 1789556422, -- Unix seconds
   updated_at = 1789556435,
 }

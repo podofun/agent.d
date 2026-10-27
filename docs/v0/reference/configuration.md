@@ -82,7 +82,7 @@ yolo      = false   # RESERVED — emits a warning and has no other effect
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `init` | string | `~/.config/agentd/init.lua` | Lua entry point path; `~/` is expanded |
-| `max_turns` | integer | `16` | Maximum tool-use loop iterations per runner call |
+| `max_turns` | integer | `16` | Maximum tool-use loop iterations per runner call outside a session. Session runs have no limit |
 | `yolo` | bool | `false` | **Reserved.** Currently emits a startup warning and is otherwise ignored |
 | `watch` | bool | `false` | Enable dev hot reload (same as `--watch` flag) |
 | `default_provider` | string | `anthropic` | Provider used when a model string has no `provider/` prefix. Any built-in or `[providers.<name>]` entry |

@@ -30,9 +30,9 @@ When a caller invokes `runners.run` (or `ctx.run`), the runtime:
 2. Checks the runner’s `ai:<provider>` grant and `[denial]`, then sends the prompt and history to the named provider.
 3. If the model returns a tool call, the runtime checks that the action is one of the runner's actions, then checks the permission engine. If the call is allowed, it runs the action.
 4. The result is fed back to the model and the loop continues.
-5. The loop ends when the model returns a final text response or `max_turns` is reached.
+5. The loop ends when the model returns a final text response. A run outside a session also ends when it reaches `max_turns`.
 
-`runtime.max_turns` (default `16`) caps the tool-use loop per runner call. You can override it in `config.toml`:
+`runtime.max_turns` (default `16`) caps the tool-use loop for runs outside a session, so a one-off call can never loop forever. A run in a [session](/v0/reference/ctx/sessions) is a conversation someone can cancel, so it has no turn limit and keeps going until the model is done. You can change the limit in `config.toml`:
 
 ```toml
 [runtime]

@@ -59,7 +59,7 @@ Invokes the action named `name` with the given `args` table. The callee's `requi
 
 ### `ctx.run(name, prompt_or_opts)`
 
-Runs the named runner with a prompt and drives its full tool-use loop until the model gives a final answer. Returns a `RunResult`. If the loop reaches `runtime.max_turns` (default 16) first, the call fails with a `runner_turn_limit` error; in a session, the work so far is kept so the next message can pick up from there. The target runner needs an `ai:<provider>` grant. The same [history validation, deadlines, concurrency limits, and optional usage result](/v0/reference/protocol#runners-run) apply to Lua and WebSocket calls.
+Runs the named runner with a prompt and drives its full tool-use loop until the model gives a final answer. Returns a `RunResult`. Outside a session, if the loop reaches `runtime.max_turns` (default 16) first, the call fails with a `runner_turn_limit` error. With `session_id`, there is no turn limit and no default deadline, so the run keeps going until the model is done. The target runner needs an `ai:<provider>` grant. The same [history validation, deadlines, concurrency limits, and optional usage result](/v0/reference/protocol#runners-run) apply to Lua and WebSocket calls.
 
 | Field | Type | Description |
 |---|---|---|
