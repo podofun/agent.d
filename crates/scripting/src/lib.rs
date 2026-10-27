@@ -1,4 +1,5 @@
 mod channels;
+mod handles;
 mod luaerr;
 mod mailer;
 mod sandbox;
@@ -263,6 +264,7 @@ impl LuaHost {
         lua.set_app_data(WorkspaceRoot::default());
         lua.set_app_data(fs::History::default());
         lua.set_app_data(PackageScope::default());
+        lua.set_app_data(handles::Handles::default());
 
         install_agentd_globals(&lua, &catalog)?;
         load_helpers(&lua)?;
@@ -676,7 +678,19 @@ fn build_collection_table(lua: &Lua, kind: ListKind) -> mlua::Result<Table> {
         })?,
     };
     t.set("list", f)?;
+    let kind = match kind {
+        ListKind::Tools => handles::Kind::Tool,
+        ListKind::Actions => handles::Kind::Action,
+        ListKind::Runners => handles::Kind::Runner,
+        ListKind::Services => handles::Kind::Service,
+    };
+    t.set("get", get_function(lua, kind)?)?;
     Ok(t)
+}
+
+/// `agentd.<collection>.get(name)`: the live handle for `name`, or `nil`.
+fn get_function(lua: &Lua, kind: handles::Kind) -> mlua::Result<Function> {
+    lua.create_function(move |lua, name: String| handles::handle_for(lua, kind, &name))
 }
 
 /// Registry key under which the single `ctx` facade table is stored.
@@ -796,7 +810,7 @@ fn ctx_thread(lua: &Lua, func: Function, with_args: bool) -> mlua::Result<mlua::
 
 // ---------- register / tool ----------
 
-fn register_action_dispatch(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
+fn register_action_dispatch(lua: &Lua, args: MultiValue) -> mlua::Result<handles::Handle> {
     if args.len() == 2 {
         let mut iter = args.into_iter();
         let name: String = lua.unpack(iter.next().unwrap())?;
@@ -813,7 +827,7 @@ fn register_action_dispatch(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
     )))
 }
 
-fn register_action(lua: &Lua, args: Value) -> mlua::Result<()> {
+fn register_action(lua: &Lua, args: Value) -> mlua::Result<handles::Handle> {
     let (name, func, meta) = match args {
         Value::String(s) => {
             return Err(mlua::Error::external(format!(
@@ -874,7 +888,7 @@ fn register_named(
     name: String,
     func: Function,
     mut meta: ActionMeta,
-) -> mlua::Result<()> {
+) -> mlua::Result<handles::Handle> {
     // Prefix + record under the active package, if any.
     let name = record_and_scope(lua, &name, ComponentKind::Action);
     // Inside a package, an explicit/inferred unqualified tool name is prefixed
@@ -899,11 +913,12 @@ fn register_named(
         let _ = lua.remove_registry_value(old);
     }
     guard.action_meta.insert(name.clone(), meta);
+    drop(guard);
     tracing::info!(action = %name, "registered action");
-    Ok(())
+    handles::register(lua, handles::Kind::Action, &name)
 }
 
-fn register_tool(lua: &Lua, t: Table) -> mlua::Result<()> {
+fn register_tool(lua: &Lua, t: Table) -> mlua::Result<handles::Handle> {
     let name: String = t
         .get("name")
         .map_err(|_| mlua::Error::external("the `agentd.tool{...}` definition table is missing its `name` field — every tool needs a name string"))?;
@@ -916,13 +931,14 @@ fn register_tool(lua: &Lua, t: Table) -> mlua::Result<()> {
         .write()
         .map_err(|e| mlua::Error::external(e.to_string()))?;
     guard.tools.insert(name.clone(), ToolMeta { requires });
+    drop(guard);
     tracing::info!(tool = %name, "registered tool");
-    Ok(())
+    handles::register(lua, handles::Kind::Tool, &name)
 }
 
 // ---------- agentd.runner ----------
 
-fn register_runner(lua: &Lua, t: Table) -> mlua::Result<()> {
+fn register_runner(lua: &Lua, t: Table) -> mlua::Result<handles::Handle> {
     let name: String = t
         .get("name")
         .map_err(|_| mlua::Error::external("the `agentd.runner{...}` definition table is missing its `name` field — every runner needs a name string"))?;
@@ -966,8 +982,9 @@ fn register_runner(lua: &Lua, t: Table) -> mlua::Result<()> {
         .app_data_ref::<RunnerRegistry>()
         .ok_or_else(|| mlua::Error::external("the runner registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
     runners.insert(def);
+    drop(runners);
     tracing::info!(runner = %name, "registered runner");
-    Ok(())
+    handles::register(lua, handles::Kind::Runner, &name)
 }
 
 /// `compact = false` disables session compaction; `compact = { after_turns =
@@ -1019,7 +1036,7 @@ fn sleep_binding(lua: &Lua, ms: u64) -> mlua::Result<Value> {
 
 // ---------- service / async / await (bare globals) ----------
 
-fn register_service(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
+fn register_service(lua: &Lua, args: MultiValue) -> mlua::Result<handles::Handle> {
     // Accepted shapes:
     //   agentd.service("name", fn)
     //   agentd.service("name", { restart = "always", backoff_ms = 5000, ... }, fn)
@@ -1102,8 +1119,9 @@ fn register_service(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
         .app_data_ref::<ServiceRegistry>()
         .ok_or_else(|| mlua::Error::external("the service registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
     services.insert(def);
+    drop(services);
     tracing::info!(service = %name, "registered service");
-    Ok(())
+    handles::register(lua, handles::Kind::Service, &name)
 }
 
 /// `async(fn)` — schedule `fn` to run as a background coroutine on its own
@@ -1169,7 +1187,7 @@ fn await_internal(lua: &Lua, handle: mlua::AnyUserData) -> mlua::Result<Value> {
 
 // ---------- agentd.skill ----------
 
-fn register_skill(lua: &Lua, t: Table) -> mlua::Result<()> {
+fn register_skill(lua: &Lua, t: Table) -> mlua::Result<handles::Handle> {
     let name: String = t
         .get("name")
         .map_err(|_| mlua::Error::external("the `agentd.skill{...}` definition table is missing its `name` field — every skill needs a name string"))?;
@@ -1188,8 +1206,9 @@ fn register_skill(lua: &Lua, t: Table) -> mlua::Result<()> {
         .app_data_ref::<SkillRegistry>()
         .ok_or_else(|| mlua::Error::external("the skill registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
     skills.insert(def);
+    drop(skills);
     tracing::info!(skill = %name, "registered skill");
-    Ok(())
+    handles::register(lua, handles::Kind::Skill, &name)
 }
 
 // ---------- agentd.skills.* (Markdown loader) ----------
@@ -1199,10 +1218,11 @@ fn build_skills_table(lua: &Lua) -> mlua::Result<Table> {
     t.set("load", lua.create_function(skills_load_binding)?)?;
     t.set("dir", lua.create_function(skills_load_dir_binding)?)?;
     t.set("list", lua.create_function(skills_list_binding)?)?;
+    t.set("get", get_function(lua, handles::Kind::Skill)?)?;
     Ok(t)
 }
 
-fn skills_load_binding(lua: &Lua, rel: String) -> mlua::Result<String> {
+fn skills_load_binding(lua: &Lua, rel: String) -> mlua::Result<handles::Handle> {
     let resolved = resolve_import_path(lua, &rel)?;
     let skills = lua
         .app_data_ref::<SkillRegistry>()
@@ -1210,20 +1230,25 @@ fn skills_load_binding(lua: &Lua, rel: String) -> mlua::Result<String> {
     let def = skills
         .load_file(&resolved)
         .map_err(|e| mlua::Error::external(e.to_string()))?;
+    drop(skills);
     tracing::info!(skill = %def.name, path = %resolved.display(), "loaded skill file");
-    Ok(def.name)
+    handles::register(lua, handles::Kind::Skill, &def.name)
 }
 
-fn skills_load_dir_binding(lua: &Lua, rel: String) -> mlua::Result<usize> {
+fn skills_load_dir_binding(lua: &Lua, rel: String) -> mlua::Result<Vec<handles::Handle>> {
     let resolved = resolve_import_path(lua, &rel)?;
     let skills = lua
         .app_data_ref::<SkillRegistry>()
         .ok_or_else(|| mlua::Error::external("the skill registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
-    let n = skills
+    let loaded = skills
         .load_dir(&resolved)
         .map_err(|e| mlua::Error::external(e.to_string()))?;
-    tracing::info!(loaded = n, dir = %resolved.display(), "loaded skills dir");
-    Ok(n)
+    drop(skills);
+    tracing::info!(loaded = loaded.len(), dir = %resolved.display(), "loaded skills dir");
+    loaded
+        .iter()
+        .map(|def| handles::register(lua, handles::Kind::Skill, &def.name))
+        .collect()
 }
 
 fn skills_list_binding(lua: &Lua, _: MultiValue) -> mlua::Result<Table> {
