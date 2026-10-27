@@ -649,10 +649,9 @@ impl Executor {
             effective_grants.insert(p.clone());
         }
 
-        // A runner-initiated call inherits the runner's cwd (the action's own
-        // `cwd`, if any, overrides it registry-side). Non-runner callers inherit
-        // nothing → the registry falls back to the workspace root.
-        // A runner's own cwd wins over the session's folder.
+        // A call inherits the runner's cwd, else the session's folder (the
+        // action's own `cwd`, if any, overrides both registry-side). With
+        // neither, the registry falls back to the workspace root.
         let inherited_cwd = caller
             .runner
             .as_ref()
@@ -919,28 +918,35 @@ impl Executor {
     /// approval setting never applies: the classifier does not answer folder
     /// questions, and with nobody to ask the answer is no.
     pub async fn ask_folder(&self, folder: &str, caller: &Caller) -> agentd_types::Verdict {
-        let Some(broker) = &self.broker else {
-            return agentd_types::Verdict::Deny;
-        };
         let id = self
             .approval_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        broker
-            .request(agentd_types::ApprovalRequest {
-                id,
-                kind: agentd_types::ApprovalKind::Folder,
-                action: folder.to_owned(),
-                tool: None,
-                requires: Vec::new(),
-                missing: Vec::new(),
-                reason: "Let agent.d work in this folder?".to_owned(),
-                caller: caller.clone(),
-                detail: Some(serde_json::json!({ "folder": folder })),
-                run_id: None,
-                session_id: None,
-                warning: None,
-            })
-            .await
+        let request = agentd_types::ApprovalRequest {
+            id,
+            kind: agentd_types::ApprovalKind::Folder,
+            action: folder.to_owned(),
+            tool: None,
+            requires: Vec::new(),
+            missing: Vec::new(),
+            reason: "Let agent.d work in this folder?".to_owned(),
+            caller: caller.clone(),
+            detail: Some(serde_json::json!({ "folder": folder })),
+            run_id: None,
+            session_id: None,
+            warning: None,
+        };
+        let verdict = match &self.broker {
+            Some(broker) => broker.request(request).await,
+            None => agentd_types::Verdict::Deny,
+        };
+        self.trace
+            .record(TraceEvent::decision(
+                "folder",
+                serde_json::json!({ "request_id": id, "folder": folder, "caller": caller }),
+                serde_json::json!({ "approval": format!("{verdict:?}"), "decided_by": "human" }),
+            ))
+            .await;
+        verdict
     }
 
     /// Whether the user trusts `folder` (an absolute real path).
@@ -1678,7 +1684,12 @@ impl Executor {
         caller.approval = Some(approval);
         caller.run_id = Some(run_id);
         caller.session_id = session.map(|m| m.id.clone());
-        caller.cwd = session.and_then(|m| m.cwd.clone());
+        // A session's folder, else the folder of the run that started this
+        // one (a nested run without a session keeps its parent's folder).
+        caller.cwd = match session {
+            Some(meta) => meta.cwd.clone(),
+            None => caller.cwd,
+        };
         Ok((caller, guard))
     }
 

@@ -164,14 +164,17 @@ impl Grants {
         self.file.package.get(name)
     }
     /// Whether `folder` (an absolute real path) is one the user trusts,
-    /// matched like an `fs.read` grant so globs mean the same thing.
+    /// matched like an `fs.read` grant so globs mean the same thing. A
+    /// trusted folder also covers every folder inside it.
     pub fn trusts_folder(&self, folder: &Path) -> bool {
         let wanted = Permission::new(format!("fs.read:{}", folder.display()));
-        self.file
-            .folders
-            .trusted
-            .iter()
-            .any(|entry| Permission::new(format!("fs.read:{}", expand_home(entry))).covers(&wanted))
+        self.file.folders.trusted.iter().any(|entry| {
+            let entry = expand_home(entry);
+            let inside = format!("{}/**", entry.trim_end_matches(['/', '\\']));
+            Permission::new(format!("fs.read:{entry}")).covers(&wanted)
+                || (!entry.ends_with('*')
+                    && Permission::new(format!("fs.read:{inside}")).covers(&wanted))
+        })
     }
 
     pub fn denial(&self) -> &Denial {
@@ -413,7 +416,9 @@ mod tests {
         assert!(grants.trusts_folder(Path::new("/w/a")));
         assert!(grants.trusts_folder(Path::new("/w/code/x/y")));
         assert!(!grants.trusts_folder(Path::new("/w/b")));
-        assert!(!grants.trusts_folder(Path::new("/w/a/inner")));
+        assert!(!grants.trusts_folder(Path::new("/w/ab")));
+        // Trusting a folder trusts what is inside it, as Claude Code does.
+        assert!(grants.trusts_folder(Path::new("/w/a/inner")));
     }
 
     #[test]

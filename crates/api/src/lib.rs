@@ -838,6 +838,15 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
                         return e;
                     }
                     let caller = ws_caller(conn, p.session, p.user);
+                    // A taken label fails before anyone is asked about a folder.
+                    if let (Some(label), Some(_)) = (&p.label, &p.cwd)
+                        && let Ok(Some(_)) = store.find_in(&conn_scope(conn, &caller), label)
+                    {
+                        return session_error(
+                            id,
+                            agentd_sessions::SessionError::LabelTaken(label.clone()),
+                        );
+                    }
                     let cwd = match &p.cwd {
                         Some(raw) => match session_cwd(&executor, conn, &caller, raw, id).await {
                             Ok(folder) => Some(folder),
@@ -1153,7 +1162,6 @@ fn ok_ser<T: Serialize>(id: u64, value: &T) -> WsResponse {
     }
 }
 
-/// Actionable hint for an error code, shown to humans next to the message.
 /// Check a folder a client asks a new session to work in, and return its
 /// real path. Only local connections may choose one. A folder the user
 /// trusts is accepted; any other is asked about once.
@@ -1176,7 +1184,7 @@ async fn session_cwd(
             "the session folder `{raw}` must be an absolute path"
         )));
     }
-    let Ok(real) = std::fs::canonicalize(path) else {
+    let Ok(real) = std::fs::canonicalize(path).map(plain_path) else {
         return Err(refuse(format!("the session folder `{raw}` does not exist")));
     };
     if !real.is_dir() {
@@ -1209,6 +1217,20 @@ async fn session_cwd(
     }
 }
 
+/// A canonical path without Windows' `\\?\` prefix, which grants and
+/// trusted folders never spell.
+fn plain_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => std::path::PathBuf::from(rest),
+        None => path,
+    }
+}
+
+/// Actionable hint for an error code, shown to humans next to the message.
 fn tip_for(code: &str) -> Option<String> {
     let tip = match code {
         "no_provider" => {
@@ -1419,5 +1441,24 @@ mod tests {
                 .unwrap()
                 .starts_with("You can configure new providers in your `config.toml`")
         );
+    }
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::plain_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn windows_verbatim_prefixes_are_removed() {
+        assert_eq!(
+            plain_path(PathBuf::from(r"\\?\C:\code\app")),
+            PathBuf::from(r"C:\code\app")
+        );
+        assert_eq!(
+            plain_path(PathBuf::from(r"\\?\UNC\server\share\x")),
+            PathBuf::from(r"\\server\share\x")
+        );
+        assert_eq!(plain_path(PathBuf::from("/w/app")), PathBuf::from("/w/app"));
     }
 }

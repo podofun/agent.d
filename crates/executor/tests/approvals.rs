@@ -625,3 +625,46 @@ fn folder_kind_serializes_as_folder() {
         "folder"
     );
 }
+
+#[derive(Default, Clone)]
+struct Recorded(Arc<std::sync::Mutex<Vec<agentd_trace::TraceEvent>>>);
+
+#[async_trait::async_trait]
+impl agentd_trace::TraceSink for Recorded {
+    async fn record(&self, event: agentd_trace::TraceEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+/// Every folder answer reaches the trace, like other approvals.
+#[tokio::test]
+async fn folder_answers_are_traced() {
+    let host = agentd_scripting::LuaHost::new().unwrap();
+    let (skills, runners, services) = (host.skills(), host.runners(), host.services());
+    let registry: Arc<dyn agentd_types::Registry> = Arc::new(host);
+    let recorded = Recorded::default();
+    let mut exec = Executor::new(
+        registry,
+        Arc::new(recorded.clone()),
+        Arc::new(engine_with_tool_grant(&[])),
+        runners,
+        services,
+        skills,
+        Arc::new(agentd_ai::ProviderRegistry::new()),
+    );
+    exec.set_broker(MockBroker::new(Verdict::AllowOnce));
+    let verdict = exec
+        .ask_folder("/w/project", &Caller::interface("ws"))
+        .await;
+    assert_eq!(verdict, Verdict::AllowOnce);
+    let events = recorded.0.lock().unwrap();
+    let event = events
+        .iter()
+        .find(|e| e.action == "folder")
+        .expect("a folder decision event");
+    let text = serde_json::to_string(event).unwrap();
+    assert!(
+        text.contains("\"folder\"") && text.contains("AllowOnce"),
+        "{text}"
+    );
+}

@@ -154,3 +154,20 @@ async fn a_runner_with_its_own_cwd_still_wins() {
     assert!(s.pinned.join("note.txt").exists());
     assert!(!s.folder.join("note.txt").exists());
 }
+
+#[tokio::test]
+async fn a_nested_run_without_a_session_keeps_its_parents_folder() {
+    let s = setup("note.txt");
+    // A run started by another run (ctx.run) carries its parent's caller.
+    let mut parent = caller();
+    parent.cwd = Some(s.folder.to_string_lossy().into_owned());
+    let options = RunOptions {
+        prompt: Some("write it".into()),
+        ..Default::default()
+    };
+    s.exec
+        .run_runner_with_options(parent, "chat", options, None)
+        .await
+        .unwrap();
+    assert!(s.folder.join("note.txt").exists());
+}

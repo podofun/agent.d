@@ -148,13 +148,25 @@ async fn prompt_verdict(req: &Value) -> Result<&'static str> {
     // stays as a separator above the summary.
     let card_lines = rows.len() as u16 + 1;
     collapse_card(card_lines);
-    println!("{}", decision_summary(verdict, action, tool));
+    println!("{}", decision_summary(verdict, action, tool, kind));
     Ok(verdict)
 }
 
 /// One-line recap of a resolved approval, e.g.
-/// `✓ You approved git.status to use git · once`.
-fn decision_summary(verdict: &str, action: &str, tool: &str) -> String {
+/// `✓ You approved git.status to use git · once`, or for a folder question
+/// `✓ You trusted /home/me/code/app · always`.
+fn decision_summary(verdict: &str, action: &str, tool: &str, kind: &str) -> String {
+    if kind == "folder" {
+        return match verdict {
+            "allow_once" => format!(
+                "  {GREEN}✓{RESET} You trusted {BOLD}{action}{RESET} {DIM}· this chat{RESET}"
+            ),
+            "allow_forever" => {
+                format!("  {GREEN}✓{RESET} You trusted {BOLD}{action}{RESET} {DIM}· always{RESET}")
+            }
+            _ => format!("  {RED}✗{RESET} You did not trust {BOLD}{action}{RESET}"),
+        };
+    }
     match verdict {
         "allow_once" => {
             format!(
@@ -223,4 +235,25 @@ fn read_verdict_key() -> &'static str {
     };
     let _ = disable_raw_mode();
     verdict
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_decisions_read_as_trust() {
+        let always = decision_summary("allow_forever", "/w/project", "-", "folder");
+        assert!(
+            always.contains("You trusted")
+                && always.contains("/w/project")
+                && always.contains("always"),
+            "{always}"
+        );
+        assert!(!always.contains("to use"), "{always}");
+        let denied = decision_summary("deny", "/w/project", "-", "folder");
+        assert!(denied.contains("did not trust"), "{denied}");
+        let action = decision_summary("allow_once", "git.status", "git", "missing_grant");
+        assert!(action.contains("to use git"), "{action}");
+    }
 }

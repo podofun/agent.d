@@ -290,3 +290,36 @@ async fn symlinks_are_judged_by_where_they_lead() {
     assert_eq!(reply["ok"], true, "{reply}");
     assert_eq!(reply["result"]["cwd"], trusted.as_str());
 }
+
+#[tokio::test]
+async fn a_taken_label_is_reported_before_any_folder_question() {
+    let (_p, folder) = project();
+    let b = boot("").await;
+    let mut socket = connect(&format!("{}/ws", b.addr), "public-tok").await;
+    socket
+        .send(Message::Text(
+            json!({ "id": 1, "method": "sessions.create", "params": { "label": "chat" } })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(next_json(&mut socket).await["ok"], true);
+    let mut asked = approver(&b, "allow_once").await;
+    socket
+        .send(Message::Text(
+            json!({ "id": 2, "method": "sessions.create", "params": { "label": "chat", "cwd": folder } })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let reply = next_json(&mut socket).await;
+    assert_eq!(reply["code"], "session_label_taken", "{reply}");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), asked.recv())
+            .await
+            .is_err(),
+        "nobody is asked about the folder"
+    );
+}
