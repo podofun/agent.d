@@ -398,3 +398,131 @@ fn remove_refuses_while_referenced() {
         "##,
     );
 }
+
+fn load_with_package(init: &str, package_main: &str) -> LuaHost {
+    let root = tempfile::tempdir().unwrap();
+    let package = root.path().join("acme");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("package.toml"),
+        "[package]\nname=\"acme\"\nentry=\"main.lua\"\n",
+    )
+    .unwrap();
+    std::fs::write(package.join("main.lua"), package_main).unwrap();
+    let path = root.path().join("init.lua");
+    std::fs::write(&path, init).unwrap();
+    let host = LuaHost::new().unwrap();
+    host.set_root(root.path());
+    host.set_packages_root(root.path());
+    host.load_file(&path).unwrap();
+    host
+}
+
+#[test]
+fn packages_cannot_change_what_they_do_not_own() {
+    let host = load_with_package(
+        r##"
+        agentd.tool{ name = "git" }
+        agentd.action("git.status", function() end)
+        agentd.skill{ name = "k" }
+        import("acme")
+        "##,
+        r##"
+        local function denied(f, what)
+          local ok, err = pcall(f)
+          assert(not ok, what .. " must be refused")
+          assert(tostring(err):find("the package `acme` cannot change", 1, true), tostring(err))
+        end
+        denied(function() agentd.actions.remove("git.status") end, "remove")
+        denied(function() agentd.actions.get("git.status").confirm = true end, "assign")
+        denied(function() agentd.tools.get("git").name = "vcs" end, "rename")
+        denied(function() agentd.skills.get("k").system = "x" end, "skill")
+
+        local a = agentd.action("x", function() end)
+        a.name = "git.status2"
+        assert(a.name == "acme/git.status2", "rename target is scoped: " .. a.name)
+        a.tool = "git"
+        assert(a.tool == "acme/git", "tool is scoped: " .. tostring(a.tool))
+        local own = agentd.skill{ name = "pk" }
+        own.system = "mine"
+        assert(own.system == "mine", "a package may change its own skill")
+        "##,
+    );
+    assert_eq!(
+        host.action_info("git.status").unwrap().tool.as_deref(),
+        Some("git")
+    );
+}
+
+#[test]
+fn package_ownership_follows_renames_and_removals() {
+    let host = load_with_package(
+        r##"import("acme")"##,
+        r##"
+        local poller = agentd.service("poller", function() end)
+        poller.name = "poller2"
+        agentd.runner{ name = "r" }
+        agentd.runners.remove("acme/r")
+        "##,
+    );
+    let packages = host.loaded_packages();
+    let acme = packages.iter().find(|p| p.name == "acme").unwrap();
+    assert_eq!(acme.services, ["acme/poller2"]);
+    assert!(acme.runners.is_empty(), "{:?}", acme.runners);
+}
+
+#[test]
+fn assignment_normalizes_like_registration() {
+    load(
+        r##"
+        local a = agentd.action{ name = "y.z", handler = function() end, confirm = true }
+        a.confirm = nil
+        assert(a.confirm == false, "nil confirm is false")
+        a.tool = "other"
+        a.tool = nil
+        assert(a.tool == "y", "nil tool is inferred from the name: " .. tostring(a.tool))
+        local s = agentd.skill{ name = "k", system = "x" }
+        s.system = "  trimmed  "
+        assert(s.system == "trimmed", "system is trimmed")
+        s.system = nil
+        assert(s.system == "", "nil system is empty")
+        local r = agentd.runner{ name = "coder" }
+        local ok, err = pcall(function() r.compact = 5 end)
+        assert(not ok and tostring(err):find("the runner `coder`", 1, true), tostring(err))
+        ok, err = pcall(function() r.compact = { keep_recent = 9, after_turns = 3 } end)
+        assert(not ok and tostring(err):find("the runner `coder`", 1, true), tostring(err))
+        "##,
+    );
+}
+
+#[test]
+fn pairs_iterates_list_properties() {
+    load(
+        r##"
+        local r = agentd.runner{ name = "coder", skills = { "a", "b" } }
+        local seen = {}
+        for i, skill in pairs(r.skills) do seen[#seen + 1] = i .. "=" .. skill end
+        assert(table.concat(seen, ",") == "1=a,2=b", table.concat(seen, ","))
+        "##,
+    );
+}
+
+#[test]
+fn errors_name_the_item_in_plain_words() {
+    load(
+        r##"
+        local old = agentd.runner{ name = "c" }
+        agentd.runner{ name = "c" }
+        local ok, err = pcall(function() return old.modle end)
+        assert(not ok and tostring(err):find("`c`", 1, true), tostring(err))
+
+        local r = agentd.runner{ name = "r", skills = { "a" } }
+        ok, err = pcall(function() r.model = r.skills end)
+        assert(not ok and tostring(err):find("the runner `r` cannot take that value for `model`", 1, true), tostring(err))
+        ok, err = pcall(function() return r.skills.foo end)
+        assert(not ok and tostring(err):find("the runner `r` list `skills` is indexed by number", 1, true), tostring(err))
+        ok, err = pcall(function() r.skills.foo = "x" end)
+        assert(not ok and tostring(err):find("is indexed by number", 1, true), tostring(err))
+        "##,
+    );
+}

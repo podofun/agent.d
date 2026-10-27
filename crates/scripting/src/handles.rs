@@ -203,6 +203,15 @@ impl Handle {
         })
     }
 
+    /// The item's name for messages, even when the handle is stale.
+    fn known_name(&self, lua: &Lua) -> String {
+        lua.app_data_ref::<Handles>()
+            .map(|handles| match handles.name_of(self.id) {
+                Ok(name) | Err((name, _)) => name,
+            })
+            .unwrap_or_default()
+    }
+
     fn property(&self, lua: &Lua, property: &str) -> mlua::Result<&'static str> {
         let known = self.kind.properties();
         known
@@ -210,7 +219,7 @@ impl Handle {
             .copied()
             .find(|p| *p == property)
             .ok_or_else(|| {
-                let name = self.name(lua).unwrap_or_default();
+                let name = self.known_name(lua);
                 mlua::Error::external(format!(
                     "the {} `{name}` has no property `{property}`",
                     self.kind.noun()
@@ -247,11 +256,17 @@ impl Handle {
     fn write(&self, lua: &Lua, key: &str, value: Value) -> mlua::Result<()> {
         let property = self.property(lua, key)?;
         let name = self.name(lua)?;
+        super::package_may_change(lua, self.kind, &name)?;
         match (self.kind, property) {
             (_, "name") => self.rename(lua, &name, value),
             (_, "handler") => set_handler(lua, self.kind, &name, value),
             (Kind::Runner, "compact") => {
-                let compact = super::compact_policy(lua, value)?;
+                let compact = super::compact_policy(lua, value).map_err(|error| {
+                    mlua::Error::external(format!(
+                        "the runner `{name}` cannot take that value for `compact` ({})",
+                        plain(&error)
+                    ))
+                })?;
                 update::<RunnerDef>(lua, self.kind, &name, |def| {
                     def.compact = compact;
                     Ok(())
@@ -263,7 +278,12 @@ impl Handle {
                 self.set_list(lua, &name, property, items)
             }
             _ => {
-                let json: serde_json::Value = lua.from_value(value)?;
+                let json: serde_json::Value = lua.from_value(value).map_err(|_| {
+                    mlua::Error::external(format!(
+                        "the {} `{name}` cannot take that value for `{property}`",
+                        self.kind.noun()
+                    ))
+                })?;
                 set_field(lua, self.kind, &name, property, json)
             }
         }
@@ -301,6 +321,7 @@ impl Handle {
                 )));
             }
         };
+        let new = super::scoped(super::active_package(lua).as_deref(), &new);
         if new == old {
             return Ok(());
         }
@@ -311,6 +332,7 @@ impl Handle {
         }
         refuse_if_used(lua, self.kind, old, "renamed")?;
         move_item(lua, self.kind, old, &new)?;
+        super::package_moved(lua, self.kind, old, Some(&new));
         lua.app_data_mut::<Handles>()
             .ok_or_else(missing)?
             .rename(self.id, &new);
@@ -442,6 +464,7 @@ pub(crate) fn remove(lua: &Lua, kind: Kind, name: &str) -> mlua::Result<()> {
             kind.noun()
         )));
     }
+    super::package_may_change(lua, kind, name)?;
     refuse_if_used(lua, kind, name, "removed")?;
     let mut stale = Vec::new();
     match kind {
@@ -473,6 +496,7 @@ pub(crate) fn remove(lua: &Lua, kind: Kind, name: &str) -> mlua::Result<()> {
     lua.app_data_mut::<Handles>()
         .ok_or_else(missing)?
         .retire(kind, name);
+    super::package_moved(lua, kind, name, None);
     Ok(())
 }
 
@@ -668,6 +692,12 @@ fn set_field(
             replace(kind, name, def, property, value)
         }),
         Kind::Skill => update::<SkillDef>(lua, kind, name, |def| {
+            // Registration trims the prompt and treats a missing one as empty.
+            let value = match (property, value) {
+                ("system", serde_json::Value::Null) => serde_json::json!(""),
+                ("system", serde_json::Value::String(text)) => serde_json::json!(text.trim()),
+                (_, value) => value,
+            };
             replace(kind, name, def, property, value)
         }),
         Kind::Service => update::<ServiceDef>(lua, kind, name, |def| {
@@ -692,7 +722,17 @@ fn set_field(
                 ))
             };
             match property {
-                "tool" => meta.tool = serde_json::from_value(value).map_err(invalid)?,
+                // Registration infers a missing tool from the name, and scopes
+                // a package's unqualified tool under the package.
+                "tool" => {
+                    let tool: Option<String> = serde_json::from_value(value).map_err(invalid)?;
+                    let package = super::active_package(lua);
+                    meta.tool = match tool {
+                        Some(tool) => Some(super::scoped(package.as_deref(), &tool)),
+                        None => name.split_once('.').map(|(tool, _)| tool.to_owned()),
+                    };
+                }
+                "confirm" if value.is_null() => meta.confirm = false,
                 "requires" => meta.requires = serde_json::from_value(value).map_err(invalid)?,
                 "confirm" => meta.confirm = serde_json::from_value(value).map_err(invalid)?,
                 "cwd" => meta.cwd = serde_json::from_value(value).map_err(invalid)?,
@@ -798,6 +838,15 @@ fn removed(kind: Kind, name: &str) -> mlua::Error {
     mlua::Error::external(format!("the {} `{name}` was removed", kind.noun()))
 }
 
+/// A Lua error's own message, without mlua's runtime or traceback framing.
+fn plain(error: &mlua::Error) -> String {
+    match error {
+        mlua::Error::ExternalError(inner) => inner.to_string(),
+        mlua::Error::CallbackError { cause, .. } => plain(cause),
+        other => other.to_string(),
+    }
+}
+
 fn lock<T>(error: std::sync::PoisonError<T>) -> mlua::Error {
     mlua::Error::external(error.to_string())
 }
@@ -845,6 +894,7 @@ impl ListHandle {
     /// `nil` remove the item and shift the rest down, as `table.remove` does.
     fn set(&self, lua: &Lua, index: i64, value: Value) -> mlua::Result<()> {
         let name = self.owner.name(lua)?;
+        super::package_may_change(lua, self.owner.kind, &name)?;
         let mut items = self.items(lua)?;
         let len = items.len() as i64;
         let noun = self.owner.kind.noun();
@@ -879,9 +929,26 @@ impl ListHandle {
     }
 }
 
+impl ListHandle {
+    /// A list key as a 1-based index, or a plain error for anything else.
+    fn index(&self, lua: &Lua, key: &Value) -> mlua::Result<i64> {
+        match key {
+            Value::Integer(index) => Ok(*index),
+            Value::Number(number) if number.fract() == 0.0 => Ok(*number as i64),
+            _ => Err(mlua::Error::external(format!(
+                "the {} `{}` list `{}` is indexed by number",
+                self.owner.kind.noun(),
+                self.owner.known_name(lua),
+                self.property
+            ))),
+        }
+    }
+}
+
 impl UserData for ListHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_method(MetaMethod::Index, |lua, this, index: i64| {
+        methods.add_meta_method(MetaMethod::Index, |lua, this, key: Value| {
+            let index = this.index(lua, &key)?;
             let items = this.items(lua)?;
             Ok(usize::try_from(index - 1)
                 .ok()
@@ -890,8 +957,23 @@ impl UserData for ListHandle {
         methods.add_meta_method(MetaMethod::Len, |lua, this, ()| Ok(this.items(lua)?.len()));
         methods.add_meta_method(
             MetaMethod::NewIndex,
-            |lua, this, (index, value): (i64, Value)| this.set(lua, index, value),
+            |lua, this, (key, value): (Value, Value)| {
+                let index = this.index(lua, &key)?;
+                this.set(lua, index, value)
+            },
         );
+        // `pairs` walks a snapshot of the items, like `ipairs`.
+        methods.add_meta_method(MetaMethod::Pairs, |lua, this, ()| {
+            let items = this.items(lua)?;
+            let next = lua.create_function(move |_, (_, at): (Value, Option<i64>)| {
+                let at = at.unwrap_or(0) + 1;
+                Ok(match items.get((at - 1) as usize) {
+                    Some(item) => (Some(at), Some(item.clone())),
+                    None => (None, None),
+                })
+            })?;
+            Ok((next, Value::Nil, Value::Nil))
+        });
         methods.add_meta_method(MetaMethod::ToString, |lua, this, ()| {
             Ok(format!("{{{}}}", this.items(lua)?.join(", ")))
         });

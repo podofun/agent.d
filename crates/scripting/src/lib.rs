@@ -126,6 +126,21 @@ struct OwnedComponents {
     actions: Vec<String>,
     runners: Vec<String>,
     services: Vec<String>,
+    /// Skills keep their registered names, but a package still owns the
+    /// ones it registered, so only it can change them through handles.
+    skills: Vec<String>,
+}
+
+impl OwnedComponents {
+    fn of(&mut self, kind: handles::Kind) -> &mut Vec<String> {
+        match kind {
+            handles::Kind::Tool => &mut self.tools,
+            handles::Kind::Action => &mut self.actions,
+            handles::Kind::Runner => &mut self.runners,
+            handles::Kind::Service => &mut self.services,
+            handles::Kind::Skill => &mut self.skills,
+        }
+    }
 }
 
 enum ComponentKind {
@@ -184,6 +199,64 @@ fn record_and_scope(lua: &Lua, raw: &str, kind: ComponentKind) -> String {
         }
     }
     name
+}
+
+/// Record a skill as owned by the active package, if any. Skill names are
+/// not scoped, but ownership still decides who may change the skill.
+fn own_skill(lua: &Lua, name: &str) {
+    let Some(scope) = lua.app_data_ref::<PackageScope>().map(|s| (*s).clone()) else {
+        return;
+    };
+    if let Some(package) = scope.active() {
+        let mut g = scope.0.write().unwrap();
+        g.owned
+            .entry(package)
+            .or_default()
+            .skills
+            .push(name.to_owned());
+    }
+}
+
+/// While a package is loading, it may change only what it registered.
+fn package_may_change(lua: &Lua, kind: handles::Kind, name: &str) -> mlua::Result<()> {
+    let Some(scope) = lua.app_data_ref::<PackageScope>().map(|s| (*s).clone()) else {
+        return Ok(());
+    };
+    let Some(package) = scope.active() else {
+        return Ok(());
+    };
+    let mut g = scope.0.write().unwrap();
+    if g.owned
+        .entry(package.clone())
+        .or_default()
+        .of(kind)
+        .iter()
+        .any(|owned| owned == name)
+    {
+        return Ok(());
+    }
+    Err(mlua::Error::external(format!(
+        "the package `{package}` cannot change the {} `{name}`, which it did not register",
+        kind.noun()
+    )))
+}
+
+/// Keep package ownership in step with a rename or a removal (`new` is `None`).
+fn package_moved(lua: &Lua, kind: handles::Kind, old: &str, new: Option<&str>) {
+    let Some(scope) = lua.app_data_ref::<PackageScope>().map(|s| (*s).clone()) else {
+        return;
+    };
+    let mut g = scope.0.write().unwrap();
+    for owned in g.owned.values_mut() {
+        let names = owned.of(kind);
+        match new {
+            Some(new) => names
+                .iter_mut()
+                .filter(|name| *name == old)
+                .for_each(|name| *name = new.to_owned()),
+            None => names.retain(|name| name != old),
+        }
+    }
 }
 
 /// Backend handle stored in Lua app-data so `context.auth.*` can reach it.
@@ -1225,6 +1298,7 @@ fn register_skill(lua: &Lua, t: Table) -> mlua::Result<handles::Handle> {
         .ok_or_else(|| mlua::Error::external("the skill registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
     skills.insert(def);
     drop(skills);
+    own_skill(lua, &name);
     tracing::info!(skill = %name, "registered skill");
     handles::register(lua, handles::Kind::Skill, &name)
 }
@@ -1249,6 +1323,7 @@ fn skills_load_binding(lua: &Lua, rel: String) -> mlua::Result<handles::Handle> 
         .load_file(&resolved)
         .map_err(|e| mlua::Error::external(e.to_string()))?;
     drop(skills);
+    own_skill(lua, &def.name);
     tracing::info!(skill = %def.name, path = %resolved.display(), "loaded skill file");
     handles::register(lua, handles::Kind::Skill, &def.name)
 }
@@ -1265,7 +1340,10 @@ fn skills_load_dir_binding(lua: &Lua, rel: String) -> mlua::Result<Vec<handles::
     tracing::info!(loaded = loaded.len(), dir = %resolved.display(), "loaded skills dir");
     loaded
         .iter()
-        .map(|def| handles::register(lua, handles::Kind::Skill, &def.name))
+        .map(|def| {
+            own_skill(lua, &def.name);
+            handles::register(lua, handles::Kind::Skill, &def.name)
+        })
         .collect()
 }
 
