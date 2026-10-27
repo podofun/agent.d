@@ -104,7 +104,11 @@ local change = ctx.fs.diff("images/sample.bin", second)
 
 History is shared by actions, runners and services. It lasts as long as the daemon runs and survives hot reloads. Restarting the daemon clears it.
 
-Only changes made through `ctx.fs` are recorded. Shell commands and other programs that change a file are not tracked. If a file's bytes or permissions no longer match the tracked state, a change or an undo stops with a conflict error and leaves the file as the other program left it. This check is not an operating-system lock, so coordinate with other programs that write the same files.
+History also records what other programs change. Around every action call that may write files, agent.d looks at the call's folder before and after the call: the chat's folder, or the runner's `cwd`. A file that a shell command, a formatter or a script created, changed or removed during the call gets a revision of its own, which you can undo like any other. Each revision names the action and run that made it. A call with no chat folder and no runner `cwd` works in the configuration folder, and nothing is recorded there.
+
+These folder checks skip what your `.gitignore` files ignore, as well as `.git`, `target` and `node_modules`. A file over 1 MiB, or one that is not text, is recorded with its size only and cannot be undone. A folder with more than 50,000 files is not checked, and symlinks are not followed. If another call is already working in the same folder for more than two seconds, the new call is not recorded, and its trace event says so.
+
+When a file changes outside agent.d, for example in your editor, history keeps that edit. The next change from agent.d works once the file has been read again, and an undo stops before it would go past your edit, so your edit stays. History compares a file's contents only. Changing its permissions, for example with `chmod`, does not count as an edit.
 
 History works on regular files. Directories, special files and files with more than one hard link on Unix are refused. A symlink resolves to its target before the grant check. A file keeps its permissions when it changes. History records file contents only: ownership, ACLs, extended attributes, timestamps and inode identity are not recorded. It is a content history for undo, and it does not replace backups or a filesystem snapshot.
 

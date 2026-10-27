@@ -182,7 +182,9 @@ agent.d sends the request to the classifier as data, and the classifier's instru
 
 - **allow**: the call runs one time. The classifier only allows once. It cannot allow forever.
 - **refuse**: the call is refused. The error starts with "The classifier refused" and gives its reason.
-- **unsure**: a human answers, as if the setting were `human`.
+- **unsure**: a human answers, as if the setting were `human`. The request they see includes the classifier's reason.
+
+The classifier also sees what you wrote. When you start a run through an interface, such as a chat, it gets your last five messages in that session and the run's prompt. If you asked for the action, or said it was fine, it can allow it on that basis. What the agent wrote is left out, since it could carry instructions from files or web pages. Runs started by services and webhooks pass no messages, and a run the agent starts with `ctx.run` passes the messages of the run that started it.
 
 If the classifier takes more than 30 seconds, fails, or gives an answer agent.d cannot read, the answer counts as unsure. The classifier handles up to four questions at a time, in its own slots apart from your other runners, so a busy daemon does not hold it up.
 
