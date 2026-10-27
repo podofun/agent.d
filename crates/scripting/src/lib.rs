@@ -2145,6 +2145,24 @@ fn lexical_clean(p: PathBuf) -> PathBuf {
     out
 }
 
+/// Replace `{cwd}` in path grants with the session's folder. Without a
+/// session folder, a grant that uses it grants nothing, so it is dropped.
+pub(crate) fn substitute_cwd(grants: &PermissionSet, cwd: Option<&str>) -> PermissionSet {
+    let mut out = PermissionSet::default();
+    for permission in grants.iter() {
+        let text = permission.as_str();
+        if !text.contains("{cwd}") {
+            out.insert(permission.clone());
+            continue;
+        }
+        let path_grant = matches!(permission.parts().0, "fs.read" | "fs.write" | "shell.exec");
+        if let (true, Some(cwd)) = (path_grant, cwd) {
+            out.insert(Permission::new(text.replace("{cwd}", cwd)));
+        }
+    }
+    out
+}
+
 /// Expand relative path grants against a base cwd (additive). A relative
 /// `fs.read`/`fs.write` spec, or a `shell.exec` spec that names a path (has a
 /// separator), gets an absolute twin joined to `base` — so a portable relative
@@ -4471,7 +4489,7 @@ impl Registry for LuaHost {
         // add canonical twins. A relative `fs.read:data/x` grant therefore covers
         // the absolute path a relative `ctx.fs.read("data/x")` resolves to.
         let effective_grants = normalize_path_grants(&resolve_relative_grants(
-            &ctx.effective_grants,
+            &substitute_cwd(&ctx.effective_grants, ctx.caller.cwd.as_deref()),
             cwd.as_deref(),
         ));
         let ctx_for_drive = ActiveContext {
@@ -4526,7 +4544,7 @@ impl Registry for LuaHost {
         let ctx_for_drive = ActiveContext {
             caller: ctx.caller.clone(),
             effective_grants: normalize_path_grants(&resolve_relative_grants(
-                &ctx.effective_grants,
+                &substitute_cwd(&ctx.effective_grants, ctx.caller.cwd.as_deref()),
                 cwd.as_deref(),
             )),
             call_chain: ctx.call_chain.clone(),
@@ -4579,7 +4597,7 @@ fn script_err(e: scheduler::DriveError) -> RegistryError {
 
 #[cfg(test)]
 mod cwd_grant_tests {
-    use super::{lexical_clean, resolve_cwd, resolve_relative_grants};
+    use super::{lexical_clean, resolve_cwd, resolve_relative_grants, substitute_cwd};
     use agentd_permissions::{Permission, PermissionSet};
     use std::path::{Path, PathBuf};
 
@@ -4610,6 +4628,23 @@ mod cwd_grant_tests {
             lexical_clean(PathBuf::from("/a/./b/../c")),
             PathBuf::from("/a/c")
         );
+    }
+
+    #[test]
+    fn cwd_placeholder_expands_for_session_calls() {
+        let grants = PermissionSet::from_iter(["fs.write:{cwd}/**", "net:example.com"]);
+        let out = substitute_cwd(&grants, Some("/w"));
+        assert!(out.contains(&Permission::new("fs.write:/w/**")));
+        assert!(out.contains(&Permission::new("net:example.com")));
+        assert!(!out.iter().any(|p| p.as_str().contains("{cwd}")));
+    }
+
+    #[test]
+    fn cwd_placeholder_grants_nothing_without_a_session_folder() {
+        let grants = PermissionSet::from_iter(["fs.write:{cwd}/**", "fs.read:/etc/hosts"]);
+        let out = substitute_cwd(&grants, None);
+        assert_eq!(out.iter().count(), 1);
+        assert!(out.contains(&Permission::new("fs.read:/etc/hosts")));
     }
 
     #[test]

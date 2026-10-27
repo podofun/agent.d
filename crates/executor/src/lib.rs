@@ -652,11 +652,13 @@ impl Executor {
         // A runner-initiated call inherits the runner's cwd (the action's own
         // `cwd`, if any, overrides it registry-side). Non-runner callers inherit
         // nothing → the registry falls back to the workspace root.
+        // A runner's own cwd wins over the session's folder.
         let inherited_cwd = caller
             .runner
             .as_ref()
             .and_then(|r| self.runners.get(r.as_str()))
-            .and_then(|def| def.cwd);
+            .and_then(|def| def.cwd)
+            .or_else(|| caller.cwd.clone());
 
         let ctx = CallContext {
             caller: caller.clone(),
@@ -920,7 +922,9 @@ impl Executor {
         let Some(broker) = &self.broker else {
             return agentd_types::Verdict::Deny;
         };
-        let id = self.approval_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = self
+            .approval_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         broker
             .request(agentd_types::ApprovalRequest {
                 id,
@@ -1674,6 +1678,7 @@ impl Executor {
         caller.approval = Some(approval);
         caller.run_id = Some(run_id);
         caller.session_id = session.map(|m| m.id.clone());
+        caller.cwd = session.and_then(|m| m.cwd.clone());
         Ok((caller, guard))
     }
 
