@@ -19,6 +19,14 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use thiserror::Error;
 
+fn paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| format!("`{}`", path.display()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn edit_not_found(path: &Path, count: usize) -> String {
     if count == 0 {
         format!(
@@ -35,7 +43,7 @@ fn edit_not_found(path: &Path, count: usize) -> String {
 
 #[derive(Debug, Error)]
 pub enum FsError {
-    #[error("file changed outside runtime history: {0}")]
+    #[error("`{}` changed outside agent.d after agent.d last wrote it, so agent.d will not overwrite it", .0.display())]
     Conflict(PathBuf),
     #[error(
         "history requires an absolute regular-file path without symlink ancestors or multiple hard links: {0}"
@@ -67,6 +75,16 @@ pub enum FsError {
     AlreadyExists(PathBuf),
     #[error("the patch removes `{}`, but its lines do not cover the whole file", .0.display())]
     RemoveLeavesLines(PathBuf),
+    #[error("the patch changes `{}` more than once, so combine those changes into one section", .0.display())]
+    DuplicatePath(PathBuf),
+    #[error(
+        "{cause}, and these files could not be put back as they were {}",
+        paths(still_changed)
+    )]
+    PatchPartlyApplied {
+        cause: Box<FsError>,
+        still_changed: Vec<PathBuf>,
+    },
     #[error(
         "`{}` changed while it was being opened and now leads to `{}`, so it was not read",
         path.display(),

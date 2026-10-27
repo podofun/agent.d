@@ -88,3 +88,15 @@ async fn apply_errors_are_sentences() {
     .unwrap_err();
     assert!(error.contains("use ctx.fs.patch for several"), "{error}");
 }
+
+#[tokio::test]
+async fn identical_texts_round_trip_as_no_change() {
+    let value = run(r#"
+        local d = ctx.diff.create("same\n", "same\n")
+        assert(d == "", "an empty diff")
+        return ctx.diff.apply("same\n", d)
+    "#)
+    .await
+    .unwrap();
+    assert_eq!(value, "same\n");
+}

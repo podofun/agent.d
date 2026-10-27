@@ -34,6 +34,21 @@ fn check_read(reads: &Reads, scope: &str, path: &Path, now: &Option<Stamp>) -> R
     }
 }
 
+/// Where `needle` starts in `text`, counting overlapping matches, up to `limit`.
+fn occurrences(text: &str, needle: &str, limit: usize) -> usize {
+    let mut count = 0;
+    let mut start = 0;
+    while count < limit {
+        let Some(at) = text[start..].find(needle) else {
+            break;
+        };
+        count += 1;
+        let first = text[start + at..].chars().next().map_or(1, char::len_utf8);
+        start += at + first;
+    }
+    count
+}
+
 /// Remember the file's current state as what `scope` has seen.
 fn note_read(reads: &Reads, scope: &str, path: &Path) -> Result<(), FsError> {
     let stamp = Image::read(path)?.stamp();
@@ -461,7 +476,7 @@ impl History {
             let count = if old.is_empty() {
                 0
             } else {
-                text.matches(&old).count()
+                occurrences(&text, &old, if replace_all { usize::MAX } else { 2 })
             };
             if count == 0 || (count > 1 && !replace_all) {
                 return Err(FsError::EditNotFound {
@@ -481,68 +496,150 @@ impl History {
         .await
     }
 
+    /// Record that `scope` was handed `bytes` as the content of `path`, so a
+    /// later edit or patch is checked against what the caller actually saw.
+    /// Best effort: a file history cannot track (a hard link, say) is simply
+    /// not recorded, and a later edit of it asks for a read.
+    pub async fn record_read_bytes(&self, scope: &str, path: &Path, bytes: &[u8]) {
+        let Ok(metadata) = fs::metadata(path) else {
+            return;
+        };
+        let stamp = Stamp {
+            digest: Sha256::digest(bytes).into(),
+            permissions: metadata.permissions(),
+        };
+        if let Ok(mut reads) = self.reads.lock() {
+            reads.insert((scope.to_owned(), path.to_path_buf()), Some(stamp));
+        }
+    }
+
     /// Apply a patch to several files, all or nothing. Files it modifies or
     /// removes must have been read by `scope` and left unchanged since; a
     /// file it creates must not exist yet. Every hunk of every file is applied
-    /// in memory first, so a hunk that does not apply changes nothing. If a
-    /// write then fails, the files already written are rolled back.
+    /// in memory first, so a hunk that does not apply changes nothing. Each
+    /// file is checked again just before it is written, and if a write fails
+    /// the files already written are put back as they were.
     pub async fn patch(
         &self,
         scope: &str,
         files: &[(PathBuf, crate::FilePatch)],
     ) -> Result<Vec<(PathBuf, usize)>, FsError> {
+        self.patch_with_pause(scope, files, || {}).await
+    }
+
+    /// [`History::patch`], running `pause` between planning and writing.
+    /// Tests use it to change a file in that window.
+    async fn patch_with_pause(
+        &self,
+        scope: &str,
+        files: &[(PathBuf, crate::FilePatch)],
+        pause: impl FnOnce(),
+    ) -> Result<Vec<(PathBuf, usize)>, FsError> {
+        let mut seen = std::collections::HashSet::new();
+        for (path, _) in files {
+            if !seen.insert(path.clone()) {
+                return Err(FsError::DuplicatePath(path.clone()));
+            }
+        }
         let mut planned = Vec::new();
         for (path, patch) in files {
             let (reads, scope, patch) = (self.reads.clone(), scope.to_owned(), patch.clone());
-            let content = self
+            let plan = self
                 .with_file(path, move |_, p| {
                     let image = Image::read(p)?;
+                    let stamp = image.stamp();
                     let text = if patch.old_path.is_none() {
                         if image.bytes.is_some() {
                             return Err(FsError::AlreadyExists(p.into()));
                         }
                         String::new()
                     } else {
-                        check_read(&reads, &scope, p, &image.stamp())?;
+                        check_read(&reads, &scope, p, &stamp)?;
                         let bytes = image.bytes.ok_or_else(|| FsError::NotFound(p.into()))?;
                         String::from_utf8(bytes).map_err(|_| FsError::InvalidUtf8(p.into()))?
                     };
                     let changed = crate::apply_patch(&text, &patch)?;
-                    if patch.new_path.is_none() {
+                    let content = if patch.new_path.is_none() {
                         if !changed.is_empty() {
                             return Err(FsError::RemoveLeavesLines(p.into()));
                         }
-                        return Ok(None);
-                    }
-                    Ok(Some(changed.into_bytes()))
+                        None
+                    } else {
+                        Some(changed.into_bytes())
+                    };
+                    Ok((stamp, content))
                 })
                 .await?;
-            planned.push((path.clone(), content));
+            planned.push((path.clone(), plan));
         }
-        let mut done: Vec<(PathBuf, usize)> = Vec::new();
-        for (path, content) in planned {
+        pause();
+        let earlier_reads: Vec<(PathBuf, Option<Option<Stamp>>)> = {
+            let reads = self.reads.lock().map_err(|_| FsError::HistoryPoisoned)?;
+            planned
+                .iter()
+                .map(|(path, _)| {
+                    (
+                        path.clone(),
+                        reads.get(&(scope.to_owned(), path.clone())).cloned(),
+                    )
+                })
+                .collect()
+        };
+        let mut done: Vec<(PathBuf, usize, usize)> = Vec::new();
+        let mut failure = None;
+        for (path, (stamp, content)) in planned {
             let (reads, scope) = (self.reads.clone(), scope.to_owned());
             let outcome = self
                 .with_file(&path, move |t, p| {
+                    if Image::read(p)?.stamp() != stamp {
+                        return Err(FsError::ChangedSinceRead(p.into()));
+                    }
+                    let previous = t.current;
                     let revision = match content {
                         Some(bytes) => t.mutate(p, Operation::Write, bytes)?,
                         None => t.mutate(p, Operation::Remove, Vec::new())?,
                     };
-                    note_read(&reads, &scope, p)?;
-                    Ok(revision)
+                    let _ = note_read(&reads, &scope, p);
+                    Ok((revision, previous))
                 })
                 .await;
             match outcome {
-                Ok(revision) => done.push((path, revision)),
+                Ok((revision, previous)) => done.push((path, revision, previous)),
                 Err(error) => {
-                    for (written, _) in done.iter().rev() {
-                        let _ = self.undo(written).await;
-                    }
-                    return Err(error);
+                    failure = Some(error);
+                    break;
                 }
             }
         }
-        Ok(done)
+        let Some(error) = failure else {
+            return Ok(done
+                .into_iter()
+                .map(|(path, revision, _)| (path, revision))
+                .collect());
+        };
+        let mut still_changed = Vec::new();
+        for (path, _, previous) in done.iter().rev() {
+            if self.restore(path, *previous).await.is_err() {
+                still_changed.push(path.clone());
+            }
+        }
+        if let Ok(mut reads) = self.reads.lock() {
+            for (path, earlier) in earlier_reads {
+                let key = (scope.to_owned(), path);
+                match earlier {
+                    Some(stamp) => reads.insert(key, stamp),
+                    None => reads.remove(&key),
+                };
+            }
+        }
+        if still_changed.is_empty() {
+            Err(error)
+        } else {
+            Err(FsError::PatchPartlyApplied {
+                cause: Box::new(error),
+                still_changed,
+            })
+        }
     }
 
     pub async fn write(&self, path: &Path, bytes: &[u8]) -> Result<usize, FsError> {
@@ -826,6 +923,120 @@ mod tests {
         let error = history.patch("s", &create).await.unwrap_err();
         assert!(error.to_string().contains("already exists"), "{error}");
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "1\n");
+    }
+
+    #[tokio::test]
+    async fn a_read_is_stamped_from_the_bytes_returned() {
+        let (_dir, path) = temp();
+        std::fs::write(&path, "new").unwrap();
+        let history = History::default();
+        // The caller was handed "old", so its read does not cover "new".
+        history.record_read_bytes("s", &path, b"old").await;
+        let error = history
+            .edit("s", &path, "new", "x", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, FsError::ChangedSinceRead(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn the_same_file_twice_in_one_patch_is_refused() {
+        let (_dir, path) = temp();
+        std::fs::write(&path, "1\n").unwrap();
+        let history = History::default();
+        history.record_read("s", &path).await.unwrap();
+        let section = file_patch("a", "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-1\n+2\n").1;
+        let error = history
+            .patch(
+                "s",
+                &[(path.clone(), section.clone()), (path.clone(), section)],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("more than once"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "1\n");
+    }
+
+    #[tokio::test]
+    async fn a_change_between_planning_and_writing_is_not_overwritten() {
+        let (_dir, path) = temp();
+        std::fs::write(&path, "1\n").unwrap();
+        let history = History::default();
+        history.record_read("s", &path).await.unwrap();
+        let section = file_patch("a", "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-1\n+2\n").1;
+        let sneaky = path.clone();
+        let error = history
+            .patch_with_pause("s", &[(path.clone(), section)], move || {
+                std::fs::write(&sneaky, "someone else\n").unwrap();
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, FsError::ChangedSinceRead(_)), "{error:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "someone else\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_write_rolls_back_cleanly() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let a = root.join("a.txt");
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let b = locked.join("b.txt");
+        std::fs::write(&a, "1\n").unwrap();
+        std::fs::write(&b, "x\n").unwrap();
+        let history = History::default();
+        history.record_read("s", &a).await.unwrap();
+        history.record_read("s", &b).await.unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let files = vec![
+            (
+                a.clone(),
+                file_patch("a.txt", "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-1\n+2\n").1,
+            ),
+            (
+                b.clone(),
+                file_patch("b.txt", "--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-x\n+y\n").1,
+            ),
+        ];
+        let result = history.patch("s", &files).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "1\n");
+        // The rollback leaves nothing to redo, and the read still counts.
+        assert!(matches!(history.redo(&a).await, Err(FsError::NoRedo)));
+        history.edit("s", &a, "1", "3", false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn overlapping_matches_count_as_ambiguous() {
+        let (_dir, path) = temp();
+        std::fs::write(&path, "}\n}\n}").unwrap();
+        let history = History::default();
+        history.record_read("s", &path).await.unwrap();
+        let error = history
+            .edit("s", &path, "}\n}", "x", false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, FsError::EditNotFound { count: 2, .. }),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_outside_change_to_a_file_agentd_wrote_says_what_to_do() {
+        let (_dir, path) = temp();
+        let history = History::default();
+        history.write(&path, b"a").await.unwrap();
+        std::fs::write(&path, "b").unwrap();
+        history.record_read("s", &path).await.unwrap();
+        let error = history.edit("s", &path, "b", "c", false).await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("changed outside agent.d"), "{message}");
+        assert!(!message.contains("runtime history:"), "{message}");
     }
 
     #[tokio::test]

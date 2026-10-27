@@ -38,6 +38,8 @@ pub enum PatchError {
         hunk: usize,
         reason: String,
     },
+    #[error("the patch {what} `{path}`, which agent.d patches do not support")]
+    Unsupported { path: String, what: String },
 }
 
 impl FilePatch {
@@ -53,6 +55,9 @@ impl FilePatch {
 
 /// A unified diff from `old` to `new`, with `a/` and `b/` path prefixes.
 pub fn create_diff(old: &str, new: &str, old_path: &str, new_path: &str, context: usize) -> String {
+    if old == new {
+        return String::new();
+    }
     let mut options = diffy::DiffOptions::new();
     options
         .set_context_len(context)
@@ -61,13 +66,85 @@ pub fn create_diff(old: &str, new: &str, old_path: &str, new_path: &str, context
     options.create_patch(old, new).to_string()
 }
 
-/// Every file patch in `text`, in order.
+/// Every file patch in `text`, in order. Git sections that only rename a
+/// file, change its mode, or carry binary data are refused rather than
+/// skipped, so a patch is never applied in part.
 pub fn parse_patch(text: &str) -> Result<Vec<FilePatch>, PatchError> {
     let lines: Vec<&str> = text.lines().collect();
     let mut patches = Vec::new();
     let mut at = 0;
+    let unsupported = |path: &str, what: &str| PatchError::Unsupported {
+        path: path.to_owned(),
+        what: what.to_owned(),
+    };
     while at < lines.len() {
         let line = lines[at];
+        if line.starts_with("Binary files ") || line == "GIT binary patch" {
+            return Err(unsupported(
+                line.trim_start_matches("Binary files "),
+                "changes the binary file",
+            ));
+        }
+        if let Some(header) = line.strip_prefix("diff --git ") {
+            // The extended header runs until the file's `---` line, the next
+            // section, or the end.
+            let path = header
+                .rsplit_once(" b/")
+                .map(|(_, path)| path)
+                .unwrap_or(header)
+                .to_owned();
+            let old = header
+                .strip_prefix("a/")
+                .and_then(|rest| rest.split_once(" b/"))
+                .map(|(old, _)| old.to_owned())
+                .unwrap_or_else(|| path.clone());
+            let mut end = at + 1;
+            let (mut created, mut deleted) = (false, false);
+            while end < lines.len()
+                && !lines[end].starts_with("--- ")
+                && !lines[end].starts_with("diff --git ")
+            {
+                let extended = lines[end];
+                if extended.starts_with("rename ")
+                    || extended.starts_with("copy ")
+                    || extended.starts_with("similarity index")
+                {
+                    return Err(unsupported(&path, "renames or copies"));
+                }
+                if extended.starts_with("old mode") || extended.starts_with("new mode") {
+                    return Err(unsupported(&path, "changes the mode of"));
+                }
+                if extended.starts_with("Binary files ") || extended == "GIT binary patch" {
+                    return Err(unsupported(&path, "changes the binary file"));
+                }
+                created |= extended.starts_with("new file mode");
+                deleted |= extended.starts_with("deleted file mode");
+                end += 1;
+            }
+            let has_hunks = lines.get(end).is_some_and(|next| next.starts_with("--- "));
+            if !has_hunks {
+                if created {
+                    patches.push(FilePatch {
+                        old_path: None,
+                        new_path: Some(path),
+                        hunks: Vec::new(),
+                    });
+                } else if deleted {
+                    patches.push(FilePatch {
+                        old_path: Some(old),
+                        new_path: None,
+                        hunks: Vec::new(),
+                    });
+                } else {
+                    return Err(unsupported(
+                        &path,
+                        "has a section with no changes to apply for",
+                    ));
+                }
+            }
+            at = end;
+            continue;
+        }
         if !line.starts_with("--- ") {
             at += 1;
             continue;
@@ -84,6 +161,16 @@ pub fn parse_patch(text: &str) -> Result<Vec<FilePatch>, PatchError> {
             ));
         };
         let new_path = header_path(&next[4..]);
+        if let (Some(old), Some(new)) = (&old_path, &new_path)
+            && old != new
+        {
+            return Err(PatchError::Parse {
+                line: at + 1,
+                reason: format!(
+                    "the patch moves `{old}` to `{new}`, which agent.d patches do not support. Send it as removing one file and creating the other"
+                ),
+            });
+        }
         at += 2;
         let mut hunks = Vec::new();
         while at < lines.len() && lines[at].starts_with("@@") {
@@ -209,18 +296,19 @@ pub fn format_patch(files: &[FilePatch]) -> String {
     out
 }
 
-/// A line of a file: its text and whether a line ending follows it.
+/// A line of a file: its text and the ending that follows it, if any.
 struct Line {
     text: String,
-    ends: bool,
+    ending: Option<&'static str>,
 }
 
 /// Apply one file's patch to `text`. Each hunk must match exactly, either
 /// where its header says or, when the file has shifted, at the one place its
-/// old lines appear.
+/// old lines appear. Every line keeps its own ending; added lines take the
+/// ending of the lines they replace or follow.
 pub fn apply_patch(text: &str, patch: &FilePatch) -> Result<String, PatchError> {
-    let crlf = text.contains("\r\n");
     let mut lines: Vec<Line> = split_lines(text);
+    let usual = usual_ending(&lines);
     let mut shift: isize = 0;
     for (number, hunk) in patch.hunks.iter().enumerate() {
         let fail = |reason: String| PatchError::Hunk {
@@ -240,6 +328,12 @@ pub fn apply_patch(text: &str, patch: &FilePatch) -> Result<String, PatchError> 
             hunk.old_start as isize - 1 + shift
         };
         let expected = expected.max(0) as usize;
+        if old.is_empty() && expected > lines.len() {
+            return Err(fail(format!(
+                "it inserts after line {expected}, but the file has {} lines",
+                lines.len()
+            )));
+        }
         let matches_at = |at: usize| {
             at + old.len() <= lines.len()
                 && old
@@ -249,21 +343,28 @@ pub fn apply_patch(text: &str, patch: &FilePatch) -> Result<String, PatchError> 
         };
         let at = if matches_at(expected) {
             expected
+        } else if old.is_empty() {
+            return Err(fail(mismatch(&lines, &old, expected)));
         } else {
             let found: Vec<usize> = (0..=lines.len().saturating_sub(old.len()))
                 .filter(|at| matches_at(*at))
+                .take(2)
                 .collect();
             match found.as_slice() {
-                [only] if !old.is_empty() => *only,
-                [] | [_] => return Err(fail(mismatch(&lines, &old, expected))),
+                [only] => *only,
+                [] => return Err(fail(mismatch(&lines, &old, expected))),
                 _ => {
-                    return Err(fail(format!(
-                        "its lines appear {} times and not where the header says",
-                        found.len()
-                    )));
+                    return Err(fail(
+                        "its lines appear more than once and not where the header says".to_owned(),
+                    ));
                 }
             }
         };
+        let region_ending = lines[at..at + old.len()]
+            .iter()
+            .find_map(|line| line.ending)
+            .or_else(|| at.checked_sub(1).and_then(|before| lines[before].ending))
+            .unwrap_or(usual);
         let mut replacement = Vec::new();
         let mut original = lines[at..at + old.len()].iter();
         for (index, line) in hunk.lines.iter().enumerate() {
@@ -276,7 +377,7 @@ pub fn apply_patch(text: &str, patch: &FilePatch) -> Result<String, PatchError> 
                     let kept = original.next().expect("matched above");
                     replacement.push(Line {
                         text: kept.text.clone(),
-                        ends: kept.ends && !no_newline,
+                        ending: if no_newline { None } else { kept.ending },
                     });
                 }
                 Some('-') => {
@@ -284,7 +385,11 @@ pub fn apply_patch(text: &str, patch: &FilePatch) -> Result<String, PatchError> 
                 }
                 Some('+') => replacement.push(Line {
                     text: line[1..].to_owned(),
-                    ends: !no_newline,
+                    ending: if no_newline {
+                        None
+                    } else {
+                        Some(region_ending)
+                    },
                 }),
                 _ => {}
             }
@@ -294,15 +399,30 @@ pub fn apply_patch(text: &str, patch: &FilePatch) -> Result<String, PatchError> 
         lines.splice(at..at + removed, replacement);
         shift += added as isize - removed as isize;
     }
-    let ending = if crlf { "\r\n" } else { "\n" };
+    // Only the last line may lack an ending, or two lines would merge.
+    let last = lines.len().saturating_sub(1);
+    for line in &mut lines[..last] {
+        line.ending.get_or_insert(usual);
+    }
     let mut out = String::new();
     for line in &lines {
         out.push_str(&line.text);
-        if line.ends {
-            out.push_str(ending);
-        }
+        out.push_str(line.ending.unwrap_or(""));
     }
     Ok(out)
+}
+
+/// The ending most lines use, `\n` when there are none.
+fn usual_ending(lines: &[Line]) -> &'static str {
+    let crlf = lines
+        .iter()
+        .filter(|line| line.ending == Some("\r\n"))
+        .count();
+    let lf = lines
+        .iter()
+        .filter(|line| line.ending == Some("\n"))
+        .count();
+    if crlf > lf { "\r\n" } else { "\n" }
 }
 
 fn split_lines(text: &str) -> Vec<Line> {
@@ -311,17 +431,20 @@ fn split_lines(text: &str) -> Vec<Line> {
     while !rest.is_empty() {
         match rest.find('\n') {
             Some(end) => {
-                let text = rest[..end].strip_suffix('\r').unwrap_or(&rest[..end]);
+                let (text, ending) = match rest[..end].strip_suffix('\r') {
+                    Some(text) => (text, "\r\n"),
+                    None => (&rest[..end], "\n"),
+                };
                 lines.push(Line {
                     text: text.to_owned(),
-                    ends: true,
+                    ending: Some(ending),
                 });
                 rest = &rest[end + 1..];
             }
             None => {
                 lines.push(Line {
                     text: rest.to_owned(),
-                    ends: false,
+                    ending: None,
                 });
                 rest = "";
             }
@@ -430,6 +553,82 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("line 2 reads `q`"), "{message}");
+    }
+
+    #[test]
+    fn git_sections_without_hunks_create_or_delete_empty_files() {
+        let text = "diff --git a/empty.txt b/empty.txt\nnew file mode 100644\nindex 0000000..e69de29\ndiff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\nindex e69de29..0000000\n";
+        let patches = parse_patch(text).unwrap();
+        assert_eq!(patches.len(), 2);
+        assert_eq!(
+            (
+                patches[0].old_path.as_deref(),
+                patches[0].new_path.as_deref()
+            ),
+            (None, Some("empty.txt"))
+        );
+        assert!(patches[0].hunks.is_empty());
+        assert_eq!(
+            (
+                patches[1].old_path.as_deref(),
+                patches[1].new_path.as_deref()
+            ),
+            (Some("gone.txt"), None)
+        );
+        assert_eq!(apply_patch("", &patches[0]).unwrap(), "");
+    }
+
+    #[test]
+    fn unsupported_git_sections_are_refused_not_skipped() {
+        for (text, what) in [
+            (
+                "diff --git a/a b/b\nsimilarity index 100%\nrename from a\nrename to b\n",
+                "renames",
+            ),
+            (
+                "diff --git a/x b/x\nold mode 100644\nnew mode 100755\n",
+                "mode",
+            ),
+            (
+                "diff --git a/p.png b/p.png\nindex 1..2 100644\nBinary files a/p.png and b/p.png differ\n",
+                "binary",
+            ),
+            (
+                "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/p.png b/p.png\nGIT binary patch\nliteral 3\n",
+                "binary",
+            ),
+        ] {
+            let error = parse_patch(text).unwrap_err().to_string();
+            assert!(error.contains(what), "{what}: {error}");
+        }
+    }
+
+    #[test]
+    fn moving_a_file_is_refused() {
+        let error = parse_patch("--- a/old.txt\n+++ b/new.txt\n@@ -1 +1 @@\n-a\n+b\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("moves `old.txt` to `new.txt`"), "{error}");
+    }
+
+    #[test]
+    fn added_lines_after_a_last_line_without_newline_do_not_merge() {
+        let patch = parse_patch("--- a/x\n+++ b/x\n@@ -1 +1,2 @@\n a\n+b\n").unwrap();
+        assert_eq!(apply_patch("a", &patch[0]).unwrap(), "a\nb\n");
+    }
+
+    #[test]
+    fn mixed_line_endings_keep_each_line_as_it_was() {
+        let patch = parse_patch("--- a/x\n+++ b/x\n@@ -2,2 +2,2 @@\n b\n-c\n+C\n").unwrap();
+        assert_eq!(
+            apply_patch("a\r\nb\nc\nd\n", &patch[0]).unwrap(),
+            "a\r\nb\nC\nd\n"
+        );
+    }
+
+    #[test]
+    fn identical_texts_make_an_empty_diff_that_applies_as_nothing() {
+        assert_eq!(create_diff("same\n", "same\n", "x", "x", 3), "");
     }
 
     #[test]

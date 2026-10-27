@@ -386,3 +386,71 @@ async fn lua_patch_respects_grants_and_paths() {
     assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "2\n");
     assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "y\n");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reading_a_hard_linked_file_still_works_in_a_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("a.txt"), "shared").unwrap();
+    std::fs::hard_link(root.join("a.txt"), root.join("b.txt")).unwrap();
+    let host = host(&root, READ, agentd_fs::History::default());
+    let value = call_as(
+        &host,
+        in_session("s1"),
+        &["fs.read:a.txt"],
+        json!({ "path": "a.txt" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(value, "shared");
+}
+
+const READ: &str = r#"
+agentd.action("test", function(args, ctx) return ctx.fs.read(args.path) end)
+"#;
+
+#[tokio::test]
+async fn a_write_counts_as_a_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let host = host(
+        &root,
+        r#"
+        agentd.action("test", function(args, ctx)
+          ctx.fs.write("new.txt", "hello world")
+          return ctx.fs.edit("new.txt", "world", "there")
+        end)
+        "#,
+        agentd_fs::History::default(),
+    );
+    call_as(
+        &host,
+        in_session("s1"),
+        &["fs.read:new.txt", "fs.write:new.txt"],
+        json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("new.txt")).unwrap(),
+        "hello there"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_scope_is_reported_before_any_permission_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("a.txt"), "x").unwrap();
+    let host = host(&root, EDIT, agentd_fs::History::default());
+    let error = call_as(
+        &host,
+        Caller::interface("test"),
+        &[],
+        json!({ "path": "a.txt", "old": "x", "new": "y" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("needs a chat session or a run"), "{error}");
+}
