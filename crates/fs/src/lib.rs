@@ -21,7 +21,10 @@ use thiserror::Error;
 
 fn edit_not_found(path: &Path, count: usize) -> String {
     if count == 0 {
-        format!("the text to replace does not appear in `{}`", path.display())
+        format!(
+            "the text to replace does not appear in `{}`",
+            path.display()
+        )
     } else {
         format!(
             "the text to replace appears {count} times in `{}`, use replace_all or include more surrounding text",
@@ -60,6 +63,10 @@ pub enum FsError {
     EditNotFound { path: PathBuf, count: usize },
     #[error("{0}")]
     Patch(#[from] PatchError),
+    #[error("the patch creates `{}`, but it already exists", .0.display())]
+    AlreadyExists(PathBuf),
+    #[error("the patch removes `{}`, but its lines do not cover the whole file", .0.display())]
+    RemoveLeavesLines(PathBuf),
     #[error(
         "`{}` changed while it was being opened and now leads to `{}`, so it was not read",
         path.display(),

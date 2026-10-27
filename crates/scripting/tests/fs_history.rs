@@ -328,3 +328,61 @@ async fn edit_without_any_scope_is_refused() {
     .unwrap_err();
     assert!(error.contains("needs a chat session or a run"), "{error}");
 }
+
+const PATCH: &str = r#"
+agentd.action("test", function(args, ctx)
+  for _, path in ipairs(args.read or {}) do ctx.fs.read(path) end
+  return ctx.fs.patch(args.patch)
+end)
+"#;
+
+#[tokio::test]
+async fn lua_patch_respects_grants_and_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("a.txt"), "1\n").unwrap();
+    std::fs::write(root.join("b.txt"), "x\n").unwrap();
+    let host = host(&root, PATCH, agentd_fs::History::default());
+    let both = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-1\n+2\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-x\n+y\n";
+
+    let error = call_as(
+        &host,
+        in_session("s1"),
+        &["fs.read:a.txt", "fs.read:b.txt", "fs.write:a.txt"],
+        json!({ "read": ["a.txt", "b.txt"], "patch": both }),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("b.txt"), "{error}");
+    assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "1\n");
+
+    let escape = "--- a/../escape.txt\n+++ b/../escape.txt\n@@ -0,0 +1 @@\n+x\n";
+    let error = call_as(
+        &host,
+        in_session("s1"),
+        &["fs.read:a.txt", "fs.write:a.txt"],
+        json!({ "patch": escape.replace("--- a/../escape.txt", "--- /dev/null") }),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("fs.write"), "{error}");
+    assert!(!root.parent().unwrap().join("escape.txt").exists());
+
+    let value = call_as(
+        &host,
+        in_session("s1"),
+        &[
+            "fs.read:a.txt",
+            "fs.read:b.txt",
+            "fs.write:a.txt",
+            "fs.write:b.txt",
+        ],
+        json!({ "read": ["a.txt", "b.txt"], "patch": both }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(value[0]["path"], "a.txt");
+    assert!(value[1]["revision"].as_u64().unwrap() >= 1);
+    assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "2\n");
+    assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "y\n");
+}

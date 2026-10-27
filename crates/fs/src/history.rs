@@ -458,7 +458,11 @@ impl History {
             } else {
                 (old, new)
             };
-            let count = if old.is_empty() { 0 } else { text.matches(&old).count() };
+            let count = if old.is_empty() {
+                0
+            } else {
+                text.matches(&old).count()
+            };
             if count == 0 || (count > 1 && !replace_all) {
                 return Err(FsError::EditNotFound {
                     path: p.into(),
@@ -475,6 +479,70 @@ impl History {
             Ok(revision)
         })
         .await
+    }
+
+    /// Apply a patch to several files, all or nothing. Files it modifies or
+    /// removes must have been read by `scope` and left unchanged since; a
+    /// file it creates must not exist yet. Every hunk of every file is applied
+    /// in memory first, so a hunk that does not apply changes nothing. If a
+    /// write then fails, the files already written are rolled back.
+    pub async fn patch(
+        &self,
+        scope: &str,
+        files: &[(PathBuf, crate::FilePatch)],
+    ) -> Result<Vec<(PathBuf, usize)>, FsError> {
+        let mut planned = Vec::new();
+        for (path, patch) in files {
+            let (reads, scope, patch) = (self.reads.clone(), scope.to_owned(), patch.clone());
+            let content = self
+                .with_file(path, move |_, p| {
+                    let image = Image::read(p)?;
+                    let text = if patch.old_path.is_none() {
+                        if image.bytes.is_some() {
+                            return Err(FsError::AlreadyExists(p.into()));
+                        }
+                        String::new()
+                    } else {
+                        check_read(&reads, &scope, p, &image.stamp())?;
+                        let bytes = image.bytes.ok_or_else(|| FsError::NotFound(p.into()))?;
+                        String::from_utf8(bytes).map_err(|_| FsError::InvalidUtf8(p.into()))?
+                    };
+                    let changed = crate::apply_patch(&text, &patch)?;
+                    if patch.new_path.is_none() {
+                        if !changed.is_empty() {
+                            return Err(FsError::RemoveLeavesLines(p.into()));
+                        }
+                        return Ok(None);
+                    }
+                    Ok(Some(changed.into_bytes()))
+                })
+                .await?;
+            planned.push((path.clone(), content));
+        }
+        let mut done: Vec<(PathBuf, usize)> = Vec::new();
+        for (path, content) in planned {
+            let (reads, scope) = (self.reads.clone(), scope.to_owned());
+            let outcome = self
+                .with_file(&path, move |t, p| {
+                    let revision = match content {
+                        Some(bytes) => t.mutate(p, Operation::Write, bytes)?,
+                        None => t.mutate(p, Operation::Remove, Vec::new())?,
+                    };
+                    note_read(&reads, &scope, p)?;
+                    Ok(revision)
+                })
+                .await;
+            match outcome {
+                Ok(revision) => done.push((path, revision)),
+                Err(error) => {
+                    for (written, _) in done.iter().rev() {
+                        let _ = self.undo(written).await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(done)
     }
 
     pub async fn write(&self, path: &Path, bytes: &[u8]) -> Result<usize, FsError> {
@@ -563,7 +631,10 @@ mod tests {
         let (_dir, path) = temp();
         std::fs::write(&path, "abc").unwrap();
         let history = History::default();
-        let error = history.edit("session:s", &path, "b", "B", false).await.unwrap_err();
+        let error = history
+            .edit("session:s", &path, "b", "B", false)
+            .await
+            .unwrap_err();
         assert!(matches!(error, FsError::NotRead(_)), "{error:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "abc");
     }
@@ -574,9 +645,15 @@ mod tests {
         std::fs::write(&path, "abc").unwrap();
         let history = History::default();
         history.record_read("session:s", &path).await.unwrap();
-        history.edit("session:s", &path, "b", "B", false).await.unwrap();
+        history
+            .edit("session:s", &path, "b", "B", false)
+            .await
+            .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "aBc");
-        history.edit("session:s", &path, "c", "C", false).await.unwrap();
+        history
+            .edit("session:s", &path, "c", "C", false)
+            .await
+            .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "aBC");
         assert_eq!(history.history(&path).await.unwrap().revisions.len(), 2);
         history.undo(&path).await.unwrap();
@@ -590,7 +667,10 @@ mod tests {
         let history = History::default();
         history.record_read("session:s", &path).await.unwrap();
         std::fs::write(&path, "abcd").unwrap();
-        let error = history.edit("session:s", &path, "b", "B", false).await.unwrap_err();
+        let error = history
+            .edit("session:s", &path, "b", "B", false)
+            .await
+            .unwrap_err();
         assert!(matches!(error, FsError::ChangedSinceRead(_)), "{error:?}");
         assert!(error.to_string().contains("read it again"), "{error}");
     }
@@ -601,12 +681,27 @@ mod tests {
         std::fs::write(&path, "x x").unwrap();
         let history = History::default();
         history.record_read("session:s", &path).await.unwrap();
-        let error = history.edit("session:s", &path, "x", "y", false).await.unwrap_err();
-        assert!(matches!(error, FsError::EditNotFound { count: 2, .. }), "{error:?}");
+        let error = history
+            .edit("session:s", &path, "x", "y", false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, FsError::EditNotFound { count: 2, .. }),
+            "{error:?}"
+        );
         assert!(error.to_string().contains("appears 2 times"), "{error}");
-        let error = history.edit("session:s", &path, "q", "y", false).await.unwrap_err();
-        assert!(matches!(error, FsError::EditNotFound { count: 0, .. }), "{error:?}");
-        history.edit("session:s", &path, "x", "y", true).await.unwrap();
+        let error = history
+            .edit("session:s", &path, "q", "y", false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, FsError::EditNotFound { count: 0, .. }),
+            "{error:?}"
+        );
+        history
+            .edit("session:s", &path, "x", "y", true)
+            .await
+            .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "y y");
     }
 
@@ -616,8 +711,121 @@ mod tests {
         std::fs::write(&path, "a\r\nb\r\n").unwrap();
         let history = History::default();
         history.record_read("session:s", &path).await.unwrap();
-        history.edit("session:s", &path, "a\nb", "a\nc", false).await.unwrap();
+        history
+            .edit("session:s", &path, "a\nb", "a\nc", false)
+            .await
+            .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\r\nc\r\n");
+    }
+
+    fn file_patch(path: &str, text: &str) -> (PathBuf, crate::FilePatch) {
+        let mut parsed = crate::parse_patch(text).unwrap();
+        (PathBuf::from(path), parsed.remove(0))
+    }
+
+    #[tokio::test]
+    async fn patch_applies_every_file_or_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (a, b) = (root.join("a.txt"), root.join("b.txt"));
+        std::fs::write(&a, "1\n").unwrap();
+        std::fs::write(&b, "x\n").unwrap();
+        let history = History::default();
+        history.record_read("s", &a).await.unwrap();
+        history.record_read("s", &b).await.unwrap();
+        let files = vec![
+            (
+                a.clone(),
+                file_patch("a.txt", "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-1\n+2\n").1,
+            ),
+            (
+                b.clone(),
+                file_patch(
+                    "b.txt",
+                    "--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-nope\n+y\n",
+                )
+                .1,
+            ),
+        ];
+        let error = history.patch("s", &files).await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("hunk 1 of `b.txt` does not apply"),
+            "{message}"
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "1\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "x\n");
+    }
+
+    #[tokio::test]
+    async fn patch_creates_modifies_and_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (new, old, edit) = (
+            root.join("new.txt"),
+            root.join("old.txt"),
+            root.join("edit.txt"),
+        );
+        std::fs::write(&old, "bye\n").unwrap();
+        std::fs::write(&edit, "a\n").unwrap();
+        let history = History::default();
+        history.record_read("s", &old).await.unwrap();
+        history.record_read("s", &edit).await.unwrap();
+        let files = vec![
+            (
+                new.clone(),
+                file_patch(
+                    "new.txt",
+                    "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hi\n",
+                )
+                .1,
+            ),
+            (
+                old.clone(),
+                file_patch(
+                    "old.txt",
+                    "--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n",
+                )
+                .1,
+            ),
+            (
+                edit.clone(),
+                file_patch(
+                    "edit.txt",
+                    "--- a/edit.txt\n+++ b/edit.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                )
+                .1,
+            ),
+        ];
+        let done = history.patch("s", &files).await.unwrap();
+        assert_eq!(done.len(), 3);
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "hi\n");
+        assert!(!old.exists());
+        assert_eq!(std::fs::read_to_string(&edit).unwrap(), "b\n");
+        history.undo(&old).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "bye\n");
+    }
+
+    #[tokio::test]
+    async fn patch_needs_reads_and_refuses_to_create_over_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let a = root.join("a.txt");
+        std::fs::write(&a, "1\n").unwrap();
+        let history = History::default();
+        let modify = vec![(
+            a.clone(),
+            file_patch("a.txt", "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-1\n+2\n").1,
+        )];
+        let error = history.patch("s", &modify).await.unwrap_err();
+        assert!(matches!(error, FsError::NotRead(_)), "{error:?}");
+        let create = vec![(
+            a.clone(),
+            file_patch("a.txt", "--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+x\n").1,
+        )];
+        let error = history.patch("s", &create).await.unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error}");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "1\n");
     }
 
     #[tokio::test]
@@ -626,7 +834,10 @@ mod tests {
         std::fs::write(&path, "abc").unwrap();
         let history = History::default();
         history.record_read("session:a", &path).await.unwrap();
-        let error = history.edit("session:b", &path, "b", "B", false).await.unwrap_err();
+        let error = history
+            .edit("session:b", &path, "b", "B", false)
+            .await
+            .unwrap_err();
         assert!(matches!(error, FsError::NotRead(_)), "{error:?}");
     }
 

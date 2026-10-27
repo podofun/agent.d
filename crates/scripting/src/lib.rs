@@ -2469,6 +2469,7 @@ fn build_fs_table(lua: &Lua) -> mlua::Result<Table> {
     t.set("read", lua.create_function(fs_read_binding)?)?;
     t.set("write", lua.create_function(fs_write_binding)?)?;
     t.set("edit", lua.create_function(fs_edit_binding)?)?;
+    t.set("patch", lua.create_function(fs_patch_binding)?)?;
     t.set("append", lua.create_function(fs_append_binding)?)?;
     t.set("exists", lua.create_function(fs_exists_binding)?)?;
     t.set("stat", lua.create_function(fs_stat_binding)?)?;
@@ -2651,6 +2652,47 @@ fn required_read_scope(lua: &Lua) -> mlua::Result<String> {
             "changing a file with edit or patch needs a chat session or a run, so agent.d knows the file was read first",
         )
     })
+}
+
+/// `ctx.fs.patch(patch, opts?)`: apply a unified diff to the files it
+/// names, all or nothing. Every file is resolved and permission-checked
+/// before anything changes. `opts.path` names the file for a one-file patch.
+fn fs_patch_binding(lua: &Lua, (text, opts): (String, Option<Table>)) -> mlua::Result<Value> {
+    let files = fs::parse_patch(&text).map_err(mlua::Error::external)?;
+    let path_override = match &opts {
+        Some(opts) => opts.get::<Option<String>>("path")?,
+        None => None,
+    };
+    if path_override.is_some() && files.len() != 1 {
+        return Err(mlua::Error::external(
+            "`path` can only name the file of a one-file patch",
+        ));
+    }
+    let mut resolved = Vec::new();
+    let mut names = Vec::new();
+    for file in files {
+        let name = path_override
+            .clone()
+            .unwrap_or_else(|| file.path().to_owned());
+        let p = resolve_path(lua, name.clone());
+        if file.old_path.is_some() {
+            check_permission_inline(lua, &Permission::new(format!("fs.read:{}", p.display())))?;
+        }
+        check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
+        names.push(name);
+        resolved.push((p, file));
+    }
+    let scope = required_read_scope(lua)?;
+    let done =
+        block_on(file_history(lua).patch(&scope, &resolved))?.map_err(mlua::Error::external)?;
+    let result = lua.create_table()?;
+    for (index, (name, (_, revision))) in names.into_iter().zip(done).enumerate() {
+        let entry = lua.create_table()?;
+        entry.set("path", name)?;
+        entry.set("revision", revision)?;
+        result.set(index + 1, entry)?;
+    }
+    Ok(Value::Table(result))
 }
 
 fn fs_edit_binding(
