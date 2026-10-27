@@ -122,7 +122,10 @@ pub fn home_dir() -> Option<PathBuf> {
 }
 
 fn expand_home(entry: &str) -> String {
-    match (entry.strip_prefix("~/").or(entry.strip_prefix("~")), home_dir()) {
+    match (
+        entry.strip_prefix("~/").or(entry.strip_prefix("~")),
+        home_dir(),
+    ) {
         (Some(rest), Some(home)) if entry == "~" || entry.starts_with("~/") => {
             home.join(rest).to_string_lossy().into_owned()
         }
@@ -164,9 +167,11 @@ impl Grants {
     /// matched like an `fs.read` grant so globs mean the same thing.
     pub fn trusts_folder(&self, folder: &Path) -> bool {
         let wanted = Permission::new(format!("fs.read:{}", folder.display()));
-        self.file.folders.trusted.iter().any(|entry| {
-            Permission::new(format!("fs.read:{}", expand_home(entry))).covers(&wanted)
-        })
+        self.file
+            .folders
+            .trusted
+            .iter()
+            .any(|entry| Permission::new(format!("fs.read:{}", expand_home(entry))).covers(&wanted))
     }
 
     pub fn denial(&self) -> &Denial {
@@ -414,7 +419,8 @@ mod tests {
     #[test]
     fn trusted_folders_expand_the_home_folder() {
         let home = home_dir().expect("a home folder in the test environment");
-        let grants = Grants::from_file(parse_grants("[folders]\ntrusted = [\"~/code/**\"]\n").unwrap());
+        let grants =
+            Grants::from_file(parse_grants("[folders]\ntrusted = [\"~/code/**\"]\n").unwrap());
         assert!(grants.trusts_folder(&home.join("code").join("x")));
     }
 
