@@ -130,39 +130,23 @@ pub struct FileDiff {
 #[derive(Clone)]
 struct Stamp {
     digest: [u8; 32],
-    /// `None` when not known, as for a file a program removed before
-    /// agent.d saw its permissions. Then only the contents are compared.
+    /// The permissions to give the file when an undo brings it back after
+    /// it was removed. `None` when not known, as for a file a program
+    /// removed before agent.d saw it.
     permissions: Option<Permissions>,
 }
 
-/// Two stamps match when the contents and the permissions a user sets are
-/// the same. Only the permission bits count: on Unix the mode bits, on
-/// Windows the read-only flag. Windows `Permissions` also carry every file
-/// attribute (archive, temporary, ...), which the write path itself changes,
-/// so comparing them would report every write as an outside edit.
+/// Two stamps match when the contents are the same. Permissions are left
+/// out: a program the agent runs, such as `chmod +x`, changes them without
+/// changing what the file holds, and a write or an undo keeps whatever
+/// permissions the file has on disk.
 impl PartialEq for Stamp {
     fn eq(&self, other: &Self) -> bool {
         self.digest == other.digest
-            && match (&self.permissions, &other.permissions) {
-                (Some(a), Some(b)) => same_permissions(a, b),
-                _ => true,
-            }
     }
 }
 
 impl Eq for Stamp {}
-
-fn same_permissions(a: &Permissions, b: &Permissions) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        a.mode() & 0o7777 == b.mode() & 0o7777
-    }
-    #[cfg(not(unix))]
-    {
-        a.readonly() == b.readonly()
-    }
-}
 
 struct Image {
     bytes: Option<Vec<u8>>,
@@ -612,6 +596,20 @@ impl Timeline {
         Ok(())
     }
 
+    /// [`Timeline::acknowledge_outside`], only when the file on disk holds
+    /// the content with `digest`.
+    fn acknowledge_seen(&mut self, path: &Path, digest: [u8; 32]) -> Result<(), FsError> {
+        match self.expected() {
+            None => return Ok(()),
+            Some(Some(expected)) if expected.digest == digest => return Ok(()),
+            Some(_) => {}
+        }
+        if Image::read(path)?.stamp().map(|s| s.digest) != Some(digest) {
+            return Ok(());
+        }
+        self.acknowledge_outside(path)
+    }
+
     fn push(&mut self, change: Change) -> usize {
         let id = change.diff.revision.id;
         self.moves.push((change.seq, self.current));
@@ -630,12 +628,16 @@ fn apply(image: &mut Image, change: &Change, forward: bool) {
         (&diff.added, &diff.removed, &change.before)
     };
     if let Some(stamp) = stamp {
+        // A file that exists keeps its permissions; one brought back gets
+        // the permissions it had.
+        if image.bytes.is_none() {
+            image.permissions = stamp.permissions.clone();
+        }
         let bytes = image.bytes.get_or_insert_with(Vec::new);
         bytes.splice(
             diff.revision.offset..diff.revision.offset + remove.len(),
             insert.iter().copied(),
         );
-        image.permissions = stamp.permissions.clone();
     } else {
         image.bytes = None;
         image.permissions = None;
@@ -806,8 +808,11 @@ impl History {
 
     /// Record that `scope` was handed `bytes` as the content of `path`, so a
     /// later edit or patch is checked against what the caller actually saw.
-    /// Best effort: a file history cannot track (a hard link, say) is simply
-    /// not recorded, and a later edit of it asks for a read.
+    /// When the file still holds `bytes` but changed outside agent.d, that
+    /// edit is accepted as [`History::acknowledge_outside`] does, since the
+    /// caller has now seen it. Best effort: a file history cannot track (a
+    /// hard link, say) is simply not recorded, and a later edit of it asks
+    /// for a read.
     pub async fn record_read_bytes(&self, scope: &str, path: &Path, bytes: &[u8]) {
         let Ok(metadata) = fs::metadata(path) else {
             return;
@@ -816,9 +821,13 @@ impl History {
             digest: Sha256::digest(bytes).into(),
             permissions: Some(metadata.permissions()),
         };
+        let seen = stamp.digest;
         if let Ok(mut reads) = self.reads.lock() {
             reads.insert((scope.to_owned(), path.to_path_buf()), Some(stamp));
         }
+        let _ = self
+            .with_file(path, move |t, p| t.acknowledge_seen(p, seen))
+            .await;
     }
 
     /// Apply a patch to several files, all or nothing. Files it modifies or
@@ -1794,6 +1803,64 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"b");
         let error = history.restore(&path, 1).await.unwrap_err();
         assert!(matches!(error, FsError::ChangedOutside(_)), "{error:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_permission_change_is_not_an_outside_edit() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, path) = temp();
+        let history = History::default();
+        history.write(&path, b"a", None).await.unwrap();
+        history.record_read("session:s", &path).await.unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(0o755)).unwrap();
+        history
+            .edit("session:s", &path, "a", "b", false, None)
+            .await
+            .unwrap();
+        history.write(&path, b"c", None).await.unwrap();
+        history.undo(&path).await.unwrap();
+        history.undo(&path).await.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"a");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        history.remove(&path, None).await.unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_fresh_read_accepts_an_outside_edit_but_undo_keeps_it() {
+        let (_dir, path) = temp();
+        let history = History::default();
+        history.write(&path, b"a", None).await.unwrap();
+        fs::write(&path, b"b").unwrap();
+        assert!(matches!(
+            history.remove(&path, None).await,
+            Err(FsError::Conflict(_))
+        ));
+        history.record_read_bytes("session:s", &path, b"b").await;
+        history.write(&path, b"c", None).await.unwrap();
+        history.undo(&path).await.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"b");
+        let error = history.undo(&path).await.unwrap_err();
+        assert!(matches!(error, FsError::ChangedOutside(_)), "{error:?}");
+        assert_eq!(fs::read(&path).unwrap(), b"b");
+    }
+
+    #[tokio::test]
+    async fn a_read_of_other_bytes_accepts_nothing() {
+        let (_dir, path) = temp();
+        let history = History::default();
+        history.write(&path, b"a", None).await.unwrap();
+        fs::write(&path, b"b").unwrap();
+        history
+            .record_read_bytes("session:s", &path, b"stale")
+            .await;
+        assert!(matches!(
+            history.write(&path, b"c", None).await,
+            Err(FsError::Conflict(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"b");
     }
 
     #[tokio::test]
