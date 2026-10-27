@@ -178,42 +178,53 @@ async fn session_history_is_loaded_and_appended() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn turn_limit_keeps_the_work_so_far_in_the_session() {
-    let looping = MockProvider::new().with_script(vec![
+async fn session_runs_are_not_capped_by_max_turns() {
+    let steps = vec![
         MockProvider::tool_call("c1", "notes.lookup", serde_json::json!({})),
         MockProvider::tool_call("c2", "notes.lookup", serde_json::json!({})),
-        MockProvider::text_only("picked up where I left off"),
-    ]);
+        MockProvider::tool_call("c3", "notes.lookup", serde_json::json!({})),
+        MockProvider::text_only("all done"),
+    ];
+    let looping = MockProvider::new().with_script(steps);
     let (exec, store) = build_with_turns(Arc::new(looping), None, 2);
     let s = store.create(ws_session()).unwrap();
 
-    let err = exec
+    let out = exec
         .run_runner_with_options(caller(), "chat", opts(&s.id, "dig in"), None)
+        .await
+        .unwrap();
+    assert_eq!(out.text, "all done");
+
+    let stored = store.turns(&s.id).unwrap();
+    assert_eq!(stored.first().unwrap().content, "dig in");
+    assert_eq!(
+        stored.iter().filter(|m| m.tool_call_id.is_some()).count(),
+        3,
+        "every tool result is kept"
+    );
+    assert_eq!(stored.last().unwrap().content, "all done");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_outside_a_session_still_stop_at_max_turns() {
+    let looping = MockProvider::new().with_script(vec![
+        MockProvider::tool_call("c1", "notes.lookup", serde_json::json!({})),
+        MockProvider::tool_call("c2", "notes.lookup", serde_json::json!({})),
+        MockProvider::text_only("never reached"),
+    ]);
+    let (exec, _store) = build_with_turns(Arc::new(looping), None, 2);
+    let options = RunOptions {
+        prompt: Some("dig in".into()),
+        ..Default::default()
+    };
+    let err = exec
+        .run_runner_with_options(caller(), "chat", options, None)
         .await
         .unwrap_err();
     assert!(
         matches!(err, RunnerError::TurnLimit { limit: 2, .. }),
         "{err}"
     );
-    assert_eq!(
-        err.to_string(),
-        "the runner used all 2 turns without finishing"
-    );
-
-    let stored = store.turns(&s.id).unwrap();
-    assert_eq!(stored.first().unwrap().content, "dig in");
-    assert_eq!(
-        stored.iter().filter(|m| m.tool_call_id.is_some()).count(),
-        2,
-        "both tool results are kept"
-    );
-    assert_eq!(stored.last().unwrap().role, agentd_ai::Role::Assistant);
-
-    let out = exec
-        .run_runner_with_options(caller(), "chat", opts(&s.id, "continue"), None)
-        .await
-        .unwrap();
-    assert_eq!(out.text, "picked up where I left off");
 }
 
 #[tokio::test(flavor = "multi_thread")]

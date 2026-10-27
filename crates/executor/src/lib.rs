@@ -42,6 +42,19 @@ use async_trait::async_trait;
 use tokio::task::JoinHandle;
 
 /// Run ids are unique per daemon process.
+/// How long a run may take. A chat in a session runs until it finishes or
+/// is cancelled unless the caller asks for a deadline; other runs get the
+/// default one.
+fn run_deadline(options: &RunOptions) -> Option<std::time::Duration> {
+    options
+        .timeout_ms
+        .or(options
+            .session_id
+            .is_none()
+            .then_some(RunOptions::DEFAULT_TIMEOUT_MS))
+        .map(std::time::Duration::from_millis)
+}
+
 static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[async_trait]
@@ -1041,9 +1054,10 @@ impl Executor {
 
     // ---------- runners ----------
 
-    /// Default ceiling on tool-use loop iterations. A misbehaving model that
-    /// keeps emitting tool calls without ever returning text would otherwise
-    /// run forever. Override the active ceiling via [`Executor::set_max_runner_turns`].
+    /// Default ceiling on tool-use loop iterations for runs outside a session.
+    /// A misbehaving model that keeps emitting tool calls without ever
+    /// returning text would otherwise run forever. Session runs have no
+    /// ceiling. Override the active ceiling via [`Executor::set_max_runner_turns`].
     pub const DEFAULT_MAX_RUNNER_TURNS: u32 = 16;
 
     /// Run a runner. For `LoopMode::ExecutorOwned` providers (Claude API,
@@ -1055,8 +1069,8 @@ impl Executor {
     /// 3. If the response carries `tool_calls`, dispatch each through
     ///    `Executor::run` so the full permission engine fires, append a
     ///    `Role::Tool` message per call, and loop.
-    /// 4. Stop when the provider returns a text-only reply or the
-    ///    `max_turns` budget is exhausted.
+    /// 4. Stop when the provider returns a text-only reply or, outside a
+    ///    session, the `max_turns` budget is exhausted.
     ///
     /// For `LoopMode::ProviderOwned` providers (Claude CLI w/ MCP, Codex CLI
     /// w/ MCP) the executor just configures `mcp_endpoint` and calls
@@ -1530,17 +1544,16 @@ impl Executor {
             .runner_slots
             .try_acquire()
             .map_err(|_| RunnerError::Busy)?;
-        let deadline = std::time::Duration::from_millis(
-            options.timeout_ms.unwrap_or(RunOptions::DEFAULT_TIMEOUT_MS),
-        );
+        let deadline = run_deadline(&options);
         let started = Instant::now();
         let execution = caller.execution_str();
-        let mut result = tokio::time::timeout(
-            deadline,
-            self.run_runner_inner(caller, runner_name, options, sink.clone()),
-        )
-        .await
-        .unwrap_or(Err(RunnerError::Timeout));
+        let run = self.run_runner_inner(caller, runner_name, options, sink.clone());
+        let mut result = match deadline {
+            Some(deadline) => tokio::time::timeout(deadline, run)
+                .await
+                .unwrap_or(Err(RunnerError::Timeout)),
+            None => run.await,
+        };
         if sink.as_ref().is_some_and(|s| s.overflowed()) {
             result = Err(RunnerError::SlowConsumer);
         }
@@ -1681,19 +1694,7 @@ impl Executor {
             }
         }
         options.messages = Some(history);
-        let (mut out, new_turns) = match self.run_model(caller, runner_name, options, sink).await {
-            Ok(done) => done,
-            Err(RunnerError::TurnLimit { limit, turns }) => {
-                store
-                    .append(&session_id, &turns)
-                    .map_err(|e| RunnerError::Session(e.to_string()))?;
-                return Err(RunnerError::TurnLimit {
-                    limit,
-                    turns: Vec::new(),
-                });
-            }
-            Err(e) => return Err(e),
-        };
+        let (mut out, new_turns) = self.run_model(caller, runner_name, options, sink).await?;
         store
             .append(&session_id, &new_turns)
             .map_err(|e| RunnerError::Session(e.to_string()))?;
@@ -1857,6 +1858,9 @@ impl Executor {
             max_tokens,
             ..
         } = options;
+        // `max_turns` stops runaway loops in one-off runs. A session run is a
+        // chat someone can cancel, so it continues until the model is done.
+        let turn_limit = caller.session_id.is_none().then_some(self.max_runner_turns);
         let def = self
             .runners
             .get(runner_name)
@@ -1988,8 +1992,7 @@ impl Executor {
                 let mut turns = 0u32;
                 let mut usage = Some(agentd_ai::types::Usage::default());
                 loop {
-                    if turns >= self.max_runner_turns {
-                        let limit = self.max_runner_turns;
+                    if let Some(limit) = turn_limit.filter(|limit| turns >= *limit) {
                         let mut turns = req.messages.split_off(base_len);
                         // Close the exchange with an assistant turn so the
                         // stored history stays valid for the next message.
@@ -2110,4 +2113,33 @@ fn compaction_cut(history: &[agentd_ai::Message], keep_recent: usize) -> Option<
 fn parse_messages(v: serde_json::Value) -> Result<Vec<agentd_ai::Message>, RunnerError> {
     serde_json::from_value(v)
         .map_err(|e| RunnerError::InvalidInput(format!("invalid message history: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_runs_outside_a_session_get_a_default_deadline() {
+        let one_off = RunOptions::default();
+        assert_eq!(
+            run_deadline(&one_off),
+            Some(std::time::Duration::from_millis(
+                RunOptions::DEFAULT_TIMEOUT_MS
+            ))
+        );
+        let chat = RunOptions {
+            session_id: Some("s".into()),
+            ..Default::default()
+        };
+        assert_eq!(run_deadline(&chat), None);
+        let bounded_chat = RunOptions {
+            timeout_ms: Some(5_000),
+            ..chat
+        };
+        assert_eq!(
+            run_deadline(&bounded_chat),
+            Some(std::time::Duration::from_millis(5_000))
+        );
+    }
 }
