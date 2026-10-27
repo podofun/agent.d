@@ -110,6 +110,10 @@ pub struct SessionMeta {
     /// for an admin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<ApprovalSetting>,
+    /// The folder runs in this session work in, as an absolute real path.
+    /// Set only when the user trusted it; `None` means the workspace root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// Unix seconds.
     pub created_at: u64,
     pub updated_at: u64,
@@ -133,6 +137,7 @@ pub struct NewSession {
     pub label: Option<String>,
     pub runner: Option<String>,
     pub approval: Option<ApprovalSetting>,
+    pub cwd: Option<String>,
 }
 
 impl NewSession {
@@ -151,6 +156,11 @@ impl NewSession {
         self.runner = runner;
         self
     }
+    pub fn cwd(mut self, cwd: Option<String>) -> Self {
+        self.cwd = cwd;
+        self
+    }
+
     pub fn approval(mut self, approval: Option<ApprovalSetting>) -> Self {
         self.approval = approval;
         self
@@ -221,6 +231,7 @@ pub(crate) fn fresh_meta(new: NewSession) -> SessionMeta {
         user: new.user,
         label: new.label,
         approval: new.approval,
+        cwd: new.cwd,
         created_at: now,
         updated_at: now,
         turn_count: 0,
