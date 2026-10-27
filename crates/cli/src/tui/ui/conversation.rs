@@ -22,14 +22,20 @@ pub(super) fn draw_conversation(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
     let inner = conversation_inner(area);
     let mut conversation = conversation_for(app, inner.width.saturating_sub(1).max(1) as usize);
-    if let Some(selection) = &app.selection {
+    if let Some(selection) = app.selection.as_ref().filter(|s| !s.is_click()) {
         selection::highlight(&mut conversation.lines, &conversation.selectable, selection);
     }
-    if let Some(hover) = app.hover
-        && conversation.tool_headers.contains(&hover)
-        && let Some(line) = conversation.lines.get_mut(hover.0)
+    // Every line of the row under the mouse lights up together.
+    if let Some((_, row)) = app.hover
+        && conversation.tool_headers.contains(&app.hover.unwrap())
     {
-        hovered(line);
+        for (line, target) in &conversation.tool_headers {
+            if *target == row
+                && let Some(line) = conversation.lines.get_mut(*line)
+            {
+                hovered(line);
+            }
+        }
     }
     let offset = conversation.offset(inner.height, app.scroll);
     frame.render_widget(
@@ -72,6 +78,8 @@ const GUTTER: usize = 3;
 /// The marker of a row that opens, and of one that is open.
 const CLOSED: &str = "▶";
 const OPEN: &str = "▼";
+/// A tool row that is open or under the mouse, in a soft white.
+const ACTIVE: Color = Color::Rgb(205, 209, 216);
 
 fn gutter(glyph: &str, color: Color) -> Span<'static> {
     Span::styled(
@@ -82,6 +90,24 @@ fn gutter(glyph: &str, color: Color) -> Span<'static> {
 
 fn indented(mut line: Line<'static>) -> Line<'static> {
     line.spans.insert(0, Span::raw(" ".repeat(GUTTER)));
+    line
+}
+
+/// A line inside an open group, behind the group's nesting line.
+fn nested(mut line: Line<'static>) -> Line<'static> {
+    line.spans
+        .insert(0, Span::styled("│  ", Style::default().fg(MUTED)));
+    line
+}
+
+/// A call inside a group: a small muted dot instead of the call's own
+/// marker, so the group's marker stands for all of them.
+fn grouped(mut line: Line<'static>) -> Line<'static> {
+    if let Some(first) = line.spans.first_mut()
+        && first.content.starts_with('✦')
+    {
+        *first = Span::styled("•  ", Style::default().fg(MUTED));
+    }
     line
 }
 
@@ -133,7 +159,12 @@ fn conversation_lines(app: &App, width: usize) -> Conversation {
                             .map(|(row, line)| selectable_range(call, row, line))
                             .map(|range| range.start + GUTTER..range.end + GUTTER),
                     );
-                    lines.extend(block.into_iter().map(indented));
+                    lines.extend(
+                        block
+                            .into_iter()
+                            .enumerate()
+                            .map(|(row, line)| nested(if row == 0 { grouped(line) } else { line })),
+                    );
                 }
             }
         } else {
@@ -196,25 +227,19 @@ fn conversation_lines(app: &App, width: usize) -> Conversation {
     }
 }
 
-/// Rows of an entry's block that open or close it when clicked: a tool
-/// row's header, and the first line of each changed file under it.
+/// Rows of an entry's block that open or close it when clicked: every row
+/// of a tool call, so the whole call acts as one control. Dragging over it
+/// still selects its text.
 fn toggle_rows<'a>(
     entry: &'a Entry,
     block: &'a [Line<'static>],
 ) -> impl Iterator<Item = usize> + 'a {
-    let expandable = entry.is_expandable_tool();
-    block
-        .iter()
-        .enumerate()
-        .filter(move |(row, line)| {
-            expandable
-                && (*row == 0
-                    || line
-                        .spans
-                        .get(2)
-                        .is_some_and(|span| span.content == CHANGE_MARK.trim_end()))
-        })
-        .map(|(row, _)| row)
+    let rows = if entry.is_expandable_tool() {
+        block.len()
+    } else {
+        0
+    };
+    0..rows
 }
 
 /// "Used 14 actions and 1 tool": a call is an action when its name is a
@@ -244,14 +269,20 @@ fn used_label(app: &App, calls: &[Entry]) -> String {
 fn group_header(app: &App, calls: &[Entry], open: bool, width: usize) -> Line<'static> {
     let label = used_label(app, calls);
     let marker = if open { OPEN } else { CLOSED };
+    // An open row keeps the plain color the mouse gives it.
+    let style = if open {
+        Style::default().fg(ACTIVE)
+    } else {
+        Style::default().fg(MUTED)
+    };
     let title: String = label
         .graphemes(true)
         .take(width.saturating_sub(2))
         .collect();
     Line::from(vec![
         gutter("✦", WARNING),
-        Span::styled(format!("{title} "), Style::default().fg(MUTED)),
-        Span::styled(marker, Style::default().fg(MUTED)),
+        Span::styled(format!("{title} "), style),
+        Span::styled(marker, style),
     ])
 }
 
@@ -326,9 +357,15 @@ fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
         (true, true) => " ▼",
         (true, false) => " ▶",
     };
+    // An open row keeps the plain color the mouse gives it.
+    let title = if entry.expanded {
+        Style::default().fg(ACTIVE)
+    } else {
+        Style::default().fg(MUTED)
+    };
     let mut spans = vec![
-        Span::styled(entry.text.clone(), Style::default().fg(MUTED)),
-        Span::styled(marker, Style::default().fg(MUTED)),
+        Span::styled(entry.text.clone(), title),
+        Span::styled(marker, title),
     ];
     for (key, value) in &short {
         let key = if key == "path" { "file" } else { key.as_str() };
@@ -345,7 +382,11 @@ fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
     } else {
         &entry.changes
     };
-    let mut lines = with_gutter("✦", WARNING, markdown::wrap_spans(spans, width));
+    let mut header = markdown::wrap_spans(spans, width);
+    if entry.expanded {
+        header.iter_mut().for_each(active);
+    }
+    let mut lines = with_gutter("✦", WARNING, header);
     let inner = width.saturating_sub(2);
     if !entry.expanded {
         if changes.is_empty() {
@@ -941,10 +982,18 @@ fn preview_text(entry: &Entry) -> &str {
 
 /// The first lines of a collapsed call's text, muted and cut to one row each.
 fn output_preview(body: &str, width: usize, rows: usize) -> Vec<Line<'static>> {
-    body.lines()
+    let text: Vec<&str> = body
+        .lines()
         .map(str::trim_end)
         .skip_while(|line| line.trim().is_empty())
-        .take(rows)
+        .collect();
+    let end = text
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .map_or(0, |last| last + 1);
+    let hidden = end.saturating_sub(rows);
+    let mut lines: Vec<Line<'static>> = text[..end.min(rows)]
+        .iter()
         .map(|line| {
             let line = markdown::printable(line);
             let line = line.as_ref();
@@ -961,7 +1010,15 @@ fn output_preview(body: &str, width: usize, rows: usize) -> Vec<Line<'static>> {
                 Span::styled(text, Style::default().fg(MUTED)),
             ]))
         })
-        .collect()
+        .collect();
+    if hidden > 0 {
+        let noun = if hidden == 1 { "line" } else { "lines" };
+        lines.push(indented(Line::styled(
+            format!("  … {hidden} more {noun}"),
+            Style::default().fg(MUTED),
+        )));
+    }
+    lines
 }
 
 /// How far the conversation can scroll up on `screen`.
@@ -997,25 +1054,18 @@ pub(in crate::tui) fn clickable_at(
         .find(|(header, _)| line == *header)
 }
 
-/// Marks a clickable row as under the mouse: its muted title and its open
-/// or closed marker take the plain text color. A changed file's line has no
-/// marker, so its path does.
+/// Marks a clickable row as under the mouse, in the same color an open row
+/// keeps.
 fn hovered(line: &mut Line<'static>) {
-    let mut started = false;
+    active(line);
+}
+
+/// The whole row in the active color: everything but its gutter marks.
+fn active(line: &mut Line<'static>) {
     for span in &mut line.spans {
-        let text = span.content.trim();
-        if matches!(text, OPEN | CLOSED) {
-            span.style = span.style.fg(Color::Reset);
-            return;
+        if !matches!(span.content.trim(), "" | "✦" | "•" | "│") {
+            span.style = span.style.fg(ACTIVE);
         }
-        if text.is_empty() || (!started && matches!(text, "✦" | "±")) {
-            if started {
-                return;
-            }
-            continue;
-        }
-        started = true;
-        span.style = span.style.fg(Color::Reset);
     }
 }
 
@@ -1689,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_lines_toggle_the_row() {
+    fn every_line_of_a_call_toggles_it() {
         let mut app = changed_call();
         for expanded in [false, true] {
             app.entries[0].set_expanded(expanded);
@@ -1706,12 +1756,15 @@ mod tests {
                 "{:?}",
                 conversation.tool_headers
             );
-            assert!(
-                !conversation
-                    .tool_headers
-                    .iter()
-                    .any(|(line, _)| conversation.lines[*line].to_string().contains("│ +b"))
-            );
+            if expanded {
+                assert!(
+                    conversation
+                        .tool_headers
+                        .iter()
+                        .any(|(line, _)| conversation.lines[*line].to_string().contains("│ +b")),
+                    "an open call closes from its diff too"
+                );
+            }
         }
     }
 
@@ -1807,9 +1860,10 @@ mod tests {
     fn long_preview_lines_are_cut_with_an_ellipsis() {
         let lines = output_preview(&format!("\n{}\nb\nc\nd", "x".repeat(50)), 10, 3);
         let text: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
-        assert_eq!(text.len(), 3);
+        assert_eq!(text.len(), 4);
         assert!(text[0].ends_with("xxxxxxxxx…"), "{}", text[0]);
         assert!(text[2].ends_with('c'));
+        assert!(text[3].ends_with("… 1 more line"), "{}", text[3]);
     }
 
     fn rendered(app: &App, width: u16, height: u16) -> String {

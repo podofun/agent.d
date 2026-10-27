@@ -99,7 +99,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         format!("  {session}"),
         Style::default().fg(SECONDARY).add_modifier(Modifier::BOLD),
     )];
-    if app.selection.is_some() {
+    if app.selection.is_some_and(|selection| !selection.is_click()) {
         spans.push(Span::styled(
             "  ·  Ctrl+C copies, Esc clears",
             Style::default().fg(SECONDARY),

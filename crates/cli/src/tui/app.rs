@@ -214,9 +214,9 @@ pub(super) struct App {
     pub(super) hover: Option<(usize, ToolRow)>,
     /// Where the mouse is while it drags a selection.
     pub(super) drag: Option<(u16, u16)>,
-    /// The clickable row the left button went down on. A press there does
-    /// not start a selection: releasing on the same row opens or closes it.
-    pub(super) press: Option<ToolRow>,
+    /// The clickable row the left button went down on, and where. Releasing
+    /// on the same row opens or closes it; dragging selects from there.
+    pub(super) press: Option<(ToolRow, u16, u16)>,
     /// When a drag past the conversation's edge last scrolled it.
     pub(super) drag_scrolled: Option<std::time::Instant>,
     /// Terminal size from the last event, for selection math.

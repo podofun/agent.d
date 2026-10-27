@@ -166,7 +166,8 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
             {
                 app.selection = None;
                 app.drag = None;
-                app.press = ui::tool_at(app, area, mouse.column, mouse.row);
+                app.press = ui::tool_at(app, area, mouse.column, mouse.row)
+                    .map(|row| (row, mouse.column, mouse.row));
                 if app.press.is_some() {
                     return Ok(Handled::Redraw);
                 }
@@ -187,6 +188,10 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if app.tab == Tab::Chat => {
+                // A drag that began on a tool row selects its text instead.
+                if let Some((_, x, y)) = app.press.take() {
+                    app.selection = ui::point_at(app, area, x, y).map(ui::Selection::at);
+                }
                 if app.selection.is_some() {
                     app.drag = Some((mouse.column, mouse.row));
                     drag_selection(app, area);
@@ -194,7 +199,7 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
             }
             MouseEventKind::Up(MouseButton::Left) if app.tab == Tab::Chat => {
                 app.drag = None;
-                if let Some(pressed) = app.press.take() {
+                if let Some((pressed, _, _)) = app.press.take() {
                     if ui::tool_at(app, area, mouse.column, mouse.row) == Some(pressed) {
                         ui::toggle_tool(app, area, pressed);
                     }
@@ -870,7 +875,7 @@ mod tests {
                     !cell.modifier.contains(ratatui::style::Modifier::UNDERLINED),
                     "hover never underlines"
                 );
-                cell.symbol() == "g" && cell.fg == ratatui::style::Color::Reset
+                cell.symbol() == "g" && cell.fg != ui::MUTED
             })
         };
         assert!(highlighted(&terminal));
