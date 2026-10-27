@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use super::linux_net::{make_pipe, set_cloexec, supervisor_path, write_file};
 use crate::gateway::{SharedSet, admit, handle_dns};
-use crate::kill_tree::KillSwitch;
+use crate::kill_tree::{KillSwitch, kill_group};
 use crate::netfilter::{PermitSet, SetConfig};
 use crate::{ExecRequest, ExecResult, SandboxPolicy, ShellError};
 
@@ -478,24 +478,24 @@ mod supervisor {
 
 /// Run `req` in a transparent netns. `host_grants` are the `net:<host>` slugs
 /// (literal IPs already split out into `literal_ips`).
-pub async fn run_contained(
+pub(crate) async fn run_contained(
     req: &ExecRequest,
     policy: &SandboxPolicy,
     host_grants: Vec<agentd_permissions::Permission>,
     literal_ips: Vec<IpAddr>,
+    tree: KillSwitch,
 ) -> Result<ExecResult, ShellError> {
+    tree.check()?;
     let sup_path = supervisor_path().ok_or_else(|| {
         ShellError::Sandbox("the network-namespace supervisor binary was not found".into())
     })?;
     let req = req.clone();
     let policy = policy.clone();
     let handle = tokio::runtime::Handle::current();
-    // The blocking thread cannot be cancelled, so a dropped exec kills the
-    // supervisor's process group instead; the thread then sees EOF and exits.
-    let tree = KillSwitch::default();
-    let _kill_on_drop = tree.on_drop();
-    let armed = tree.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    // The blocking thread cannot be cancelled, so a dropped or timed-out exec
+    // kills the supervisor's process group through `tree`; the thread then
+    // sees EOF and returns what it read.
+    tokio::task::spawn_blocking(move || {
         run_contained_blocking(
             &req,
             &policy,
@@ -503,13 +503,37 @@ pub async fn run_contained(
             host_grants,
             literal_ips,
             handle,
-            &armed,
+            &tree,
         )
     })
     .await
-    .map_err(|e| ShellError::Sandbox(format!("a background sandbox task failed ({e})")))?;
+    .map_err(|e| ShellError::Sandbox(format!("a background sandbox task failed ({e})")))?
+}
+
+/// Block until `child` has exited, without reaping it. While the zombie
+/// stays unreaped its pid, and so its process group id, cannot be reused, so
+/// the kill switch stays safe to fire until it is disarmed.
+fn wait_exited(child: libc::pid_t) {
+    // SAFETY: waitid(2) on our own child with a zeroed, stack-owned siginfo.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        while libc::waitid(
+            libc::P_PID,
+            child as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT,
+        ) != 0
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {}
+    }
+}
+
+/// Disarm the kill switch and reap `child`, in that order: the switch must
+/// never fire at a group id that reaping may have freed.
+fn reap(child: libc::pid_t, tree: &KillSwitch) -> Option<WaitStatus> {
+    wait_exited(child);
     tree.disarm();
-    result
+    waitpid(Pid::from_raw(child), None).ok()
 }
 
 fn socketpair(ty: SockType) -> std::io::Result<(RawFd, RawFd)> {
@@ -530,6 +554,7 @@ fn run_contained_blocking(
     tree: &KillSwitch,
 ) -> Result<ExecResult, ShellError> {
     let sb = |e: String| ShellError::Sandbox(e);
+    tree.check()?;
 
     let (ctrl_host, ctrl_sup) = socketpair(SockType::Stream).map_err(|e| sb(e.to_string()))?;
     // SEQPACKET (not DGRAM): preserves DNS message boundaries AND signals EOF when
@@ -622,7 +647,7 @@ fn run_contained_blocking(
     // Also set the group from this side, so it exists before any kill.
     // SAFETY: setpgid(2) on our own unreaped child, before it execs.
     unsafe { libc::setpgid(child, child) };
-    tree.arm(child);
+    let armed = tree.arm(kill_group(child));
 
     // Close the ends the child/supervisor owns (parent keeps its own).
     for fd in [
@@ -641,9 +666,15 @@ fn run_contained_blocking(
         // SAFETY: `child` is our own unreaped fork leading its own group, so
         // the id cannot be reused; this also stops any setup tool it started.
         unsafe { libc::killpg(child, libc::SIGKILL) };
-        let _ = waitpid(Pid::from_raw(child), None);
+        let _ = reap(child, tree);
         sb(msg)
     };
+    // A timeout or drop that came before the group existed: the switch has
+    // already killed it, so never release the child into the command.
+    if let Err(e) = armed {
+        let _ = abort(String::new());
+        return Err(e);
+    }
 
     // Wait for the child's "unshared" signal.
     let mut tmp = [0u8; 1];
@@ -692,7 +723,7 @@ fn run_contained_blocking(
         for fd in [ctrl_host, dns_host, udp_host, out.rd, err.rd, sin.wr] {
             let _ = close(fd);
         }
-        let _ = waitpid(Pid::from_raw(child), None);
+        let _ = reap(child, tree);
         return Err(sb(detail));
     }
 
@@ -741,13 +772,15 @@ fn run_contained_blocking(
         let _ = close(sin.wr);
     }
 
-    let exit_code = match waitpid(Pid::from_raw(child), None) {
-        Ok(WaitStatus::Exited(_, code)) => code,
-        _ => -1,
-    };
-
+    // Drain the output before reaping: until the supervisor is reaped its
+    // group can still be killed, which matters when a background process keeps
+    // the pipes open after the command itself has exited.
     let stdout = String::from_utf8_lossy(&out_join.join().unwrap_or_default()).into_owned();
     let stderr_text = String::from_utf8_lossy(&err_join.join().unwrap_or_default()).into_owned();
+    let exit_code = match reap(child, tree) {
+        Some(WaitStatus::Exited(_, code)) => code,
+        _ => -1,
+    };
     let _ = ctrl_join.join();
     let _ = dns_join.join();
     let _ = udp_join.join();
@@ -768,6 +801,7 @@ fn run_contained_blocking(
         exit_code,
         stdout,
         stderr,
+        timed_out: false,
     })
 }
 

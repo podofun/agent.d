@@ -59,9 +59,15 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecResult {
+    /// The program's exit code. Meaningless when `timed_out` is set, since the
+    /// program was killed rather than allowed to exit.
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+    /// The program ran past `timeout_ms`, so it and everything it started were
+    /// killed. `stdout` and `stderr` hold what it wrote before that.
+    #[serde(default)]
+    pub timed_out: bool,
 }
 
 #[derive(Debug, Error)]
@@ -96,40 +102,66 @@ pub enum ShellError {
     /// The child could reach a path the operator denies, so it was not started.
     #[error("{0}")]
     DeniedReach(String),
-    /// The program ran past `timeout_ms`, so it and everything it started were
-    /// killed.
-    #[error("`{bin}` was stopped after {}", format_duration(*.timeout_ms))]
-    TimedOut { bin: String, timeout_ms: u64 },
+    /// `timeout_ms` was zero, which would stop the program before it started.
+    #[error("a shell timeout must be at least 1 ms")]
+    InvalidTimeout,
+    /// The exec was cancelled or timed out before the program started, so it
+    /// never ran. `exec` reports a timeout as a timed-out result instead.
+    #[error("the command was stopped before it started")]
+    Stopped,
 }
 
-/// Render a timeout the way a person would say it: `250 ms`, `120 s`, `1.5 s`.
-fn format_duration(ms: u64) -> String {
-    if ms < 1000 {
-        format!("{ms} ms")
-    } else if ms.is_multiple_of(1000) {
-        format!("{} s", ms / 1000)
-    } else {
-        format!("{:.1} s", ms as f64 / 1000.0)
-    }
-}
+/// How long a timed-out exec waits, after killing the tree, for the backend to
+/// hand back the output it read. Only a process that left the tree (for example
+/// with `setsid`) and still holds the output pipes makes it wait this long.
+const OUTPUT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Run a command. The caller is responsible for permission checks BEFORE
 /// invoking this function. The shell crate is a primitive; gating lives in
 /// the context binding layer.
 ///
 /// Dropping the returned future kills the program and everything it started,
-/// on every backend. A `timeout_ms` is that same drop on a deadline.
+/// on every backend. When `timeout_ms` passes, the same kill happens and the
+/// result comes back with `timed_out` set and the output read so far.
 pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
-    let Some(timeout_ms) = req.timeout_ms else {
-        return run(req).await;
+    if req.timeout_ms == Some(0) {
+        return Err(ShellError::InvalidTimeout);
+    }
+    let tree = kill_tree::KillSwitch::default();
+    let deadline = req.timeout_ms.map(std::time::Duration::from_millis);
+    let run = run(req, tree.clone());
+    tokio::pin!(run);
+    // Declared after `run`, so on drop it fires first, while the backend still
+    // owns the unreaped group leader.
+    let guard = tree.on_drop();
+
+    let Some(deadline) = deadline else {
+        let res = run.await;
+        guard.defuse();
+        return res;
     };
-    let bin = req.bin.clone();
-    tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), run(req))
-        .await
-        .unwrap_or(Err(ShellError::TimedOut { bin, timeout_ms }))
+    let res = match tokio::time::timeout(deadline, &mut run).await {
+        Ok(res) => res,
+        Err(_) => {
+            tree.fire();
+            let collected = tokio::time::timeout(OUTPUT_GRACE, &mut run).await;
+            let (stdout, stderr) = match collected {
+                Ok(Ok(res)) => (res.stdout, res.stderr),
+                _ => (String::new(), String::new()),
+            };
+            Ok(ExecResult {
+                exit_code: -1,
+                stdout,
+                stderr,
+                timed_out: true,
+            })
+        }
+    };
+    guard.defuse();
+    res
 }
 
-async fn run(req: ExecRequest) -> Result<ExecResult, ShellError> {
+async fn run(req: ExecRequest, tree: kill_tree::KillSwitch) -> Result<ExecResult, ShellError> {
     // Fail closed: if a sandbox policy is requested but no backend can enforce
     // it, refuse to run rather than spawn unconfined.
     if let Some(policy) = &req.sandbox
@@ -161,13 +193,14 @@ async fn run(req: ExecRequest) -> Result<ExecResult, ShellError> {
                 &policy,
                 host_grants,
                 literal_ips,
+                tree,
             )
             .await;
         }
         // Windows enforces host-granular net via WFP filters scoped to the
         // child's AppContainer package SID (handled inside run_contained).
         #[cfg(target_os = "windows")]
-        return sandbox::windows_run_contained(&req, &policy).await;
+        return sandbox::windows_run_contained(&req, &policy, tree).await;
         // macOS enforces via the transparent pf-broker path: same DNS-pin +
         // PermitSet core as Linux, capture via pf redirect to a daemon relay.
         #[cfg(target_os = "macos")]
@@ -176,7 +209,8 @@ async fn run(req: ExecRequest) -> Result<ExecResult, ShellError> {
                 return Err(ShellError::SandboxUnavailable);
             }
             let (host_grants, literal_ips) = dns_pin::split_grants(&policy.net_hosts);
-            return sandbox::macos_run_contained(&req, &policy, host_grants, literal_ips).await;
+            return sandbox::macos_run_contained(&req, &policy, host_grants, literal_ips, tree)
+                .await;
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
         return Err(ShellError::SandboxUnavailable);
@@ -189,7 +223,7 @@ async fn run(req: ExecRequest) -> Result<ExecResult, ShellError> {
     if let Some(policy) = req.sandbox.clone()
         && !policy.unrestricted
     {
-        return sandbox::windows_run_contained(&req, &policy).await;
+        return sandbox::windows_run_contained(&req, &policy, tree).await;
     }
 
     // macOS enforces via an argv wrapper (sandbox-exec), chosen before spawn.
@@ -241,15 +275,13 @@ async fn run(req: ExecRequest) -> Result<ExecResult, ShellError> {
         bin: req.bin.clone(),
         source: e,
     })?;
-    let tree = kill_tree::KillSwitch::default();
-    // Declared after `child`, so on drop it fires while the leader is unreaped.
-    let _kill_on_drop = tree.on_drop();
     #[cfg(unix)]
     if let Some(pid) = child.id() {
-        tree.arm(pid as i32);
+        tree.arm(kill_tree::kill_group(pid as i32))?;
     }
-    // Windows has no process groups; a job assigned right after spawn catches
-    // everything the child starts from here on.
+    // Windows has no process groups. This path is unsandboxed, so a job
+    // assigned right after spawn is best effort: it catches everything the
+    // child starts from here on, and `kill_on_drop` still stops the child.
     #[cfg(windows)]
     if let Some(handle) = child.raw_handle()
         && let Ok(job) = kill_tree::Job::new()
@@ -257,7 +289,7 @@ async fn run(req: ExecRequest) -> Result<ExecResult, ShellError> {
             .assign(windows::Win32::Foundation::HANDLE(handle))
             .is_ok()
     {
-        tree.arm(std::sync::Arc::new(job));
+        tree.arm(job.into_kill())?;
     }
 
     if let (Some(input), Some(mut stdin)) = (req.stdin.as_ref(), child.stdin.take()) {
@@ -268,7 +300,6 @@ async fn run(req: ExecRequest) -> Result<ExecResult, ShellError> {
     }
 
     let output = child.wait_with_output().await?;
-    tree.disarm();
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr_text = String::from_utf8_lossy(&output.stderr).into_owned();
     let exit_code = output.status.code().unwrap_or(-1);
@@ -290,6 +321,7 @@ async fn run(req: ExecRequest) -> Result<ExecResult, ShellError> {
         exit_code,
         stdout,
         stderr,
+        timed_out: false,
     })
 }
 
@@ -407,7 +439,10 @@ mod tests {
             bin: "/bin/sh".into(),
             args: vec![
                 "-c".into(),
-                format!("sleep 30 & echo $! > {}; sleep 30", pid_file.display()),
+                format!(
+                    "echo started; sleep 30 & echo $! > {}; sleep 30",
+                    pid_file.display()
+                ),
             ],
             cwd: None,
             stdin: None,
@@ -464,11 +499,56 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("grandchild.pid");
         let started = std::time::Instant::now();
-        let err = exec(tree_req(&pid_file, Some(300))).await.unwrap_err();
+        let task = tokio::spawn(exec(tree_req(&pid_file, Some(1500))));
+        let grandchild = read_pid(&pid_file).await;
+        let res = task.await.unwrap().unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
-        assert!(matches!(err, ShellError::TimedOut { .. }), "got {err}");
-        assert_eq!(err.to_string(), "`/bin/sh` was stopped after 300 ms");
-        assert_stops(read_pid(&pid_file).await).await;
+        assert!(res.timed_out, "{res:?}");
+        assert_eq!(
+            res.stdout.trim(),
+            "started",
+            "output before the kill is kept"
+        );
+        assert_stops(grandchild).await;
+    }
+
+    #[tokio::test]
+    async fn a_timeout_that_fires_at_once_still_stops_the_program() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        let res = exec(ExecRequest {
+            bin: "/bin/sh".into(),
+            args: vec!["-c".into(), format!("sleep 2; touch {}", marker.display())],
+            cwd: None,
+            stdin: None,
+            separate_stderr: true,
+            timeout_ms: Some(1),
+            sandbox: None,
+        })
+        .await
+        .unwrap();
+        assert!(res.timed_out, "{res:?}");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(
+            !marker.exists(),
+            "the program kept running after its timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_timeout_is_refused() {
+        let err = exec(ExecRequest {
+            bin: "/bin/echo".into(),
+            args: vec![],
+            cwd: None,
+            stdin: None,
+            separate_stderr: true,
+            timeout_ms: Some(0),
+            sandbox: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ShellError::InvalidTimeout), "got {err}");
     }
 
     #[tokio::test]
@@ -497,13 +577,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(res.stdout.trim(), "hello");
-    }
-
-    #[test]
-    fn timeouts_read_like_a_person_would_say_them() {
-        assert_eq!(format_duration(250), "250 ms");
-        assert_eq!(format_duration(120_000), "120 s");
-        assert_eq!(format_duration(1500), "1.5 s");
     }
 
     // macOS resolves /tmp -> /private/tmp, so pin to Linux.

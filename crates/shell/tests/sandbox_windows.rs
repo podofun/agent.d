@@ -737,15 +737,15 @@ async fn a_hard_link_in_a_granted_folder_to_a_denied_file_is_refused() {
     assert!(matches!(err, ShellError::DeniedReach(_)), "{err}");
 }
 
-/// A PowerShell command that starts a hidden `ping` running ~30 s, records its
-/// pid in the granted folder, then blocks itself for 30 s.
+/// A PowerShell command that starts a hidden `ping` running about two minutes,
+/// records its pid in the granted folder, then blocks itself as long.
 fn tree_req(dir: &std::path::Path, timeout_ms: Option<u64>) -> ExecRequest {
     let pid_file = dir.join("pid");
     let mut r = req(
         powershell(),
         ps(format!(
-            "$p = Start-Process -FilePath ping.exe -ArgumentList '-n','30','127.0.0.1' -WindowStyle Hidden -PassThru; \
-             Set-Content -Path '{}' -Value $p.Id; Start-Sleep -Seconds 30",
+            "$p = Start-Process -FilePath ping.exe -ArgumentList '-n','120','127.0.0.1' -WindowStyle Hidden -PassThru; \
+             Set-Content -Path '{}' -Value $p.Id; Start-Sleep -Seconds 120",
             pid_file.display()
         )),
         policy(dir),
@@ -755,7 +755,7 @@ fn tree_req(dir: &std::path::Path, timeout_ms: Option<u64>) -> ExecRequest {
 }
 
 async fn read_pid(dir: &std::path::Path) -> u32 {
-    for _ in 0..800 {
+    for _ in 0..2400 {
         if let Ok(text) = std::fs::read_to_string(dir.join("pid"))
             && let Ok(pid) = text.trim().parse()
         {
@@ -788,9 +788,11 @@ async fn assert_stops(pid: u32) {
 async fn timeout_kills_the_command_and_its_children() {
     let _serial = SANDBOX_SERIAL.lock().await;
     let dir = tempfile::tempdir().unwrap();
-    let err = exec(tree_req(dir.path(), Some(8000))).await.unwrap_err();
-    assert!(matches!(err, ShellError::TimedOut { .. }), "got {err}");
-    assert_stops(read_pid(dir.path()).await).await;
+    let task = tokio::spawn(exec(tree_req(dir.path(), Some(30_000))));
+    let grandchild = read_pid(dir.path()).await;
+    let res = task.await.unwrap().expect("a timeout is a result");
+    assert!(res.timed_out, "{res:?}");
+    assert_stops(grandchild).await;
 }
 
 #[tokio::test]

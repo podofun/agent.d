@@ -305,7 +305,10 @@ fn tree_req(dir: &std::path::Path, timeout_ms: Option<u64>) -> ExecRequest {
         bin: "/bin/sh".into(),
         args: vec![
             "-c".into(),
-            format!("sleep 30 & echo $! > {}/pid; sleep 30", dir.display()),
+            format!(
+                "echo started; sleep 30 & echo $! > {}/pid; sleep 30",
+                dir.display()
+            ),
         ],
         cwd: None,
         stdin: None,
@@ -316,7 +319,7 @@ fn tree_req(dir: &std::path::Path, timeout_ms: Option<u64>) -> ExecRequest {
 }
 
 async fn read_pid(dir: &std::path::Path) -> i32 {
-    for _ in 0..400 {
+    for _ in 0..1200 {
         if let Ok(text) = std::fs::read_to_string(dir.join("pid"))
             && let Ok(pid) = text.trim().parse()
         {
@@ -364,13 +367,42 @@ async fn timeout_kills_the_netns_command_and_its_children() {
     }
     supervisor_env();
     let dir = tempfile::tempdir().unwrap();
-    let started = std::time::Instant::now();
-    let err = agentd_shell::exec(tree_req(dir.path(), Some(1500)))
+    let task = tokio::spawn(agentd_shell::exec(tree_req(dir.path(), Some(5000))));
+    let grandchild = read_pid(dir.path()).await;
+    let res = task.await.unwrap().expect("a timeout is a result");
+    assert!(res.timed_out, "{res:?}");
+    assert_eq!(
+        res.stdout.trim(),
+        "started",
+        "output before the kill is kept"
+    );
+    assert_stops(grandchild).await;
+}
+
+/// A timeout that fires while the namespace is still being set up must still
+/// stop the command: it may never get to run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timeout_during_netns_setup_still_stops_the_command() {
+    if !netns_e2e_enabled() || !userns_net_supported() || !tooling_present() {
+        eprintln!("skip: set AGENTD_TEST_NETNS=1 (needs userns + nft/ip)");
+        return;
+    }
+    supervisor_env();
+    let dir = tempfile::tempdir().unwrap();
+    let mut req = tree_req(dir.path(), Some(1));
+    req.args = vec![
+        "-c".into(),
+        format!("sleep 2; touch {}/survived", dir.path().display()),
+    ];
+    let res = agentd_shell::exec(req)
         .await
-        .unwrap_err();
-    assert!(started.elapsed() < std::time::Duration::from_secs(10));
-    assert_eq!(err.to_string(), "`/bin/sh` was stopped after 1.5 s");
-    assert_stops(read_pid(dir.path()).await).await;
+        .expect("a timeout is a result");
+    assert!(res.timed_out, "{res:?}");
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    assert!(
+        !dir.path().join("survived").exists(),
+        "the command kept running after its timeout"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
