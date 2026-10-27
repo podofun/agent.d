@@ -59,6 +59,23 @@ d.action({
 })
 
 d.action({
+  name = "files.read_edit",
+  tool = "files",
+  handler = function(args, ctx)
+    ctx.fs.read(args.path)
+    return ctx.fs.edit(args.path, args.old, args.new)
+  end,
+})
+
+d.action({
+  name = "files.remove",
+  tool = "files",
+  handler = function(args, ctx)
+    return ctx.fs.remove(args.path)
+  end,
+})
+
+d.action({
   name = "files.delegate",
   tool = "files",
   handler = function(args, ctx)
@@ -577,6 +594,81 @@ async fn outside_edits_between_calls_do_not_block_writes() {
         "{error}"
     );
     assert_eq!(read(&path), "edited by the user");
+}
+
+/// A chat caller, so `ctx.fs.read` and `ctx.fs.edit` share a read scope.
+fn session_caller(s: &Setup) -> Caller {
+    let mut caller = caller(s);
+    caller.session_id = Some("chat".into());
+    caller
+}
+
+/// Write a script, let a program touch it in a later captured call, then
+/// edit, write and remove it through `ctx.fs`.
+async fn change_after_program(script: &str) {
+    let s = setup();
+    let path = s.project.join("demo.sh");
+    call(
+        &s,
+        "files.write",
+        json!({ "path": "demo.sh", "content": "echo one\n" }),
+    )
+    .await;
+    call(&s, "files.sh", json!({ "script": script })).await;
+    call_as(
+        &s,
+        session_caller(&s),
+        "files.read_edit",
+        json!({ "path": "demo.sh", "old": "one", "new": "two" }),
+    )
+    .await;
+    assert_eq!(read(&path), "echo two\n");
+    call(
+        &s,
+        "files.write",
+        json!({ "path": "demo.sh", "content": "echo three\n" }),
+    )
+    .await;
+    s.history.undo(&path).await.unwrap();
+    assert_eq!(read(&path), "echo two\n");
+    call(&s, "files.remove", json!({ "path": "demo.sh" })).await;
+    assert!(!path.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_made_executable_by_a_program_can_still_be_changed() {
+    change_after_program("chmod +x demo.sh && ./demo.sh").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_run_by_a_program_can_still_be_changed() {
+    change_after_program("sh demo.sh").await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_permission_change_by_the_user_keeps_the_file_changeable() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = setup();
+    let path = s.project.join("a.txt");
+    call(
+        &s,
+        "files.write",
+        json!({ "path": "a.txt", "content": "first" }),
+    )
+    .await;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    call(
+        &s,
+        "files.write",
+        json!({ "path": "a.txt", "content": "second" }),
+    )
+    .await;
+    s.history.undo(&path).await.unwrap();
+    assert_eq!(read(&path), "first");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
 }
 
 #[tokio::test(flavor = "multi_thread")]
