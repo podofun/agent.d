@@ -68,6 +68,8 @@ Type `/` to see what you can do:
 | `/help` | Show every command and shortcut |
 | `/quit` | Leave chat |
 
+Code in replies is highlighted by language, using your terminal's own colors, so it reads well on light and dark themes.
+
 Enter sends your message, Shift+Enter adds a new line, Shift+Tab switches the approval mode, and Ctrl+C stops a reply or leaves chat.
 
 A chat works in the folder you start `agentctl chat` from. The first time you use a folder, agent.d asks whether to trust it: "Allow once" trusts it for this chat, and "Always trust" remembers it in `grants.toml`. If you say no, the chat starts without a folder and tells you so.
