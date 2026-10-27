@@ -12,6 +12,8 @@ ctx.caller -> {
   runner?:    string,
   service?:   string,
   session?:   string,
+  session_id?: string,
+  run_id?:    string,
   user?:      string,
   execution?: string,
 }
@@ -27,6 +29,8 @@ All fields are `string | nil`. You should check for `nil` before using any field
 | `runner` | `string \| nil` | Name of the runner that is making this tool call, if the action was invoked from a runner loop. |
 | `service` | `string \| nil` | Name of the service that called `ctx.call`, if applicable. |
 | `session` | `string \| nil` | Session identifier. Defaults to `ws-<n>` (the connection sequence number) and can be overridden by the client via the `session` field in `actions.call` or `runners.run`. |
+| `session_id` | `string \| nil` | The chat session the run belongs to, set when the run was started with a `session_id`. Use it to keep state per chat. |
+| `run_id` | `string \| nil` | The run this call is part of, set for calls a runner makes. |
 | `user` | `string \| nil` | User identifier. `nil` unless the client sets `user` in the call params. |
 | `execution` | `string \| nil` | Unique identifier for this invocation. |
 
