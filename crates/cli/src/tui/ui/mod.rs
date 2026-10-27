@@ -11,6 +11,7 @@ use super::app::{App, Tab};
 mod approval;
 mod browser;
 mod conversation;
+mod highlight;
 mod logo;
 mod markdown;
 mod selection;
