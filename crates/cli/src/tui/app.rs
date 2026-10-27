@@ -689,19 +689,41 @@ impl App {
         result
     }
 
+    /// What a new chat asks `sessions.create` for: its runner, the folder
+    /// `agentctl` runs in, an approval mode if one is chosen, and a name
+    /// taken from the first message.
+    pub(super) fn session_params(&self, runner: &str, input: &str) -> Value {
+        let mut params = json!({ "runner": runner, "label": self.title_for(input) });
+        if let Ok(cwd) = std::env::current_dir() {
+            params["cwd"] = json!(cwd.to_string_lossy());
+        }
+        if let Some(mode) = self.approval_mode {
+            params["approval"] = json!(mode);
+        }
+        params
+    }
+
     async fn start_run(&mut self, messages: &[String]) -> Result<()> {
         let input = messages.join("\n\n");
         let input = input.as_str();
         let runner = self.runner.clone().context("no runner")?;
         if self.session.is_none() {
-            let mut params = json!({ "runner": runner });
-            if let Some(mode) = self.approval_mode {
-                params["approval"] = json!(mode);
+            let mut params = self.session_params(&runner, input);
+            let mut created = self.call("sessions.create", params.clone()).await;
+            // A folder the user denied, or one this connection may not choose,
+            // is not worth failing the message over: work without one.
+            if let Err(error) = &created
+                && folder_refused(error)
+            {
+                self.notice = Some(format!(
+                    "Working without a folder: {}",
+                    error.to_string().lines().next().unwrap_or_default()
+                ));
+                params.as_object_mut().map(|map| map.remove("cwd"));
+                created = self.call("sessions.create", params.clone()).await;
             }
-            // Name the chat after its first message. A taken name is not
-            // worth failing the message over, so fall back to no name.
-            params["label"] = json!(self.title_for(input));
-            let created = match self.call("sessions.create", params.clone()).await {
+            // A taken name is not worth failing the message over either.
+            let created = match created {
                 Ok(created) => created,
                 Err(error) if error.to_string().contains("already exists") => {
                     params.as_object_mut().map(|map| map.remove("label"));
@@ -1144,15 +1166,47 @@ async fn current_branch() -> Option<String> {
     (output.status.success() && !branch.is_empty()).then_some(branch)
 }
 
+/// A refusal from the daemon, keeping its code so callers can react to a
+/// specific one. It reads the same as before: the message, then the tip.
+#[derive(Debug)]
+pub(super) struct DaemonError {
+    pub(super) code: Option<String>,
+    pub(super) message: String,
+    pub(super) tip: Option<String>,
+}
+
+impl std::fmt::Display for DaemonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.tip {
+            Some(tip) => write!(f, "{}\n{tip}", self.message),
+            None => write!(f, "{}", self.message),
+        }
+    }
+}
+
+impl std::error::Error for DaemonError {}
+
+/// Whether the daemon refused the folder a new chat asked to work in, so the
+/// chat can start without one.
+pub(super) fn folder_refused(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<DaemonError>().is_some_and(|error| {
+        matches!(
+            error.code.as_deref(),
+            Some("session_folder_denied" | "session_folder_not_allowed")
+        )
+    })
+}
+
 fn response_result(response: WsResponse) -> Result<Value> {
     if response.ok {
         Ok(response.result.unwrap_or(Value::Null))
     } else {
-        let message = response.error.as_deref().unwrap_or("unknown error");
-        match response.tip.as_deref() {
-            Some(tip) => Err(anyhow!("{message}\n{tip}")),
-            None => Err(anyhow!("{message}")),
+        Err(DaemonError {
+            code: response.code,
+            message: response.error.unwrap_or_else(|| "unknown error".into()),
+            tip: response.tip,
         }
+        .into())
     }
 }
 
@@ -1160,6 +1214,33 @@ fn response_result(response: WsResponse) -> Result<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn new_chats_send_their_folder() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, Some("coder".into()));
+        let params = app.session_params("coder", "hello");
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(params["cwd"], here.to_string_lossy().as_ref());
+        assert_eq!(params["runner"], "coder");
+        app.approval_mode = Some("human");
+        assert_eq!(app.session_params("coder", "hello")["approval"], "human");
+    }
+
+    #[test]
+    fn only_folder_refusals_fall_back_to_no_folder() {
+        let refused = |code: &str| {
+            anyhow::Error::new(DaemonError {
+                code: Some(code.into()),
+                message: "no".into(),
+                tip: None,
+            })
+        };
+        assert!(folder_refused(&refused("session_folder_denied")));
+        assert!(folder_refused(&refused("session_folder_not_allowed")));
+        assert!(!folder_refused(&refused("session_label_taken")));
+        assert!(!folder_refused(&anyhow::anyhow!("session folder")));
+        assert_eq!(refused("x").to_string(), "no");
+    }
 
     #[test]
     fn setting_changes_show_in_the_conversation_once_each() {

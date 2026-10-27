@@ -22,7 +22,11 @@ pub(super) fn draw_approval(frame: &mut Frame<'_>, request: &ApprovalRequest, sc
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Block::default()
-            .title(" Permission request ")
+            .title(if request.kind == ApprovalKind::Folder {
+                " Folder request "
+            } else {
+                " Permission request "
+            })
             .borders(Borders::ALL)
             .border_style(Style::default().fg(WARNING)),
         popup,
@@ -48,7 +52,11 @@ pub(super) fn draw_approval(frame: &mut Frame<'_>, request: &ApprovalRequest, sc
                 ),
                 Span::raw("   "),
                 Span::styled(
-                    "[f] Always",
+                    if request.kind == ApprovalKind::Folder {
+                        "[f] Always trust"
+                    } else {
+                        "[f] Always"
+                    },
                     Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("   "),
@@ -174,6 +182,38 @@ mod tests {
         assert!(!rendered.contains("Session ws-6"));
         assert!(!rendered.contains("{\""));
         assert!(!rendered.contains("has not been granted"));
+    }
+
+    #[test]
+    fn folder_requests_read_as_a_question() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.approval = Some(
+            serde_json::from_value(json!({
+                "id": 9,
+                "kind": "folder",
+                "action": "/home/me/code/foo",
+                "requires": [],
+                "missing": [],
+                "reason": "Let agent.d work in this folder?",
+                "caller": { "interface": "ws", "session": "ws-6" }
+            }))
+            .unwrap(),
+        );
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("/home/me/code/foo"), "{rendered}");
+        assert!(rendered.contains("Let agent.d work in this folder?"));
+        assert!(rendered.contains("[f] Always trust"));
+        assert!(rendered.contains("Folder"));
+        assert!(!rendered.contains("Permission request"));
     }
 
     #[test]
