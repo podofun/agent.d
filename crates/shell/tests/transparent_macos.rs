@@ -164,3 +164,82 @@ async fn wildcard_grant_resolves_like_linux() {
         "wildcard-granted name must resolve + exchange data (Linux parity): {res:?}"
     );
 }
+
+/// A unique `sleep` duration, so `pgrep -f` finds exactly this test's process
+/// whatever uid it runs as.
+fn marker() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    format!("30.{nanos:09}")
+}
+
+/// A script whose background `sleep` (the grandchild) carries `marker`, while
+/// the shell itself blocks in a foreground `sleep`.
+fn tree_script(marker: &str) -> String {
+    format!("sleep {marker} & sleep 30")
+}
+
+fn running(marker: &str) -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-f", &format!("sleep {marker}")])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+async fn wait_until(marker: &str, want_running: bool) {
+    for _ in 0..400 {
+        if running(marker) == want_running {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!(
+        "`sleep {marker}` running = {}, expected {want_running}",
+        !want_running
+    );
+}
+
+fn tree_req(marker: &str, timeout_ms: Option<u64>) -> ExecRequest {
+    ExecRequest {
+        bin: "/bin/sh".into(),
+        args: vec!["-c".into(), tree_script(marker)],
+        cwd: None,
+        stdin: None,
+        separate_stderr: true,
+        timeout_ms,
+        sandbox: Some(policy(vec!["net:203.0.113.77"])),
+    }
+}
+
+/// The child runs as a broker-leased uid the daemon cannot signal, so a
+/// timeout hangs up on the broker, which kills the child's process group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timeout_kills_the_broker_spawned_command_and_its_children() {
+    if !e2e_enabled() {
+        eprintln!("{SKIP}");
+        return;
+    }
+    let marker = marker();
+    let err = agentd_shell::exec(tree_req(&marker, Some(3000)))
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "`/bin/sh` was stopped after 3 s");
+    wait_until(&marker, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropping_the_exec_future_kills_the_broker_spawned_command() {
+    if !e2e_enabled() {
+        eprintln!("{SKIP}");
+        return;
+    }
+    let marker = marker();
+    let task = tokio::spawn(agentd_shell::exec(tree_req(&marker, None)));
+    wait_until(&marker, true).await;
+    task.abort();
+    let _ = task.await;
+    wait_until(&marker, false).await;
+}

@@ -146,6 +146,7 @@ pub async fn run_contained(
 ) -> Result<ExecResult, ShellError> {
     let _serialize = net_lock().lock().await;
     let broker = Arc::new(Broker::connect()?);
+    let mut hang_up = HangUp::new(&broker)?;
 
     // Relay + DNS listeners (std sockets; converted to tokio below).
     let tcp = bind_dual_tcp().map_err(|e| {
@@ -256,6 +257,7 @@ pub async fn run_contained(
     let tcp = tokio::net::TcpListener::from_std(tcp).map_err(io_sb)?;
     let relay_task =
         tokio::spawn(async move { relay_loop(tcp, relay_broker, relay_set, relay_grants).await });
+    hang_up.tasks = vec![dns_task.abort_handle(), relay_task.abort_handle()];
 
     // Feed stdin (if any), drain stdout/stderr to completion (EOF = child done).
     if let (Some(input), Some(fd)) = (&req.stdin, stdin_wr) {
@@ -310,6 +312,38 @@ pub async fn run_contained(
         stdout,
         stderr,
     })
+}
+
+/// Hangs up on the broker when dropped. The child runs as a leased uid the
+/// daemon cannot signal, so a dropped or timed-out exec relies on the broker:
+/// on hang-up it tears the session down and kills the child's process group.
+/// The relay tasks hold their own broker handle, so they are stopped too.
+struct HangUp {
+    stream: UnixStream,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl HangUp {
+    fn new(broker: &Broker) -> Result<Self, ShellError> {
+        let stream = broker.stream.lock().unwrap().try_clone().map_err(|e| {
+            ShellError::Sandbox(format!(
+                "could not hold the sandbox broker connection ({e})"
+            ))
+        })?;
+        Ok(HangUp {
+            stream,
+            tasks: Vec::new(),
+        })
+    }
+}
+
+impl Drop for HangUp {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 fn io_sb(e: std::io::Error) -> ShellError {

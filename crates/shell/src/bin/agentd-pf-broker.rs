@@ -318,9 +318,10 @@ mod macos {
         }
 
         fn kill_child(&mut self, pid: i32) {
-            // SAFETY: kill(2)+waitpid(2) on a pid this broker forked. Signalling
-            // and reaping a raw pid has no safe std equivalent (no Child handle).
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            // SAFETY: killpg(2)+waitpid(2) on a pid this broker forked, which
+            // leads its own process group, so everything it started dies too.
+            // Signalling and reaping a raw pid has no safe std equivalent.
+            unsafe { libc::killpg(pid, libc::SIGKILL) };
             let mut status = 0;
             unsafe { libc::waitpid(pid, &mut status, 0) };
         }
@@ -447,12 +448,14 @@ mod macos {
         }
         if pid == 0 {
             // SAFETY: async-signal-safe-only region in the forked child. Every
-            // call here (dup2/open/close/chdir/setgid/setgroups/setuid/execv/
-            // _exit) is on the POSIX async-signal-safe list and operates on fds
+            // call here (setpgid/dup2/open/close/chdir/setgid/setgroups/setuid/
+            // execv/_exit) is on the POSIX async-signal-safe list and operates on fds
             // and CStrings that outlive this block; no allocation, no locks. A
             // safe wrapper (e.g. Command) is forbidden here because it may
             // allocate/lock between fork and exec.
             unsafe {
+                // Lead a new process group, so teardown can kill the whole tree.
+                libc::setpgid(0, 0);
                 libc::dup2(out_w, 1);
                 libc::dup2(err_w, 2);
                 if in_r >= 0 {
@@ -483,10 +486,14 @@ mod macos {
                 libc::_exit(127);
             }
         }
-        // Parent: close the child ends, keep the daemon-facing ends.
-        // SAFETY: close(2) on the parent's copies of the child-side pipe fds,
-        // owned here as raw ints; the daemon-facing ends stay open in `fds`.
+        // Parent: set the child's group from this side too, so it exists before
+        // any teardown can kill it. Then close the child ends, keep the
+        // daemon-facing ends.
+        // SAFETY: setpgid(2) on our own unreaped child, and close(2) on the
+        // parent's copies of the child-side pipe fds, owned here as raw ints;
+        // the daemon-facing ends stay open in `fds`.
         unsafe {
+            libc::setpgid(pid, pid);
             libc::close(out_w);
             libc::close(err_w);
             if in_r >= 0 {
