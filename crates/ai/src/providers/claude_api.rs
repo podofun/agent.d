@@ -552,6 +552,8 @@ mod tests {
                         arguments: serde_json::json!({ "q": "x" }),
                     }],
                     tool_call_id: None,
+                    changes: Vec::new(),
+                    more: 0,
                 },
                 Message::tool_result("c1", r#"{"found":"x=42"}"#),
             ],

@@ -201,6 +201,8 @@ async fn tool_call_round_trip_decodes_arguments() {
                 content: String::new(),
                 tool_calls: res.tool_calls.clone(),
                 tool_call_id: None,
+                changes: Vec::new(),
+                more: 0,
             },
             Message::tool_result("c1", r#"{"found":"x=42"}"#),
         ],

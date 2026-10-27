@@ -158,6 +158,7 @@ allowed_actions = ["files.write"]
 
 struct Setup {
     exec: Arc<Executor>,
+    sessions: Arc<agentd_sessions::MemSessionStore>,
     history: agentd_fs::History,
     baseline: agentd_fs::Baseline,
     trace: Arc<Collect>,
@@ -211,11 +212,14 @@ fn setup_with(provider: MockProvider) -> Setup {
     );
     exec.set_config_folder(config.path().to_path_buf());
     exec.set_file_capture(history.clone(), baseline.clone());
+    let sessions = Arc::new(agentd_sessions::MemSessionStore::new());
+    exec.set_sessions(sessions.clone());
     let exec = Arc::new(exec);
     host.set_runner_dispatcher(ExecutorHandle::new(exec.clone()));
     host.set_inline_approvals(exec.clone());
     Setup {
         exec,
+        sessions,
         history,
         baseline,
         trace,
@@ -818,4 +822,45 @@ async fn tool_results_report_the_files_a_call_changed() {
     let change = one(&changes, "note.txt");
     assert_eq!(change.operation, ChangeKind::Created);
     assert!(change.diff.unwrap().contains("+hello"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_saved_session_keeps_the_files_each_call_changed() {
+    use agentd_sessions::{NewSession, Scope, SessionStore};
+    let s = setup_with(MockProvider::new().with_script(vec![
+        MockProvider::tool_call(
+            "c1",
+            "files.write",
+            json!({ "path": "note.txt", "content": "hello\n" }),
+        ),
+        MockProvider::text_only("done"),
+    ]));
+    let session = s
+        .sessions
+        .create(NewSession {
+            cwd: Some(s.project.to_string_lossy().into_owned()),
+            ..NewSession::in_scope(&Scope::from_caller(Some("test"), None, None))
+        })
+        .unwrap();
+    s.exec
+        .run_runner_with_options(
+            Caller::interface("test"),
+            "helper",
+            agentd_runners::RunOptions {
+                prompt: Some("write it".into()),
+                session_id: Some(session.id.clone()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let turns = s.sessions.turns(&session.id).unwrap();
+    let tool = turns
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+        .expect("the saved tool message");
+    let change = one(&tool.changes, "note.txt");
+    assert_eq!(change.operation, ChangeKind::Created);
+    assert!(change.diff.as_deref().unwrap().contains("+hello"));
 }

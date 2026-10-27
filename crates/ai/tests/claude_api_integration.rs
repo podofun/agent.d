@@ -215,6 +215,8 @@ async fn tool_result_turn_serialized_as_user_role_with_tool_result_block() {
                     arguments: serde_json::json!({ "q": "x" }),
                 }],
                 tool_call_id: None,
+                changes: Vec::new(),
+                more: 0,
             },
             Message::tool_result("tu_1", "{\"found\":\"x=42\"}"),
         ],

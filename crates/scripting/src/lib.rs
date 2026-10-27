@@ -3672,6 +3672,8 @@ fn build_completion_request(
                     content,
                     tool_calls: Vec::new(),
                     tool_call_id: None,
+                    changes: Vec::new(),
+                    more: 0,
                 });
             }
             req.messages = out;

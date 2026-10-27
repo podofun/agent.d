@@ -1978,6 +1978,8 @@ impl Executor {
                 },
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                changes: Vec::new(),
+                more: 0,
             })
             .collect();
         req.messages
@@ -2227,6 +2229,8 @@ impl Executor {
                         content: resp.text.clone(),
                         tool_calls: resp.tool_calls.clone(),
                         tool_call_id: None,
+                        changes: Vec::new(),
+                        more: 0,
                     });
                     for call in resp.tool_calls {
                         let id = call.id.clone();
@@ -2247,25 +2251,28 @@ impl Executor {
                             args: call.arguments.clone(),
                         };
                         let result = self.run_with_changes(tool_caller.clone(), action).await;
+                        let run_id = tool_caller.run_id.as_deref();
+                        // Kept on the saved tool message too, so a reopened
+                        // session shows the same files and diffs.
+                        let (changes, more) = match &result {
+                            Ok((_, _, changes)) => {
+                                capture::cap_changes(self.redact_changes(run_id, changes))
+                            }
+                            Err(_) => (Vec::new(), 0),
+                        };
                         if let Some(sink) = &sink {
-                            let run_id = tool_caller.run_id.as_deref();
-                            let (output, error, all_changes) = match &result {
-                                Ok((res, _, changes)) => (
-                                    self.runs.redact_secrets(run_id, &res.value),
-                                    None,
-                                    self.redact_changes(run_id, changes),
-                                ),
-                                Err((e, _)) => {
-                                    (serde_json::Value::Null, Some(e.to_string()), Vec::new())
+                            let (output, error) = match &result {
+                                Ok((res, _, _)) => {
+                                    (self.runs.redact_secrets(run_id, &res.value), None)
                                 }
+                                Err((e, _)) => (serde_json::Value::Null, Some(e.to_string())),
                             };
-                            let (changes, more) = capture::cap_changes(all_changes);
                             let _ = sink.send(agentd_ai::StreamEvent::ToolResult {
                                 name: call.name.clone(),
                                 input: self.runs.redact_secrets(run_id, &call.arguments),
                                 output,
                                 error,
-                                changes,
+                                changes: changes.clone(),
                                 more,
                             });
                         }
@@ -2277,7 +2284,11 @@ impl Executor {
                             }
                             Err((e, _)) => format!("tool call failed ({e})"),
                         };
-                        req.messages.push(agentd_ai::Message::tool_result(id, text));
+                        req.messages.push(agentd_ai::Message {
+                            changes,
+                            more,
+                            ..agentd_ai::Message::tool_result(id, text)
+                        });
                     }
                 }
             }

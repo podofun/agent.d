@@ -423,6 +423,8 @@ async fn compaction_never_splits_a_tool_call_group() {
                     content: String::new(),
                     tool_calls: vec![call],
                     tool_call_id: None,
+                    changes: Vec::new(),
+                    more: 0,
                 },
                 agentd_ai::Message::tool_result("c1", "{}"),
                 agentd_ai::Message::assistant("a5"),

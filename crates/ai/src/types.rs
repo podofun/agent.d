@@ -31,6 +31,13 @@ pub struct Message {
     /// answering. Ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// When `role == Tool`, the files the call changed, so a saved session
+    /// can show them again. Never sent to a model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<FileChange>,
+    /// How many more changed files were left out of `changes`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub more: usize,
 }
 
 impl Message {
@@ -40,6 +47,8 @@ impl Message {
             content: text.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            changes: Vec::new(),
+            more: 0,
         }
     }
     pub fn assistant(text: impl Into<String>) -> Self {
@@ -48,6 +57,8 @@ impl Message {
             content: text.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            changes: Vec::new(),
+            more: 0,
         }
     }
     pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
@@ -56,6 +67,8 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
+            changes: Vec::new(),
+            more: 0,
         }
     }
 }
