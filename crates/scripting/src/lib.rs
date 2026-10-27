@@ -3894,6 +3894,8 @@ fn build_caller_table(lua: &Lua) -> mlua::Result<Table> {
                 "session" => c.session.as_ref().map(|x| x.as_str().to_string()),
                 "user" => c.user.as_ref().map(|x| x.as_str().to_string()),
                 "execution" => c.execution.as_ref().map(|x| x.as_str().to_string()),
+                "session_id" => c.session_id.clone(),
+                "run_id" => c.run_id.clone(),
                 _ => None,
             };
             match v {

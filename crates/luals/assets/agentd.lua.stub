@@ -363,6 +363,8 @@ function string.split(s, sep) end
 ---@field session string|nil
 ---@field user string|nil
 ---@field execution string|nil
+---@field session_id string|nil  The chat session the run belongs to, if any.
+---@field run_id string|nil      The run this call is part of, if any.
 
 ---@class Ctx.Ai
 ---@field ask fun(prompt: string, opts?: { provider?: string, model?: string, max_tokens?: integer, system?: string }): string
