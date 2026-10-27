@@ -296,6 +296,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "mlua",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

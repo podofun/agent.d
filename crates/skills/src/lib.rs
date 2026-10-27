@@ -86,6 +86,11 @@ impl SkillRegistry {
         g.get(name).cloned()
     }
 
+    /// Unregister a skill, returning its definition if it was registered.
+    pub fn remove(&self, name: &str) -> Option<SkillDef> {
+        self.inner.write().unwrap().remove(name)
+    }
+
     pub fn list(&self) -> Vec<SkillDef> {
         let g = self.inner.read().unwrap();
         g.values().cloned().collect()
@@ -112,22 +117,22 @@ impl SkillRegistry {
         self.inner.read().unwrap().len()
     }
 
-    /// Load every `*.md` file under `dir` into the registry. Missing dir = ok.
-    pub fn load_dir(&self, dir: &Path) -> Result<usize, SkillError> {
+    /// Load every `*.md` file under `dir` into the registry and return what
+    /// was loaded. A missing dir loads nothing.
+    pub fn load_dir(&self, dir: &Path) -> Result<Vec<SkillDef>, SkillError> {
         if !dir.exists() {
             tracing::warn!(path = %dir.display(), "skills dir missing");
-            return Ok(0);
+            return Ok(Vec::new());
         }
-        let mut n = 0;
+        let mut loaded = Vec::new();
         for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("md") {
                 continue;
             }
-            self.load_file(path)?;
-            n += 1;
+            loaded.push(self.load_file(path)?);
         }
-        Ok(n)
+        Ok(loaded)
     }
 
     /// Parse a single Markdown skill file and insert it.
@@ -270,6 +275,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remove_returns_and_drops_the_item() {
+        let registry = SkillRegistry::new();
+        registry.insert(SkillDef {
+            name: "a".into(),
+            ..Default::default()
+        });
+        assert_eq!(registry.remove("a").map(|def| def.name), Some("a".into()));
+        assert!(registry.get("a").is_none());
+        assert!(registry.remove("a").is_none());
+    }
+
+    #[test]
     fn parses_minimal_frontmatter() {
         let src = r#"---
 name: reviewer
@@ -334,7 +351,7 @@ description: nope
         .unwrap();
         std::fs::write(tmp.path().join("skip.txt"), "noise").unwrap();
         let reg = SkillRegistry::new();
-        let n = reg.load_dir(tmp.path()).unwrap();
+        let n = reg.load_dir(tmp.path()).unwrap().len();
         assert_eq!(n, 1);
         assert!(reg.get("reviewer").is_some());
     }

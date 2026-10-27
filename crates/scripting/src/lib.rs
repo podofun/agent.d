@@ -1,4 +1,5 @@
 mod channels;
+mod handles;
 mod luaerr;
 mod mailer;
 mod sandbox;
@@ -125,6 +126,21 @@ struct OwnedComponents {
     actions: Vec<String>,
     runners: Vec<String>,
     services: Vec<String>,
+    /// Skills keep their registered names, but a package still owns the
+    /// ones it registered, so only it can change them through handles.
+    skills: Vec<String>,
+}
+
+impl OwnedComponents {
+    fn of(&mut self, kind: handles::Kind) -> &mut Vec<String> {
+        match kind {
+            handles::Kind::Tool => &mut self.tools,
+            handles::Kind::Action => &mut self.actions,
+            handles::Kind::Runner => &mut self.runners,
+            handles::Kind::Service => &mut self.services,
+            handles::Kind::Skill => &mut self.skills,
+        }
+    }
 }
 
 enum ComponentKind {
@@ -183,6 +199,64 @@ fn record_and_scope(lua: &Lua, raw: &str, kind: ComponentKind) -> String {
         }
     }
     name
+}
+
+/// Record a skill as owned by the active package, if any. Skill names are
+/// not scoped, but ownership still decides who may change the skill.
+fn own_skill(lua: &Lua, name: &str) {
+    let Some(scope) = lua.app_data_ref::<PackageScope>().map(|s| (*s).clone()) else {
+        return;
+    };
+    if let Some(package) = scope.active() {
+        let mut g = scope.0.write().unwrap();
+        g.owned
+            .entry(package)
+            .or_default()
+            .skills
+            .push(name.to_owned());
+    }
+}
+
+/// While a package is loading, it may change only what it registered.
+fn package_may_change(lua: &Lua, kind: handles::Kind, name: &str) -> mlua::Result<()> {
+    let Some(scope) = lua.app_data_ref::<PackageScope>().map(|s| (*s).clone()) else {
+        return Ok(());
+    };
+    let Some(package) = scope.active() else {
+        return Ok(());
+    };
+    let mut g = scope.0.write().unwrap();
+    if g.owned
+        .entry(package.clone())
+        .or_default()
+        .of(kind)
+        .iter()
+        .any(|owned| owned == name)
+    {
+        return Ok(());
+    }
+    Err(mlua::Error::external(format!(
+        "the package `{package}` cannot change the {} `{name}`, which it did not register",
+        kind.noun()
+    )))
+}
+
+/// Keep package ownership in step with a rename or a removal (`new` is `None`).
+fn package_moved(lua: &Lua, kind: handles::Kind, old: &str, new: Option<&str>) {
+    let Some(scope) = lua.app_data_ref::<PackageScope>().map(|s| (*s).clone()) else {
+        return;
+    };
+    let mut g = scope.0.write().unwrap();
+    for owned in g.owned.values_mut() {
+        let names = owned.of(kind);
+        match new {
+            Some(new) => names
+                .iter_mut()
+                .filter(|name| *name == old)
+                .for_each(|name| *name = new.to_owned()),
+            None => names.retain(|name| name != old),
+        }
+    }
 }
 
 /// Backend handle stored in Lua app-data so `context.auth.*` can reach it.
@@ -263,6 +337,7 @@ impl LuaHost {
         lua.set_app_data(WorkspaceRoot::default());
         lua.set_app_data(fs::History::default());
         lua.set_app_data(PackageScope::default());
+        lua.set_app_data(handles::Handles::default());
 
         install_agentd_globals(&lua, &catalog)?;
         load_helpers(&lua)?;
@@ -676,7 +751,31 @@ fn build_collection_table(lua: &Lua, kind: ListKind) -> mlua::Result<Table> {
         })?,
     };
     t.set("list", f)?;
+    let kind = match kind {
+        ListKind::Tools => handles::Kind::Tool,
+        ListKind::Actions => handles::Kind::Action,
+        ListKind::Runners => handles::Kind::Runner,
+        ListKind::Services => handles::Kind::Service,
+    };
+    add_handle_functions(lua, &t, kind)?;
     Ok(t)
+}
+
+/// `get`, `find` and `remove` on an `agentd.<collection>` table.
+fn add_handle_functions(lua: &Lua, t: &Table, kind: handles::Kind) -> mlua::Result<()> {
+    t.set(
+        "get",
+        lua.create_function(move |lua, name: String| handles::handle_for(lua, kind, &name))?,
+    )?;
+    t.set(
+        "find",
+        lua.create_function(move |lua, query: Value| handles::find(lua, kind, query))?,
+    )?;
+    t.set(
+        "remove",
+        lua.create_function(move |lua, name: String| handles::remove(lua, kind, &name))?,
+    )?;
+    Ok(())
 }
 
 /// Registry key under which the single `ctx` facade table is stored.
@@ -796,7 +895,7 @@ fn ctx_thread(lua: &Lua, func: Function, with_args: bool) -> mlua::Result<mlua::
 
 // ---------- register / tool ----------
 
-fn register_action_dispatch(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
+fn register_action_dispatch(lua: &Lua, args: MultiValue) -> mlua::Result<handles::Handle> {
     if args.len() == 2 {
         let mut iter = args.into_iter();
         let name: String = lua.unpack(iter.next().unwrap())?;
@@ -813,7 +912,7 @@ fn register_action_dispatch(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
     )))
 }
 
-fn register_action(lua: &Lua, args: Value) -> mlua::Result<()> {
+fn register_action(lua: &Lua, args: Value) -> mlua::Result<handles::Handle> {
     let (name, func, meta) = match args {
         Value::String(s) => {
             return Err(mlua::Error::external(format!(
@@ -874,7 +973,7 @@ fn register_named(
     name: String,
     func: Function,
     mut meta: ActionMeta,
-) -> mlua::Result<()> {
+) -> mlua::Result<handles::Handle> {
     // Prefix + record under the active package, if any.
     let name = record_and_scope(lua, &name, ComponentKind::Action);
     // Inside a package, an explicit/inferred unqualified tool name is prefixed
@@ -899,11 +998,12 @@ fn register_named(
         let _ = lua.remove_registry_value(old);
     }
     guard.action_meta.insert(name.clone(), meta);
+    drop(guard);
     tracing::info!(action = %name, "registered action");
-    Ok(())
+    handles::register(lua, handles::Kind::Action, &name)
 }
 
-fn register_tool(lua: &Lua, t: Table) -> mlua::Result<()> {
+fn register_tool(lua: &Lua, t: Table) -> mlua::Result<handles::Handle> {
     let name: String = t
         .get("name")
         .map_err(|_| mlua::Error::external("the `agentd.tool{...}` definition table is missing its `name` field — every tool needs a name string"))?;
@@ -916,13 +1016,14 @@ fn register_tool(lua: &Lua, t: Table) -> mlua::Result<()> {
         .write()
         .map_err(|e| mlua::Error::external(e.to_string()))?;
     guard.tools.insert(name.clone(), ToolMeta { requires });
+    drop(guard);
     tracing::info!(tool = %name, "registered tool");
-    Ok(())
+    handles::register(lua, handles::Kind::Tool, &name)
 }
 
 // ---------- agentd.runner ----------
 
-fn register_runner(lua: &Lua, t: Table) -> mlua::Result<()> {
+fn register_runner(lua: &Lua, t: Table) -> mlua::Result<handles::Handle> {
     let name: String = t
         .get("name")
         .map_err(|_| mlua::Error::external("the `agentd.runner{...}` definition table is missing its `name` field — every runner needs a name string"))?;
@@ -966,15 +1067,22 @@ fn register_runner(lua: &Lua, t: Table) -> mlua::Result<()> {
         .app_data_ref::<RunnerRegistry>()
         .ok_or_else(|| mlua::Error::external("the runner registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
     runners.insert(def);
+    drop(runners);
     tracing::info!(runner = %name, "registered runner");
-    Ok(())
+    handles::register(lua, handles::Kind::Runner, &name)
 }
 
 /// `compact = false` disables session compaction; `compact = { after_turns =
 /// 40, keep_recent = 10, prompt = "..." }` overrides any subset of the
 /// defaults; absent = daemon defaults.
 fn read_compact_policy(lua: &Lua, t: &Table) -> mlua::Result<Option<CompactPolicy>> {
-    match t.get::<Value>("compact")? {
+    compact_policy(lua, t.get::<Value>("compact")?)
+}
+
+/// A runner's `compact` value: `nil`/`true` for the defaults, `false` to turn
+/// compaction off, or a table overriding the defaults.
+fn compact_policy(lua: &Lua, value: Value) -> mlua::Result<Option<CompactPolicy>> {
+    match value {
         Value::Nil => Ok(None),
         Value::Boolean(true) => Ok(None),
         Value::Boolean(false) => Ok(Some(CompactPolicy {
@@ -1019,7 +1127,7 @@ fn sleep_binding(lua: &Lua, ms: u64) -> mlua::Result<Value> {
 
 // ---------- service / async / await (bare globals) ----------
 
-fn register_service(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
+fn register_service(lua: &Lua, args: MultiValue) -> mlua::Result<handles::Handle> {
     // Accepted shapes:
     //   agentd.service("name", fn)
     //   agentd.service("name", { restart = "always", backoff_ms = 5000, ... }, fn)
@@ -1102,8 +1210,9 @@ fn register_service(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
         .app_data_ref::<ServiceRegistry>()
         .ok_or_else(|| mlua::Error::external("the service registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
     services.insert(def);
+    drop(services);
     tracing::info!(service = %name, "registered service");
-    Ok(())
+    handles::register(lua, handles::Kind::Service, &name)
 }
 
 /// `async(fn)` — schedule `fn` to run as a background coroutine on its own
@@ -1169,7 +1278,7 @@ fn await_internal(lua: &Lua, handle: mlua::AnyUserData) -> mlua::Result<Value> {
 
 // ---------- agentd.skill ----------
 
-fn register_skill(lua: &Lua, t: Table) -> mlua::Result<()> {
+fn register_skill(lua: &Lua, t: Table) -> mlua::Result<handles::Handle> {
     let name: String = t
         .get("name")
         .map_err(|_| mlua::Error::external("the `agentd.skill{...}` definition table is missing its `name` field — every skill needs a name string"))?;
@@ -1188,8 +1297,10 @@ fn register_skill(lua: &Lua, t: Table) -> mlua::Result<()> {
         .app_data_ref::<SkillRegistry>()
         .ok_or_else(|| mlua::Error::external("the skill registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
     skills.insert(def);
+    drop(skills);
+    own_skill(lua, &name);
     tracing::info!(skill = %name, "registered skill");
-    Ok(())
+    handles::register(lua, handles::Kind::Skill, &name)
 }
 
 // ---------- agentd.skills.* (Markdown loader) ----------
@@ -1199,10 +1310,11 @@ fn build_skills_table(lua: &Lua) -> mlua::Result<Table> {
     t.set("load", lua.create_function(skills_load_binding)?)?;
     t.set("dir", lua.create_function(skills_load_dir_binding)?)?;
     t.set("list", lua.create_function(skills_list_binding)?)?;
+    add_handle_functions(lua, &t, handles::Kind::Skill)?;
     Ok(t)
 }
 
-fn skills_load_binding(lua: &Lua, rel: String) -> mlua::Result<String> {
+fn skills_load_binding(lua: &Lua, rel: String) -> mlua::Result<handles::Handle> {
     let resolved = resolve_import_path(lua, &rel)?;
     let skills = lua
         .app_data_ref::<SkillRegistry>()
@@ -1210,20 +1322,29 @@ fn skills_load_binding(lua: &Lua, rel: String) -> mlua::Result<String> {
     let def = skills
         .load_file(&resolved)
         .map_err(|e| mlua::Error::external(e.to_string()))?;
+    drop(skills);
+    own_skill(lua, &def.name);
     tracing::info!(skill = %def.name, path = %resolved.display(), "loaded skill file");
-    Ok(def.name)
+    handles::register(lua, handles::Kind::Skill, &def.name)
 }
 
-fn skills_load_dir_binding(lua: &Lua, rel: String) -> mlua::Result<usize> {
+fn skills_load_dir_binding(lua: &Lua, rel: String) -> mlua::Result<Vec<handles::Handle>> {
     let resolved = resolve_import_path(lua, &rel)?;
     let skills = lua
         .app_data_ref::<SkillRegistry>()
         .ok_or_else(|| mlua::Error::external("the skill registry is not available in this Lua state — this is a bug in agentd, please report it"))?;
-    let n = skills
+    let loaded = skills
         .load_dir(&resolved)
         .map_err(|e| mlua::Error::external(e.to_string()))?;
-    tracing::info!(loaded = n, dir = %resolved.display(), "loaded skills dir");
-    Ok(n)
+    drop(skills);
+    tracing::info!(loaded = loaded.len(), dir = %resolved.display(), "loaded skills dir");
+    loaded
+        .iter()
+        .map(|def| {
+            own_skill(lua, &def.name);
+            handles::register(lua, handles::Kind::Skill, &def.name)
+        })
+        .collect()
 }
 
 fn skills_list_binding(lua: &Lua, _: MultiValue) -> mlua::Result<Table> {
