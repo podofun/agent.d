@@ -32,8 +32,9 @@ RUN cargo build --release -p daemon -p agentd-cli
 FROM alpine:latest
 
 # nft installs the per-command NAT redirect inside the nested network namespace;
-# busybox already provides `ip`.
-RUN apk add --no-cache nftables
+# busybox already provides `ip`. tini runs as PID 1 and reaps the processes a
+# timed-out or cancelled command leaves behind once its tree is killed.
+RUN apk add --no-cache nftables tini
 
 RUN adduser -S -D -H -h /var/lib/agentd agentd \
     && mkdir -p /var/lib/agentd /etc/agentd \
@@ -58,4 +59,4 @@ EXPOSE 7777
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
     CMD wget -q -O- http://127.0.0.1:7777/health || exit 1
 
-ENTRYPOINT ["agentd"]
+ENTRYPOINT ["/sbin/tini", "--", "agentd"]
