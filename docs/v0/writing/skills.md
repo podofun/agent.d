@@ -36,14 +36,17 @@ Load a directory of `*.md` files at once:
 
 ```lua
 -- loads every *.md under the skills/ directory
-agentd.skills.dir("skills")    -- returns count loaded
+local loaded = agentd.skills.dir("skills")    -- the skills it loaded
 ```
 
 Load a single file by path:
 
 ```lua
-local name = agentd.skills.load("skills/reviewer.md")
+local reviewer = agentd.skills.load("skills/reviewer.md")
+print(reviewer.name, reviewer.description)
 ```
+
+Each call gives back live skills you can read and change, as described in [Changing what you registered](/v0/writing/init#changing-what-you-registered).
 
 Both calls resolve the path relative to `init.lua` and reject absolute paths and
 `..` traversal — the same rules as `import`.
