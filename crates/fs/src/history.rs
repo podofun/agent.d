@@ -1894,7 +1894,7 @@ mod tests {
         let mark = history.mark();
         history.write(&path, b"two", None).await.unwrap();
         history.write(&path, b"three", None).await.unwrap();
-        let moved = history.moved_since(mark, &[root.clone()]).await;
+        let moved = history.moved_since(mark, std::slice::from_ref(&root)).await;
         assert_eq!(moved.len(), 1, "{moved:?}");
         assert_eq!(moved[0].path, path);
         assert_eq!(moved[0].revision, 3);
@@ -1904,14 +1904,19 @@ mod tests {
 
         let mark = history.mark();
         history.undo(&path).await.unwrap();
-        let moved = history.moved_since(mark, &[root.clone()]).await;
+        let moved = history.moved_since(mark, std::slice::from_ref(&root)).await;
         assert_eq!(content(&moved[0].before), Some(b"three".to_vec()));
         assert_eq!(content(&moved[0].after), Some(b"two".to_vec()));
 
         let mark = history.mark();
         history.undo(&path).await.unwrap();
         history.redo(&path).await.unwrap();
-        assert!(history.moved_since(mark, &[root.clone()]).await.is_empty());
+        assert!(
+            history
+                .moved_since(mark, std::slice::from_ref(&root))
+                .await
+                .is_empty()
+        );
         assert!(
             history
                 .moved_since(0, &[root.join("elsewhere")])
@@ -1928,7 +1933,9 @@ mod tests {
         let history = History::default();
         history.write(&path, b"a", None).await.unwrap();
         fs::write(&path, b"edited").unwrap();
-        history.acknowledge_outside_in(&[root.clone()]).await;
+        history
+            .acknowledge_outside_in(std::slice::from_ref(&root))
+            .await;
         history.write(&path, b"c", None).await.unwrap();
     }
 }

@@ -33,6 +33,17 @@ use agentd_permissions::{Caller, PermissionSet};
 /// many were left out.
 const MAX_DIFF_LINES: usize = 400;
 
+/// A tool result lists at most this many changed files, the last ones.
+pub(crate) const MAX_REPORTED: usize = 200;
+
+/// The last [`MAX_REPORTED`] of `changes`, and how many were left out. A
+/// command such as `git checkout` can change thousands of files.
+pub(crate) fn cap_changes(mut changes: Vec<FileChange>) -> (Vec<FileChange>, usize) {
+    let more = changes.len().saturating_sub(MAX_REPORTED);
+    changes.drain(..more);
+    (changes, more)
+}
+
 /// How long a call waits for a folder another call is changing.
 pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(2);
 
@@ -363,10 +374,9 @@ pub(crate) fn diff_for(
     };
     let diff = agentd_fs::create_diff(&old, &new, path, path, 3);
     let (mut added, mut removed) = (0, 0);
-    for line in diff.lines() {
-        if line.starts_with("+++") || line.starts_with("---") {
-            continue;
-        }
+    // Skip the `---` and `+++` file headers, which come before the first
+    // hunk; a removed `-- comment` line inside a hunk starts the same way.
+    for line in diff.lines().skip_while(|line| !line.starts_with("@@")) {
         if line.starts_with('+') {
             added += 1;
         } else if line.starts_with('-') {
@@ -397,6 +407,37 @@ mod tests {
             digest: [0; 32],
             content: Some(text.as_bytes().to_vec()),
         }
+    }
+
+    #[test]
+    fn reports_keep_the_last_files_and_count_the_rest() {
+        let changes: Vec<FileChange> = (0..250)
+            .map(|i| {
+                report(
+                    Path::new("/w"),
+                    &Path::new("/w").join(format!("{i:03}.txt")),
+                    None,
+                    Some(&snapshot("x\n")),
+                    Some(1),
+                )
+            })
+            .collect();
+        let (kept, more) = cap_changes(changes.clone());
+        assert_eq!((kept.len(), more), (MAX_REPORTED, 50));
+        assert_eq!(kept[0].path, "050.txt");
+        assert_eq!(kept[MAX_REPORTED - 1].path, "249.txt");
+        let (kept, more) = cap_changes(changes[..3].to_vec());
+        assert_eq!((kept.len(), more), (3, 0));
+    }
+
+    #[test]
+    fn lines_that_look_like_file_headers_are_counted() {
+        let (diff, added, removed) = diff_for(
+            Some(&snapshot("a\n-- old comment\n")),
+            Some(&snapshot("a\n++ new line\n")),
+            "f.lua",
+        );
+        assert_eq!((added, removed), (1, 1), "{diff:?}");
     }
 
     #[test]

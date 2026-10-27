@@ -2249,7 +2249,7 @@ impl Executor {
                         let result = self.run_with_changes(tool_caller.clone(), action).await;
                         if let Some(sink) = &sink {
                             let run_id = tool_caller.run_id.as_deref();
-                            let (output, error, changes) = match &result {
+                            let (output, error, all_changes) = match &result {
                                 Ok((res, _, changes)) => (
                                     self.runs.redact_secrets(run_id, &res.value),
                                     None,
@@ -2259,12 +2259,14 @@ impl Executor {
                                     (serde_json::Value::Null, Some(e.to_string()), Vec::new())
                                 }
                             };
+                            let (changes, more) = capture::cap_changes(all_changes);
                             let _ = sink.send(agentd_ai::StreamEvent::ToolResult {
                                 name: call.name.clone(),
                                 input: self.runs.redact_secrets(run_id, &call.arguments),
                                 output,
                                 error,
                                 changes,
+                                more,
                             });
                         }
                         let text = match result {

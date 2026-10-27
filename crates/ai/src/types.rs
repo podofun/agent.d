@@ -284,11 +284,19 @@ pub enum StreamEvent {
         /// The files the call changed, however it changed them.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         changes: Vec<FileChange>,
+        /// How many more files the call changed than `changes` lists. Only
+        /// the last ones are listed when a call changes very many.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        more: usize,
     },
     /// One provider turn finished. The executor-owned loop may start another
     /// turn after dispatching tools; the final turn is followed by the
     /// complete response instead.
     TurnEnd,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// One file a tool call changed. `revision` is the file history revision
@@ -428,9 +436,11 @@ mod tests {
             output: serde_json::Value::Null,
             error: None,
             changes: Vec::new(),
+            more: 0,
         };
         let json = serde_json::to_value(&event).unwrap();
         assert!(json.get("changes").is_none(), "{json}");
+        assert!(json.get("more").is_none(), "{json}");
 
         let event = StreamEvent::ToolResult {
             name: "files.write".into(),
@@ -446,8 +456,10 @@ mod tests {
                 added: 1,
                 removed: 0,
             }],
+            more: 7,
         };
         let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["more"], 7);
         assert_eq!(
             json["changes"],
             serde_json::json!([{

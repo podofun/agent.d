@@ -385,6 +385,7 @@ impl agentd_ai::Provider for ChangesProvider {
                 added: 1,
                 removed: 0,
             }],
+            more: 0,
         });
         self.complete(req).await
     }
