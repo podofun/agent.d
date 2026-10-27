@@ -250,7 +250,7 @@ fn group_header(app: &App, calls: &[Entry], open: bool, width: usize) -> Line<'s
         .collect();
     Line::from(vec![
         gutter("✦", WARNING),
-        Span::styled(format!("{title} "), Style::default().fg(MUTED)),
+        Span::styled(format!("{title} "), Style::default()),
         Span::styled(marker, Style::default().fg(MUTED)),
     ])
 }
@@ -327,7 +327,7 @@ fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
         (true, false) => " ▶",
     };
     let mut spans = vec![
-        Span::styled(entry.text.clone(), Style::default().fg(SECONDARY)),
+        Span::styled(entry.text.clone(), Style::default()),
         Span::styled(marker, Style::default().fg(MUTED)),
     ];
     for (key, value) in &short {
