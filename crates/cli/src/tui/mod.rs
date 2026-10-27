@@ -199,11 +199,22 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                     }
                 }
             }
+            MouseEventKind::Moved => {
+                // Redraw only when the row under the mouse changes.
+                let hover = (app.tab == Tab::Chat && app.approval.is_none())
+                    .then(|| ui::clickable_at(app, area, mouse.column, mouse.row))
+                    .flatten();
+                if hover == app.hover {
+                    return Ok(Handled::Ignored);
+                }
+                app.hover = hover;
+            }
             MouseEventKind::ScrollUp => {
                 if app.approval.is_some() {
                     app.approval_scroll = app.approval_scroll.saturating_sub(3);
                 } else if app.tab == Tab::Chat {
                     scroll_up(app, area, 3);
+                    app.hover = ui::clickable_at(app, area, mouse.column, mouse.row);
                 } else {
                     app.move_selection(-1, false);
                 }
@@ -213,6 +224,7 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                     app.approval_scroll = app.approval_scroll.saturating_add(3);
                 } else if app.tab == Tab::Chat {
                     scroll_down(app, 3);
+                    app.hover = ui::clickable_at(app, area, mouse.column, mouse.row);
                 } else {
                     app.move_selection(1, false);
                 }
@@ -501,7 +513,7 @@ async fn submit_draft(app: &mut App) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use app::EntryKind;
+    use app::{EntryKind, ToolRow};
 
     #[tokio::test]
     async fn typing_in_the_browser_filters_and_esc_clears_before_closing() {
@@ -817,6 +829,48 @@ mod tests {
         .unwrap();
         assert!(app.entries[1].expanded);
         assert!(app.selection.is_none());
+    }
+
+    #[tokio::test]
+    async fn hovering_a_tool_row_highlights_it_until_the_mouse_leaves() {
+        let (mut app, screen, x, y) = chat_with_tool();
+        let header = y + 2;
+        let moved = |column, row| mouse(MouseEventKind::Moved, column, row);
+        let handled = handle_event(&mut app, moved(x + 4, header), screen)
+            .await
+            .unwrap();
+        assert!(matches!(handled, Handled::Redraw));
+        assert!(
+            matches!(app.hover, Some((_, ToolRow::Entry(1)))),
+            "{:?}",
+            app.hover
+        );
+
+        let backend = ratatui::backend::TestBackend::new(screen.width, screen.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+        let underlined = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+            (0..screen.width).any(|column| {
+                terminal.backend().buffer()[(column, header)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)
+            })
+        };
+        assert!(underlined(&terminal));
+
+        let handled = handle_event(&mut app, moved(x + 5, header), screen)
+            .await
+            .unwrap();
+        assert!(
+            matches!(handled, Handled::Ignored),
+            "moving within the same row does not redraw"
+        );
+        handle_event(&mut app, moved(x + 4, y), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.hover, None);
+        terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+        assert!(!underlined(&terminal));
     }
 
     #[tokio::test]

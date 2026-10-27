@@ -17,7 +17,7 @@ mod markdown;
 mod selection;
 
 pub(super) use conversation::conversation_inner;
-pub(super) use conversation::{max_scroll, suggestion_at, toggle_tool, tool_at};
+pub(super) use conversation::{clickable_at, max_scroll, suggestion_at, toggle_tool, tool_at};
 pub(super) use logo::SPIN as LEAF_SPIN;
 #[cfg(test)]
 pub(super) use selection::Point;

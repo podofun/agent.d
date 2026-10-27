@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -25,6 +27,28 @@ pub(super) fn wrap_plain(text: &str, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// `text` as the terminal will draw it: a tab becomes four spaces, a newline
+/// a space, and every other control character is dropped. The terminal acts
+/// on control characters instead of drawing them, so a tab jumps to the next
+/// tab stop without clearing the cells it passes and a carriage return goes
+/// back to the start of the row. Either leaves the screen out of step with
+/// what the TUI measured, and the cells it skipped are never redrawn.
+pub(super) fn printable(text: &str) -> Cow<'_, str> {
+    if !text.contains(char::is_control) {
+        return Cow::Borrowed(text);
+    }
+    let mut clean = String::with_capacity(text.len() + 8);
+    for character in text.chars() {
+        match character {
+            '\t' => clean.push_str("    "),
+            '\n' => clean.push(' '),
+            character if character.is_control() => {}
+            character => clean.push(character),
+        }
+    }
+    Cow::Owned(clean)
+}
+
 /// Wraps styled spans on spaces, keeping each span's style. A word wider than
 /// the line is broken by grapheme.
 pub(super) fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
@@ -34,7 +58,7 @@ pub(super) fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'s
     let mut used = 0;
     for span in spans {
         let style = span.style;
-        for word in span.content.split_inclusive(' ') {
+        for word in printable(&span.content).split_inclusive(' ') {
             let trimmed = word.trim_end_matches(' ');
             let word_width = trimmed.width();
             if used > 0 && used + word_width > width {
@@ -81,7 +105,7 @@ pub(super) fn cut_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'st
     let mut cut = Vec::new();
     for span in spans {
         let mut body = String::new();
-        for grapheme in span.content.graphemes(true) {
+        for grapheme in printable(&span.content).graphemes(true) {
             let grapheme_width = grapheme.width();
             if used + grapheme_width > width {
                 if !body.is_empty() {
@@ -777,5 +801,21 @@ mod tests {
             "{lines:?}"
         );
         assert!(lines.iter().all(|line| line.width() <= 60), "{lines:?}");
+    }
+
+    #[test]
+    fn printable_text_has_no_control_characters() {
+        assert!(matches!(printable("plain \u{2014} text"), Cow::Borrowed(_)));
+        assert_eq!(printable("  2\tset -e\r"), "  2    set -e");
+        assert_eq!(printable("red\u{1b}[31m\u{7}"), "red[31m");
+        let wrapped = wrap_spans(vec![Span::raw("a\tb\r\nc")], 20);
+        assert_eq!(text_of(&wrapped), vec!["a    b c"]);
+        let cut = cut_spans(vec![Span::raw("\tx\u{1F44B}y")], 6);
+        assert_eq!(
+            cut.iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "    x"
+        );
     }
 }
