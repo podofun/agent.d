@@ -62,6 +62,9 @@ pub struct TConfig {
     pub status_fd: RawFd,
     pub bin: String,
     pub args: Vec<String>,
+    /// The folder the command starts in. `None` keeps the supervisor's.
+    #[serde(default)]
+    pub cwd: Option<String>,
     pub read_paths: Vec<String>,
     pub write_paths: Vec<String>,
 }
@@ -431,6 +434,16 @@ mod supervisor {
             unsafe { libc::_exit(126) };
         }
 
+        if let Some(cwd) = &cfg.cwd
+            && let Err(e) = std::env::set_current_dir(cwd)
+        {
+            report(
+                cfg.status_fd,
+                format!("could not start in the folder `{cwd}` ({e})").as_bytes(),
+            );
+            unsafe { libc::_exit(126) };
+        }
+
         // No proxy env: enforcement is transparent (kernel redirect + host allowlist).
         let policy = SandboxPolicy {
             read_paths: cfg.read_paths.iter().map(Into::into).collect(),
@@ -554,6 +567,7 @@ fn run_contained_blocking(
         status_fd: st.wr,
         bin: req.bin.clone(),
         args: req.args.clone(),
+        cwd: req.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
         read_paths: policy
             .read_paths
             .iter()

@@ -99,6 +99,7 @@ If two identical questions come from the same run at the same time, agent.d asks
 | `missing_grant` | Adds the permissions to the `granted` list of the tool or service. |
 | `runner_action` | Adds the action to the runner's `allowed_actions` list. |
 | `confirm` | Adds the action to `[approval].skip`. |
+| `folder` | Adds the folder to `[folders].trusted`. |
 
 For the current run, "allow forever" works like "allow once". Later calls get the new grant from the file.
 
@@ -113,7 +114,7 @@ Each approval request has these fields:
 | Field | Description |
 |---|---|
 | `id` | The request identifier. Send it back with your answer. |
-| `kind` | Why agent.d asks: `missing_grant`, `runner_action`, or `confirm`. |
+| `kind` | Why agent.d asks: `missing_grant`, `runner_action`, `confirm`, or `folder`. |
 | `action` | The full action name, for example `git.status`. |
 | `tool` | The tool that owns the action. |
 | `reason` | A sentence that tells what is missing. |
@@ -125,6 +126,10 @@ Each approval request has these fields:
 | `caller` | Who made the call: the `runner`, `interface`, `service`, `session`, and `user`. |
 
 Secrets never appear in a request. If the run read a secret with `ctx.secret.get`, agent.d replaces its value with `<secret name>` everywhere in `detail`. agent.d also shortens very long values.
+
+## Folder questions
+
+When a chat starts in a folder you have not trusted yet, agent.d asks whether it may work there. The request has the kind `folder`, and its `action` is the folder's full path. "Allow once" trusts the folder for that chat, "Always trust" also adds it to [`[folders]`](/v0/security/grants#folders) so you are not asked again, and "Deny" starts the chat without a folder. A person always answers folder questions: the classifier never does, and if nobody is connected to answer, the folder is refused.
 
 ## The classifier
 

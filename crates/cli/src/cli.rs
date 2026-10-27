@@ -159,6 +159,9 @@ pub(crate) enum SessionCmd {
         label: Option<String>,
         #[arg(long)]
         user: Option<String>,
+        /// The folder its runs work in. You are asked once before agent.d trusts it.
+        #[arg(long)]
+        cwd: Option<String>,
     },
     Ls {
         #[arg(long, default_value_t = 50)]

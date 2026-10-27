@@ -127,6 +127,17 @@ mod tests {
     }
 
     #[test]
+    fn session_new_takes_a_folder() {
+        let c = parse(&["session", "new", "--cwd", "/w/project"]);
+        assert!(matches!(
+            c.cmd,
+            Cmd::Session {
+                cmd: crate::cli::SessionCmd::New { cwd: Some(ref cwd), .. }
+            } if cwd == "/w/project"
+        ));
+    }
+
+    #[test]
     fn pkg_rm_alias_parses() {
         let c = parse(&["pkg", "rm", "foo"]);
         assert!(matches!(

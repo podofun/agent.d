@@ -797,6 +797,7 @@ fn build_and_store_ctx(lua: &Lua) -> mlua::Result<()> {
     let fs = build_fs_table(lua)?;
     wrap_table_fns(lua, &fs)?;
     ctx.set("fs", fs)?;
+    ctx.set("diff", build_diff_table(lua)?)?;
     ctx.set("http", build_http_table(lua)?)?;
     let secret = build_secret_table(lua)?;
     wrap_table_fns(lua, &secret)?;
@@ -2145,6 +2146,24 @@ fn lexical_clean(p: PathBuf) -> PathBuf {
     out
 }
 
+/// Replace `{cwd}` in path grants with the session's folder. Without a
+/// session folder, a grant that uses it grants nothing, so it is dropped.
+pub(crate) fn substitute_cwd(grants: &PermissionSet, cwd: Option<&str>) -> PermissionSet {
+    let mut out = PermissionSet::default();
+    for permission in grants.iter() {
+        let text = permission.as_str();
+        if !text.contains("{cwd}") {
+            out.insert(permission.clone());
+            continue;
+        }
+        let path_grant = matches!(permission.parts().0, "fs.read" | "fs.write" | "shell.exec");
+        if let (true, Some(cwd)) = (path_grant, cwd) {
+            out.insert(Permission::new(text.replace("{cwd}", cwd)));
+        }
+    }
+    out
+}
+
 /// Expand relative path grants against a base cwd (additive). A relative
 /// `fs.read`/`fs.write` spec, or a `shell.exec` spec that names a path (has a
 /// separator), gets an absolute twin joined to `base` — so a portable relative
@@ -2241,6 +2260,9 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
             .and_then(|active| active.cwd.clone())
     });
     refuse_if_program_denied(lua, &req.bin, cwd.as_deref())?;
+    // The program starts where the action works unless the call says otherwise,
+    // the same folder the checks above and any question use.
+    req.cwd = cwd.clone();
     // Confine the child to the execution's effective filesystem/network grants,
     // after refusing a reach that overlaps a denial and before asking anything.
     let mut policy = {
@@ -2400,10 +2422,100 @@ fn parse_timeout_ms(t: &Table) -> mlua::Result<Option<u64>> {
 
 // ---------- context.fs ----------
 
+/// `ctx.diff`: unified diffs as text and as tables. Pure string work, so no
+/// permission applies; changing files goes through `ctx.fs`.
+fn build_diff_table(lua: &Lua) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    t.set(
+        "create",
+        lua.create_function(|_, (old, new, opts): (String, String, Option<Table>)| {
+            let path = match &opts {
+                Some(opts) => opts.get::<Option<String>>("path")?,
+                None => None,
+            }
+            .unwrap_or_else(|| "file".to_owned());
+            let context = match &opts {
+                Some(opts) => opts.get::<Option<usize>>("context")?,
+                None => None,
+            }
+            .unwrap_or(3);
+            Ok(fs::create_diff(&old, &new, &path, &path, context))
+        })?,
+    )?;
+    t.set(
+        "parse",
+        lua.create_function(|lua, text: String| {
+            let files = fs::parse_patch(&text).map_err(mlua::Error::external)?;
+            patches_to_lua(lua, &files)
+        })?,
+    )?;
+    t.set(
+        "format",
+        lua.create_function(|lua, files: Value| {
+            let files: Vec<fs::FilePatch> = lua.from_value(files).map_err(|e| {
+                mlua::Error::external(format!(
+                    "format takes the list ctx.diff.parse returns ({e})"
+                ))
+            })?;
+            Ok(fs::format_patch(&files))
+        })?,
+    )?;
+    t.set(
+        "apply",
+        lua.create_function(|lua, (text, patch): (String, Value)| {
+            // `create` of two identical texts gives an empty diff: nothing to do.
+            if let Value::String(diff) = &patch
+                && diff.as_bytes().is_empty()
+            {
+                return Ok(text);
+            }
+            let patch = one_file_patch(lua, patch)?;
+            fs::apply_patch(&text, &patch).map_err(mlua::Error::external)
+        })?,
+    )?;
+    Ok(t)
+}
+
+/// File patches as Lua tables, with `/dev/null` paths as `nil`.
+fn patches_to_lua(lua: &Lua, files: &[fs::FilePatch]) -> mlua::Result<Value> {
+    lua.to_value_with(
+        files,
+        mlua::SerializeOptions::new()
+            .serialize_none_to_null(false)
+            .serialize_unit_to_null(false),
+    )
+}
+
+/// A patch for one file, given as diff text or as one parsed file table.
+fn one_file_patch(lua: &Lua, patch: Value) -> mlua::Result<fs::FilePatch> {
+    match patch {
+        Value::String(text) => {
+            let mut files = fs::parse_patch(&text.to_str()?).map_err(mlua::Error::external)?;
+            if files.len() != 1 {
+                return Err(mlua::Error::external(
+                    "apply takes a patch for one file; use ctx.fs.patch for several",
+                ));
+            }
+            Ok(files.remove(0))
+        }
+        Value::Table(_) => lua.from_value(patch).map_err(|e| {
+            mlua::Error::external(format!(
+                "apply takes diff text or one file from ctx.diff.parse ({e})"
+            ))
+        }),
+        other => Err(mlua::Error::external(format!(
+            "apply takes diff text or one file from ctx.diff.parse, but got a {} value",
+            other.type_name()
+        ))),
+    }
+}
+
 fn build_fs_table(lua: &Lua) -> mlua::Result<Table> {
     let t = lua.create_table()?;
     t.set("read", lua.create_function(fs_read_binding)?)?;
     t.set("write", lua.create_function(fs_write_binding)?)?;
+    t.set("edit", lua.create_function(fs_edit_binding)?)?;
+    t.set("patch", lua.create_function(fs_patch_binding)?)?;
     t.set("append", lua.create_function(fs_append_binding)?)?;
     t.set("exists", lua.create_function(fs_exists_binding)?)?;
     t.set("stat", lua.create_function(fs_stat_binding)?)?;
@@ -2555,7 +2667,93 @@ fn fs_read_binding(lua: &Lua, path: String) -> mlua::Result<mlua::String> {
     // Read through a handle confirmed to be the checked file, so a symlink
     // swapped in after the check cannot redirect the read.
     let bytes = block_on(fs::read_bytes_verified(&p))?.map_err(mlua::Error::external)?;
+    if let Some(scope) = read_scope(lua) {
+        block_on(file_history(lua).record_read_bytes(&scope, &p, &bytes))?;
+    }
     lua.create_string(bytes)
+}
+
+/// Who a read counts for when a later edit or patch checks it: the chat
+/// session, else the run, else the connection. `None` when the caller has
+/// none of these.
+fn read_scope(lua: &Lua) -> Option<String> {
+    let active = lua.app_data_ref::<ActiveContext>()?;
+    let caller = &active.caller;
+    if let Some(session) = &caller.session_id {
+        return Some(format!("session:{session}"));
+    }
+    if let Some(run) = &caller.run_id {
+        return Some(format!("run:{run}"));
+    }
+    caller
+        .session
+        .as_ref()
+        .map(|connection| format!("connection:{}", connection.as_str()))
+}
+
+/// The read scope an edit or a patch needs, or an error saying why there is none.
+fn required_read_scope(lua: &Lua) -> mlua::Result<String> {
+    read_scope(lua).ok_or_else(|| {
+        mlua::Error::external(
+            "changing a file with edit or patch needs a chat session or a run, so agent.d knows the file was read first",
+        )
+    })
+}
+
+/// `ctx.fs.patch(patch, opts?)`: apply a unified diff to the files it
+/// names, all or nothing. Every file is resolved and permission-checked
+/// before anything changes. `opts.path` names the file for a one-file patch.
+fn fs_patch_binding(lua: &Lua, (text, opts): (String, Option<Table>)) -> mlua::Result<Value> {
+    let scope = required_read_scope(lua)?;
+    let files = fs::parse_patch(&text).map_err(mlua::Error::external)?;
+    let path_override = match &opts {
+        Some(opts) => opts.get::<Option<String>>("path")?,
+        None => None,
+    };
+    if path_override.is_some() && files.len() != 1 {
+        return Err(mlua::Error::external(
+            "`path` can only name the file of a one-file patch",
+        ));
+    }
+    let mut resolved = Vec::new();
+    let mut names = Vec::new();
+    for file in files {
+        let name = path_override
+            .clone()
+            .unwrap_or_else(|| file.path().to_owned());
+        let p = resolve_path(lua, name.clone());
+        if file.old_path.is_some() {
+            check_permission_inline(lua, &Permission::new(format!("fs.read:{}", p.display())))?;
+        }
+        check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
+        names.push(name);
+        resolved.push((p, file));
+    }
+    let done =
+        block_on(file_history(lua).patch(&scope, &resolved))?.map_err(mlua::Error::external)?;
+    let result = lua.create_table()?;
+    for (index, (name, (_, revision))) in names.into_iter().zip(done).enumerate() {
+        let entry = lua.create_table()?;
+        entry.set("path", name)?;
+        entry.set("revision", revision)?;
+        result.set(index + 1, entry)?;
+    }
+    Ok(Value::Table(result))
+}
+
+fn fs_edit_binding(
+    lua: &Lua,
+    (path, old, new, opts): (String, String, String, Option<Table>),
+) -> mlua::Result<usize> {
+    let replace_all = match &opts {
+        Some(opts) => opts.get::<Option<bool>>("replace_all")?.unwrap_or(false),
+        None => false,
+    };
+    let scope = required_read_scope(lua)?;
+    let p = resolve_path(lua, path);
+    check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
+    block_on(file_history(lua).edit(&scope, &p, &old, &new, replace_all))?
+        .map_err(mlua::Error::external)
 }
 
 fn fs_write_binding(lua: &Lua, args: MultiValue) -> mlua::Result<usize> {
@@ -2572,7 +2770,14 @@ fn fs_write_binding(lua: &Lua, args: MultiValue) -> mlua::Result<usize> {
     })?)?;
     let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
-    block_on(file_history(lua).write(&p, &content.as_bytes()))?.map_err(mlua::Error::external)
+    let history = file_history(lua);
+    let revision =
+        block_on(history.write(&p, &content.as_bytes()))?.map_err(mlua::Error::external)?;
+    // The caller knows exactly what it wrote, so it counts as a read.
+    if let Some(scope) = read_scope(lua) {
+        block_on(history.record_read_bytes(&scope, &p, &content.as_bytes()))?;
+    }
+    Ok(revision)
 }
 
 fn fs_append_binding(lua: &Lua, args: MultiValue) -> mlua::Result<usize> {
@@ -3913,6 +4118,8 @@ fn build_caller_table(lua: &Lua) -> mlua::Result<Table> {
                 "session" => c.session.as_ref().map(|x| x.as_str().to_string()),
                 "user" => c.user.as_ref().map(|x| x.as_str().to_string()),
                 "execution" => c.execution.as_ref().map(|x| x.as_str().to_string()),
+                "session_id" => c.session_id.clone(),
+                "run_id" => c.run_id.clone(),
                 _ => None,
             };
             match v {
@@ -4490,7 +4697,7 @@ impl Registry for LuaHost {
         // add canonical twins. A relative `fs.read:data/x` grant therefore covers
         // the absolute path a relative `ctx.fs.read("data/x")` resolves to.
         let effective_grants = normalize_path_grants(&resolve_relative_grants(
-            &ctx.effective_grants,
+            &substitute_cwd(&ctx.effective_grants, ctx.caller.cwd.as_deref()),
             cwd.as_deref(),
         ));
         let ctx_for_drive = ActiveContext {
@@ -4545,7 +4752,7 @@ impl Registry for LuaHost {
         let ctx_for_drive = ActiveContext {
             caller: ctx.caller.clone(),
             effective_grants: normalize_path_grants(&resolve_relative_grants(
-                &ctx.effective_grants,
+                &substitute_cwd(&ctx.effective_grants, ctx.caller.cwd.as_deref()),
                 cwd.as_deref(),
             )),
             call_chain: ctx.call_chain.clone(),
@@ -4598,7 +4805,7 @@ fn script_err(e: scheduler::DriveError) -> RegistryError {
 
 #[cfg(test)]
 mod cwd_grant_tests {
-    use super::{lexical_clean, resolve_cwd, resolve_relative_grants};
+    use super::{lexical_clean, resolve_cwd, resolve_relative_grants, substitute_cwd};
     use agentd_permissions::{Permission, PermissionSet};
     use std::path::{Path, PathBuf};
 
@@ -4629,6 +4836,23 @@ mod cwd_grant_tests {
             lexical_clean(PathBuf::from("/a/./b/../c")),
             PathBuf::from("/a/c")
         );
+    }
+
+    #[test]
+    fn cwd_placeholder_expands_for_session_calls() {
+        let grants = PermissionSet::from_iter(["fs.write:{cwd}/**", "net:example.com"]);
+        let out = substitute_cwd(&grants, Some("/w"));
+        assert!(out.contains(&Permission::new("fs.write:/w/**")));
+        assert!(out.contains(&Permission::new("net:example.com")));
+        assert!(!out.iter().any(|p| p.as_str().contains("{cwd}")));
+    }
+
+    #[test]
+    fn cwd_placeholder_grants_nothing_without_a_session_folder() {
+        let grants = PermissionSet::from_iter(["fs.write:{cwd}/**", "fs.read:/etc/hosts"]);
+        let out = substitute_cwd(&grants, None);
+        assert_eq!(out.iter().count(), 1);
+        assert!(out.contains(&Permission::new("fs.read:/etc/hosts")));
     }
 
     #[test]

@@ -92,6 +92,7 @@ export default defineConfig({
             { text: 'ctx.log', link: '/v0/reference/ctx/logging' },
             { text: 'ctx.shell', link: '/v0/reference/ctx/shell' },
             { text: 'ctx.fs', link: '/v0/reference/ctx/fs' },
+            { text: 'ctx.diff', link: '/v0/reference/ctx/diff' },
             { text: 'ctx.http', link: '/v0/reference/ctx/http' },
             { text: 'ctx.ws', link: '/v0/reference/ctx/websocket' },
             { text: 'ctx.secret', link: '/v0/reference/ctx/secrets' },

@@ -123,6 +123,28 @@ permissions = ["net:tracker.example.com", "fs.read:/home/me/project/.env"]
 
 Use a denial for something that must never happen, whatever the grants say. A denial applies everywhere that agent.d checks access: in action calls, inside running handlers, in programs that `ctx.shell` starts, and in the AI providers. A file denial must be an absolute path. See [What a denial guarantees](/v0/security/denials) for the full list and its limits.
 
+### `[folders]`
+
+Lists the folders chat sessions may work in without asking. When you start `agentctl chat` in a folder that is not listed, agent.d asks you once whether to trust it, and choosing "Always trust" adds the folder here for you. You will rarely need to edit this list by hand, but you can.
+
+```toml
+[folders]
+trusted = ["~/code/**", "/srv/work/site"]
+```
+
+Each entry is an absolute path or a glob, and `~` means your home folder. Trusting a folder also trusts every folder inside it. A relative entry, or the root of the disk, is an error when the file loads.
+
+### Grants that follow the chat's folder
+
+A grant can say `{cwd}` where a path goes. In a chat session that works in a folder, `{cwd}` becomes that folder, so one grants file works for every project you open:
+
+```toml
+[tool.files]
+granted = ["fs.read:{cwd}/**", "fs.write:{cwd}/**"]
+```
+
+`{cwd}` works in `fs.read`, `fs.write` and `shell.exec` grants. A call outside such a session, for example `agentctl call`, gets nothing from a `{cwd}` grant, while its other grants work as usual. `{cwd}` cannot be used in `[denial]`, because a denial must hold everywhere.
+
 ### `[approval]`
 
 Controls how questions are answered.
@@ -188,7 +210,7 @@ skip       = []
 - A component's own entry always has priority over a package grant.
 - For interfaces and services, an empty `allowed_actions` list means "no limit". For runners, an action that is not on the list causes a question.
 - agent.d resolves file paths before it compares them. It follows symlinks and removes `..` segments, so an alias cannot get around a grant or a denial. On macOS and Windows, uppercase and lowercase letters in paths are the same.
-- A relative `fs.read` or `fs.write` grant starts from the component's working directory, which is the workspace root by default. So `fs.read:notes/**` works on every machine. An absolute grant stays as you wrote it.
+- A relative `fs.read` or `fs.write` grant starts from the component's working directory: in a chat session with a folder, that folder, and otherwise the workspace root. So `fs.read:notes/**` works on every machine. An absolute grant stays as you wrote it.
 - A `shell.exec` value is a program name or a path. agent.d finds the program file that the value names, so `shell.exec:python3` and `/usr/bin/python3` are the same program.
 
 ## See also

@@ -26,7 +26,7 @@
 //! load instead of silently dropping a rule.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -100,6 +100,37 @@ pub struct GrantsFile {
     pub denial: Denial,
     #[serde(default)]
     pub approval: Approval,
+    #[serde(default)]
+    pub folders: Folders,
+}
+
+/// `[folders]`: the folders chat sessions may work in without asking.
+/// "Always trust" on a folder question appends here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Folders {
+    /// Absolute folders or globs (`/home/me/code/**`); `~` means the home folder.
+    #[serde(default)]
+    pub trusted: Vec<String>,
+}
+
+/// The user's home folder, for `~` in trusted folders.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+fn expand_home(entry: &str) -> String {
+    match (
+        entry.strip_prefix("~/").or(entry.strip_prefix("~")),
+        home_dir(),
+    ) {
+        (Some(rest), Some(home)) if entry == "~" || entry.starts_with("~/") => {
+            home.join(rest).to_string_lossy().into_owned()
+        }
+        _ => entry.to_owned(),
+    }
 }
 
 /// Materialized grants used by the engine. Provides fast lookups.
@@ -132,6 +163,20 @@ impl Grants {
     pub fn package(&self, name: &str) -> Option<&PackageGrants> {
         self.file.package.get(name)
     }
+    /// Whether `folder` (an absolute real path) is one the user trusts,
+    /// matched like an `fs.read` grant so globs mean the same thing. A
+    /// trusted folder also covers every folder inside it.
+    pub fn trusts_folder(&self, folder: &Path) -> bool {
+        let wanted = Permission::new(format!("fs.read:{}", folder.display()));
+        self.file.folders.trusted.iter().any(|entry| {
+            let entry = expand_home(entry);
+            let inside = format!("{}/**", entry.trim_end_matches(['/', '\\']));
+            Permission::new(format!("fs.read:{entry}")).covers(&wanted)
+                || (!entry.ends_with('*')
+                    && Permission::new(format!("fs.read:{inside}")).covers(&wanted))
+        })
+    }
+
     pub fn denial(&self) -> &Denial {
         &self.file.denial
     }
@@ -217,6 +262,28 @@ fn check_grants(file: &GrantsFile) -> Result<(), String> {
                     p.as_str()
                 ));
             }
+        }
+    }
+    for p in file.denial.permissions.iter() {
+        if p.as_str().contains("{cwd}") {
+            return Err(format!(
+                "uses `{{cwd}}` in `[denial]` (`{}`), but denials must be absolute paths that hold for every session",
+                p.as_str()
+            ));
+        }
+    }
+    for entry in &file.folders.trusted {
+        let expanded = expand_home(entry);
+        if !is_absolute_path(&expanded) {
+            return Err(format!(
+                "trusts the folder `{entry}` in `[folders]`, which is not an absolute path. Write the full path, or start it with `~/`"
+            ));
+        }
+        let trimmed = expanded.trim_end_matches(['*', '/', '\\']);
+        if trimmed.is_empty() || Path::new(&expanded).parent().is_none() || trimmed.ends_with(':') {
+            return Err(format!(
+                "trusts `{entry}` in `[folders]`, which is the root of the disk. Trust the folders you work in instead"
+            ));
         }
     }
     for p in file.denial.permissions.iter() {
@@ -339,6 +406,40 @@ mod tests {
         assert!(err("[denial]\npermissions = [\"fs.read:.env\"]\n").contains("absolute"));
         assert!(err("[denial]\npermissions = [\"fs.write:~/secrets\"]\n").contains("absolute"));
         parse_grants("[denial]\npermissions = [\"fs.read:/proj/.env\", \"fs.read\"]\n").unwrap();
+    }
+
+    #[test]
+    fn trusted_folders_match_paths_and_globs() {
+        let grants = Grants::from_file(
+            parse_grants("[folders]\ntrusted = [\"/w/a\", \"/w/code/**\"]\n").unwrap(),
+        );
+        assert!(grants.trusts_folder(Path::new("/w/a")));
+        assert!(grants.trusts_folder(Path::new("/w/code/x/y")));
+        assert!(!grants.trusts_folder(Path::new("/w/b")));
+        assert!(!grants.trusts_folder(Path::new("/w/ab")));
+        // Trusting a folder trusts what is inside it, as Claude Code does.
+        assert!(grants.trusts_folder(Path::new("/w/a/inner")));
+    }
+
+    #[test]
+    fn trusted_folders_expand_the_home_folder() {
+        let home = home_dir().expect("a home folder in the test environment");
+        let grants =
+            Grants::from_file(parse_grants("[folders]\ntrusted = [\"~/code/**\"]\n").unwrap());
+        assert!(grants.trusts_folder(&home.join("code").join("x")));
+    }
+
+    #[test]
+    fn bad_trusted_entries_are_load_errors() {
+        assert!(err("[folders]\ntrusted = [\"rel/path\"]\n").contains("absolute"));
+        assert!(err("[folders]\ntrusted = [\"/\"]\n").contains("root"));
+    }
+
+    #[test]
+    fn cwd_placeholder_is_refused_in_denials() {
+        let e = err("[denial]\npermissions = [\"fs.write:{cwd}/**\"]\n");
+        assert!(e.contains("{cwd}") && e.contains("[denial]"), "{e}");
+        parse_grants("[tool.files]\ngranted = [\"fs.write:{cwd}/**\"]\n").unwrap();
     }
 
     #[test]

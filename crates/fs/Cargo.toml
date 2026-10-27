@@ -9,6 +9,7 @@ thiserror.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread"] }
+diffy = "0.5.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

@@ -300,7 +300,9 @@ On SIGINT or SIGTERM the daemon stops admitting work and allows up to 30 seconds
 
 Create a chat session to store conversation history. The result contains session metadata; pass its `id` as `session_id` in `runners.run`.
 
-The optional parameters are `label`, `runner`, `approval`, `session` and `user`, all strings. A label is a name you choose, such as a chat id or ticket number. Labels are unique per interface, including across users; an existing label returns `session_label_taken`. The `runner` field is informational and does not restrict which runner can use the session. The `approval` field sets who answers questions for runs in the session (`human`, `classifier`, or `nobody`); see [`sessions.set_approval`](#sessions-set-approval). The `session` and `user` fields set the caller identity, as they do for `actions.call` and `runners.run`.
+The optional parameters are `label`, `runner`, `approval`, `cwd`, `session` and `user`, all strings. A label is a name you choose, such as a chat id or ticket number. Labels are unique per interface, including across users; an existing label returns `session_label_taken`. The `runner` field is informational and does not restrict which runner can use the session. The `approval` field sets who answers questions for runs in the session (`human`, `classifier`, or `nobody`); see [`sessions.set_approval`](#sessions-set-approval). The `session` and `user` fields set the caller identity, as they do for `actions.call` and `runners.run`.
+
+The `cwd` field is the folder the session's runs work in, as an absolute path. Only connections that use the daemon token or the admin token may set it, so a bot on an interface token never can. agent.d resolves the folder to its real path and accepts it when it is listed under [`[folders]`](/v0/security/grants#folders) in grants.toml, or a folder inside one. For any other folder it asks a person through the [approval channel](#control-plane) with the kind `folder`, and the request waits for the answer. A refused folder returns `session_folder_denied`; a folder this connection may not choose, or one that is missing, relative, not a folder or the root of the disk, returns `session_folder_not_allowed`. A taken label is reported before anyone is asked.
 
 The session belongs to the connection's interface (`interface:ws` for the daemon token, `interface:<name>` for an [interface token](#interface-tokens), or `admin:ws` for an [admin connection](#admin-token-on-ws)). If you pass `user`, later requests must carry the same user to access it. Without `user`, the session is visible to all callers from that interface.
 
@@ -404,6 +406,8 @@ List background services with their current state.
 | `session_not_found` | The session does not exist or is not visible to this caller | Run `agentctl session ls` to list sessions, or `agentctl session new` to start one |
 | `session_busy` | Another run is using that session | Wait for it to finish, then retry |
 | `session_label_taken` | `sessions.create` reused a label | Fetch the existing one with `sessions.get { label }` instead |
+| `session_folder_not_allowed` | `sessions.create` asked for a folder this connection may not choose, or one that cannot be used | Start the chat on this machine, in an existing project folder |
+| `session_folder_denied` | Nobody trusted the folder `sessions.create` asked for | Start the chat from a folder you trust, or add it under `[folders] trusted` in grants.toml |
 | `sessions_unavailable` | No session store is configured | — |
 | `unknown_skill` | Runner references a skill that is not registered | Run `agentctl skills ls` to list skills |
 | `no_provider` | The runner could not resolve a provider for its model | You can configure new providers in your `config.toml` |
@@ -452,7 +456,7 @@ When a call needs an approval and the run's setting sends it to a human, the ser
 | Field | Description |
 |---|---|
 | `id` | Request id to echo in `approvals.resolve` |
-| `kind` | Why agent.d asks: `missing_grant`, `runner_action`, or `confirm` |
+| `kind` | Why agent.d asks: `missing_grant`, `runner_action`, `confirm`, or `folder` |
 | `action` | Fully-qualified action name |
 | `tool` | Tool that owns the action |
 | `reason` | Human-readable explanation |

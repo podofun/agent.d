@@ -154,6 +154,8 @@ struct Renderer {
     lists: Vec<ListKind>,
     quote_depth: usize,
     code: Option<String>,
+    /// The language tag of the code block being collected, if any.
+    code_language: String,
     marker: Option<String>,
     table: Option<Table>,
 }
@@ -169,6 +171,7 @@ impl Renderer {
             lists: Vec::new(),
             quote_depth: 0,
             code: None,
+            code_language: String::new(),
             marker: None,
             table: None,
         }
@@ -239,10 +242,17 @@ impl Renderer {
             Tag::CodeBlock(kind) => {
                 self.blank_line();
                 self.code = Some(String::new());
+                self.code_language.clear();
                 if let CodeBlockKind::Fenced(language) = kind
                     && !language.is_empty()
                 {
                     self.push_code_line(&language, true);
+                    // A tag may carry attributes after the language: `rust,ignore`.
+                    self.code_language = language
+                        .split([',', ' '])
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned();
                 }
             }
             Tag::List(start) => {
@@ -310,8 +320,18 @@ impl Renderer {
             }
             TagEnd::CodeBlock => {
                 if let Some(code) = self.code.take() {
-                    for line in code.trim_end_matches('\n').split('\n') {
-                        self.push_code_line(line, false);
+                    let code = code.trim_end_matches('\n');
+                    match super::highlight::highlight(code, &self.code_language) {
+                        Some(lines) => {
+                            for spans in lines {
+                                self.push_code_spans(spans);
+                            }
+                        }
+                        None => {
+                            for line in code.split('\n') {
+                                self.push_code_line(line, false);
+                            }
+                        }
                     }
                 }
             }
@@ -499,26 +519,42 @@ impl Renderer {
     }
 
     fn push_code_line(&mut self, line: &str, muted: bool) {
-        let prefix = format!("{}│ ", self.indent());
         let style = if muted {
             Style::default().fg(self.palette.muted)
         } else {
             Style::default()
         };
+        self.push_code_spans(vec![Span::styled(line.to_owned(), style)]);
+    }
+
+    /// One code line: the muted `│ ` prefix, then `spans` cut to the width
+    /// by grapheme, never wrapped.
+    fn push_code_spans(&mut self, spans: Vec<Span<'static>>) {
+        let prefix = format!("{}│ ", self.indent());
         let mut used = prefix.width();
-        let mut body = String::new();
-        for grapheme in line.graphemes(true) {
-            let grapheme_width = grapheme.width();
-            if used + grapheme_width > self.width {
-                break;
+        let mut line = vec![Span::styled(
+            prefix,
+            Style::default().fg(self.palette.muted),
+        )];
+        'spans: for span in spans {
+            let mut body = String::new();
+            for grapheme in span.content.graphemes(true) {
+                let grapheme_width = grapheme.width();
+                if used + grapheme_width > self.width {
+                    if !body.is_empty() {
+                        line.push(Span::styled(body, span.style));
+                    }
+                    break 'spans;
+                }
+                body.push_str(grapheme);
+                used += grapheme_width;
             }
-            body.push_str(grapheme);
-            used += grapheme_width;
+            line.push(Span::styled(body, span.style));
         }
-        self.lines.push(Line::from(vec![
-            Span::styled(prefix, Style::default().fg(self.palette.muted)),
-            Span::styled(body, style),
-        ]));
+        if line.len() == 1 {
+            line.push(Span::raw(String::new()));
+        }
+        self.lines.push(Line::from(line));
     }
 
     fn finish(mut self) -> Vec<Line<'static>> {
@@ -598,6 +634,39 @@ mod tests {
         assert_eq!(text[1], "│ let x = 1;");
         assert_eq!(text[2].chars().count(), 20);
         assert_eq!(text.len(), 3);
+    }
+
+    #[test]
+    fn fenced_code_is_highlighted() {
+        let lines = render("```rust\nlet x = 1;\n```", 40, palette());
+        assert_eq!(text_of(&lines)[1], "│ let x = 1;");
+        assert!(
+            lines[1].spans[1..]
+                .iter()
+                .any(|span| span.style.fg.is_some() && span.style.fg != Some(palette().muted)),
+            "{:?}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn unknown_fences_render_plain() {
+        let lines = render("```nolang\nx\n```", 40, palette());
+        assert_eq!(lines[1].spans.len(), 2);
+        assert_eq!(lines[1].spans[1].content, "x");
+        assert_eq!(lines[1].spans[1].style, Style::default());
+    }
+
+    #[test]
+    fn highlighted_lines_truncate_by_grapheme() {
+        let lines = render(
+            "```rust\nlet s = \"日本語日本語日本語\";\n```",
+            16,
+            palette(),
+        );
+        let line = &text_of(&lines)[1];
+        assert!(line.width() <= 16, "{line}");
+        assert!(line.starts_with("│ let s = \"日"), "{line}");
     }
 
     #[test]

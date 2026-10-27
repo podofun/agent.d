@@ -7,9 +7,11 @@
 //! relative inputs first.
 
 mod history;
+mod patch;
 mod verified;
 
 pub use history::{FileDiff, FileHistory, History, Operation, Revision};
+pub use patch::{FilePatch, Hunk, PatchError, apply_patch, create_diff, format_patch, parse_patch};
 pub use verified::{open_verified, read_bytes_verified, real_path};
 
 use std::path::{Path, PathBuf};
@@ -17,9 +19,31 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use thiserror::Error;
 
+fn paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| format!("`{}`", path.display()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn edit_not_found(path: &Path, count: usize) -> String {
+    if count == 0 {
+        format!(
+            "the text to replace does not appear in `{}`",
+            path.display()
+        )
+    } else {
+        format!(
+            "the text to replace appears {count} times in `{}`, use replace_all or include more surrounding text",
+            path.display()
+        )
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum FsError {
-    #[error("file changed outside runtime history: {0}")]
+    #[error("`{}` changed outside agent.d after agent.d last wrote it, so agent.d will not overwrite it", .0.display())]
     Conflict(PathBuf),
     #[error(
         "history requires an absolute regular-file path without symlink ancestors or multiple hard links: {0}"
@@ -39,6 +63,28 @@ pub enum FsError {
     Io(#[from] std::io::Error),
     #[error("invalid utf-8 in `{0}`")]
     InvalidUtf8(PathBuf),
+    #[error("read `{}` before changing it, so the change is based on what is there now", .0.display())]
+    NotRead(PathBuf),
+    #[error("`{}` changed since it was last read, read it again before changing it", .0.display())]
+    ChangedSinceRead(PathBuf),
+    #[error("{}", edit_not_found(path, *count))]
+    EditNotFound { path: PathBuf, count: usize },
+    #[error("{0}")]
+    Patch(#[from] PatchError),
+    #[error("the patch creates `{}`, but it already exists", .0.display())]
+    AlreadyExists(PathBuf),
+    #[error("the patch removes `{}`, but its lines do not cover the whole file", .0.display())]
+    RemoveLeavesLines(PathBuf),
+    #[error("the patch changes `{}` more than once, so combine those changes into one section", .0.display())]
+    DuplicatePath(PathBuf),
+    #[error(
+        "{cause}, and these files could not be put back as they were {}",
+        paths(still_changed)
+    )]
+    PatchPartlyApplied {
+        cause: Box<FsError>,
+        still_changed: Vec<PathBuf>,
+    },
     #[error(
         "`{}` changed while it was being opened and now leads to `{}`, so it was not read",
         path.display(),
