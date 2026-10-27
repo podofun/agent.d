@@ -18,6 +18,7 @@
 //! work identically whether the caller is a one-shot HTTP request, an LLM
 //! tool call, or a background Discord gateway loop.
 
+mod capture;
 mod classifier;
 mod runs;
 
@@ -393,6 +394,14 @@ pub struct Executor {
     runs: Arc<runs::Runs>,
     /// Questions the classifier answers at once.
     classifier_slots: tokio::sync::Semaphore,
+    /// File history and the folder baseline used to capture what each
+    /// action call changes. `None` captures nothing.
+    capture: Option<capture::Capture>,
+    /// The configuration folder (the one holding `init.lua`). A runner's
+    /// relative `cwd` resolves against it. It is never a working folder by
+    /// itself, so a call with no session folder and no runner `cwd`
+    /// captures nothing.
+    config_folder: Option<std::path::PathBuf>,
 }
 
 /// Removes the session id from the in-flight set when the run ends.
@@ -437,7 +446,22 @@ impl Executor {
             active_sessions: Arc::new(std::sync::Mutex::new(Default::default())),
             runs: Arc::new(runs::Runs::default()),
             classifier_slots: tokio::sync::Semaphore::new(classifier::CLASSIFIER_SLOTS),
+            capture: None,
+            config_folder: None,
         }
+    }
+
+    /// Capture the files every action call changes into `history`, the same
+    /// history the `ctx.fs` bindings write, using `baseline` to tell what
+    /// changed.
+    pub fn set_file_capture(&mut self, history: agentd_fs::History, baseline: agentd_fs::Baseline) {
+        self.capture = Some(capture::Capture { history, baseline });
+    }
+
+    /// The configuration folder, which a runner's relative `cwd` resolves
+    /// against. File changes are never captured in it on its own account.
+    pub fn set_config_folder(&mut self, folder: std::path::PathBuf) {
+        self.config_folder = Some(folder);
     }
 
     /// Wire the durable session store. `RedbSessionStore` in production,
@@ -506,6 +530,19 @@ impl Executor {
         caller: Caller,
         call: ActionCall,
     ) -> Result<(ActionResult, u128), (RegistryError, u128)> {
+        self.run_with_changes(caller, call)
+            .await
+            .map(|(result, duration, _)| (result, duration))
+    }
+
+    /// Run an action and report the files it changed, however it changed
+    /// them. Each change is also recorded in file history, so it can be
+    /// undone.
+    pub async fn run_with_changes(
+        &self,
+        caller: Caller,
+        call: ActionCall,
+    ) -> Result<(ActionResult, u128, Vec<agentd_ai::FileChange>), (RegistryError, u128)> {
         let action_name = call.action.clone();
         let args = call.args.clone();
         let started = Instant::now();
@@ -659,14 +696,31 @@ impl Executor {
             .and_then(|def| def.cwd)
             .or_else(|| caller.cwd.clone());
 
+        let capturing = self
+            .begin_capture(&caller, inherited_cwd.as_deref(), &effective_grants)
+            .await;
+        let mut call_caller = caller.clone();
+        if let Some(capturing) = &capturing {
+            capturing.enclose(&mut call_caller);
+        }
         let ctx = CallContext {
-            caller: caller.clone(),
+            caller: call_caller,
             effective_grants,
             call_chain: vec![action_name.clone()],
             cwd: inherited_cwd,
         };
 
         let outcome = self.registry.call(ctx, call).await;
+        let (changes, note) = match (capturing, &self.capture) {
+            (Some(capturing), Some(capture)) => {
+                let actor = agentd_fs::Actor {
+                    action: action_name.clone(),
+                    run_id: caller.run_id.clone(),
+                };
+                capture.finish(capturing, actor).await
+            }
+            _ => (Vec::new(), None),
+        };
         let dur = started.elapsed().as_millis();
         match outcome {
             Ok(res) => {
@@ -674,22 +728,86 @@ impl Executor {
                     .record(
                         TraceEvent::ok(&action_name, args, dur, res.value.clone())
                             .with_execution(execution.clone())
-                            .with_kind("action"),
+                            .with_kind("action")
+                            .with_note(note),
                     )
                     .await;
-                Ok((res, dur))
+                Ok((res, dur, changes))
             }
             Err(e) => {
                 self.trace
                     .record(
                         TraceEvent::err(&action_name, args, dur, e.to_string())
                             .with_execution(execution.clone())
-                            .with_kind("action"),
+                            .with_kind("action")
+                            .with_note(note),
                     )
                     .await;
                 Err((e, dur))
             }
         }
+    }
+
+    /// Start capturing the folders this call may change. Nothing is captured
+    /// when no capture is set up, the call has no working folder (a session
+    /// folder or a runner `cwd`), or it has no `fs.write` grant there. A
+    /// nested call never waits for a folder: it leaves its enclosing call's
+    /// folders to that call, and only scans them itself when the enclosing
+    /// call does not scan and this one may run programs.
+    async fn begin_capture(
+        &self,
+        caller: &Caller,
+        inherited_cwd: Option<&str>,
+        grants: &PermissionSet,
+    ) -> Option<capture::Started> {
+        let capture = self.capture.as_ref()?;
+        let working = match inherited_cwd.map(std::path::Path::new)? {
+            cwd if cwd.is_absolute() => cwd.to_path_buf(),
+            cwd => self.config_folder.as_ref()?.join(cwd),
+        };
+        let working = capture::canonical(&working);
+        let grants = capture::with_cwd(grants, caller.cwd.as_deref());
+        let roots = capture::capture_roots(&working, &grants);
+        let scans = capture::runs_programs(caller, &grants);
+        if caller.capturing.is_empty() {
+            if roots.is_empty() {
+                return None;
+            }
+            return Some(capture.begin(working, roots, scans, true).await);
+        }
+        if caller.capturing_scans || !scans {
+            return None;
+        }
+        let held: Vec<_> = roots
+            .into_iter()
+            .filter(|root| caller.capturing.iter().any(|h| root.starts_with(h)))
+            .collect();
+        if held.is_empty() {
+            return None;
+        }
+        Some(capture.begin(working, held, true, false).await)
+    }
+
+    /// `changes` with every secret the run read replaced by its name in each
+    /// diff, as tool inputs and outputs are.
+    fn redact_changes(
+        &self,
+        run_id: Option<&str>,
+        changes: &[agentd_ai::FileChange],
+    ) -> Vec<agentd_ai::FileChange> {
+        changes
+            .iter()
+            .cloned()
+            .map(|mut change| {
+                if let Some(diff) = change.diff.take() {
+                    let redacted = self
+                        .runs
+                        .redact_secrets(run_id, &serde_json::Value::String(diff));
+                    change.diff = redacted.as_str().map(str::to_owned);
+                }
+                change
+            })
+            .collect()
     }
 
     // ---------- approval escalation ----------
@@ -2128,26 +2246,35 @@ impl Executor {
                             action: call.name.clone(),
                             args: call.arguments.clone(),
                         };
-                        let result = self.run(tool_caller.clone(), action).await;
+                        let result = self.run_with_changes(tool_caller.clone(), action).await;
                         if let Some(sink) = &sink {
                             let run_id = tool_caller.run_id.as_deref();
-                            let (output, error) = match &result {
-                                Ok((res, _)) => {
-                                    (self.runs.redact_secrets(run_id, &res.value), None)
+                            let (output, error, all_changes) = match &result {
+                                Ok((res, _, changes)) => (
+                                    self.runs.redact_secrets(run_id, &res.value),
+                                    None,
+                                    self.redact_changes(run_id, changes),
+                                ),
+                                Err((e, _)) => {
+                                    (serde_json::Value::Null, Some(e.to_string()), Vec::new())
                                 }
-                                Err((e, _)) => (serde_json::Value::Null, Some(e.to_string())),
                             };
+                            let (changes, more) = capture::cap_changes(all_changes);
                             let _ = sink.send(agentd_ai::StreamEvent::ToolResult {
                                 name: call.name.clone(),
                                 input: self.runs.redact_secrets(run_id, &call.arguments),
                                 output,
                                 error,
+                                changes,
+                                more,
                             });
                         }
                         let text = match result {
-                            Ok((res, _)) => serde_json::to_string(&res.value).unwrap_or_else(|e| {
-                                format!("the tool result could not be serialized to JSON ({e})")
-                            }),
+                            Ok((res, _, _)) => {
+                                serde_json::to_string(&res.value).unwrap_or_else(|e| {
+                                    format!("the tool result could not be serialized to JSON ({e})")
+                                })
+                            }
                             Err((e, _)) => format!("tool call failed ({e})"),
                         };
                         req.messages.push(agentd_ai::Message::tool_result(id, text));

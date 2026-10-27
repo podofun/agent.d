@@ -5,11 +5,13 @@ edition.workspace = true
 
 [dependencies]
 agentd-ai.workspace = true
+agentd-fs.workspace = true
 agentd-mcp.workspace = true
 agentd-permissions.workspace = true
 agentd-runners.workspace = true
 agentd-sessions.workspace = true
 agentd-services.workspace = true
+agentd-shell.workspace = true
 agentd-skills.workspace = true
 agentd-trace.workspace = true
 agentd-types.workspace = true

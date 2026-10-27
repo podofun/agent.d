@@ -454,3 +454,45 @@ async fn a_missing_scope_is_reported_before_any_permission_check() {
     .unwrap_err();
     assert!(error.contains("needs a chat session or a run"), "{error}");
 }
+
+#[tokio::test]
+async fn revisions_name_the_action_and_run_that_made_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host(
+        dir.path(),
+        r#"
+        agentd.action("notes.save", function(_, ctx)
+            ctx.fs.write("note.txt", "a")
+            return ctx.fs.history("note.txt")
+        end)
+    "#,
+        agentd_fs::History::default(),
+    );
+    let mut caller = Caller::interface("test");
+    caller.run_id = Some("run-7".into());
+    let result = host
+        .call(
+            CallContext {
+                caller,
+                effective_grants: PermissionSet::from_iter([
+                    "fs.read:note.txt",
+                    "fs.write:note.txt",
+                ]),
+                call_chain: vec!["notes.save".into()],
+                cwd: None,
+            },
+            ActionCall {
+                action: "notes.save".into(),
+                args: Value::Null,
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let revision = &result["revisions"][0];
+    assert_eq!(
+        revision["actor"],
+        json!({ "action": "notes.save", "run_id": "run-7" })
+    );
+    assert_eq!(revision["restorable"], true);
+}

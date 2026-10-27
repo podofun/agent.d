@@ -18,6 +18,6 @@ pub use providers::{
 };
 pub use registry::ProviderRegistry;
 pub use types::{
-    CompletionRequest, CompletionResponse, LoopMode, McpEndpoint, Message, Provider, ProviderError,
-    Role, StreamEvent, StreamSink, ToolCall, ToolDef,
+    ChangeKind, CompletionRequest, CompletionResponse, FileChange, LoopMode, McpEndpoint, Message,
+    Provider, ProviderError, Role, StreamEvent, StreamSink, ToolCall, ToolDef,
 };

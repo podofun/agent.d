@@ -2733,8 +2733,8 @@ fn fs_patch_binding(lua: &Lua, (text, opts): (String, Option<Table>)) -> mlua::R
         names.push(name);
         resolved.push((p, file));
     }
-    let done =
-        block_on(file_history(lua).patch(&scope, &resolved))?.map_err(mlua::Error::external)?;
+    let done = block_on(file_history(lua).patch(&scope, &resolved, file_actor(lua)))?
+        .map_err(mlua::Error::external)?;
     let result = lua.create_table()?;
     for (index, (name, (_, revision))) in names.into_iter().zip(done).enumerate() {
         let entry = lua.create_table()?;
@@ -2756,7 +2756,7 @@ fn fs_edit_binding(
     let scope = required_read_scope(lua)?;
     let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
-    block_on(file_history(lua).edit(&scope, &p, &old, &new, replace_all))?
+    block_on(file_history(lua).edit(&scope, &p, &old, &new, replace_all, file_actor(lua)))?
         .map_err(mlua::Error::external)
 }
 
@@ -2775,8 +2775,8 @@ fn fs_write_binding(lua: &Lua, args: MultiValue) -> mlua::Result<usize> {
     let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
     let history = file_history(lua);
-    let revision =
-        block_on(history.write(&p, &content.as_bytes()))?.map_err(mlua::Error::external)?;
+    let revision = block_on(history.write(&p, &content.as_bytes(), file_actor(lua)))?
+        .map_err(mlua::Error::external)?;
     // The caller knows exactly what it wrote, so it counts as a read.
     if let Some(scope) = read_scope(lua) {
         block_on(history.record_read_bytes(&scope, &p, &content.as_bytes()))?;
@@ -2797,7 +2797,8 @@ fn fs_append_binding(lua: &Lua, args: MultiValue) -> mlua::Result<usize> {
     )?;
     let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
-    block_on(file_history(lua).append(&p, &content.as_bytes()))?.map_err(mlua::Error::external)
+    block_on(file_history(lua).append(&p, &content.as_bytes(), file_actor(lua)))?
+        .map_err(mlua::Error::external)
 }
 
 fn fs_exists_binding(lua: &Lua, path: String) -> mlua::Result<bool> {
@@ -2856,13 +2857,23 @@ fn fs_list_dir_binding(lua: &Lua, path: String) -> mlua::Result<Table> {
 fn fs_remove_binding(lua: &Lua, path: String) -> mlua::Result<usize> {
     let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
-    block_on(file_history(lua).remove(&p))?.map_err(mlua::Error::external)
+    block_on(file_history(lua).remove(&p, file_actor(lua)))?.map_err(mlua::Error::external)
 }
 
 fn file_history(lua: &Lua) -> fs::History {
     lua.app_data_ref::<fs::History>()
         .expect("file history installed")
         .clone()
+}
+
+/// The action, and the run it belongs to, that a file change made now is
+/// recorded under.
+fn file_actor(lua: &Lua) -> Option<fs::Actor> {
+    let active = lua.app_data_ref::<ActiveContext>()?;
+    Some(fs::Actor {
+        action: active.call_chain.last()?.clone(),
+        run_id: active.caller.run_id.clone(),
+    })
 }
 
 fn fs_history_binding(lua: &Lua, path: String) -> mlua::Result<Value> {
