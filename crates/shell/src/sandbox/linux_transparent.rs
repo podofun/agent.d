@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use super::linux_net::{make_pipe, set_cloexec, supervisor_path, write_file};
 use crate::gateway::{SharedSet, admit, handle_dns};
+use crate::kill_tree::KillSwitch;
 use crate::netfilter::{PermitSet, SetConfig};
 use crate::{ExecRequest, ExecResult, SandboxPolicy, ShellError};
 
@@ -476,11 +477,26 @@ pub async fn run_contained(
     let req = req.clone();
     let policy = policy.clone();
     let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        run_contained_blocking(&req, &policy, &sup_path, host_grants, literal_ips, handle)
+    // The blocking thread cannot be cancelled, so a dropped exec kills the
+    // supervisor's process group instead; the thread then sees EOF and exits.
+    let tree = KillSwitch::default();
+    let _kill_on_drop = tree.on_drop();
+    let armed = tree.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        run_contained_blocking(
+            &req,
+            &policy,
+            &sup_path,
+            host_grants,
+            literal_ips,
+            handle,
+            &armed,
+        )
     })
     .await
-    .map_err(|e| ShellError::Sandbox(format!("a background sandbox task failed ({e})")))?
+    .map_err(|e| ShellError::Sandbox(format!("a background sandbox task failed ({e})")))?;
+    tree.disarm();
+    result
 }
 
 fn socketpair(ty: SockType) -> std::io::Result<(RawFd, RawFd)> {
@@ -498,6 +514,7 @@ fn run_contained_blocking(
     host_grants: Vec<agentd_permissions::Permission>,
     literal_ips: Vec<IpAddr>,
     handle: tokio::runtime::Handle,
+    tree: &KillSwitch,
 ) -> Result<ExecResult, ShellError> {
     let sb = |e: String| ShellError::Sandbox(e);
 
@@ -565,6 +582,11 @@ fn run_contained_blocking(
     if child == 0 {
         // SAFETY: async-signal-safe-only region in the forked child.
         unsafe {
+            // Lead a new process group: the supervisor, the command, and
+            // everything the command starts share it, so one `killpg` stops all.
+            if libc::setpgid(0, 0) != 0 {
+                libc::_exit(125);
+            }
             let flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNET;
             if libc::unshare(flags) != 0 {
                 libc::_exit(125);
@@ -583,6 +605,11 @@ fn run_contained_blocking(
         }
     }
 
+    // Also set the group from this side, so it exists before any kill.
+    // SAFETY: setpgid(2) on our own unreaped child, before it execs.
+    unsafe { libc::setpgid(child, child) };
+    tree.arm(child);
+
     // Close the ends the child/supervisor owns (parent keeps its own).
     for fd in [
         ctrl_sup, dns_sup, udp_sup, out.wr, err.wr, sin.rd, s1.wr, s2.rd, st.wr,
@@ -597,8 +624,9 @@ fn run_contained_blocking(
         ] {
             let _ = close(fd);
         }
-        // SAFETY: `child` is our own unreaped fork, so the pid cannot be reused.
-        unsafe { libc::kill(child, libc::SIGKILL) };
+        // SAFETY: `child` is our own unreaped fork leading its own group, so
+        // the id cannot be reused; this also stops any setup tool it started.
+        unsafe { libc::killpg(child, libc::SIGKILL) };
         let _ = waitpid(Pid::from_raw(child), None);
         sb(msg)
     };
