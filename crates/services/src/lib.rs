@@ -119,6 +119,11 @@ impl ServiceRegistry {
         g.get(name).map(|e| e.def.clone())
     }
 
+    /// Unregister a service, returning its definition if it was registered.
+    pub fn remove(&self, name: &str) -> Option<ServiceDef> {
+        self.inner.write().unwrap().remove(name).map(|e| e.def)
+    }
+
     pub fn names(&self) -> Vec<String> {
         let g = self.inner.read().unwrap();
         g.keys().cloned().collect()
@@ -176,6 +181,18 @@ impl ServiceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_returns_and_drops_the_item() {
+        let registry = ServiceRegistry::new();
+        registry.insert(ServiceDef {
+            name: "a".into(),
+            ..Default::default()
+        });
+        assert_eq!(registry.remove("a").map(|def| def.name), Some("a".into()));
+        assert!(registry.get("a").is_none());
+        assert!(registry.remove("a").is_none());
+    }
 
     #[test]
     fn insert_and_get() {

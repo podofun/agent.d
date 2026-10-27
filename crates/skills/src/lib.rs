@@ -86,6 +86,11 @@ impl SkillRegistry {
         g.get(name).cloned()
     }
 
+    /// Unregister a skill, returning its definition if it was registered.
+    pub fn remove(&self, name: &str) -> Option<SkillDef> {
+        self.inner.write().unwrap().remove(name)
+    }
+
     pub fn list(&self) -> Vec<SkillDef> {
         let g = self.inner.read().unwrap();
         g.values().cloned().collect()
@@ -268,6 +273,18 @@ fn push_array(def: &mut SkillDef, key: &str, value: String) -> Result<(), SkillE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_returns_and_drops_the_item() {
+        let registry = SkillRegistry::new();
+        registry.insert(SkillDef {
+            name: "a".into(),
+            ..Default::default()
+        });
+        assert_eq!(registry.remove("a").map(|def| def.name), Some("a".into()));
+        assert!(registry.get("a").is_none());
+        assert!(registry.remove("a").is_none());
+    }
 
     #[test]
     fn parses_minimal_frontmatter() {
