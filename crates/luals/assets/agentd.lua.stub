@@ -271,6 +271,31 @@ function string.split(s, sep) end
 ---@field undo fun(path: string): integer
 ---@field redo fun(path: string): integer
 ---@field restore fun(path: string, revision: integer): integer
+---Replace `old` with `new` in a file read earlier in this session (or run)
+---and unchanged since. Without `replace_all`, `old` must appear once.
+---@field edit fun(path: string, old: string, new: string, opts?: { replace_all?: boolean }): integer
+---Apply a unified diff to the files it names, all or nothing. Files it
+---changes or removes must have been read and left unchanged.
+---@field patch fun(patch: string, opts?: { path?: string }): { path: string, revision: integer }[]
+
+---@class Ctx.DiffHunk
+---@field old_start integer
+---@field old_lines integer
+---@field new_start integer
+---@field new_lines integer
+---@field lines string[]                   Each keeps its leading " ", "-" or "+".
+
+---@class Ctx.FilePatch
+---@field old_path? string                 `nil` when the file is created.
+---@field new_path? string                 `nil` when the file is removed.
+---@field hunks Ctx.DiffHunk[]
+
+---Unified diffs as text and as tables. No permission needed.
+---@class Ctx.Diff
+---@field create fun(old: string, new: string, opts?: { path?: string, context?: integer }): string
+---@field parse fun(text: string): Ctx.FilePatch[]
+---@field format fun(files: Ctx.FilePatch[]): string
+---@field apply fun(text: string, patch: string|Ctx.FilePatch): string
 
 ---@class Ctx.FileRevision
 ---@field id integer
@@ -401,6 +426,7 @@ function string.split(s, sep) end
 ---@class Ctx
 ---@field log Ctx.Log
 ---@field fs Ctx.Fs
+---@field diff Ctx.Diff
 ---@field http Ctx.Http
 ---@field ws Ctx.Ws
 ---@field secret Ctx.Secret

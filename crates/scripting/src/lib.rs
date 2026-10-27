@@ -797,6 +797,7 @@ fn build_and_store_ctx(lua: &Lua) -> mlua::Result<()> {
     let fs = build_fs_table(lua)?;
     wrap_table_fns(lua, &fs)?;
     ctx.set("fs", fs)?;
+    ctx.set("diff", build_diff_table(lua)?)?;
     ctx.set("http", build_http_table(lua)?)?;
     let secret = build_secret_table(lua)?;
     wrap_table_fns(lua, &secret)?;
@@ -2381,10 +2382,100 @@ fn parse_shell_args(_lua: &Lua, args: MultiValue) -> mlua::Result<ExecRequest> {
 
 // ---------- context.fs ----------
 
+/// `ctx.diff`: unified diffs as text and as tables. Pure string work, so no
+/// permission applies; changing files goes through `ctx.fs`.
+fn build_diff_table(lua: &Lua) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    t.set(
+        "create",
+        lua.create_function(|_, (old, new, opts): (String, String, Option<Table>)| {
+            let path = match &opts {
+                Some(opts) => opts.get::<Option<String>>("path")?,
+                None => None,
+            }
+            .unwrap_or_else(|| "file".to_owned());
+            let context = match &opts {
+                Some(opts) => opts.get::<Option<usize>>("context")?,
+                None => None,
+            }
+            .unwrap_or(3);
+            Ok(fs::create_diff(&old, &new, &path, &path, context))
+        })?,
+    )?;
+    t.set(
+        "parse",
+        lua.create_function(|lua, text: String| {
+            let files = fs::parse_patch(&text).map_err(mlua::Error::external)?;
+            patches_to_lua(lua, &files)
+        })?,
+    )?;
+    t.set(
+        "format",
+        lua.create_function(|lua, files: Value| {
+            let files: Vec<fs::FilePatch> = lua.from_value(files).map_err(|e| {
+                mlua::Error::external(format!(
+                    "format takes the list ctx.diff.parse returns ({e})"
+                ))
+            })?;
+            Ok(fs::format_patch(&files))
+        })?,
+    )?;
+    t.set(
+        "apply",
+        lua.create_function(|lua, (text, patch): (String, Value)| {
+            // `create` of two identical texts gives an empty diff: nothing to do.
+            if let Value::String(diff) = &patch
+                && diff.as_bytes().is_empty()
+            {
+                return Ok(text);
+            }
+            let patch = one_file_patch(lua, patch)?;
+            fs::apply_patch(&text, &patch).map_err(mlua::Error::external)
+        })?,
+    )?;
+    Ok(t)
+}
+
+/// File patches as Lua tables, with `/dev/null` paths as `nil`.
+fn patches_to_lua(lua: &Lua, files: &[fs::FilePatch]) -> mlua::Result<Value> {
+    lua.to_value_with(
+        files,
+        mlua::SerializeOptions::new()
+            .serialize_none_to_null(false)
+            .serialize_unit_to_null(false),
+    )
+}
+
+/// A patch for one file, given as diff text or as one parsed file table.
+fn one_file_patch(lua: &Lua, patch: Value) -> mlua::Result<fs::FilePatch> {
+    match patch {
+        Value::String(text) => {
+            let mut files = fs::parse_patch(&text.to_str()?).map_err(mlua::Error::external)?;
+            if files.len() != 1 {
+                return Err(mlua::Error::external(
+                    "apply takes a patch for one file; use ctx.fs.patch for several",
+                ));
+            }
+            Ok(files.remove(0))
+        }
+        Value::Table(_) => lua.from_value(patch).map_err(|e| {
+            mlua::Error::external(format!(
+                "apply takes diff text or one file from ctx.diff.parse ({e})"
+            ))
+        }),
+        other => Err(mlua::Error::external(format!(
+            "apply takes diff text or one file from ctx.diff.parse, but got a {} value",
+            other.type_name()
+        ))),
+    }
+}
+
 fn build_fs_table(lua: &Lua) -> mlua::Result<Table> {
     let t = lua.create_table()?;
     t.set("read", lua.create_function(fs_read_binding)?)?;
     t.set("write", lua.create_function(fs_write_binding)?)?;
+    t.set("edit", lua.create_function(fs_edit_binding)?)?;
+    t.set("patch", lua.create_function(fs_patch_binding)?)?;
     t.set("append", lua.create_function(fs_append_binding)?)?;
     t.set("exists", lua.create_function(fs_exists_binding)?)?;
     t.set("stat", lua.create_function(fs_stat_binding)?)?;
@@ -2536,7 +2627,93 @@ fn fs_read_binding(lua: &Lua, path: String) -> mlua::Result<mlua::String> {
     // Read through a handle confirmed to be the checked file, so a symlink
     // swapped in after the check cannot redirect the read.
     let bytes = block_on(fs::read_bytes_verified(&p))?.map_err(mlua::Error::external)?;
+    if let Some(scope) = read_scope(lua) {
+        block_on(file_history(lua).record_read_bytes(&scope, &p, &bytes))?;
+    }
     lua.create_string(bytes)
+}
+
+/// Who a read counts for when a later edit or patch checks it: the chat
+/// session, else the run, else the connection. `None` when the caller has
+/// none of these.
+fn read_scope(lua: &Lua) -> Option<String> {
+    let active = lua.app_data_ref::<ActiveContext>()?;
+    let caller = &active.caller;
+    if let Some(session) = &caller.session_id {
+        return Some(format!("session:{session}"));
+    }
+    if let Some(run) = &caller.run_id {
+        return Some(format!("run:{run}"));
+    }
+    caller
+        .session
+        .as_ref()
+        .map(|connection| format!("connection:{}", connection.as_str()))
+}
+
+/// The read scope an edit or a patch needs, or an error saying why there is none.
+fn required_read_scope(lua: &Lua) -> mlua::Result<String> {
+    read_scope(lua).ok_or_else(|| {
+        mlua::Error::external(
+            "changing a file with edit or patch needs a chat session or a run, so agent.d knows the file was read first",
+        )
+    })
+}
+
+/// `ctx.fs.patch(patch, opts?)`: apply a unified diff to the files it
+/// names, all or nothing. Every file is resolved and permission-checked
+/// before anything changes. `opts.path` names the file for a one-file patch.
+fn fs_patch_binding(lua: &Lua, (text, opts): (String, Option<Table>)) -> mlua::Result<Value> {
+    let scope = required_read_scope(lua)?;
+    let files = fs::parse_patch(&text).map_err(mlua::Error::external)?;
+    let path_override = match &opts {
+        Some(opts) => opts.get::<Option<String>>("path")?,
+        None => None,
+    };
+    if path_override.is_some() && files.len() != 1 {
+        return Err(mlua::Error::external(
+            "`path` can only name the file of a one-file patch",
+        ));
+    }
+    let mut resolved = Vec::new();
+    let mut names = Vec::new();
+    for file in files {
+        let name = path_override
+            .clone()
+            .unwrap_or_else(|| file.path().to_owned());
+        let p = resolve_path(lua, name.clone());
+        if file.old_path.is_some() {
+            check_permission_inline(lua, &Permission::new(format!("fs.read:{}", p.display())))?;
+        }
+        check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
+        names.push(name);
+        resolved.push((p, file));
+    }
+    let done =
+        block_on(file_history(lua).patch(&scope, &resolved))?.map_err(mlua::Error::external)?;
+    let result = lua.create_table()?;
+    for (index, (name, (_, revision))) in names.into_iter().zip(done).enumerate() {
+        let entry = lua.create_table()?;
+        entry.set("path", name)?;
+        entry.set("revision", revision)?;
+        result.set(index + 1, entry)?;
+    }
+    Ok(Value::Table(result))
+}
+
+fn fs_edit_binding(
+    lua: &Lua,
+    (path, old, new, opts): (String, String, String, Option<Table>),
+) -> mlua::Result<usize> {
+    let replace_all = match &opts {
+        Some(opts) => opts.get::<Option<bool>>("replace_all")?.unwrap_or(false),
+        None => false,
+    };
+    let scope = required_read_scope(lua)?;
+    let p = resolve_path(lua, path);
+    check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
+    block_on(file_history(lua).edit(&scope, &p, &old, &new, replace_all))?
+        .map_err(mlua::Error::external)
 }
 
 fn fs_write_binding(lua: &Lua, args: MultiValue) -> mlua::Result<usize> {
@@ -2553,7 +2730,14 @@ fn fs_write_binding(lua: &Lua, args: MultiValue) -> mlua::Result<usize> {
     })?)?;
     let p = resolve_path(lua, path);
     check_permission_inline(lua, &Permission::new(format!("fs.write:{}", p.display())))?;
-    block_on(file_history(lua).write(&p, &content.as_bytes()))?.map_err(mlua::Error::external)
+    let history = file_history(lua);
+    let revision =
+        block_on(history.write(&p, &content.as_bytes()))?.map_err(mlua::Error::external)?;
+    // The caller knows exactly what it wrote, so it counts as a read.
+    if let Some(scope) = read_scope(lua) {
+        block_on(history.record_read_bytes(&scope, &p, &content.as_bytes()))?;
+    }
+    Ok(revision)
 }
 
 fn fs_append_binding(lua: &Lua, args: MultiValue) -> mlua::Result<usize> {
