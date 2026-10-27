@@ -906,6 +906,18 @@ impl Executor {
         }
     }
 
+    /// Remember `folder` (an absolute real path) as trusted: append it to
+    /// `[folders].trusted` in grants.toml, once, and reload.
+    pub async fn trust_folder(&self, folder: &str) -> Result<(), String> {
+        self.apply_forever(agentd_types::ApprovalKind::Folder, None, None, folder, &[])
+            .await
+    }
+
+    /// Whether the user trusts `folder` (an absolute real path).
+    pub fn trusts_folder(&self, folder: &std::path::Path) -> bool {
+        self.engine.load().grants().trusts_folder(folder)
+    }
+
     /// Persist an "allow forever" verdict to `grants.toml` and hot-reload the
     /// engine. Serialized against concurrent writers via `forever_write_lock`.
     async fn apply_forever(
@@ -983,6 +995,20 @@ impl Executor {
                     .or_insert(toml_edit::value(toml_edit::Array::new()));
                 append_unique(
                     ensure_string_array(allowed),
+                    std::slice::from_ref(&action_name.to_string()),
+                );
+            }
+            agentd_types::ApprovalKind::Folder => {
+                let trusted = doc
+                    .as_table_mut()
+                    .entry("folders")
+                    .or_insert(toml_edit::table())
+                    .as_table_mut()
+                    .ok_or("the `folders` key in grants.toml is not a table. Remove or rename the conflicting `folders` entry")?
+                    .entry("trusted")
+                    .or_insert(toml_edit::value(toml_edit::Array::new()));
+                append_unique(
+                    ensure_string_array(trusted),
                     std::slice::from_ref(&action_name.to_string()),
                 );
             }

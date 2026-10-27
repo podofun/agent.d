@@ -23,6 +23,9 @@ pub enum ApprovalKind {
     /// A runner tried an action absent from its `allowed_actions` allowlist.
     /// `AllowForever` appends the action to the runner's list.
     RunnerAction,
+    /// A chat session asked to work in a folder the user has not trusted.
+    /// `action` holds the folder; `AllowForever` adds it to `[folders].trusted`.
+    Folder,
 }
 
 /// An operator's decision on an [`ApprovalRequest`].

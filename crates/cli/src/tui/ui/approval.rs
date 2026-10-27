@@ -101,6 +101,13 @@ fn approval_body(request: &ApprovalRequest) -> Vec<Line<'static>> {
                 lines.push(Line::raw(request.reason.clone()));
             }
         }
+        ApprovalKind::Folder => {
+            lines.push(Line::raw("Let agent.d work in this folder?"));
+            lines.push(Line::styled(
+                "Always trust adds it to [folders] in grants.toml.",
+                Style::default().fg(MUTED),
+            ));
+        }
     }
     if let Some(caller) = caller_summary(request) {
         lines.push(Line::raw(""));
