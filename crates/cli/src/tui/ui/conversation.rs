@@ -250,7 +250,7 @@ fn group_header(app: &App, calls: &[Entry], open: bool, width: usize) -> Line<'s
         .collect();
     Line::from(vec![
         gutter("✦", WARNING),
-        Span::styled(format!("{title} "), Style::default()),
+        Span::styled(format!("{title} "), Style::default().fg(MUTED)),
         Span::styled(marker, Style::default().fg(MUTED)),
     ])
 }
@@ -327,7 +327,7 @@ fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
         (true, false) => " ▶",
     };
     let mut spans = vec![
-        Span::styled(entry.text.clone(), Style::default()),
+        Span::styled(entry.text.clone(), Style::default().fg(MUTED)),
         Span::styled(marker, Style::default().fg(MUTED)),
     ];
     for (key, value) in &short {
@@ -336,20 +336,19 @@ fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
         spans.push(Span::styled(format!("{key} "), Style::default().fg(MUTED)));
         spans.push(Span::raw(value.clone()));
     }
-    // A call that changed files shows them as diffs, so the sizes of the
-    // text it was given would only repeat them.
-    let sizes: &[(String, String)] = if entry.changes.is_empty() { &long } else { &[] };
-    for (key, text) in sizes {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("{key}  {}", size_of(text)),
-            Style::default().fg(MUTED),
-        ));
-    }
+    // A chat saved before calls kept their changes still shows an edit or a
+    // write as a diff, worked out from the text the call was given.
+    let derived;
+    let changes: &[FileChange] = if entry.changes.is_empty() {
+        derived = derived_change(entry);
+        derived.as_slice()
+    } else {
+        &entry.changes
+    };
     let mut lines = with_gutter("✦", WARNING, markdown::wrap_spans(spans, width));
     let inner = width.saturating_sub(2);
     if !entry.expanded {
-        if entry.changes.is_empty() {
+        if changes.is_empty() {
             lines.extend(output_preview(preview_text(entry), inner, 3));
             return lines;
         }
@@ -362,13 +361,13 @@ fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
     } else {
         COLLAPSED_FILES
     };
-    for change in entry.changes.iter().take(shown) {
+    for change in changes.iter().take(shown) {
         lines.extend(change_summary(change, inner));
         if entry.expanded {
             lines.extend(diff_lines(change, inner));
         }
     }
-    if let Some(more) = entry.changes.len().checked_sub(shown).filter(|n| *n > 0) {
+    if let Some(more) = changes.len().checked_sub(shown).filter(|n| *n > 0) {
         let files = if more == 1 { "file" } else { "files" };
         lines.push(indented(Line::styled(
             format!("  and {more} more {files}"),
@@ -380,14 +379,10 @@ fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
     }
     // A call that changed files shows what it did as their diffs: the text
     // it was given and the receipt it returned would only repeat them.
-    if !entry.changes.is_empty() && !entry.failed {
+    if !changes.is_empty() && !entry.failed {
         return lines;
     }
-    let long = if entry.changes.is_empty() {
-        long
-    } else {
-        Vec::new()
-    };
+    let long = if changes.is_empty() { long } else { Vec::new() };
     for (key, text) in &long {
         block(&mut lines, inner, key, text, MUTED);
     }
@@ -405,6 +400,39 @@ fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
         _ => {}
     }
     lines
+}
+
+/// The change an edit (`path`, `old`, `new`) or a write (`path`,
+/// `content`) made, worked out from its arguments, for calls saved without
+/// their changes. Nothing for any other call, or one that failed.
+fn derived_change(entry: &Entry) -> Vec<FileChange> {
+    let Some(Value::Object(input)) = entry.input.as_ref() else {
+        return Vec::new();
+    };
+    let text = |key: &str| input.get(key).and_then(Value::as_str);
+    let Some(path) = text("path").filter(|_| !entry.failed) else {
+        return Vec::new();
+    };
+    let (old, new) = match (text("old"), text("new"), text("content")) {
+        (Some(old), Some(new), _) => (old, new),
+        (None, None, Some(content)) if entry.text.ends_with("write") => ("", content),
+        _ => return Vec::new(),
+    };
+    let mut diff = String::from("@@ @@\n");
+    for line in old.lines() {
+        diff.push_str(&format!("-{line}\n"));
+    }
+    for line in new.lines() {
+        diff.push_str(&format!("+{line}\n"));
+    }
+    vec![FileChange {
+        path: path.to_owned(),
+        operation: "modified".to_owned(),
+        diff: Some(diff),
+        binary: false,
+        added: new.lines().count(),
+        removed: old.lines().count(),
+    }]
 }
 
 /// A labelled block of text behind a `│ ` bar in `bar`'s color.
@@ -793,14 +821,6 @@ fn filled_row(spans: Vec<Span<'static>>, width: usize, background: Color) -> Lin
         ));
     }
     line
-}
-
-/// "3 lines" for multi-line text, "250 chars" for a single long line.
-fn size_of(text: &str) -> String {
-    match text.lines().count() {
-        0 | 1 => format!("{} chars", text.chars().count()),
-        lines => format!("{lines} lines"),
-    }
 }
 
 /// `± path  +12 -3`: one file a call changed, and how. Created and removed
@@ -1221,7 +1241,7 @@ mod tests {
         assert!(text.contains("file"), "{text}");
         assert!(text.contains("/home/me/project/crates"), "{text}");
         assert!(text.contains("versation.rs"), "{text}");
-        assert!(text.contains("content  3 lines"), "{text}");
+        assert!(!text.contains("content"), "{text}");
         assert!(
             !text.contains("fn main() {"),
             "collapsed rows do not preview long arguments"
@@ -1230,10 +1250,9 @@ mod tests {
 
         app.entries[0].set_expanded(true);
         let text = rendered(&app, 50, 20);
-        assert!(text.contains("content"));
-        assert!(text.contains("│ }"));
-        assert!(text.contains("result"));
-        assert!(text.contains("│ Done"));
+        assert!(!text.contains("content"), "{text}");
+        assert!(text.contains("│ +}"), "a write shows as a diff: {text}");
+        assert!(!text.contains("│ Done"), "{text}");
     }
 
     fn change(path: &str, operation: &str, diff: Option<&str>) -> FileChange {
@@ -1347,20 +1366,23 @@ mod tests {
     }
 
     #[test]
-    fn long_arguments_are_summarized_not_previewed() {
+    fn long_arguments_are_left_off_the_header() {
         let mut app = App::new("http://127.0.0.1:7777", 1000, None);
         app.push_tool("fs.write", "");
         app.entries[0].input = Some(json!({ "path": "a.rs", "content": "x\ny\nz" }));
         app.entries[0].set_expanded(false);
         let lines = plain_lines(&app, 60);
-        assert!(lines[0].contains("content  3 lines"), "{lines:?}");
-        assert!(!lines.iter().any(|line| line.trim() == "x"), "{lines:?}");
+        assert!(!lines[0].contains("content"), "{lines:?}");
+        assert!(
+            lines.iter().any(|line| line.contains("± a.rs  +3 -0")),
+            "a write saved without its changes still shows as one: {lines:?}"
+        );
 
         let mut app = App::new("http://127.0.0.1:7777", 1000, None);
-        app.push_tool("fs.write", "");
+        app.push_tool("notes.save", "");
         app.entries[0].input = Some(json!({ "content": "y".repeat(250) }));
         let lines = plain_lines(&app, 60);
-        assert!(lines[0].contains("content  250 chars"), "{lines:?}");
+        assert!(!lines[0].contains("content"), "{lines:?}");
     }
 
     #[test]
