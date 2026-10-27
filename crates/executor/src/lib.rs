@@ -818,7 +818,7 @@ impl Executor {
     /// classifier never allows forever.
     async fn decide(
         &self,
-        req: agentd_types::ApprovalRequest,
+        mut req: agentd_types::ApprovalRequest,
         key: Option<String>,
     ) -> runs::Answered {
         self.runs
@@ -841,6 +841,8 @@ impl Executor {
                             };
                         }
                         classifier::ClassifierAnswer::Unsure(reason) => {
+                            // The person who answers sees why it came to them.
+                            req.reason = format!("The classifier was unsure: {reason}");
                             unsure = Some(format!("the classifier was unsure: {reason}"));
                         }
                     }
@@ -1758,6 +1760,38 @@ impl Executor {
         result
     }
 
+    /// What a person wrote, for the classifier: their last messages in the
+    /// session and this run's prompt. Only a run a person started through
+    /// an interface has any; services, webhooks and nested runs do not.
+    fn user_said(
+        &self,
+        caller: &Caller,
+        options: &RunOptions,
+        session: Option<&agentd_sessions::SessionMeta>,
+    ) -> Vec<String> {
+        const KEPT: usize = 5;
+        const LONGEST: usize = 2000;
+        if caller.run_id.is_some() || caller.interface.is_none() {
+            return Vec::new();
+        }
+        let mut said: Vec<String> = match (session, &self.sessions) {
+            (Some(meta), Some(store)) => store
+                .turns(&meta.id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|m| m.role == agentd_ai::Role::User)
+                .map(|m| m.content)
+                .collect(),
+            _ => Vec::new(),
+        };
+        said.extend(options.prompt.clone());
+        let start = said.len().saturating_sub(KEPT);
+        said.drain(..start);
+        said.into_iter()
+            .map(|text| text.chars().take(LONGEST).collect())
+            .collect()
+    }
+
     /// Fix who answers this run's questions and give the run its ids. Runs
     /// once, when the run starts; the values ride on the caller, which every
     /// check inside the run sees.
@@ -1798,7 +1832,10 @@ impl Executor {
             "run-{}",
             RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        let guard = self.runs.start(&run_id, caller.run_id.as_deref());
+        let user_said = self.user_said(&caller, options, session);
+        let guard = self
+            .runs
+            .start(&run_id, caller.run_id.as_deref(), user_said);
         caller.approval = Some(approval);
         caller.run_id = Some(run_id);
         caller.session_id = session.map(|m| m.id.clone());
