@@ -12,7 +12,7 @@ mod patch;
 mod verified;
 
 pub use baseline::{Baseline, ScanChange, ScanLimits, Snapshot};
-pub use history::{FileDiff, FileHistory, History, Operation, Revision};
+pub use history::{Actor, FileDiff, FileHistory, History, Operation, Revision};
 pub use patch::{FilePatch, Hunk, PatchError, apply_patch, create_diff, format_patch, parse_patch};
 pub use verified::{open_verified, read_bytes_verified, real_path};
 
@@ -98,6 +98,16 @@ pub enum FsError {
         root.display()
     )]
     TooManyFiles { root: PathBuf, limit: usize },
+    #[error(
+        "`{}` was too large or binary to keep its earlier content, so this change cannot be undone",
+        .0.display()
+    )]
+    NotRestorable(PathBuf),
+    #[error(
+        "`{}` changed outside agent.d after this change, so undoing it would discard that edit",
+        .0.display()
+    )]
+    ChangedOutside(PathBuf),
 }
 
 #[derive(Debug, Clone, Serialize)]
