@@ -913,6 +913,32 @@ impl Executor {
             .await
     }
 
+    /// Ask a person whether a chat session may work in `folder`. The run's
+    /// approval setting never applies: the classifier does not answer folder
+    /// questions, and with nobody to ask the answer is no.
+    pub async fn ask_folder(&self, folder: &str, caller: &Caller) -> agentd_types::Verdict {
+        let Some(broker) = &self.broker else {
+            return agentd_types::Verdict::Deny;
+        };
+        let id = self.approval_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        broker
+            .request(agentd_types::ApprovalRequest {
+                id,
+                kind: agentd_types::ApprovalKind::Folder,
+                action: folder.to_owned(),
+                tool: None,
+                requires: Vec::new(),
+                missing: Vec::new(),
+                reason: "Let agent.d work in this folder?".to_owned(),
+                caller: caller.clone(),
+                detail: Some(serde_json::json!({ "folder": folder })),
+                run_id: None,
+                session_id: None,
+                warning: None,
+            })
+            .await
+    }
+
     /// Whether the user trusts `folder` (an absolute real path).
     pub fn trusts_folder(&self, folder: &std::path::Path) -> bool {
         self.engine.load().grants().trusts_folder(folder)

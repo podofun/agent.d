@@ -838,10 +838,18 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
                         return e;
                     }
                     let caller = ws_caller(conn, p.session, p.user);
+                    let cwd = match &p.cwd {
+                        Some(raw) => match session_cwd(&executor, conn, &caller, raw, id).await {
+                            Ok(folder) => Some(folder),
+                            Err(response) => return response,
+                        },
+                        None => None,
+                    };
                     let new = agentd_sessions::NewSession::in_scope(&conn_scope(conn, &caller))
                         .label(p.label)
                         .runner(p.runner)
-                        .approval(p.approval);
+                        .approval(p.approval)
+                        .cwd(cwd);
                     match store.create(new) {
                         Ok(meta) => ok_ser(id, &meta),
                         Err(e) => session_error(id, e),
@@ -1014,6 +1022,8 @@ struct NameParam {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct CreateSessionParams {
+    /// The folder the session's runs work in, absolute.
+    cwd: Option<String>,
     label: Option<String>,
     runner: Option<String>,
     approval: Option<agentd_permissions::ApprovalSetting>,
@@ -1144,6 +1154,61 @@ fn ok_ser<T: Serialize>(id: u64, value: &T) -> WsResponse {
 }
 
 /// Actionable hint for an error code, shown to humans next to the message.
+/// Check a folder a client asks a new session to work in, and return its
+/// real path. Only local connections may choose one. A folder the user
+/// trusts is accepted; any other is asked about once.
+async fn session_cwd(
+    executor: &Executor,
+    conn: &ConnIdentity,
+    caller: &Caller,
+    raw: &str,
+    id: u64,
+) -> Result<String, WsResponse> {
+    let refuse = |message: String| err(id, "session_folder_not_allowed", message);
+    if conn.interface != "ws" && !conn.admin {
+        return Err(refuse(
+            "bots and other interfaces cannot choose a folder for a session".to_owned(),
+        ));
+    }
+    let path = std::path::Path::new(raw);
+    if !path.is_absolute() {
+        return Err(refuse(format!(
+            "the session folder `{raw}` must be an absolute path"
+        )));
+    }
+    let Ok(real) = std::fs::canonicalize(path) else {
+        return Err(refuse(format!("the session folder `{raw}` does not exist")));
+    };
+    if !real.is_dir() {
+        return Err(refuse(format!(
+            "the session folder `{raw}` is not a folder"
+        )));
+    }
+    if real.parent().is_none() {
+        return Err(refuse(format!(
+            "the session folder `{raw}` is the root of the disk, start the chat in a project folder instead"
+        )));
+    }
+    let folder = real.to_string_lossy().into_owned();
+    if executor.trusts_folder(&real) {
+        return Ok(folder);
+    }
+    match executor.ask_folder(&folder, caller).await {
+        agentd_types::Verdict::AllowOnce => Ok(folder),
+        agentd_types::Verdict::AllowForever => {
+            if let Err(error) = executor.trust_folder(&folder).await {
+                tracing::warn!(%folder, %error, "a trusted folder could not be remembered");
+            }
+            Ok(folder)
+        }
+        agentd_types::Verdict::Deny => Err(err(
+            id,
+            "session_folder_denied",
+            format!("working in `{folder}` was not allowed"),
+        )),
+    }
+}
+
 fn tip_for(code: &str) -> Option<String> {
     let tip = match code {
         "no_provider" => {
@@ -1170,6 +1235,12 @@ fn tip_for(code: &str) -> Option<String> {
         }
         "bad_params" => "Pass args as `-d key=value` or `-j '<json>'`",
         "approval_forbidden" => "Connect with the admin token, or use a stricter setting",
+        "session_folder_not_allowed" => {
+            "Start the chat on this machine, in an existing project folder"
+        }
+        "session_folder_denied" => {
+            "Start the chat from a folder you trust, or add it under [folders] trusted in grants.toml. https://docs.podo.fun/agentd/v0/security/grants"
+        }
         "classifier_not_configured" => {
             "Name a classifier runner in `[approval].classifier` in grants.toml, or use `human` or `nobody`"
         }
