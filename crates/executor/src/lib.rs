@@ -2142,6 +2142,7 @@ impl Executor {
                                 input: self.runs.redact_secrets(run_id, &call.arguments),
                                 output,
                                 error,
+                                changes: Vec::new(),
                             });
                         }
                         let text = match result {

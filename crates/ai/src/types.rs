@@ -281,11 +281,36 @@ pub enum StreamEvent {
         output: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// The files the call changed, however it changed them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changes: Vec<FileChange>,
     },
     /// One provider turn finished. The executor-owned loop may start another
     /// turn after dispatching tools; the final turn is followed by the
     /// complete response instead.
     TurnEnd,
+}
+
+/// One file a tool call changed. `revision` is the file history revision
+/// that undoes it, when it was recorded. `diff` is a unified diff, `None`
+/// for a binary or very large file (then `binary` says which).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FileChange {
+    pub path: String,
+    pub operation: ChangeKind,
+    pub revision: Option<usize>,
+    pub diff: Option<String>,
+    pub binary: bool,
+    pub added: usize,
+    pub removed: usize,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    Created,
+    Modified,
+    Removed,
 }
 
 /// Bounded event delivery. Overflow is recorded so the executor can fail the
@@ -300,13 +325,13 @@ impl StreamSink {
     pub fn send(
         &self,
         event: StreamEvent,
-    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<StreamEvent>> {
+    ) -> Result<(), Box<tokio::sync::mpsc::error::TrySendError<StreamEvent>>> {
         let result = self.sender.try_send(event);
         if matches!(result, Err(tokio::sync::mpsc::error::TrySendError::Full(_))) {
             self.overflowed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        result
+        result.map_err(Box::new)
     }
 
     pub fn overflowed(&self) -> bool {
@@ -388,5 +413,57 @@ pub trait Provider: Send + Sync {
         _sink: StreamSink,
     ) -> Result<CompletionResponse, ProviderError> {
         self.complete(req).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_results_serialize_changes_only_when_present() {
+        let event = StreamEvent::ToolResult {
+            name: "files.write".into(),
+            input: serde_json::json!({}),
+            output: serde_json::Value::Null,
+            error: None,
+            changes: Vec::new(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert!(json.get("changes").is_none(), "{json}");
+
+        let event = StreamEvent::ToolResult {
+            name: "files.write".into(),
+            input: serde_json::json!({}),
+            output: serde_json::Value::Null,
+            error: None,
+            changes: vec![FileChange {
+                path: "src/a.rs".into(),
+                operation: ChangeKind::Modified,
+                revision: Some(3),
+                diff: Some("@@ -1 +1 @@\n-a\n+b\n".into()),
+                binary: false,
+                added: 1,
+                removed: 0,
+            }],
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json["changes"],
+            serde_json::json!([{
+                "path": "src/a.rs",
+                "operation": "modified",
+                "revision": 3,
+                "diff": "@@ -1 +1 @@\n-a\n+b\n",
+                "binary": false,
+                "added": 1,
+                "removed": 0,
+            }])
+        );
+        let back: StreamEvent = serde_json::from_value(json).unwrap();
+        let StreamEvent::ToolResult { changes, .. } = back else {
+            panic!("not a tool result");
+        };
+        assert_eq!(changes[0].operation, ChangeKind::Modified);
     }
 }

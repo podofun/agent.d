@@ -306,6 +306,7 @@ async fn streaming_run_emits_deltas_and_returns_complete_outcome() {
                 input,
                 output,
                 error,
+                ..
             } => Some((name, input, output, error)),
             _ => None,
         })

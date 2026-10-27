@@ -352,6 +352,85 @@ async fn non_streaming_run_gets_single_complete_response() {
     assert_eq!(resp["result"]["text"], "streamed hello");
 }
 
+/// Streams one tool result that changed a file, then replies.
+struct ChangesProvider;
+
+#[async_trait]
+impl agentd_ai::Provider for ChangesProvider {
+    fn name(&self) -> &str {
+        "mock"
+    }
+    async fn complete(
+        &self,
+        _req: agentd_ai::CompletionRequest,
+    ) -> Result<agentd_ai::CompletionResponse, agentd_ai::ProviderError> {
+        Ok(agentd_ai::MockProvider::text_only("done"))
+    }
+    async fn complete_streaming(
+        &self,
+        req: agentd_ai::CompletionRequest,
+        sink: agentd_ai::StreamSink,
+    ) -> Result<agentd_ai::CompletionResponse, agentd_ai::ProviderError> {
+        let _ = sink.send(agentd_ai::StreamEvent::ToolResult {
+            name: "files.write".into(),
+            input: serde_json::json!({ "path": "a.txt" }),
+            output: serde_json::json!(2),
+            error: None,
+            changes: vec![agentd_ai::FileChange {
+                path: "a.txt".into(),
+                operation: agentd_ai::ChangeKind::Created,
+                revision: Some(2),
+                diff: Some("@@ -0,0 +1 @@\n+b\n".into()),
+                binary: false,
+                added: 1,
+                removed: 0,
+            }],
+        });
+        self.complete(req).await
+    }
+}
+
+#[tokio::test]
+async fn streamed_tool_results_carry_their_file_changes() {
+    let (url, _) = boot_runner(Arc::new(ChangesProvider), true).await;
+    let (mut sock, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    send_request(
+        &mut sock,
+        serde_json::json!({
+            "id": 11,
+            "method": "runners.run",
+            "params": { "name": "helper", "prompt": "hi", "stream": true }
+        }),
+    )
+    .await;
+    let mut deltas = Vec::new();
+    loop {
+        let frame = receive(&mut sock).await;
+        if frame.get("event").and_then(|e| e.as_str()) == Some("runner.delta") {
+            deltas.push(frame["delta"].clone());
+            continue;
+        }
+        assert_eq!(frame["ok"], true, "{frame}");
+        break;
+    }
+    let result = deltas
+        .iter()
+        .find(|d| d["type"] == "tool_result")
+        .expect("a tool_result delta");
+    assert_eq!(
+        result["changes"],
+        serde_json::json!([{
+            "path": "a.txt",
+            "operation": "created",
+            "revision": 2,
+            "diff": "@@ -0,0 +1 @@\n+b\n",
+            "binary": false,
+            "added": 1,
+            "removed": 0,
+        }])
+    );
+}
+
 struct ControlledProvider {
     requests: std::sync::Mutex<Vec<agentd_ai::CompletionRequest>>,
     started: tokio::sync::Notify,
