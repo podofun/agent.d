@@ -850,7 +850,7 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
                     let cwd = match &p.cwd {
                         Some(raw) => match session_cwd(&executor, conn, &caller, raw, id).await {
                             Ok(folder) => Some(folder),
-                            Err(response) => return response,
+                            Err(response) => return *response,
                         },
                         None => None,
                     };
@@ -1171,8 +1171,8 @@ async fn session_cwd(
     caller: &Caller,
     raw: &str,
     id: u64,
-) -> Result<String, WsResponse> {
-    let refuse = |message: String| err(id, "session_folder_not_allowed", message);
+) -> Result<String, Box<WsResponse>> {
+    let refuse = |message: String| Box::new(err(id, "session_folder_not_allowed", message));
     if conn.interface != "ws" && !conn.admin {
         return Err(refuse(
             "bots and other interfaces cannot choose a folder for a session".to_owned(),
@@ -1209,11 +1209,11 @@ async fn session_cwd(
             }
             Ok(folder)
         }
-        agentd_types::Verdict::Deny => Err(err(
+        agentd_types::Verdict::Deny => Err(Box::new(err(
             id,
             "session_folder_denied",
             format!("working in `{folder}` was not allowed"),
-        )),
+        ))),
     }
 }
 
