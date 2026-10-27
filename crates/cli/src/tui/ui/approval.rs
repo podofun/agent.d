@@ -178,10 +178,8 @@ fn detail_lines(detail: Option<&serde_json::Value>) -> Vec<Line<'static>> {
 
 fn caller_summary(request: &ApprovalRequest) -> Option<String> {
     let caller = &request.caller;
+    // The runner is left out: in a chat it is always the one you talk to.
     let mut parts = Vec::new();
-    if let Some(runner) = &caller.runner {
-        parts.push(format!("Runner {}", runner.as_str()));
-    }
     if let Some(service) = &caller.service {
         parts.push(format!("Service {}", service.as_str()));
     }
@@ -228,7 +226,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("fs.read:/work/**"));
-        assert!(rendered.contains("Runner review"));
+        assert!(!rendered.contains("Runner review"));
         assert!(!rendered.contains("future runs"));
         assert!(!rendered.contains("Client ws"));
         assert!(!rendered.contains("Session ws-6"));
