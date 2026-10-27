@@ -51,13 +51,18 @@ pub fn apply(_policy: &SandboxPolicy) -> Result<(), SandboxError> {
 /// filter set scoped to the child's AppContainer package SID enforces the
 /// host/IP allowlist (transparent, driver-free); otherwise the child gets no
 /// network capability at all.
-pub async fn run_contained(
+pub(crate) async fn run_contained(
     req: &crate::ExecRequest,
     policy: &SandboxPolicy,
+    tree: crate::kill_tree::KillSwitch,
 ) -> Result<crate::ExecResult, crate::ShellError> {
+    tree.check()?;
     let req = req.clone();
     let policy = policy.clone();
-    tokio::task::spawn_blocking(move || imp::run_blocking(&req, &policy))
+    // The blocking thread cannot be cancelled, so a dropped or timed-out exec
+    // terminates the command's job through `tree`; the thread then sees its
+    // pipes close and returns what it read.
+    tokio::task::spawn_blocking(move || imp::run_blocking(&req, &policy, &tree))
         .await
         .map_err(|e| {
             crate::ShellError::Sandbox(format!("a background sandbox task failed ({e})"))
@@ -140,14 +145,16 @@ mod imp {
     };
     use windows::Win32::System::Pipes::CreatePipe;
     use windows::Win32::System::Threading::{
-        CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+        CREATE_NEW_CONSOLE, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
         DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
         InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTF_USESHOWWINDOW,
-        STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ResumeThread,
+        STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+        UpdateProcThreadAttribute, WaitForSingleObject,
     };
     use windows::core::{PCWSTR, PWSTR};
 
+    use crate::kill_tree::{Job, KillSwitch};
     use crate::policy::SandboxPolicy;
     use crate::{ExecRequest, ExecResult, ShellError};
 
@@ -1116,10 +1123,12 @@ mod imp {
     pub fn run_blocking(
         req: &ExecRequest,
         policy: &SandboxPolicy,
+        tree: &KillSwitch,
     ) -> Result<ExecResult, ShellError> {
         // Network children get the `internetClient` capability + a WFP filter set
         // scoped to their package SID (host/IP allowlist). Denied children get no
         // capability and no WFP, so the OS blocks all outbound by construction.
+        tree.check()?;
         let net = policy.allow_net;
         let sid = appcontainer_sid(net)?;
         let bin_path = resolve_bin_path(&req.bin).ok_or_else(|| {
@@ -1385,7 +1394,13 @@ mod imp {
                 // node) tries to create a conhost from INSIDE the lowbox, which
                 // deadlocks — the AppContainer token cannot complete console
                 // creation. With a console to inherit, nested spawns just work.
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE,
+                //
+                // Start suspended so the process joins its job (below) before
+                // it can start anything outside it.
+                EXTENDED_STARTUPINFO_PRESENT
+                    | CREATE_UNICODE_ENVIRONMENT
+                    | CREATE_NEW_CONSOLE
+                    | CREATE_SUSPENDED,
                 env_ptr,
                 cwd_ptr,
                 &siex.StartupInfo,
@@ -1404,6 +1419,50 @@ mod imp {
             spawn.map_err(|e| {
                 ShellError::Sandbox(format!("could not start `{}` ({e})", bin_path.display()))
             })?;
+
+            // Everything the command starts joins this job, so terminating it
+            // on timeout or drop stops the whole tree.
+            let job = Job::new().and_then(|job| job.assign(pi.hProcess).map(|()| job));
+            let job = match job {
+                Ok(job) => job,
+                Err(e) => {
+                    // SAFETY: `pi` holds live handles from the successful
+                    // CreateProcessW above; each is closed exactly once here.
+                    unsafe {
+                        let _ = TerminateProcess(pi.hProcess, 1);
+                        let _ = CloseHandle(pi.hProcess);
+                        let _ = CloseHandle(pi.hThread);
+                    }
+                    return Err(sb(format!(
+                        "the command could not be placed in a job object ({e})"
+                    )));
+                }
+            };
+            // A timeout or drop that came first terminates the still-suspended
+            // process now, through its job.
+            if let Err(e) = tree.arm(job.into_kill()) {
+                // SAFETY: as above, live handles closed exactly once.
+                unsafe {
+                    let _ = CloseHandle(pi.hProcess);
+                    let _ = CloseHandle(pi.hThread);
+                }
+                return Err(e);
+            }
+            // SAFETY: `pi.hThread` is the live primary thread handle of the
+            // suspended child.
+            if unsafe { ResumeThread(pi.hThread) } == u32::MAX {
+                let e = std::io::Error::last_os_error();
+                // SAFETY: as above, live handles closed exactly once.
+                unsafe {
+                    let _ = TerminateProcess(pi.hProcess, 1);
+                    let _ = CloseHandle(pi.hProcess);
+                    let _ = CloseHandle(pi.hThread);
+                }
+                return Err(sb(format!(
+                    "could not resume `{}` ({e})",
+                    bin_path.display()
+                )));
+            }
 
             // Feed stdin, if any, then close.
             if let Some(input) = &req.stdin {
@@ -1446,6 +1505,7 @@ mod imp {
                 exit_code,
                 stdout,
                 stderr,
+                timed_out: false,
             })
         })();
 

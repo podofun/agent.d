@@ -24,7 +24,7 @@ pub use backend::wrap_argv;
 pub mod macos_transparent;
 
 #[cfg(target_os = "macos")]
-pub use macos_transparent::run_contained as macos_run_contained;
+pub(crate) use macos_transparent::run_contained as macos_run_contained;
 
 #[cfg(unix)]
 pub mod macos_broker;
@@ -33,7 +33,7 @@ pub mod macos_broker;
 pub mod macos_pf_rules;
 
 #[cfg(target_os = "windows")]
-pub use backend::run_contained as windows_run_contained;
+pub(crate) use backend::run_contained as windows_run_contained;
 
 /// Grant the sandbox ancestor-directory metadata/traverse so path
 /// canonicalization works for arbitrary programs (Windows parity with the

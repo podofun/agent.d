@@ -249,7 +249,8 @@ function string.split(s, sep) end
 ---@class Ctx.ShellResult
 ---@field stdout string
 ---@field stderr string
----@field exit_code integer
+---@field exit_code? integer
+---@field timed_out boolean
 
 ---@class Ctx.ShellOpts
 ---@field bin string
@@ -257,6 +258,7 @@ function string.split(s, sep) end
 ---@field cwd? string
 ---@field stdin? string
 ---@field separate_stderr? boolean
+---@field timeout_ms? integer
 
 ---@class Ctx.Fs
 ---@field read fun(path: string): string
@@ -442,7 +444,7 @@ local Ctx = {}
 ---@overload fun(opts: Ctx.ShellOpts): Ctx.ShellResult
 ---@param bin string
 ---@param args? string[]
----@param opts? { cwd?: string, stdin?: string, separate_stderr?: boolean }
+---@param opts? { cwd?: string, stdin?: string, separate_stderr?: boolean, timeout_ms?: integer }
 ---@return Ctx.ShellResult
 function Ctx.shell(bin, args, opts) end
 

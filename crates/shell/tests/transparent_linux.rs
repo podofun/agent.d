@@ -92,6 +92,7 @@ fn raw_tcp_req(dst: SocketAddr) -> ExecRequest {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: None,
     }
 }
@@ -163,6 +164,7 @@ async fn dns_denied_name_does_not_resolve() {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: None,
     };
     req.sandbox = Some(policy(vec!["net:allowed.example.com"]));
@@ -180,6 +182,7 @@ fn sh_req(script: &str, net_hosts: Vec<&str>) -> ExecRequest {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: Some(policy(net_hosts)),
     }
 }
@@ -244,6 +247,7 @@ fn udp_echo_req(dst: SocketAddr, net_hosts: Vec<&str>) -> ExecRequest {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: Some(policy(net_hosts)),
     }
 }
@@ -292,6 +296,131 @@ async fn udp_to_denied_ip_is_dropped() {
     );
 }
 
+/// A netns command that records the pid of a background `sleep` it starts, then
+/// blocks in a foreground `sleep`. The pid file lives in a granted folder.
+fn tree_req(dir: &std::path::Path, timeout_ms: Option<u64>) -> ExecRequest {
+    let mut policy = policy(vec!["net:203.0.113.77"]);
+    policy.write_paths = vec![dir.to_path_buf()];
+    ExecRequest {
+        bin: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            format!(
+                "echo started; sleep 30 & echo $! > {}/pid; sleep 30",
+                dir.display()
+            ),
+        ],
+        cwd: None,
+        stdin: None,
+        separate_stderr: true,
+        timeout_ms,
+        sandbox: Some(policy),
+    }
+}
+
+async fn read_pid(dir: &std::path::Path) -> i32 {
+    for _ in 0..1200 {
+        if let Ok(text) = std::fs::read_to_string(dir.join("pid"))
+            && let Ok(pid) = text.trim().parse()
+        {
+            return pid;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("the script never wrote its pid file");
+}
+
+/// Whether `pid` still runs per `kill -0`, counting an unreaped zombie as gone.
+fn running(pid: i32) -> bool {
+    let alive = std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map(|s| {
+            s.rsplit(')')
+                .next()
+                .unwrap_or("")
+                .trim_start()
+                .starts_with('Z')
+        })
+        .unwrap_or(false);
+    alive && !zombie
+}
+
+async fn assert_stops(pid: i32) {
+    for _ in 0..200 {
+        if !running(pid) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("process {pid} is still running");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timeout_kills_the_netns_command_and_its_children() {
+    if !netns_e2e_enabled() || !userns_net_supported() || !tooling_present() {
+        eprintln!("skip: set AGENTD_TEST_NETNS=1 (needs userns + nft/ip)");
+        return;
+    }
+    supervisor_env();
+    let dir = tempfile::tempdir().unwrap();
+    let task = tokio::spawn(agentd_shell::exec(tree_req(dir.path(), Some(5000))));
+    let grandchild = read_pid(dir.path()).await;
+    let res = task.await.unwrap().expect("a timeout is a result");
+    assert!(res.timed_out, "{res:?}");
+    assert_eq!(
+        res.stdout.trim(),
+        "started",
+        "output before the kill is kept"
+    );
+    assert_stops(grandchild).await;
+}
+
+/// A timeout that fires while the namespace is still being set up must still
+/// stop the command: it may never get to run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timeout_during_netns_setup_still_stops_the_command() {
+    if !netns_e2e_enabled() || !userns_net_supported() || !tooling_present() {
+        eprintln!("skip: set AGENTD_TEST_NETNS=1 (needs userns + nft/ip)");
+        return;
+    }
+    supervisor_env();
+    let dir = tempfile::tempdir().unwrap();
+    let mut req = tree_req(dir.path(), Some(1));
+    req.args = vec![
+        "-c".into(),
+        format!("sleep 2; touch {}/survived", dir.path().display()),
+    ];
+    let res = agentd_shell::exec(req)
+        .await
+        .expect("a timeout is a result");
+    assert!(res.timed_out, "{res:?}");
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    assert!(
+        !dir.path().join("survived").exists(),
+        "the command kept running after its timeout"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropping_the_exec_future_kills_the_netns_command() {
+    if !netns_e2e_enabled() || !userns_net_supported() || !tooling_present() {
+        eprintln!("skip: set AGENTD_TEST_NETNS=1 (needs userns + nft/ip)");
+        return;
+    }
+    supervisor_env();
+    let dir = tempfile::tempdir().unwrap();
+    let task = tokio::spawn(agentd_shell::exec(tree_req(dir.path(), None)));
+    let grandchild = read_pid(dir.path()).await;
+    assert!(running(grandchild));
+    task.abort();
+    let _ = task.await;
+    assert_stops(grandchild).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn network_run_starts_in_the_requested_folder() {
     if !netns_e2e_enabled() || !userns_net_supported() || !tooling_present() {
@@ -309,6 +438,7 @@ async fn network_run_starts_in_the_requested_folder() {
         cwd: Some(folder.clone()),
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: Some(sandbox),
     };
     let res = agentd_shell::exec(req).await.expect("exec");

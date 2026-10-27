@@ -23,6 +23,7 @@ fn req(bin: &str, args: Vec<String>, policy: SandboxPolicy) -> ExecRequest {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: Some(policy),
     }
 }

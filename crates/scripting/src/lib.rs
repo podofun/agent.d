@@ -2314,9 +2314,13 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
         .block_on(shell_exec(req))
         .map_err(|e| mlua::Error::external(e.to_string()))?;
     let out = lua.create_table()?;
-    out.set("exit_code", result.exit_code)?;
+    // A killed program has no exit code; `timed_out` says why.
+    if !result.timed_out {
+        out.set("exit_code", result.exit_code)?;
+    }
     out.set("stdout", result.stdout)?;
     out.set("stderr", result.stderr)?;
+    out.set("timed_out", result.timed_out)?;
     Ok(Value::Table(out))
 }
 
@@ -2346,12 +2350,14 @@ fn parse_shell_args(_lua: &Lua, args: MultiValue) -> mlua::Result<ExecRequest> {
             let cwd: Option<String> = t.get("cwd").ok();
             let stdin: Option<String> = t.get("stdin").ok();
             let separate_stderr: bool = t.get::<Option<bool>>("separate_stderr")?.unwrap_or(true);
+            let timeout_ms = parse_timeout_ms(&t)?;
             Ok(ExecRequest {
                 bin,
                 args,
                 cwd: cwd.map(Into::into),
                 stdin,
                 separate_stderr,
+                timeout_ms,
                 sandbox: None,
             })
         }
@@ -2370,13 +2376,13 @@ fn parse_shell_args(_lua: &Lua, args: MultiValue) -> mlua::Result<ExecRequest> {
                 }
             };
             let opts = iter.next();
-            let (cwd, stdin, separate_stderr) = match opts {
-                None | Some(Value::Nil) => (None, None, true),
+            let (cwd, stdin, separate_stderr, timeout_ms) = match opts {
+                None | Some(Value::Nil) => (None, None, true, None),
                 Some(Value::Table(t)) => {
                     let cwd: Option<String> = t.get("cwd").ok();
                     let stdin: Option<String> = t.get("stdin").ok();
                     let sep: bool = t.get::<Option<bool>>("separate_stderr")?.unwrap_or(true);
-                    (cwd, stdin, sep)
+                    (cwd, stdin, sep, parse_timeout_ms(&t)?)
                 }
                 Some(other) => {
                     return Err(mlua::Error::external(format!(
@@ -2391,6 +2397,7 @@ fn parse_shell_args(_lua: &Lua, args: MultiValue) -> mlua::Result<ExecRequest> {
                 cwd: cwd.map(Into::into),
                 stdin,
                 separate_stderr,
+                timeout_ms,
                 sandbox: None,
             })
         }
@@ -2399,6 +2406,22 @@ fn parse_shell_args(_lua: &Lua, args: MultiValue) -> mlua::Result<ExecRequest> {
             other.type_name()
         ))),
     }
+}
+
+/// Read the optional `timeout_ms` of a `ctx.shell` call: a positive whole
+/// number of milliseconds, or nothing for no limit.
+fn parse_timeout_ms(t: &Table) -> mlua::Result<Option<u64>> {
+    let ms = match t.get::<Value>("timeout_ms")? {
+        Value::Nil => return Ok(None),
+        Value::Integer(n) if n > 0 => Some(n as u64),
+        Value::Number(n) if n > 0.0 && n.fract() == 0.0 && n < u64::MAX as f64 => Some(n as u64),
+        _ => None,
+    };
+    ms.map(Some).ok_or_else(|| {
+        mlua::Error::external(
+            "the `timeout_ms` option of `ctx.shell` must be a positive whole number of milliseconds",
+        )
+    })
 }
 
 // ---------- context.fs ----------

@@ -27,6 +27,7 @@ fn sh(script: String, policy: SandboxPolicy) -> ExecRequest {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: Some(policy),
     }
 }
@@ -133,6 +134,7 @@ async fn net_denied_blocks_outbound() {
         cwd: None,
         stdin: None,
         separate_stderr: true,
+        timeout_ms: None,
         sandbox: Some(write_policy(dir.path())),
     })
     .await
@@ -189,4 +191,72 @@ async fn read_through_the_data_volume_path_is_denied() {
         !res.stdout.contains("top-secret"),
         "data-volume read must be blocked: {res:?}"
     );
+}
+
+/// A unique `sleep` duration, so `pgrep -f` finds exactly this test's process
+/// whatever uid it runs as.
+fn marker() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    format!("30.{nanos:09}")
+}
+
+/// A script whose background `sleep` (the grandchild) carries `marker`, while
+/// the shell itself blocks in a foreground `sleep`.
+fn tree_script(marker: &str) -> String {
+    format!("sleep {marker} & sleep 30")
+}
+
+fn running(marker: &str) -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-f", &format!("sleep {marker}")])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+async fn wait_until(marker: &str, want_running: bool) {
+    for _ in 0..1200 {
+        if running(marker) == want_running {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!(
+        "`sleep {marker}` running = {}, expected {want_running}",
+        !want_running
+    );
+}
+
+#[tokio::test]
+async fn timeout_kills_the_sandboxed_command_and_its_children() {
+    if skip() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let marker = marker();
+    let mut req = sh(tree_script(&marker), write_policy(dir.path()));
+    req.timeout_ms = Some(10_000);
+    let task = tokio::spawn(exec(req));
+    wait_until(&marker, true).await;
+    let res = task.await.unwrap().expect("a timeout is a result");
+    assert!(res.timed_out, "{res:?}");
+    wait_until(&marker, false).await;
+}
+
+#[tokio::test]
+async fn dropping_the_exec_future_kills_the_sandboxed_command() {
+    if skip() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let marker = marker();
+    let req = sh(tree_script(&marker), write_policy(dir.path()));
+    let task = tokio::spawn(exec(req));
+    wait_until(&marker, true).await;
+    task.abort();
+    let _ = task.await;
+    wait_until(&marker, false).await;
 }

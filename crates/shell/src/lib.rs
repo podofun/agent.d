@@ -15,6 +15,7 @@ use tokio::process::Command;
 pub mod dns_pin;
 pub mod dns_wire;
 pub mod gateway;
+mod kill_tree;
 #[cfg(target_os = "windows")]
 pub mod netbroker;
 pub mod netfilter;
@@ -41,6 +42,10 @@ pub struct ExecRequest {
     /// merged into stdout (handy for tools that mix the two).
     #[serde(default = "default_true")]
     pub separate_stderr: bool,
+    /// Stop the program, and everything it started, once this many
+    /// milliseconds pass. `None` lets it run until it exits.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
     /// Native-OS sandbox policy applied to the child. `None` = no sandbox
     /// (internal callers only; `ctx.shell` always sets `Some`). Host-derived,
     /// never wire data, so it is skipped during (de)serialization.
@@ -54,9 +59,15 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecResult {
+    /// The program's exit code. Meaningless when `timed_out` is set, since the
+    /// program was killed rather than allowed to exit.
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+    /// The program ran past `timeout_ms`, so it and everything it started were
+    /// killed. `stdout` and `stderr` hold what it wrote before that.
+    #[serde(default)]
+    pub timed_out: bool,
 }
 
 #[derive(Debug, Error)]
@@ -91,12 +102,66 @@ pub enum ShellError {
     /// The child could reach a path the operator denies, so it was not started.
     #[error("{0}")]
     DeniedReach(String),
+    /// `timeout_ms` was zero, which would stop the program before it started.
+    #[error("a shell timeout must be at least 1 ms")]
+    InvalidTimeout,
+    /// The exec was cancelled or timed out before the program started, so it
+    /// never ran. `exec` reports a timeout as a timed-out result instead.
+    #[error("the command was stopped before it started")]
+    Stopped,
 }
+
+/// How long a timed-out exec waits, after killing the tree, for the backend to
+/// hand back the output it read. Only a process that left the tree (for example
+/// with `setsid`) and still holds the output pipes makes it wait this long.
+const OUTPUT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Run a command. The caller is responsible for permission checks BEFORE
 /// invoking this function. The shell crate is a primitive; gating lives in
 /// the context binding layer.
+///
+/// Dropping the returned future kills the program and everything it started,
+/// on every backend. When `timeout_ms` passes, the same kill happens and the
+/// result comes back with `timed_out` set and the output read so far.
 pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
+    if req.timeout_ms == Some(0) {
+        return Err(ShellError::InvalidTimeout);
+    }
+    let tree = kill_tree::KillSwitch::default();
+    let deadline = req.timeout_ms.map(std::time::Duration::from_millis);
+    let run = run(req, tree.clone());
+    tokio::pin!(run);
+    // Declared after `run`, so on drop it fires first, while the backend still
+    // owns the unreaped group leader.
+    let guard = tree.on_drop();
+
+    let Some(deadline) = deadline else {
+        let res = run.await;
+        guard.defuse();
+        return res;
+    };
+    let res = match tokio::time::timeout(deadline, &mut run).await {
+        Ok(res) => res,
+        Err(_) => {
+            tree.fire();
+            let collected = tokio::time::timeout(OUTPUT_GRACE, &mut run).await;
+            let (stdout, stderr) = match collected {
+                Ok(Ok(res)) => (res.stdout, res.stderr),
+                _ => (String::new(), String::new()),
+            };
+            Ok(ExecResult {
+                exit_code: -1,
+                stdout,
+                stderr,
+                timed_out: true,
+            })
+        }
+    };
+    guard.defuse();
+    res
+}
+
+async fn run(req: ExecRequest, tree: kill_tree::KillSwitch) -> Result<ExecResult, ShellError> {
     // Fail closed: if a sandbox policy is requested but no backend can enforce
     // it, refuse to run rather than spawn unconfined.
     if let Some(policy) = &req.sandbox
@@ -128,13 +193,14 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
                 &policy,
                 host_grants,
                 literal_ips,
+                tree,
             )
             .await;
         }
         // Windows enforces host-granular net via WFP filters scoped to the
         // child's AppContainer package SID (handled inside run_contained).
         #[cfg(target_os = "windows")]
-        return sandbox::windows_run_contained(&req, &policy).await;
+        return sandbox::windows_run_contained(&req, &policy, tree).await;
         // macOS enforces via the transparent pf-broker path: same DNS-pin +
         // PermitSet core as Linux, capture via pf redirect to a daemon relay.
         #[cfg(target_os = "macos")]
@@ -143,7 +209,8 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
                 return Err(ShellError::SandboxUnavailable);
             }
             let (host_grants, literal_ips) = dns_pin::split_grants(&policy.net_hosts);
-            return sandbox::macos_run_contained(&req, &policy, host_grants, literal_ips).await;
+            return sandbox::macos_run_contained(&req, &policy, host_grants, literal_ips, tree)
+                .await;
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
         return Err(ShellError::SandboxUnavailable);
@@ -156,7 +223,7 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
     if let Some(policy) = req.sandbox.clone()
         && !policy.unrestricted
     {
-        return sandbox::windows_run_contained(&req, &policy).await;
+        return sandbox::windows_run_contained(&req, &policy, tree).await;
     }
 
     // macOS enforces via an argv wrapper (sandbox-exec), chosen before spawn.
@@ -198,10 +265,32 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
         cmd.stderr(Stdio::piped()); // captured separately, merged below
     }
 
+    // The child leads a new process group that everything it starts joins, so
+    // the whole tree can be killed at once.
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd.kill_on_drop(true);
+
     let mut child = cmd.spawn().map_err(|e| ShellError::Spawn {
         bin: req.bin.clone(),
         source: e,
     })?;
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        tree.arm(kill_tree::kill_group(pid as i32))?;
+    }
+    // Windows has no process groups. This path is unsandboxed, so a job
+    // assigned right after spawn is best effort: it catches everything the
+    // child starts from here on, and `kill_on_drop` still stops the child.
+    #[cfg(windows)]
+    if let Some(handle) = child.raw_handle()
+        && let Ok(job) = kill_tree::Job::new()
+        && job
+            .assign(windows::Win32::Foundation::HANDLE(handle))
+            .is_ok()
+    {
+        tree.arm(job.into_kill())?;
+    }
 
     if let (Some(input), Some(mut stdin)) = (req.stdin.as_ref(), child.stdin.take()) {
         stdin.write_all(input.as_bytes()).await?;
@@ -232,6 +321,7 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
         exit_code,
         stdout,
         stderr,
+        timed_out: false,
     })
 }
 
@@ -248,6 +338,7 @@ mod tests {
             cwd: None,
             stdin: None,
             separate_stderr: true,
+            timeout_ms: None,
             sandbox: None,
         })
         .await
@@ -265,6 +356,7 @@ mod tests {
             cwd: None,
             stdin: None,
             separate_stderr: true,
+            timeout_ms: None,
             sandbox: None,
         })
         .await
@@ -280,6 +372,7 @@ mod tests {
             cwd: None,
             stdin: None,
             separate_stderr: true,
+            timeout_ms: None,
             sandbox: None,
         })
         .await
@@ -296,6 +389,7 @@ mod tests {
             cwd: None,
             stdin: None,
             separate_stderr: false,
+            timeout_ms: None,
             sandbox: None,
         })
         .await
@@ -313,6 +407,7 @@ mod tests {
             cwd: None,
             stdin: Some("payload".into()),
             separate_stderr: true,
+            timeout_ms: None,
             sandbox: None,
         })
         .await
@@ -328,11 +423,160 @@ mod tests {
             cwd: None,
             stdin: None,
             separate_stderr: true,
+            timeout_ms: None,
             sandbox: None,
         })
         .await
         .unwrap_err();
         assert!(matches!(err, ShellError::Spawn { .. }));
+    }
+
+    /// A script that records the pid of a background `sleep` it starts, then
+    /// blocks in a foreground `sleep`, so both the direct child and a
+    /// grandchild are alive until something kills them.
+    fn tree_req(pid_file: &std::path::Path, timeout_ms: Option<u64>) -> ExecRequest {
+        ExecRequest {
+            bin: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!(
+                    "echo started; sleep 30 & echo $! > {}; sleep 30",
+                    pid_file.display()
+                ),
+            ],
+            cwd: None,
+            stdin: None,
+            separate_stderr: true,
+            timeout_ms,
+            sandbox: None,
+        }
+    }
+
+    async fn read_pid(pid_file: &std::path::Path) -> i32 {
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(pid_file)
+                && let Ok(pid) = text.trim().parse()
+            {
+                return pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the script never wrote its pid file");
+    }
+
+    /// Whether `pid` still runs, as `kill -0` sees it. A zombie waiting for its
+    /// parent to reap it no longer runs, so it counts as gone.
+    fn running(pid: i32) -> bool {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|s| {
+                s.rsplit(')')
+                    .next()
+                    .unwrap_or("")
+                    .trim_start()
+                    .starts_with('Z')
+            })
+            .unwrap_or(false);
+        alive && !zombie
+    }
+
+    async fn assert_stops(pid: i32) {
+        for _ in 0..200 {
+            if !running(pid) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("process {pid} is still running");
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_the_program_and_its_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let started = std::time::Instant::now();
+        let task = tokio::spawn(exec(tree_req(&pid_file, Some(1500))));
+        let grandchild = read_pid(&pid_file).await;
+        let res = task.await.unwrap().unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(res.timed_out, "{res:?}");
+        assert_eq!(
+            res.stdout.trim(),
+            "started",
+            "output before the kill is kept"
+        );
+        assert_stops(grandchild).await;
+    }
+
+    #[tokio::test]
+    async fn a_timeout_that_fires_at_once_still_stops_the_program() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        let res = exec(ExecRequest {
+            bin: "/bin/sh".into(),
+            args: vec!["-c".into(), format!("sleep 2; touch {}", marker.display())],
+            cwd: None,
+            stdin: None,
+            separate_stderr: true,
+            timeout_ms: Some(1),
+            sandbox: None,
+        })
+        .await
+        .unwrap();
+        assert!(res.timed_out, "{res:?}");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(
+            !marker.exists(),
+            "the program kept running after its timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_timeout_is_refused() {
+        let err = exec(ExecRequest {
+            bin: "/bin/echo".into(),
+            args: vec![],
+            cwd: None,
+            stdin: None,
+            separate_stderr: true,
+            timeout_ms: Some(0),
+            sandbox: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ShellError::InvalidTimeout), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_exec_future_kills_the_program_and_its_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let task = tokio::spawn(exec(tree_req(&pid_file, None)));
+        let grandchild = read_pid(&pid_file).await;
+        assert!(running(grandchild));
+        task.abort();
+        let _ = task.await;
+        assert_stops(grandchild).await;
+    }
+
+    #[tokio::test]
+    async fn a_program_that_finishes_in_time_is_not_affected() {
+        let res = exec(ExecRequest {
+            bin: "/bin/echo".into(),
+            args: vec!["hello".into()],
+            cwd: None,
+            stdin: None,
+            separate_stderr: true,
+            timeout_ms: Some(10_000),
+            sandbox: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(res.stdout.trim(), "hello");
     }
 
     // macOS resolves /tmp -> /private/tmp, so pin to Linux.
@@ -345,6 +589,7 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp")),
             stdin: None,
             separate_stderr: true,
+            timeout_ms: None,
             sandbox: None,
         })
         .await

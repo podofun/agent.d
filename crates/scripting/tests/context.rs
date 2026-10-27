@@ -161,6 +161,82 @@ async fn shell_exec_allowed_with_grant() {
     assert_eq!(code, 0);
 }
 
+async fn run_shell_action(body: &str) -> Result<serde_json::Value, String> {
+    let dir = write_tools(&[(
+        "s.lua",
+        &format!(
+            r#"
+            agentd.action{{
+              name = "s.slow",
+              handler = function(_, ctx)
+                {body}
+              end,
+            }}
+        "#
+        ),
+    )]);
+    let host = LuaHost::new().unwrap();
+    host.load_dir(dir.path()).unwrap();
+    let started = std::time::Instant::now();
+    let res = host
+        .call(
+            ctx(&["shell.exec"], &["s.slow"]),
+            ActionCall {
+                action: "s.slow".into(),
+                args: serde_json::Value::Null,
+            },
+        )
+        .await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    res.map(|r| r.value).map_err(|e| e.to_string())
+}
+
+// Unix-only: spawns `/bin/sh`.
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_timeout_option_stops_the_program_and_keeps_its_output() {
+    let res = run_shell_action(
+        r#"return ctx.shell("/bin/sh", {"-c", "echo started; sleep 30"}, { timeout_ms = 500 })"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(res["timed_out"], true, "{res}");
+    assert!(res["exit_code"].is_null(), "{res}");
+    assert_eq!(res["stdout"].as_str().unwrap().trim(), "started", "{res}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_timeout_field_in_the_table_form_stops_the_program() {
+    let res = run_shell_action(
+        r#"return ctx.shell({ bin = "/bin/sleep", args = {"30"}, timeout_ms = 500 })"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(res["timed_out"], true, "{res}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_program_that_finishes_reports_it_did_not_time_out() {
+    let res = run_shell_action(r#"return ctx.shell("/bin/echo", {"hi"}, { timeout_ms = 10000 })"#)
+        .await
+        .unwrap();
+    assert_eq!(res["timed_out"], false, "{res}");
+    assert_eq!(res["exit_code"], 0, "{res}");
+}
+
+#[tokio::test]
+async fn shell_timeout_must_be_a_positive_whole_number() {
+    let msg = run_shell_action(r#"return ctx.shell("echo", {"hi"}, { timeout_ms = -5 })"#)
+        .await
+        .unwrap_err();
+    assert!(
+        msg.contains("must be a positive whole number of milliseconds"),
+        "got: {msg}"
+    );
+}
+
 // Unix-only: spawns `/bin/echo`. The scoped-grant DENY path
 // (shell_exec_scoped_denies_other_bin) runs on every platform.
 #[cfg(unix)]

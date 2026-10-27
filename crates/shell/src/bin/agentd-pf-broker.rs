@@ -230,12 +230,48 @@ mod macos {
     /// the child's stdio back to the daemon via `SCM_RIGHTS`.
     struct MacBackend {
         pending_fds: Vec<RawFd>,
+        conn_fd: RawFd,
     }
 
     impl MacBackend {
-        fn new(_conn_fd: RawFd) -> Self {
+        fn new(conn_fd: RawFd) -> Self {
             MacBackend {
                 pending_fds: Vec::new(),
+                conn_fd,
+            }
+        }
+
+        /// Whether the daemon hung up, waiting up to 100 ms to find out. The
+        /// daemon sends nothing while it waits for `Exit`, so a readable
+        /// socket that yields no bytes is the hang-up.
+        fn daemon_hung_up(&self) -> bool {
+            let mut pfd = libc::pollfd {
+                fd: self.conn_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll(2) and recv(2) on the live connection fd, with a
+            // stack-owned pollfd and a one-byte stack buffer.
+            unsafe {
+                if libc::poll(&mut pfd, 1, 100) <= 0 {
+                    return false;
+                }
+                if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                    return true;
+                }
+                let mut byte = 0u8;
+                let got = libc::recv(
+                    self.conn_fd,
+                    &mut byte as *mut u8 as *mut libc::c_void,
+                    1,
+                    libc::MSG_PEEK,
+                );
+                if got > 0 {
+                    // Unexpected data: leave it for the request loop and back
+                    // off, so this never spins.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                got == 0
             }
         }
     }
@@ -304,10 +340,24 @@ mod macos {
 
         fn wait_child(&mut self, pid: i32) -> i32 {
             let mut status = 0;
-            // SAFETY: waitpid(2) on a pid this broker forked; `status` is a valid
-            // local out-param. std has no child-reaping API for a bare pid we
-            // fork()'d ourselves (Command owns its own Child), so libc is required.
-            unsafe { libc::waitpid(pid, &mut status, 0) };
+            // Poll instead of blocking, so a daemon that hangs up mid-wait (a
+            // timeout or a cancelled run) still gets the child's group killed.
+            // SAFETY: waitpid(2)/killpg(2) on a pid this broker forked, which
+            // leads its own group; `status` is a valid local out-param. std has
+            // no child-reaping API for a bare pid we fork()'d ourselves.
+            loop {
+                let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if reaped != 0 {
+                    break;
+                }
+                if self.daemon_hung_up() {
+                    unsafe {
+                        libc::killpg(pid, libc::SIGKILL);
+                        libc::waitpid(pid, &mut status, 0);
+                    }
+                    break;
+                }
+            }
             if libc::WIFEXITED(status) {
                 libc::WEXITSTATUS(status)
             } else if libc::WIFSIGNALED(status) {
@@ -318,9 +368,10 @@ mod macos {
         }
 
         fn kill_child(&mut self, pid: i32) {
-            // SAFETY: kill(2)+waitpid(2) on a pid this broker forked. Signalling
-            // and reaping a raw pid has no safe std equivalent (no Child handle).
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            // SAFETY: killpg(2)+waitpid(2) on a pid this broker forked, which
+            // leads its own process group, so everything it started dies too.
+            // Signalling and reaping a raw pid has no safe std equivalent.
+            unsafe { libc::killpg(pid, libc::SIGKILL) };
             let mut status = 0;
             unsafe { libc::waitpid(pid, &mut status, 0) };
         }
@@ -447,12 +498,14 @@ mod macos {
         }
         if pid == 0 {
             // SAFETY: async-signal-safe-only region in the forked child. Every
-            // call here (dup2/open/close/chdir/setgid/setgroups/setuid/execv/
-            // _exit) is on the POSIX async-signal-safe list and operates on fds
+            // call here (setpgid/dup2/open/close/chdir/setgid/setgroups/setuid/
+            // execv/_exit) is on the POSIX async-signal-safe list and operates on fds
             // and CStrings that outlive this block; no allocation, no locks. A
             // safe wrapper (e.g. Command) is forbidden here because it may
             // allocate/lock between fork and exec.
             unsafe {
+                // Lead a new process group, so teardown can kill the whole tree.
+                libc::setpgid(0, 0);
                 libc::dup2(out_w, 1);
                 libc::dup2(err_w, 2);
                 if in_r >= 0 {
@@ -483,10 +536,14 @@ mod macos {
                 libc::_exit(127);
             }
         }
-        // Parent: close the child ends, keep the daemon-facing ends.
-        // SAFETY: close(2) on the parent's copies of the child-side pipe fds,
-        // owned here as raw ints; the daemon-facing ends stay open in `fds`.
+        // Parent: set the child's group from this side too, so it exists before
+        // any teardown can kill it. Then close the child ends, keep the
+        // daemon-facing ends.
+        // SAFETY: setpgid(2) on our own unreaped child, and close(2) on the
+        // parent's copies of the child-side pipe fds, owned here as raw ints;
+        // the daemon-facing ends stay open in `fds`.
         unsafe {
+            libc::setpgid(pid, pid);
             libc::close(out_w);
             libc::close(err_w);
             if in_r >= 0 {

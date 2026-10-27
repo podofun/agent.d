@@ -32,6 +32,7 @@ use agentd_permissions::Permission;
 use super::macos_broker::SOCKET_PATH;
 use super::macos_broker::proto::{ErrKind, Proto, Req, Resp, read_msg, write_msg};
 use crate::gateway::{SharedSet, admit, handle_dns};
+use crate::kill_tree::KillSwitch;
 use crate::netfilter::{PermitSet, SetConfig};
 use crate::{ExecRequest, ExecResult, SandboxPolicy, ShellError};
 
@@ -138,14 +139,18 @@ fn net_lock() -> &'static tokio::sync::Mutex<()> {
 
 /// Run `req` under the transparent pf-broker sandbox. Same signature as the
 /// Linux backend so `lib.rs` dispatch is symmetric.
-pub async fn run_contained(
+pub(crate) async fn run_contained(
     req: &ExecRequest,
     policy: &SandboxPolicy,
     host_grants: Vec<Permission>,
     literal_ips: Vec<IpAddr>,
+    tree: KillSwitch,
 ) -> Result<ExecResult, ShellError> {
+    tree.check()?;
     let _serialize = net_lock().lock().await;
+    tree.check()?;
     let broker = Arc::new(Broker::connect()?);
+    let mut hang_up = HangUp::new(&broker)?;
 
     // Relay + DNS listeners (std sockets; converted to tokio below).
     let tcp = bind_dual_tcp().map_err(|e| {
@@ -233,6 +238,16 @@ pub async fn run_contained(
         Some((pid, stdin_wr, stdout_rd, stderr_rd))
     };
     let (_pid, stdin_wr, stdout_rd, stderr_rd) = pid.unwrap();
+    // A timeout hangs up on the broker, which kills the child's process group.
+    // When the timeout came first, the hang-up happens here and the exec stops.
+    let hang_up_on_timeout = hang_up.stream.try_clone().map_err(|e| {
+        ShellError::Sandbox(format!(
+            "could not hold the sandbox broker connection ({e})"
+        ))
+    })?;
+    tree.arm(Box::new(move || {
+        let _ = hang_up_on_timeout.shutdown(std::net::Shutdown::Both);
+    }))?;
 
     // Shared permitted set, seeded with literal IP grants (identical to Linux).
     let set: SharedSet = {
@@ -256,6 +271,7 @@ pub async fn run_contained(
     let tcp = tokio::net::TcpListener::from_std(tcp).map_err(io_sb)?;
     let relay_task =
         tokio::spawn(async move { relay_loop(tcp, relay_broker, relay_set, relay_grants).await });
+    hang_up.tasks = vec![dns_task.abort_handle(), relay_task.abort_handle()];
 
     // Feed stdin (if any), drain stdout/stderr to completion (EOF = child done).
     if let (Some(input), Some(fd)) = (&req.stdin, stdin_wr) {
@@ -276,14 +292,27 @@ pub async fn run_contained(
     let stdout = String::from_utf8_lossy(&out_task.await.unwrap_or_default()).into_owned();
     let stderr_text = String::from_utf8_lossy(&err_task.await.unwrap_or_default()).into_owned();
 
-    // Child's stdio closed → reap it via the broker for the exit code.
-    let exit_code = match broker.call(&Req::Wait)? {
-        Resp::Exit { code } => code,
-        Resp::Err { kind, msg } => return Err(broker_error(kind, msg)),
-        _ => {
-            return Err(ShellError::Sandbox(
-                "unexpected broker reply during wait".to_string(),
-            ));
+    // Child's stdio closed → reap it via the broker for the exit code. The
+    // broker blocks until the child exits, so wait off the async workers. After
+    // a timeout the connection is gone and the broker has killed the child, so
+    // keep the output and skip the exit code.
+    let exit_code = if tree.fired() {
+        -1
+    } else {
+        let waiter = broker.clone();
+        let reply = tokio::task::spawn_blocking(move || waiter.call(&Req::Wait))
+            .await
+            .map_err(|e| ShellError::Sandbox(format!("a background sandbox task failed ({e})")))?;
+        match reply {
+            Ok(Resp::Exit { code }) => code,
+            _ if tree.fired() => -1,
+            Ok(Resp::Err { kind, msg }) => return Err(broker_error(kind, msg)),
+            Ok(_) => {
+                return Err(ShellError::Sandbox(
+                    "unexpected broker reply during wait".to_string(),
+                ));
+            }
+            Err(e) => return Err(e),
         }
     };
 
@@ -309,7 +338,40 @@ pub async fn run_contained(
         exit_code,
         stdout,
         stderr,
+        timed_out: false,
     })
+}
+
+/// Hangs up on the broker when dropped. The child runs as a leased uid the
+/// daemon cannot signal, so a dropped exec relies on the broker:
+/// on hang-up it tears the session down and kills the child's process group.
+/// The relay tasks hold their own broker handle, so they are stopped too.
+struct HangUp {
+    stream: UnixStream,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl HangUp {
+    fn new(broker: &Broker) -> Result<Self, ShellError> {
+        let stream = broker.stream.lock().unwrap().try_clone().map_err(|e| {
+            ShellError::Sandbox(format!(
+                "could not hold the sandbox broker connection ({e})"
+            ))
+        })?;
+        Ok(HangUp {
+            stream,
+            tasks: Vec::new(),
+        })
+    }
+}
+
+impl Drop for HangUp {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 fn io_sb(e: std::io::Error) -> ShellError {
