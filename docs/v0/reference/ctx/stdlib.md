@@ -1,6 +1,6 @@
 # Standard Library Extensions
 
-agent.d augments Lua's standard library with a `json` global and additional methods on the built-in `string` library. These are **globals** — not under `ctx.*` — and are available in every file, including `init.lua`, action handlers, and service bodies.
+agent.d augments Lua's standard library with a `json` global and additional methods on the built-in `string` library. They are **globals** outside `ctx`, available in every file, including `init.lua`, action handlers and service bodies.
 
 **Required permission:** none.
 
@@ -28,7 +28,7 @@ Parse a JSON string and return the corresponding Lua value.
 | `nulls` | `"sentinel"` | JSON `null` values are returned as `json.null` (userdata). Check with `json.is_null(v)`. This is the default when `nulls` is omitted. |
 | `nulls` | `"nil"` | JSON `null` values are returned as Lua `nil`. Use with care in arrays or tables where `nil` collapses the structure. |
 
-**Returns:** `any` — `string`, `number`, `boolean`, `table`, `json.null`, or `nil`.
+**Returns:** `any`: `string`, `number`, `boolean`, `table`, `json.null` or `nil`.
 
 ### `json.null`
 
@@ -112,7 +112,7 @@ local parts = string.split(line, ",")
 
 ## See also
 
-- [ctx — overview](/v0/reference/ctx/)
+- [ctx overview](/v0/reference/ctx/)
 - [Concurrency](/v0/reference/ctx/concurrency)
 - [Writing tools](/v0/writing/tools)
 - [ctx.http](/v0/reference/ctx/http)

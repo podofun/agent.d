@@ -1,8 +1,8 @@
-# ctx.shell — Shell Execution
+# ctx.shell: Shell Execution
 
-`ctx.shell` runs a child process using an explicit argument vector. There is no shell string interpretation — each token is a discrete argument, which prevents injection attacks by construction.
+`ctx.shell` runs a child process from an explicit argument vector. No shell parses the command: each entry in `args` reaches the program as one argument, so input that contains quotes, spaces or `;` cannot inject extra commands.
 
-**Required permission:** `shell.exec` or `shell.exec:<bin>` — see [Security: permission slugs](/v0/security/permission-slugs) and [Security: sandbox](/v0/security/sandbox).
+**Required permission:** `shell.exec` or `shell.exec:<bin>`. See [Security: permission slugs](/v0/security/permission-slugs) and [Security: sandbox](/v0/security/sandbox).
 
 ## Signatures
 
@@ -36,7 +36,7 @@ Both forms are identical in behavior; use whichever is cleaner at the call site.
 | `stderr` | `string` | Captured standard error (empty when `separate_stderr` is `false`). |
 | `exit_code` | `integer` | Process exit code. Zero means success. |
 
-`ctx.shell` does **not** raise an error on non-zero exit — check `result.exit_code` yourself.
+A non-zero exit does not raise an error, so check `result.exit_code` yourself.
 
 ## Permission
 
@@ -91,7 +91,7 @@ end)
 ```
 
 ::: warning Argv-only
-Never pass a shell string like `"git status --short"` as `bin`. The entire string would be treated as the binary name. Always split your command into `bin` + `args`.
+Put the program name in `bin` and each argument in `args`. A whole command such as `"git status --short"` passed as `bin` is treated as the name of a single program.
 :::
 
 ::: tip Sandbox
@@ -103,4 +103,4 @@ In production the shell executor runs inside the native sandbox. See [Security: 
 - [Security: sandbox](/v0/security/sandbox)
 - [Security: permission slugs](/v0/security/permission-slugs)
 - [Security: grants](/v0/security/grants)
-- [ctx — overview](/v0/reference/ctx/)
+- [ctx overview](/v0/reference/ctx/)

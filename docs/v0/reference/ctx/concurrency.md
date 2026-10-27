@@ -1,6 +1,6 @@
 # Concurrency
 
-agent.d exposes a set of global functions for cooperative concurrency: coroutine spawning, parallel fan-out, channels, and timers. These are **globals** — they are available everywhere, not under `ctx.*`.
+agent.d exposes a set of global functions for cooperative concurrency: coroutine spawning, parallel fan-out, channels, and timers. They are **globals**, available everywhere without going through `ctx`.
 
 **Required permission:** none.
 
@@ -147,5 +147,5 @@ Use `limit` in `parallel` and `parallel_map` to avoid overwhelming downstream se
 
 - [Concepts: runtime](/v0/concepts/runtime)
 - [Concepts: services](/v0/concepts/services)
-- [ctx.call — running runners](/v0/reference/ctx/calls)
-- [ctx — overview](/v0/reference/ctx/)
+- [ctx.call: running runners](/v0/reference/ctx/calls)
+- [ctx overview](/v0/reference/ctx/)

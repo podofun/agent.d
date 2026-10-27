@@ -1,8 +1,8 @@
-# ctx.sessions — Chat Sessions
+# ctx.sessions: Chat Sessions
 
-A session is a conversation the daemon remembers for you. Pass a `session_id` to a runner to load its stored history and save the new exchange. The history survives daemon restarts, and older messages can be replaced with a summary as the conversation grows.
+Use sessions when a runner should remember a conversation across calls, for example one chat in a Telegram bridge. A session is a conversation the daemon stores for you. When you pass a `session_id` to a runner, the daemon loads the stored history before the run and saves the new exchange after it. The history survives daemon restarts, and once the conversation grows long, the daemon replaces older messages with a summary (see [Compaction](#compaction)).
 
-`ctx.sessions` creates and inspects those sessions. The runner call itself goes through the usual `ctx.run`.
+`ctx.sessions` creates and inspects sessions. You run a runner in a session with the usual `ctx.run`.
 
 **Required permissions:** `sessions.read` for `get`, `find`, `list` and `turns`; `sessions.write` for `create`, `set_approval` and `delete`. Grant both permissions for `open`, because it looks up the session before creating it.
 
@@ -49,17 +49,17 @@ Each `Message` in `turns` has a `role` (`user`, `assistant` or `tool`) and `cont
 
 ### `ctx.sessions.open`
 
-Use `open` to find a session by label or create it if it does not exist. For example, a Telegram bridge can use the chat id as its label to continue the conversation on later calls. Labels are unique per owner, including across users, so use a label that identifies both the chat and the user when each user needs a separate session.
+`open` finds a session by label, or creates it when none exists. A Telegram bridge, for example, can use the chat id as the label and pick up the same conversation on every later call. Labels are unique per owner across all users, so when each user needs a separate session, use a label that names both the chat and the user.
 
 ### `ctx.sessions.create`
 
-Starts a fresh session and returns it. Its owner is the calling interface (or service) and its `user` is `ctx.caller.user`; neither can be set from the options table. Pass a `label` when you need to find it again by name; labels are unique per owner and a taken label is an error.
+Starts a new session and returns it. Its owner is the calling interface or service, and its `user` is `ctx.caller.user`. The options table cannot set either one. Pass a `label` when you want to find the session again by name. A label that is already taken by the same owner raises an error.
 
 You can also pass `approval` to set who answers questions for runs in the session: `"human"`, `"classifier"`, or `"nobody"`. See [Approval in a session](#approval-in-a-session).
 
 ### `ctx.sessions.set_approval`
 
-Changes the approval setting of a session, or clears it with `nil`. The change applies to the next run in the session. A session outside the caller's scope is an error.
+Changes the approval setting of a session, or clears it with `nil`. The change applies from the next run in the session. Calling it on a session outside the caller's scope raises an error.
 
 ```lua
 ctx.sessions.set_approval(session.id, "nobody")
@@ -71,7 +71,7 @@ Fetch one session by daemon id or by your label. Both return `nil` when nothing 
 
 ### `ctx.sessions.turns`
 
-The full stored conversation, oldest first. After a compaction the first turn is a `[Conversation summary]` written by the model.
+Returns the full stored conversation, oldest first. After a compaction, the first turn is a `[Conversation summary]` written by the model.
 
 ### `ctx.sessions.delete`
 
@@ -112,17 +112,17 @@ agentctl call chat.reply --json '{"chat_id":"42","text":"My name is Fathi."}'
 agentctl call chat.reply --json '{"chat_id":"42","text":"What is my name?"}'
 ```
 
-These CLI calls share a session owned by the daemon's `ws` interface, with no user attached. A bridge that authenticates users must pass `user` in the `actions.call` request parameters, outside `args`. The handler inherits that identity through `ctx.caller.user`; do not pass `user` to `ctx.sessions.open` or `ctx.sessions.create`.
+Both CLI calls use the same session, owned by the daemon's `ws` interface, with no user attached. A bridge that authenticates its users passes `user` in the `actions.call` request parameters, next to `args`. The handler receives that identity as `ctx.caller.user`, and `ctx.sessions.open` and `ctx.sessions.create` pick it up from there.
 
-`session_id` and `messages` are mutually exclusive; a session run always needs a `prompt`. Two runs on the same session at the same time are refused with `session_busy` rather than interleaved.
+A session run takes a `prompt` and cannot take `messages`. One session runs one run at a time: a second run that starts while the first is still going fails with `session_busy`.
 
 ## Compaction
 
 Before a run, the daemon checks whether the session has at least 60 stored messages. If it does, the model selected for that run summarizes the older messages while at least the newest 20 remain unchanged. A user prompt, an assistant reply and each tool result count as separate messages, called turns in the API. The summary becomes the first user message in the stored history.
 
-The daemon keeps additional messages when needed to avoid separating a tool call from its result. If there is no suitable user-message boundary, it skips compaction for that run.
+The daemon keeps extra messages when that is needed to keep a tool call next to its result. If it finds no user message to cut at, it skips compaction for that run.
 
-Every runner gets this behavior with no configuration. Tune or disable it per runner with the optional `compact` field described in [Writing runners](/v0/writing/runners#compaction).
+Every runner compacts this way by default. You can tune or turn it off per runner with the optional `compact` field described in [Writing runners](/v0/writing/runners#compaction).
 
 If the summary call fails, the run proceeds with the full history and a warning is logged.
 
@@ -130,31 +130,31 @@ If the summary call fails, the run proceeds with the full history and a warning 
 
 Every session has an owner: the interface whose token created it (`interface:webapp`), or the Lua service that did (`service:discord_handler`). When the creating call carried a `user`, the session is bound to that user too.
 
-A caller sees a session only when both match: same owner, and the same `user` if the session has one. The `get`, `find`, `turns`, `list` and `delete` methods, and runs with `session_id`, treat sessions outside that scope as missing. Sessions created without a `user` are visible to every caller with the same owner. Labels are unique per owner, so creating a label used by another user can still produce a duplicate-label error.
+A caller sees a session when it has the same owner and, if the session has a `user`, the same user. The `get`, `find`, `turns`, `list` and `delete` methods, and runs with `session_id`, treat any other session as missing. A session created without a `user` is visible to every caller with the same owner. Because labels are unique per owner, creating a label that another user already holds still raises a duplicate-label error.
 
-What that means in practice:
+To keep clients and users apart:
 
-- Give each client its own token under [`[interfaces.<name>]`](/v0/reference/configuration#interfaces-name-sections). Your web backend and your Telegram bridge then cannot see each other's sessions, and neither can the daemon's own token.
-- Have the bridge authenticate the person first, then pass their id as `user` on every call: `create`, the run, `get`, `delete`. The daemon trusts the interface for that assertion and enforces it from then on.
-- Scripts inherit the scope of whoever called them through `ctx.caller`; they cannot widen it, and `ctx.sessions.create` refuses a `user` option for that reason.
+- Give each client its own token under [`[interfaces.<name>]`](/v0/reference/configuration#interfaces-name-sections). Your web backend, your Telegram bridge and the daemon's own token then each see only their own sessions.
+- Have the bridge authenticate the person first, then pass their id as `user` on every call: `create`, the run, `get` and `delete`. The daemon takes the interface's word for who the user is and enforces it from then on.
+- Scripts work in the scope of whoever called them, through `ctx.caller`. They cannot widen it, which is why `ctx.sessions.create` refuses a `user` option.
 
-Sessions that an [admin connection](/v0/security/approvals#admin-connections) creates belong to admin connections only. Lua scripts and other clients never see them.
+Sessions that an [admin connection](/v0/security/approvals#admin-connections) creates are visible to admin connections only. Lua scripts and other clients do not see them.
 
 ## Approval in a session
 
-A session can carry an approval setting. It tells agent.d who answers questions for every run in the session: a human, a classifier, or nobody. A bridge can set `nobody` on each chat, for example, so that a stranger in a group chat can never cause an approval request.
+A session can carry an approval setting that says who answers questions for every run in it: a human, a classifier or nobody. A bridge can set `nobody` on each chat, for example, so that a stranger in a group chat cannot cause an approval request.
 
-agent.d decides each run's setting when the run starts. It starts from the runner's default, then applies the session's value, then the value given to the run. A stricter value always applies. A looser value applies only when an admin connection starts the run, so a session value from Lua can only make a run stricter. See [Where the setting comes from](/v0/security/approvals#where-the-setting-comes-from).
+agent.d works out each run's setting when the run starts. It begins with the runner's default, then applies the session's value, then the value given to the run. A stricter value takes effect from any of these. A looser value takes effect only when an admin connection starts the run, so a session value set from Lua can make a run stricter and no looser. See [Where the setting comes from](/v0/security/approvals#where-the-setting-comes-from).
 
 `"classifier"` needs `[approval].classifier` in `grants.toml`. Without it, `create` and `set_approval` refuse the value.
 
 ## Storage
 
-Sessions live in the same redb file as `ctx.memory`, under the daemon's data directory (`/var/lib/agentd` in the container image). Use one daemon per data volume. Stop the daemon before copying `memory.redb` to back up both memory and sessions.
+Sessions live in the same file as `ctx.memory`, under the daemon's data directory (`/var/lib/agentd` in the container image). Use one daemon per data volume. Stop the daemon before copying `memory.redb` to back up both memory and sessions.
 
 ## See also
 
-- [`ctx.run`](/v0/reference/ctx/calls) — the call that consumes a session
-- [`ctx.memory`](/v0/reference/ctx/memory) — free-form durable storage for everything that is not a conversation
-- [Protocol: `sessions.*`](/v0/reference/protocol#sessions-create) — the same operations over WebSocket
+- [`ctx.run`](/v0/reference/ctx/calls): the call that runs a runner in a session
+- [`ctx.memory`](/v0/reference/ctx/memory): durable storage for any other data
+- [Protocol: `sessions.*`](/v0/reference/protocol#sessions-create): the same operations over WebSocket
 - [CLI: `agentctl session`](/v0/reference/cli#agentctl-session-new)

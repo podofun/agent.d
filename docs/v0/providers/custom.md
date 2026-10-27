@@ -88,7 +88,7 @@ api_key_secret = "gateway_api_key"
 default_model = "claude-compatible-model"
 ```
 
-The `api_key_secret` value is the keyring name, not the API key.
+The `api_key_secret` value is the name of the keyring entry that holds the API key.
 
 Store the key with the same name:
 

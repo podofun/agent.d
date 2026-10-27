@@ -1,8 +1,10 @@
 # Services
 
-A service is a long-running background Lua task managed by the daemon. Use services for things that need to run continuously without a client trigger — event gateways, pollers, message queue consumers, or periodic jobs.
+A service is a long-running Lua task that the daemon runs in the background. Use a service for work that runs on its own, with no client call to start it: event gateways, pollers, message queue consumers, or periodic jobs.
 
 ## Defining a service
+
+You register a service with `agentd.service`:
 
 ```lua
 agentd.service("discord_gateway", { restart = "always", backoff_ms = 5000 }, function(ctx)
@@ -21,29 +23,29 @@ agentd.service(name, body)
 agentd.service(name, opts, body)
 ```
 
-`opts` controls restart supervision:
+`opts` controls whether and how the service restarts:
 
 | Option | Default | Meaning |
 |---|---|---|
-| `restart` | — | `"always"` restarts on any exit; `"on_failure"` restarts only on error. |
-| `backoff_ms` | — | Initial delay before the first restart (milliseconds). |
-| `backoff_max_ms` | — | Maximum backoff delay (milliseconds). |
+| `restart` | none | `"always"` restarts on any exit. `"on_failure"` restarts only on error. |
+| `backoff_ms` | 1000 | Delay before the first restart (milliseconds). |
+| `backoff_max_ms` | 60000 | Longest delay between restarts (milliseconds). |
 
 When `restart` is omitted, the service runs once and is not restarted.
 
 ## Supervision and restarts
 
-The daemon's supervisor starts each service in its own coroutine. If the service body returns or throws, the supervisor checks the `restart` policy:
+The daemon starts each service in its own coroutine and watches it. When the service body returns or raises an error, the daemon checks the `restart` setting:
 
-- `"always"` — restart unconditionally, with the configured backoff.
-- `"on_failure"` — restart only if the body threw an error.
-- no policy — the service exits permanently.
+- `"always"`: restart, after the delay.
+- `"on_failure"`: restart only if the body raised an error.
+- Not set: the service stays stopped.
 
-Backoff applies between restarts. If both `backoff_ms` and `backoff_max_ms` are set, the delay grows up to the maximum.
+The delay starts at `backoff_ms` and doubles after each failure in a row, up to `backoff_max_ms`.
 
 ## Services as callers
 
-A service is a first-class caller. It has its own grant section in `grants.toml`:
+A service makes calls in its own name, like a client or a runner. It has its own grant section in `grants.toml`:
 
 ```toml
 [service.discord_handler]
@@ -51,7 +53,7 @@ granted         = ["ai:openai", "net:discord.com", "memory.read:discord/**", "me
 allowed_actions = ["discord.send"]
 ```
 
-`granted` lists the capability slugs the service's `ctx` handle is allowed to use. `allowed_actions` restricts which other actions the service may invoke via `ctx.call`. Both are checked by the permission engine on every call — the service does not bypass layers.
+`granted` lists the capability slugs the service's `ctx` handle may use. `allowed_actions` limits which actions the service may call with `ctx.call`. agent.d checks both on every call, with the same checks as any other caller.
 
 ## ctx in a service
 
@@ -67,15 +69,17 @@ agentd.service("my_poller", { restart = "always", backoff_ms = 2000 }, function(
 end)
 ```
 
-Services have access to the full `ctx` API — shell, filesystem, HTTP, WebSocket, secrets, memory, AI calls, and inter-component calls — subject to their `granted` slugs.
+Services can use the full `ctx` API (shell, filesystem, HTTP, WebSocket, secrets, memory, AI calls, and calls to other actions), limited by their `granted` slugs.
 
 ## Durable state across reloads
 
-Services are restarted on hot reload because the Lua runtime is rebuilt. To preserve state across reloads, write it to `ctx.memory` (durable, redb-backed). The data survives both restarts and reloads.
+A hot reload rebuilds the Lua runtime, so services restart with it. To keep data across reloads and restarts, write it to `ctx.memory`, which is stored on disk.
 
-Use `ctx.state` only for in-session bookkeeping that you don't need to survive a reload.
+Use `ctx.state` for short-lived bookkeeping that can be lost on a reload.
 
 ## Listing services
+
+To see each service and its state, run:
 
 ```bash [release]
 agentctl services ls

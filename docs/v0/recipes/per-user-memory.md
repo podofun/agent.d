@@ -1,10 +1,10 @@
 # Recipe: Per-user memory
 
-Store a rolling history of interactions per user (or per channel, per session) using `ctx.memory`. The history survives daemon restarts and hot reloads, unlike `ctx.state` which is ephemeral. This pattern is lifted directly from the Discord example's channel-history helpers.
+This recipe keeps a rolling history of conversations for each user (or each channel or session) with `ctx.memory`. The history survives daemon restarts and hot reloads, which `ctx.state` does not. The pattern comes from the channel-history helpers in the Discord example.
 
 ## How it works
 
-`ctx.memory.create(namespace)` returns a handle to a durable key/value store backed by `redb`. You pick a namespace string that encodes the identity dimension you care about — by caller user, by session, by channel, or any combination:
+`ctx.memory.create(namespace)` returns a handle to a durable key/value store on disk. Choose a namespace string that separates the data the way you need: by caller user, by session, by channel, or a mix:
 
 ```lua
 -- Keyed by user
@@ -174,7 +174,7 @@ agentctl call chat.send \
 ```
 
 ::: info Passing user identity
-`agentctl call` sends requests over `/ws`. The `user` field in `ctx.caller` is populated from the `user` param in the WebSocket envelope. With `agentctl`, you cannot set `user` directly from the CLI — the caller is the CLI's session. In production, the calling system (a bot, an interface) sets `user` in the `actions.call` params. See the [protocol reference](/v0/reference/protocol).
+`agentctl call` sends requests over `/ws`. The `user` field in `ctx.caller` comes from the `user` parameter of the WebSocket request. `agentctl` cannot set `user` from the CLI: the caller is the CLI's session. In production, the calling system (a bot, an interface) sets `user` in the `actions.call` params. See the [protocol reference](/v0/reference/protocol).
 :::
 
 ## Verify
@@ -188,7 +188,7 @@ agentctl call chat.send \
 
    The second reply should reference the name from the first message, confirming the history is being read back.
 
-2. Restart the daemon and repeat the second call — the history must persist, confirming `ctx.memory` is durable.
+2. Restart the daemon and repeat the second call. The reply should still know the name, which shows that `ctx.memory` kept the history.
 
 3. Call `chat.clear` and verify the next response has no memory of earlier messages:
 
@@ -206,7 +206,7 @@ agentctl call chat.send \
 | Per-channel (Discord, Slack) | `"discord/chan/" .. channel_id` |
 | Per-runner execution | `"runs/" .. ctx.caller.execution` |
 
-You can also store data other than conversation turns — preferences, state machines, counters — in different keys under the same namespace.
+You can also store other data, such as preferences, state machines or counters, in different keys under the same namespace.
 
 ## See also
 

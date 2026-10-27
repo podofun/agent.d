@@ -1,6 +1,6 @@
 # Authoring packages
 
-A package is a directory containing a `package.toml` manifest and one or more Lua files. This page walks through the layout and conventions using the `acme` example from the repository.
+Write a package when you want to share a set of tools, runners or services with other agent.d users. A package is a directory with a `package.toml` manifest and one or more Lua files. This page walks through the layout using the `acme` example from the repository.
 
 ## Directory layout
 
@@ -10,7 +10,7 @@ acme/
 └── main.lua       # entry point (or whatever `entry` names)
 ```
 
-You can have as many additional Lua files as you like; use `import(...)` inside `main.lua` to load them.
+You can add as many Lua files as you like. Load them with `import(...)` inside `main.lua`.
 
 ## `package.toml`
 
@@ -40,15 +40,15 @@ permissions = [
 ]
 ```
 
-This is a **flat list of permission slugs** that covers every component the package registers. It is a declaration, not a grant — the operator must approve it with `[package.acme] trusted = true` in `grants.toml` before any permission takes effect.
+This is a **flat list of permission slugs** for every component the package registers. The list only declares what the package needs. The permissions take effect after the person running the daemon adds `[package.acme] trusted = true` to `grants.toml`.
 
 ::: warning
-Declare only what your package actually needs. Operators review this list before trusting a package; a bloated permission set reduces trust.
+Declare only what your package needs. People read this list before they trust a package, and a long list makes them less likely to.
 :::
 
 ## Entry point (`main.lua`)
 
-The entry point registers components using the standard `agentd.*` API. Everything registered here is automatically prefixed with the package name at load time.
+The entry point registers components with the usual `agentd.*` API. Everything registered here gets the package name as a prefix when it loads.
 
 ```lua
 -- examples/packages/acme/main.lua
@@ -68,7 +68,7 @@ agentd.runner{
 }
 ```
 
-## Auto-prefixing rules
+## Prefixing rules
 
 | What you write | What gets registered |
 |---|---|
@@ -77,11 +77,7 @@ agentd.runner{
 | `agentd.runner{ name = "reviewer" }` | `acme/reviewer` |
 | `actions = { "git.diff" }` inside a runner | resolved to `acme/git.diff` |
 
-Callers reference the fully-qualified name: `agentctl call acme/git.diff`.
-
-## What the manifest does not do
-
-The `permissions` list in `package.toml` **never self-grants**. It is metadata that the operator reads at install time and then approves (or not) in `grants.toml`. The package cannot bypass the permission engine.
+Callers use the full name: `agentctl call acme/git.diff`.
 
 ## See also
 

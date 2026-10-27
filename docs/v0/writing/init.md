@@ -1,33 +1,30 @@
-# init.lua — Configuration Entry File
+# init.lua: the configuration entry file
 
-`init.lua` is the single file the daemon evaluates at startup. Everything else in
-your configuration — tools, runners, skills, services — is pulled in from here via
-`import()` or the skill loaders.
+`init.lua` is the file the daemon runs at startup. The rest of your configuration (tools, runners, skills and services) is pulled in from here with `import()` or the skill loaders.
 
 ## How `import` works
+
+Use `import` to split your configuration into several files and load each one from `init.lua`:
 
 ```lua
 import("tools/git.lua")
 import("runners/backend_reviewer.lua")
 ```
 
-`import` resolves paths **relative to the entry file** (`init.lua`). Two path
-forms are rejected with an error at load time:
+`import` resolves paths **relative to the entry file** (`init.lua`). Two path forms fail with an error at load time:
 
 - Absolute paths (`/home/user/something.lua`)
 - Parent-directory traversal (`../shared/util.lua`)
 
-This keeps all configuration dependencies rooted in one place and prevents
-components from reaching outside their own tree.
+This keeps every file your configuration depends on inside one folder.
 
 ::: tip
-`import` de-duplicates paths: calling `import` on the same canonicalized path a second time is a no-op — the file is not re-evaluated. You can safely import shared helpers from multiple files without worrying about double-registration.
+`import` loads each file once. A second `import` of the same file does nothing, so several files can import a shared helper without registering anything twice.
 :::
 
 ## Organizing the configuration directory
 
-A flat single file is fine for small setups. For anything larger, a conventional
-layout keeps things navigable:
+A single file works well for small setups. For anything larger, this layout keeps things easy to find:
 
 ```
 ~/.config/agentd/
@@ -55,8 +52,7 @@ agent.d provides three skill helpers on the `agentd.skills` table:
 | `agentd.skills.load(path)` | Loads a single `.md` skill file. Returns the skill. |
 | `agentd.skills.list()` | Returns a `string[]` of currently registered skill names. |
 
-Paths passed to `dir` and `load` follow the same rules as `import`: relative to
-the entry file, no absolute paths, no `..` traversal.
+Paths passed to `dir` and `load` follow the same rules as `import`: they are relative to the entry file, and absolute paths and `..` are errors.
 
 ## A realistic init.lua
 
@@ -82,13 +78,13 @@ import("runners/reviewer.lua")
 import("services/poller.lua")
 ```
 
-The daemon evaluates this file in order. Registration calls (`agentd.tool`,
-`agentd.action`, `agentd.runner`, `agentd.skill`, `agentd.service`) can appear in
-any imported file; the runtime collects them all before serving requests.
+The daemon runs this file from top to bottom. Registration calls (`agentd.tool`, `agentd.action`, `agentd.runner`, `agentd.skill`, `agentd.service`) can appear in any imported file. The daemon collects them all before it serves requests.
 
 ## Changing what you registered
 
-Every registration call gives back the thing it registered: `agentd.runner{...}` returns the runner, `agentd.action(...)` the action, and the same goes for `agentd.tool`, `agentd.skill`, `agentd.service`, `agentd.skills.load` and `agentd.skills.dir`. What you get back is live. Reading a property shows its current value, and assigning one changes the registered item, so there is nothing else to call:
+Sometimes you want to adjust something after it is registered, for example a runner or action that came from a file you did not write. Every registration call returns what it registered: `agentd.runner{...}` returns the runner, `agentd.action(...)` the action, and the same goes for `agentd.tool`, `agentd.skill`, `agentd.service`, `agentd.skills.load` and `agentd.skills.dir`.
+
+The returned value is a live handle. Reading a property gives its current value, and assigning a property changes the registered item directly:
 
 ```lua
 local coder = agentd.runner({ name = "coder", model = "anthropic/claude-sonnet-5-5" })
@@ -98,9 +94,9 @@ table.insert(coder.skills, "terse")    -- lists are live too
 coder.name = "pair"                    -- renames it; `coder` still points at it
 ```
 
-This is most useful for changing defaults you did not write. If you import a set of runners and actions from somewhere else, you can adjust them from your own file, imported last, instead of copying and editing them. That way updating the imported files never overwrites your changes.
+This is most useful for defaults you did not write. If you import a set of runners and actions from somewhere else, adjust them from your own file and import that file last. Your changes stay in your file, and updating the imported files leaves them in place.
 
-Each collection on `agentd` can look items up, search for them, and remove them:
+Each collection on `agentd` can look up an item by name, search for items, and remove them:
 
 | Call | Returns |
 |---|---|
@@ -108,9 +104,9 @@ Each collection on `agentd` can look items up, search for them, and remove them:
 | `agentd.runners.find(query)` | A list of matching runners, sorted by name. |
 | `agentd.runners.remove(name)` | Nothing. The runner is unregistered. |
 
-The same three calls exist on `agentd.actions`, `agentd.tools`, `agentd.skills` and `agentd.services`, next to the `list()` each already had. Anything you get back also has `remove()`, so `agentd.runners.get("coder"):remove()` works too.
+The same three calls exist on `agentd.actions`, `agentd.tools`, `agentd.skills` and `agentd.services`, next to their `list()`. Each handle also has `remove()`, so `agentd.runners.get("coder"):remove()` works too.
 
-A query is either a function that receives each item and returns `true` to keep it, or a table of properties that must all match. In a table, a string can use `*` as a wildcard, and a string matches a list property when any item in the list matches:
+A query is either a function or a table. A function receives each item and returns `true` to keep it. A table lists properties that must all match. In a table, a string can use `*` as a wildcard, and a string matches a list property when any item in the list matches:
 
 ```lua
 -- every git action
@@ -127,28 +123,22 @@ local slow = agentd.runners.find(function(runner)
 end)
 ```
 
-A few rules keep this predictable:
+These rules apply to handles:
 
 - An assignment is checked the same way registration checks it, on the line that makes it. A property the item does not have (a typo such as `coder.modle`) or a value of the wrong type is an error, and the item stays as it was.
-- An item that others still use cannot be renamed or removed. Removing an action that a runner lists, for example, fails with a message naming the runner, so update the runner first.
-- If a later registration replaces an item, or the item is removed, using an older reference to it fails with a message saying so. It never quietly reads the new item.
-- Code inside a [package](/v0/packages/) can only change, rename or remove what that package registered, and the names it assigns are scoped under the package the same way its registrations are.
-- These calls are meant for `init.lua` and the files it imports, while your configuration loads.
+- An item that something else still uses cannot be renamed or removed. For example, removing an action that a runner lists fails with a message naming the runner. Update the runner first.
+- If a later registration replaces an item, or the item is removed, using an older handle to it fails with an error that says so.
+- Code inside a [package](/v0/packages/) can change, rename or remove only what that package registered. Names it assigns are scoped under the package, like its registrations.
+- Use these calls in `init.lua` and the files it imports, while your configuration loads.
 
-Action properties are `name`, `tool`, `requires`, `confirm`, `cwd`, `input`, `output` and `handler`. Reading `input` or `output` returns the compiled JSON Schema rather than the shorthand you wrote. Runners also accept `actions` as another name for `allowed_actions`.
+Action properties are `name`, `tool`, `requires`, `confirm`, `cwd`, `input`, `output` and `handler`. Reading `input` or `output` returns the compiled JSON Schema, which can differ from the shorthand you wrote. Runners also accept `actions` as another name for `allowed_actions`.
 
 ## Hot reload
 
-When the daemon runs with `--watch` (or `AGENTD_WATCH=true`), it watches
-`init.lua`, every file pulled in via `import()`, loaded skill `.md` sources, and
-`grants.toml`. Any change triggers a full rebuild of the runtime in place —
-in-flight requests drain on the old runtime while the new one takes over. Durable
-[memory](/v0/concepts/memory-and-state) and a connected approval operator survive
-reloads.
+When the daemon runs with `--watch` (or `AGENTD_WATCH=true`), it watches `init.lua`, every file pulled in with `import()`, loaded skill `.md` files, and `grants.toml`. Any change rebuilds the configuration in place. Requests already in progress finish on the old configuration while new ones use the new one. Durable [memory](/v0/concepts/memory-and-state) and a connected approver stay in place across reloads.
 
 ::: info
-`--watch` is a development convenience. Production deployments typically restart
-the daemon process when you want to pick up changes.
+`--watch` is meant for development. In production, restart the daemon to pick up changes.
 :::
 
 ## See also

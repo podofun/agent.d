@@ -1,6 +1,6 @@
 # Architecture
 
-A map of how agent.d is structured: the Rust/Lua boundary, the crate workspace, and how a request moves from a connected client to a Lua handler and back.
+This page is a map of how agent.d is built: the split between Rust and Lua, the crates in the workspace, and how a request moves from a connected client to a Lua handler and back. Read it before you change the code.
 
 ## The Rust / Lua boundary
 
@@ -22,7 +22,7 @@ agent.d is split into two layers with a hard boundary between them.
 - Composition of components via `agentd.*` registration calls
 - Coordination logic (channels, timers, `parallel`, `async`/`await`)
 
-Lua code never touches the host directly. Every privileged operation goes through a `ctx` handle whose methods are implemented in Rust and gated by the permission engine before any host call is made.
+Lua code reaches the host only through a `ctx` handle. Its methods are written in Rust, and each one passes the permission engine before it touches the host.
 
 ## Crate workspace
 
@@ -40,8 +40,10 @@ Lua code never touches the host directly. Every privileged operation goes throug
 | `services` | Service supervisor: starts Lua service bodies as tasks, applies restart/backoff policy, exposes state and `last_error` |
 | `shell` | `ctx.shell` implementation: argv-only process execution (no shell string), enforces `shell.exec[:<bin>]` grant |
 | `fs` | `ctx.fs.*` implementation: path resolution with symlink/`..` canonicalisation before grant check |
-| `http` | `ctx.http.*` implementation: reqwest-based HTTP client, enforces `net:<host>` grant |
-| `ws` | `ctx.ws.connect` implementation: WebSocket client, enforces `net:<host>` grant |
+| `net` | HTTP client, WebSocket client and SMTP mailer behind `ctx.http`, `ctx.ws` and `ctx.mailer`. It only moves bytes: `scripting` checks the `net:<host>` grant before calling it |
+| `netbroker` | Windows only: a small service that changes Windows Filtering Platform rules for the daemon, so the daemon itself runs without admin rights |
+| `process` | Builds host process commands, including Windows script shims |
+| `sessions` | Durable chat sessions: each session's ordered turns, label, owner and token totals |
 | `secrets` | `ctx.secret.*` implementation: OS keyring via the platform secret store, enforces `secret:<key>` grant |
 | `memory` | `ctx.memory.*` implementation: durable namespaced key/value store (redb), enforces `memory.read/write` grants |
 | `ai` | `ctx.ai.*` implementation: provider registry and dispatch; built-in providers: `anthropic`, `anthropic-cli`, `openai`, `codex`, `openai-cli` |
@@ -54,12 +56,12 @@ Lua code never touches the host directly. Every privileged operation goes throug
 
 ## Hot-swappable executor
 
-The executor is wrapped in an `ArcSwap<Executor>`. This is what makes `--watch` (hot reload) safe under concurrent load:
+The executor is wrapped in an `ArcSwap<Executor>`, which lets `--watch` (hot reload) replace it while requests are running:
 
 1. The file watcher detects a change to `init.lua`, an imported file, a skill `.md`, or `grants.toml`.
 2. A new `Executor` is built from scratch by re-running the Lua entry file.
 3. `ArcSwap::store` atomically replaces the pointer.
-4. In-flight requests hold an `Arc` clone of the old executor and drain naturally — they are never interrupted.
+4. Requests already running hold an `Arc` clone of the old executor and finish on it without interruption.
 5. New requests immediately pick up the new executor.
 6. Durable memory (`redb`) and a connected approval operator survive across reloads, because they live outside the executor.
 
@@ -102,6 +104,6 @@ The default test suite avoids network calls and live model requests. Optional in
 
 ## See also
 
-- [Concepts: runtime](/v0/concepts/runtime) — runtime concepts from a user perspective
+- [Concepts: runtime](/v0/concepts/runtime): the runtime from a user's point of view
 - [Concepts: permissions](/v0/concepts/permissions): how a call is decided
-- [Reference: configuration](/v0/reference/configuration) — daemon and runtime config knobs
+- [Reference: configuration](/v0/reference/configuration): daemon and runtime settings

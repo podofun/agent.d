@@ -1,14 +1,14 @@
 # Observability
 
-How to monitor a running agent.d daemon: the JSONL trace sink, log-level filters, and what to watch for in production.
+When an agent does something unexpected, or a service goes quiet, you need to see what the daemon did. This page covers the trace log, which records every call, the daemon's log level, and what to watch for in production.
 
 ## Trace log
 
-Every action call, runner invocation, permission decision, and service event is written as a JSONL record to the trace file.
+The daemon writes every action call, runner run, permission decision and service event as one JSON line in the trace file.
 
 **Default path:** `$XDG_STATE_HOME/agentd/trace.jsonl`
 
-Override it with `--trace` or `AGENTD_TRACE` (the old `--trace-file` / `AGENTD_TRACE_FILE` names still work as deprecated aliases):
+To change it, use `--trace` or `AGENTD_TRACE`. The old names `--trace-file` and `AGENTD_TRACE_FILE` still work, but they are deprecated:
 
 ```bash
 agentd --trace /var/log/agentd/trace.jsonl
@@ -22,6 +22,8 @@ trace_file = "/var/log/agentd/trace.jsonl"
 ```
 
 ### Tailing the trace with agentctl
+
+`agentctl trace` prints the newest lines of the trace, or follows it live:
 
 ```bash
 # Print the last 20 lines (default) and exit
@@ -38,14 +40,14 @@ agentctl trace --file /var/log/agentd/trace.jsonl -f -n 100
 ```
 
 ::: tip
-`agentctl trace` reads the JSONL trace file directly from local disk — it does not connect to the daemon. The `--file` flag overrides the local path to read from (default: the state-dir `trace.jsonl`). Use it when the daemon was started with a custom `--trace` pointing to a different location.
+`agentctl trace` reads the trace file from local disk and does not connect to the daemon. By default it reads `trace.jsonl` in the state folder. If the daemon was started with a custom `--trace` path, pass the same path with `--file`.
 :::
 
 ## Log level
 
-The daemon emits structured tracing output to stderr. The log level is controlled by a [tracing](https://docs.rs/tracing-subscriber) filter string.
+The daemon also writes log messages to stderr. A [tracing](https://docs.rs/tracing-subscriber) filter string sets how much it writes.
 
-**Precedence:** `--log` flag > `AGENTD_LOG` env var > `log_level` in `config.toml` > `RUST_LOG` env var > built-in default (`warn`).
+The daemon uses the first of these that is set: the `--log` flag, the `AGENTD_LOG` environment variable, `log_level` in `config.toml`, the `RUST_LOG` environment variable, and finally the default, `warn`.
 
 | Example filter | Effect |
 |---|---|
@@ -53,7 +55,7 @@ The daemon emits structured tracing output to stderr. The log level is controlle
 | `info` | Startup events, each request handled |
 | `debug` | Detailed request lifecycle |
 | `trace` | Everything including internal spans |
-| `agentd_executor=debug,warn` | Debug for the executor crate, warn for everything else |
+| `agentd_executor=debug,warn` | Debug for the part that runs actions and runners, warn for everything else |
 | `agentd_executor=trace` | Full trace for the executor only |
 
 Set it at launch:
@@ -75,11 +77,11 @@ log_level = "info"
 
 ### Permission denials
 
-A denied action call appears in the trace and in the log at `warn` level. If you see unexpected denials:
+A refused action call appears in the trace and in the log at `warn` level. If you see refusals you did not expect:
 
 1. Check which grant is missing: `agentctl grants listen` shows the missing permissions in the approval request.
 2. Add the grant to `grants.toml` under the appropriate `[tool.*]`, `[runner.*]`, `[service.*]`, or `[interface.*]` section.
-3. Check that `[denial]` does not list the action or one of its permissions. A denial is never sent for approval.
+3. Check that `[denial]` does not list the action or one of its permissions. Denied calls are refused without a question.
 
 ### Approval decisions
 
@@ -87,16 +89,16 @@ Each approval decision appears in the trace as an event with the kind `approval`
 
 ### Service health
 
-Long-running services can crash and restart. Check their current state:
+Long-running services can crash and restart. To check their current state, run:
 
 ```bash
 agentctl services ls
 ```
 
-The output includes `state` (running, stopped, etc.) and `last_error` when a service has faulted. A service with `restart = "always"` or `restart = "on_failure"` will be restarted automatically after `backoff_ms` (default behaviour defined in the service registration).
+The output includes `state` (running, stopped, and so on) and, after a failure, `last_error`. A service with `restart = "always"` or `restart = "on_failure"` restarts on its own after a delay that starts at `backoff_ms` (1000 ms unless you set it when you register the service) and doubles after each failure in a row, up to `backoff_max_ms`.
 
 ::: warning
-A service stuck in a restart loop will surface repeated errors in the trace log. Investigate `last_error` before assuming the daemon itself is unhealthy.
+A service stuck in a restart loop shows repeated errors in the trace log. Read `last_error` before you suspect the daemon itself.
 :::
 
 ### Liveness
@@ -109,7 +111,7 @@ curl http://127.0.0.1:7777/health
 
 ## See also
 
-- [Deployment](/v0/operations/deployment) — binding address, token management, systemd unit
-- [Troubleshooting](/v0/operations/troubleshooting) — common issues and fixes
-- [Reference: CLI](/v0/reference/cli) — full `agentctl trace` flag reference
-- [Concepts: services](/v0/concepts/services) — service lifecycle and restart behaviour
+- [Deployment](/v0/operations/deployment): binding address, token management, systemd unit
+- [Troubleshooting](/v0/operations/troubleshooting): common issues and fixes
+- [Reference: CLI](/v0/reference/cli): full `agentctl trace` flag reference
+- [Concepts: services](/v0/concepts/services): service lifecycle and restart behaviour

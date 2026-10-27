@@ -1,4 +1,4 @@
-# ctx.fs — Filesystem
+# ctx.fs: Filesystem
 
 Read and write files from inside an action or runner. Lua strings carry arbitrary bytes, including NUL and non-UTF-8 data; the same methods handle text and binary files.
 
@@ -12,7 +12,7 @@ agentd.action{
 }
 ```
 
-Every call needs a matching grant in `grants.toml`. Reads need `fs.read:<path>`; writes, appends, and deletes need `fs.write:<path>`. Without the grant, the call will throw an error before touching disk.
+Every call needs a matching grant in `grants.toml`. Reads need `fs.read:<path>`; writes, appends, and deletes need `fs.write:<path>`. Without the grant, the call raises an error before it touches the disk.
 
 ## Methods
 
@@ -22,8 +22,8 @@ Every call needs a matching grant in `grants.toml`. Reads need `fs.read:<path>`;
 | `ctx.fs.write(path, content)`  | `fs.write:<path>` | `integer` | Write `content`, replacing the file. Creates parent folders.  |
 | `ctx.fs.append(path, content)` | `fs.write:<path>` | `integer` | Append bytes, creating the file and parent folders if missing. |
 | `ctx.fs.exists(path)`          | `fs.read:<path>`  | `boolean` | `true` if the path exists.                                    |
-| `ctx.fs.stat(path)`            | `fs.read:<path>`  | `table`   | File metadata — see [stat](#stat).                            |
-| `ctx.fs.list_dir(path)`        | `fs.read:<path>`  | `table[]` | List a directory — see [list_dir](#list-dir).                 |
+| `ctx.fs.stat(path)`            | `fs.read:<path>`  | `table`   | File metadata. See [stat](#stat).                             |
+| `ctx.fs.list_dir(path)`        | `fs.read:<path>`  | `table[]` | List a directory. See [list_dir](#list-dir).                  |
 | `ctx.fs.remove(path)`          | `fs.write:<path>` | `integer` | Delete a file.                                                |
 | `ctx.fs.history(path)` | `fs.read:<path>` | `table` | Current revision and all retained revision metadata. |
 | `ctx.fs.diff(path, revision)` | `fs.read:<path>` | `table` | Binary splice for one revision. |
@@ -33,11 +33,11 @@ Every call needs a matching grant in `grants.toml`. Reads need `fs.read:<path>`;
 | `ctx.fs.edit(path, old, new, opts?)` | `fs.write:<path>` | `integer` | Replace exact text in a file you have read. See [Changing part of a file](#changing-part-of-a-file). |
 | `ctx.fs.patch(patch, opts?)` | `fs.read` and `fs.write` for each file | `table[]` | Apply a unified diff to the files it names, all or nothing. |
 
-A missing file makes `read`, `stat`, and `list_dir` throw an error. It's advised that you guard with `exists` first if the file might not be there.
+A missing file makes `read`, `stat` and `list_dir` raise an error. If the file might not be there, check with `exists` first.
 
 ## Changing part of a file
 
-Often you want to change a few lines rather than rewrite a whole file. `ctx.fs.edit` replaces one piece of text, and `ctx.fs.patch` applies a unified diff, the format `git diff` prints and models write.
+Use `ctx.fs.edit` and `ctx.fs.patch` when you want to change a few lines and keep the rest of the file as it is. `edit` replaces one piece of text. `patch` applies a unified diff, the format `git diff` prints and models write.
 
 ```lua
 -- Requires fs.read:src/** and fs.write:src/**.
@@ -45,9 +45,11 @@ local source = ctx.fs.read("src/main.rs")
 ctx.fs.edit("src/main.rs", "println!(\"hi\")", "println!(\"hello\")")
 ```
 
-Both follow one rule: **you can only change what you have seen.** The file must have been read in the same chat session (or the same run, outside a session) and must not have changed since. That way an edit is always based on what is really on disk, never on an older copy or a guess. If something else changed the file in between, such as your editor or a shell command, the call stops with a message asking you to read it again. Writing a file with `ctx.fs.write` counts as having read it, so you can write a file and then edit it. A plain `ctx.fs.write` never needs a read, because it replaces the file outright.
+Before you change part of a file, read it in the same chat session, or in the same run outside a session. If the file changed after you read it, for example because your editor or a shell command saved it, the call stops and asks you to read it again. This keeps edits tied to the file as it is on disk now.
 
-`edit` replaces `old` with `new`. Without `{ replace_all = true }`, `old` must appear exactly once, and if it appears more than once the error tells you how many times, so you can include more surrounding text. Files with Windows line endings keep them.
+Writing a file with `ctx.fs.write` counts as reading it, so you can write a file and then edit it. A plain `ctx.fs.write` works without a read, because it replaces the whole file.
+
+`edit` replaces `old` with `new`. By default `old` must appear exactly once. If it appears more than once, the error tells you how many times, and you can add surrounding text to make it unique. Pass `{ replace_all = true }` to replace every occurrence. Files with Windows line endings keep them.
 
 `patch` takes diff text and returns `{ { path = ..., revision = ... }, ... }` for the files it changed:
 
@@ -63,13 +65,17 @@ local changed = ctx.fs.patch([[
 ]])
 ```
 
-A patch is applied **all or nothing**. Every file is checked and every change is worked out before anything is written, so if one part does not apply, no file changes, and the error names the file, the hunk, and the line that differs. A patch can create files (`--- /dev/null`) and remove them (`+++ /dev/null`). Renames, permission changes and binary files are refused rather than skipped, so a patch is never applied in part. To apply a one-file diff to a different path, pass `{ path = "other.rs" }`.
+`patch` checks every file and works out every change before it writes anything. Either every file in the patch changes or none does. When one part does not apply, the error names the file, the hunk and the line that differs.
 
-Edits and patches are recorded in the file's history like any write, so `undo` and `restore` cover them. To build or inspect diffs without touching files, use [`ctx.diff`](/v0/reference/ctx/diff).
+A patch can create a file (`--- /dev/null`) and remove one (`+++ /dev/null`). A patch that renames a file, changes its permissions or carries binary data fails as a whole. To apply a one-file diff to a different path, pass `{ path = "other.rs" }`.
+
+Edits and patches go into the file's history like any other write, so `undo` and `restore` work on them. To build or inspect diffs in memory, use [`ctx.diff`](/v0/reference/ctx/diff).
 
 ## Binary diffs and undo/redo
 
-Every successful `write`, `append`, and `remove` records a diff and returns its per-file revision ID. Reads and metadata queries do not change the file or create revisions. Revision `0` represents the file's original state before its first tracked mutation, including whether it existed. Empty files and missing files are distinct.
+Each successful `write`, `append` and `remove` records what changed and returns a revision ID for that file. You can use these IDs to look at a change, undo it, or go back to any earlier version. Reads and metadata queries leave the history alone.
+
+Revision `0` is the file as it was before its first tracked change, including whether it existed at all. An empty file and a missing file are different states.
 
 ```lua
 -- Requires both fs.read:images/** and fs.write:images/**.
@@ -86,15 +92,27 @@ local change = ctx.fs.diff("images/sample.bin", second)
 -- change.added == string.char(254)
 ```
 
-`history(path)` returns `{ current = id, revisions = { ... } }`. Each revision has `id`, `parent`, `operation` (`write`, `append`, or `remove`), `timestamp_ms`, `offset`, `removed_bytes`, `added_bytes`, `before_size`, and `after_size`. An absent size means that the file did not exist on that side of the diff. `diff(path, id)` returns `{ revision = metadata, removed = bytes, added = bytes }`. Replace `removed` bytes at the zero-based `offset` with `added` to apply the splice; reverse them to undo it. File existence is recorded separately in the sizes.
+`history(path)` returns `{ current = id, revisions = { ... } }`. Each revision has `id`, `parent`, `operation` (`write`, `append` or `remove`), `timestamp_ms`, `offset`, `removed_bytes`, `added_bytes`, `before_size` and `after_size`. A missing size means the file did not exist on that side of the change.
 
-Undo and redo follow the current branch. Writing after undo clears the redo stack but retains every earlier revision, so `restore` can still reach the old branch. Explicit `restore` clears the redo stack. Unknown revision IDs and exhausted undo/redo stacks raise errors. Revision IDs are scoped to the resolved absolute file path. `ctx.fs.patch` is the only multi-file change, and it is all or nothing.
+`diff(path, id)` returns `{ revision = metadata, removed = bytes, added = bytes }`. To apply the change, replace the `removed` bytes at the zero-based `offset` with `added`. To undo it, do the reverse.
 
-History is shared by actions, runners, and services for the daemon's lifetime and survives hot reloads. Restarting the daemon discards it. Only mutations through `ctx.fs` are recorded; shell commands and external programs are not intercepted. If current bytes or permissions differ from the tracked state, mutation and replay fail with a conflict instead of overwriting the outside change. Coordinate outside writers: conflict checks are not an operating-system lock against other processes.
+### How undo and redo move
 
-Diff computation is linear in file size and retains only the changed middle span, omitting the common prefix and suffix. There is no text parsing or quadratic line comparison. Widely separated edits can retain a large span. Writes and replay stage the complete target file before atomic replacement; appends therefore also require work proportional to file size. History stays in memory without automatic eviction, and replay cost grows with the file size and number of intervening revisions.
+`undo` and `redo` step along the current line of revisions. If you write after an undo, the redo stack is cleared, and every earlier revision stays in the history, so `restore` can still reach it. `restore` also clears the redo stack. An unknown revision ID, or an undo or redo with nothing left to step to, raises an error. Revision IDs belong to one file, identified by its full resolved path.
 
-Undoing file creation also removes parent directories created by that write if they remain empty. Existing file permissions are preserved. The API operates on regular files; directories, special files, and multiply linked files on Unix are rejected for tracked mutation. Symlinks resolve to their targets before authorization. Inode identity, ownership, ACLs, extended attributes, and timestamps are not versioned. This is file-content history, not a filesystem snapshot or crash recovery.
+### What history covers
+
+History is shared by actions, runners and services. It lasts as long as the daemon runs and survives hot reloads. Restarting the daemon clears it.
+
+Only changes made through `ctx.fs` are recorded. Shell commands and other programs that change a file are not tracked. If a file's bytes or permissions no longer match the tracked state, a change or an undo stops with a conflict error and leaves the file as the other program left it. This check is not an operating-system lock, so coordinate with other programs that write the same files.
+
+History works on regular files. Directories, special files and files with more than one hard link on Unix are refused. A symlink resolves to its target before the grant check. A file keeps its permissions when it changes. History records file contents only: ownership, ACLs, extended attributes, timestamps and inode identity are not recorded. It is a content history for undo, and it does not replace backups or a filesystem snapshot.
+
+Undoing the creation of a file also removes any parent folders that write created, as long as they are empty.
+
+### Cost
+
+Computing a change takes time in proportion to the file size. History stores only the span between the first and last changed byte, so two edits far apart in one write keep a large span. Every write and replay builds the complete new file before swapping it in, so an append also costs time in proportion to the file size. History stays in memory and is not trimmed automatically, and replaying a revision takes longer for bigger files and for revisions further back.
 
 ### stat
 
@@ -132,13 +150,13 @@ By default, the working directory is the folder that contains `init.lua`. Thus, 
 
 The working directory is decided per call, using the first of these that applies:
 
-1. `cwd` on the action itself — `agentd.action{ cwd = "..." }`
+1. `cwd` on the action itself: `agentd.action{ cwd = "..." }`
 2. `cwd` on the runner that called the action
 3. the folder of the chat session the run belongs to, if it has one
 4. the working directory it inherited from the action that called it
 5. the workspace root (the default)
 
-A relative `cwd` is always joined onto the workspace root, so even when the action inherited a working directory, it does not stack on top of it. An action that inherits `<workspace>/a` and declares `cwd = "b"` runs in `<workspace>/b`, not `<workspace>/a/b`. An absolute `cwd` is used as-is.
+A relative `cwd` is joined onto the workspace root, even when the action inherited a different working directory. An action that inherits `<workspace>/a` and declares `cwd = "b"` runs in `<workspace>/b`. An absolute `cwd` is used as written.
 
 ```lua
 -- Every relative path in this action is rooted at <workspace>/reports.
@@ -164,7 +182,7 @@ ctx.fs.with_cwd(dir, fn)    -- run fn() with the working directory set to `dir`
 
 `chdir` is like `cd` in a shell: absolute `dir` switches there, relative `dir` moves relative to where you already are. It stays in effect for the rest of the call.
 
-`with_cwd` runs `fn` in `dir` and puts the working directory back afterwards — even if `fn` errors or waits on I/O. Reach for it when you want a temporary switch:
+`with_cwd` runs `fn` in `dir` and puts the working directory back afterwards, also when `fn` raises an error or waits on I/O. Use it for a temporary switch:
 
 ```lua
 local readme = ctx.fs.with_cwd("vendor/lib", function()
@@ -194,16 +212,16 @@ Use `**` to cover a whole subtree and `*` for a single level: `fs.read:notes/**`
 
 ## Safety
 
-Whatever path a tool passes, agentd first works out the real file it points to — it follows any symlinks and resolves `..` segments down to the actual location on disk. It then checks that real location against the tool's grants and, if allowed, reads or writes that same real location.
+Whatever path a tool passes, agentd first works out the real file it points to. It follows symlinks and resolves `..` segments down to the actual location on disk. It then checks that location against the tool's grants and, if allowed, reads or writes that same location.
 
-This is what confines the tool. A path that a tool builds from model output or untrusted input can't reach past its grants: a symlink pointing somewhere ungranted, or a `../` that climbs out of a granted folder, both resolve to their real target — and the real target is what gets checked. So a `fs.read:/data/**` grant stays scoped to `/data`, no matter what the tool hands in:
+This keeps a tool inside its grants, even when it builds paths from model output or untrusted input. A symlink that points somewhere ungranted, or a `../` that climbs out of a granted folder, resolves to its real target, and agentd checks that target. A `fs.read:/data/**` grant stays scoped to `/data`:
 
 ```lua
 -- Tool granted only fs.read:/data/**
 ctx.fs.read("/data/../etc/passwd")   -- resolves to /etc/passwd → denied
 ```
 
-`chdir` plays by the same rule. It only moves where a tool's relative paths start from — it hands out no new access. After a `chdir`, each path is still resolved to its real location and checked against the tool's grants, so a tool can't `chdir` into a granted folder and then `../` its way out.
+`chdir` follows the same rule. It moves the point where a tool's relative paths start and grants no new access. After a `chdir`, each path is still resolved to its real location and checked against the tool's grants, so a tool that moves into a granted folder cannot `../` its way out.
 
 ## More examples
 
@@ -246,4 +264,4 @@ agentd.action{
 - [Security: permission slugs](/v0/security/permission-slugs)
 - [Security: grants](/v0/security/grants)
 - [ctx.shell](/v0/reference/ctx/shell)
-- [ctx — overview](/v0/reference/ctx/)
+- [ctx overview](/v0/reference/ctx/)

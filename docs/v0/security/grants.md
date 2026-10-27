@@ -1,6 +1,6 @@
 # grants.toml reference
 
-`grants.toml` is where you decide what your agents may do. Each component says what it needs, but no component can give itself access. Only this file gives access. It also holds the rules that nobody can override, and it says who answers when an agent asks for more.
+`grants.toml` is where you decide what your agents may do. Each component says what it needs, and this file decides what it gets. The file also holds the rules that nobody can override, and it says who answers when an agent asks for more.
 
 Read this page when you add a tool, a runner, or a service, or when a call fails with a permission error.
 
@@ -14,10 +14,10 @@ When you run the daemon with `--watch`, it loads the file again each time you sa
 
 ### The file is strict
 
-agent.d reads every line of the file and refuses to start if a line is wrong. A rule that does nothing is dangerous, because you think it protects you. So these mistakes stop the load and tell you which line to fix:
+agent.d reads every line of the file and refuses to start if a line is wrong. A rule that silently does nothing is dangerous, because you believe it protects you. These mistakes stop the load and tell you which line to fix:
 
 - An unknown section or key, for example a misspelled `[denail]` or `alowed_actions`.
-- A pattern that can never match. A `*` is supported only at the end of a value, as in `api.*` or `/srv/app/**`. So `net:*.example.com` is an error.
+- A pattern that cannot match anything. A `*` is supported only at the end of a value, as in `api.*` or `/srv/app/**`, so `net:*.example.com` is an error.
 - An IPv6 address prefix such as `net:2001:db8:*`. agent.d compares IPv6 addresses in their shortest form, so a prefix can fail to match. Grant or deny full addresses.
 - A file denial that is not an absolute path, such as `fs.read:.env` or `fs.read:~/.ssh/**`.
 - An `approval` key outside a `[runner.<name>]` section.
@@ -44,7 +44,7 @@ agent.d checks every action call in two stages.
 
 If all checks pass, the call runs. If a question is not answered with an allow, the call is refused. Who answers the questions depends on the run's approval setting. See [Interactive approvals](/v0/security/approvals).
 
-An approval never skips a later check. After each answer, agent.d checks the call again from the start.
+An approval answers one question. After each answer, agent.d checks the call again from the start, and every other check still applies.
 
 ## Schema
 
@@ -72,7 +72,7 @@ allowed_actions = ["git.diff", "git.status"]
 approval = "human"
 ```
 
-The approval setting is in `grants.toml` and never in Lua. This way, a runner cannot choose its own setting.
+The approval setting lives in `grants.toml`. Lua cannot set it, so a runner cannot choose its own.
 
 ### `[interface.<name>]`
 
@@ -109,11 +109,11 @@ Approves all the permissions that an installed package declares. Without this en
 trusted = true
 ```
 
-With `trusted = true`, every component of the package gets the permissions from its `package.toml`. To narrow one component, write its own entry, such as `[tool."acme/git"]`. An entry for a component always has priority over the package grant.
+With `trusted = true`, every component of the package gets the permissions from its `package.toml`. To narrow one component, write its own entry, such as `[tool."acme/git"]`. A component's own entry takes priority over the package grant.
 
 ### `[denial]`
 
-Lists what nobody may do or reach. A denial applies to everyone, including you, and agent.d never asks about it.
+Lists what nobody may do or reach. Use it for things that must not happen whatever the grants say. A denial applies to everyone, including you, and a call it blocks is refused without a question.
 
 ```toml
 [denial]
@@ -121,11 +121,11 @@ actions     = ["pkg.publish"]
 permissions = ["net:tracker.example.com", "fs.read:/home/me/project/.env"]
 ```
 
-Use a denial for something that must never happen, whatever the grants say. A denial applies everywhere that agent.d checks access: in action calls, inside running handlers, in programs that `ctx.shell` starts, and in the AI providers. A file denial must be an absolute path. See [What a denial guarantees](/v0/security/denials) for the full list and its limits.
+agent.d applies a denial everywhere it checks access: action calls, running handlers, programs that `ctx.shell` starts, and the AI providers. A file denial must be an absolute path. See [What a denial guarantees](/v0/security/denials) for the full list and its limits.
 
 ### `[folders]`
 
-Lists the folders chat sessions may work in without asking. When you start `agentctl chat` in a folder that is not listed, agent.d asks you once whether to trust it, and choosing "Always trust" adds the folder here for you. You will rarely need to edit this list by hand, but you can.
+Lists the folders that chat sessions may work in without a question. When you start `agentctl chat` in a folder that is not listed, agent.d asks whether to trust it. Choosing "Always trust" adds the folder here for you, so you seldom need to edit this list by hand.
 
 ```toml
 [folders]
@@ -136,18 +136,18 @@ Each entry is an absolute path or a glob, and `~` means your home folder. Trusti
 
 ### Grants that follow the chat's folder
 
-A grant can say `{cwd}` where a path goes. In a chat session that works in a folder, `{cwd}` becomes that folder, so one grants file works for every project you open:
+When you open chats in many projects, you want one set of grants that points at whichever folder the chat is in. Write `{cwd}` where the path goes. In a chat session that works in a folder, `{cwd}` becomes that folder:
 
 ```toml
 [tool.files]
 granted = ["fs.read:{cwd}/**", "fs.write:{cwd}/**"]
 ```
 
-`{cwd}` works in `fs.read`, `fs.write` and `shell.exec` grants. A call outside such a session, for example `agentctl call`, gets nothing from a `{cwd}` grant, while its other grants work as usual. `{cwd}` cannot be used in `[denial]`, because a denial must hold everywhere.
+`{cwd}` works in `fs.read`, `fs.write` and `shell.exec` grants. A call made outside such a session, for example with `agentctl call`, gets nothing from a `{cwd}` grant. Its other grants work as usual. `[denial]` does not accept `{cwd}`, because a denial has to hold in every session.
 
 ### `[approval]`
 
-Controls how questions are answered.
+Controls who answers questions and which confirm actions skip the question.
 
 ```toml
 [approval]
@@ -156,7 +156,7 @@ skip       = ["deploy.preview"]
 ```
 
 - `classifier` names the runner that answers questions when a run's setting is `"classifier"`. See [The classifier](/v0/security/approvals#the-classifier).
-- `skip` lists actions with `confirm = true` that are never asked about. When you choose "allow forever" for a confirm question, agent.d adds the action here for you. You can also edit the list by hand.
+- `skip` lists actions with `confirm = true` that run without a question. When you choose "allow forever" for a confirm question, agent.d adds the action here for you. You can also edit the list by hand.
 
 ## Full annotated example
 
@@ -206,8 +206,8 @@ skip       = []
 
 ## Key rules to remember
 
-- A component's `requires` field says what it needs. It never gives access.
-- A component's own entry always has priority over a package grant.
+- A component's `requires` field says what it needs. Access comes from this file.
+- A component's own entry takes priority over a package grant.
 - For interfaces and services, an empty `allowed_actions` list means "no limit". For runners, an action that is not on the list causes a question.
 - agent.d resolves file paths before it compares them. It follows symlinks and removes `..` segments, so an alias cannot get around a grant or a denial. On macOS and Windows, uppercase and lowercase letters in paths are the same.
 - A relative `fs.read` or `fs.write` grant starts from the component's working directory: in a chat session with a folder, that folder, and otherwise the workspace root. So `fs.read:notes/**` works on every machine. An absolute grant stays as you wrote it.

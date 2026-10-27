@@ -1,6 +1,6 @@
-# ctx.call / ctx.run / ctx.structured — Cross-Component Calls
+# ctx.call / ctx.run / ctx.structured: Cross-Component Calls
 
-These three functions let one component invoke another: `ctx.call` dispatches an action, `ctx.run` drives a runner through its full tool-use loop, and `ctx.structured` extracts a validated JSON object from a runner's reply.
+Use these functions when one action, runner or service needs another one. `ctx.call` calls an action. `ctx.run` runs a runner through its full tool-use loop. `ctx.structured` runs a runner and returns its reply as a validated JSON object.
 
 ## Signatures
 
@@ -42,13 +42,13 @@ ctx.validate_output(value: any) -> (ok: boolean, reason: string?)
 
 ### `ctx.tools()`
 
-Returns the names of all currently registered actions. Useful for introspection or building dynamic dispatchers.
+Returns the names of every registered action. Use it to inspect what is loaded or to build a dispatcher that picks an action at runtime.
 
 **Returns:** `string[]`
 
 ### `ctx.call(name, args?)`
 
-Invokes the action named `name` with the given `args` table. The callee's `requires` permissions are checked against the current grant context. Actions with `confirm = true` **cannot** be called via `ctx.call` — they require interactive approval and will be rejected.
+Calls the action named `name` with the `args` table. The called action's `requires` permissions are checked against the current grants. An action with `confirm = true` needs interactive approval, so `ctx.call` refuses it with an error.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -59,7 +59,9 @@ Invokes the action named `name` with the given `args` table. The callee's `requi
 
 ### `ctx.run(name, prompt_or_opts)`
 
-Runs the named runner with a prompt and drives its full tool-use loop until the model gives a final answer. Returns a `RunResult`. Outside a session, if the loop reaches `runtime.max_turns` (default 16) first, the call fails with a `runner_turn_limit` error. With `session_id`, there is no turn limit and no default deadline, so the run keeps going until the model is done. The target runner needs an `ai:<provider>` grant. The same [history validation, deadlines, concurrency limits, and optional usage result](/v0/reference/protocol#runners-run) apply to Lua and WebSocket calls.
+Runs the named runner with a prompt and keeps its tool-use loop going until the model gives a final answer. Returns a `RunResult`. The runner needs an `ai:<provider>` grant.
+
+Outside a session, a run stops after `runtime.max_turns` turns (default 16) and the call fails with a `runner_turn_limit` error. A run with `session_id` has no turn limit and no default deadline, and keeps going until the model is done. The same [history validation, deadlines, concurrency limits, and optional usage result](/v0/reference/protocol#runners-run) apply to Lua and WebSocket calls.
 
 | Field | Type | Description |
 |---|---|---|
@@ -69,13 +71,13 @@ Runs the named runner with a prompt and drives its full tool-use loop until the 
 | `model` | `string` | Override the runner's model for this call. |
 | `messages` | `table[]` | Full message history for the request. |
 | `history` | `table[]` | Prior conversation turns to prepend. |
-| `approval` | `string` | Who answers this run's questions: `"human"`, `"classifier"`, or `"nobody"`. From Lua, you can only make a run stricter. |
+| `approval` | `string` | Who answers this run's questions: `"human"`, `"classifier"` or `"nobody"`. From Lua, this can make a run stricter and no looser. |
 
-A run that `ctx.run` starts is never looser than the run that started it. If the parent run is `nobody`, the new run is `nobody` too. A value that is looser than the runner's setting is an error, `approval_forbidden`. See [Where the setting comes from](/v0/security/approvals#where-the-setting-comes-from).
+A run that `ctx.run` starts is at least as strict as the run that started it. If the parent run is `nobody`, the new run is `nobody` too. A value looser than the runner's setting fails with `approval_forbidden`. See [Where the setting comes from](/v0/security/approvals#where-the-setting-comes-from).
 
 ### `ctx.structured(name, opts)`
 
-Like `ctx.run`, but instructs the runner to return a JSON object and decodes it. You can supply a `validate` function to check the decoded value; if validation fails the call is retried up to `retries` times.
+Works like `ctx.run`, and also tells the runner to reply with a JSON object, which it decodes for you. Pass a `validate` function to check the decoded value. When the check fails, the call asks the model again, up to `retries` times.
 
 | Field | Type | Description |
 |---|---|---|
@@ -83,16 +85,13 @@ Like `ctx.run`, but instructs the runner to return a JSON object and decodes it.
 | `system` | `string` | System prompt override. |
 | `model` | `string` | Model override. |
 | `retries` | `integer` | Number of retry attempts on decode or validation failure. |
-| `validate` | `fun(value): boolean, string?` or `"inherit"` | Called with the decoded table; return `false, reason` to retry. The string `"inherit"` uses the enclosing action's `output` schema as the contract instead. |
+| `validate` | `fun(value): boolean, string?` or `"inherit"` | Called with the decoded table. Return `false, reason` to retry. The string `"inherit"` checks the value against the enclosing action's `output` schema. |
 
-**Returns:** `(decoded: table, response: RunResult)` — two values.
+**Returns:** two values, `(decoded: table, response: RunResult)`.
 
 #### `validate = "inherit"`
 
-When the action you're writing already declares an `output` schema, you don't
-need to restate the same checks in a `validate` function. Pass
-`validate = "inherit"` and the model's reply is validated against that schema —
-same retry-with-reason loop, one single source of truth for the shape:
+When your action already declares an `output` schema, pass `validate = "inherit"` to check the model's reply against that schema. The retry loop works the same way, and the shape is defined in one place:
 
 ```lua
 agentd.action({
@@ -113,23 +112,13 @@ agentd.action({
 })
 ```
 
-If the reply doesn't match, the model is reprompted with the exact rejection
-reason (e.g. `` /population_millions: expected number ``) until it conforms or
-`retries` is exhausted. Using `"inherit"` in an action that declares no
-`output` schema is an error — declare the schema first.
+If the reply does not match, the model is asked again with the reason it was rejected, for example `` /population_millions: expected number ``, until it matches or `retries` runs out. Using `"inherit"` in an action without an `output` schema raises an error, so declare the schema first.
 
 ### `ctx.validate_output(value)`
 
-Checks any value against the enclosing action's declared `output` schema.
-Returns `true`, or `false, reason` on mismatch. This is what
-`validate = "inherit"` uses under the hood; call it directly when you want to
-pre-check a value you assembled yourself before returning it.
+Checks any value against the enclosing action's declared `output` schema. Returns `true`, or `false, reason` when the value does not match. `validate = "inherit"` uses this check. Call it directly to check a value you built yourself before you return it.
 
-`ctx.structured` validates a runner's reply at the point you call it. To
-validate an **action's own** arguments and return value — declaratively, and so
-AI runners see the expected shape — describe them with `input`/`output`
-schemas; see
-[Describing arguments and results](/v0/writing/tools#describing-arguments-and-results).
+`ctx.structured` checks a runner's reply where you call it. To check an action's own arguments and return value, describe them with `input` and `output` schemas. Runners then also see the expected shape. See [Describing arguments and results](/v0/writing/tools#describing-arguments-and-results).
 
 ## RunResult
 
@@ -139,7 +128,7 @@ schemas; see
 | `provider` | `string` | Provider prefix used for the call. |
 | `usage` | `table \| nil` | Cumulative provider-reported tokens when every turn reports usage; see [runner results](/v0/reference/protocol#runners-run). |
 | `model` | `string` | Exact model string used. |
-| `stop_reason` | `string \| nil` | Why the runner stopped (e.g. `"end_turn"`, `"max_tokens"`). |
+| `stop_reason` | `string \| nil` | Why the runner stopped, for example `"end_turn"` or `"max_tokens"`. |
 
 ## Examples
 
@@ -185,7 +174,7 @@ end)
 ```
 
 ::: warning confirm actions
-`ctx.call` cannot invoke actions that have `confirm = true`. Calling one raises an error. Confirmed actions must be invoked directly by a client that can present the approval prompt.
+`ctx.call` raises an error for actions that have `confirm = true`. A client that can show the approval prompt has to call those actions directly.
 :::
 
 ## See also
@@ -193,5 +182,5 @@ end)
 - [Concepts: tools and actions](/v0/concepts/tools-and-actions)
 - [Concepts: runners](/v0/concepts/runners)
 - [Writing tools: describing arguments and results](/v0/writing/tools#describing-arguments-and-results)
-- [ctx.ai — inline model calls](/v0/reference/ctx/ai)
+- [ctx.ai: inline model calls](/v0/reference/ctx/ai)
 - [Security: approvals](/v0/security/approvals)

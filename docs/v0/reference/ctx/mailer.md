@@ -1,8 +1,8 @@
-# ctx.mailer — Email (SMTP)
+# ctx.mailer: Email (SMTP)
 
-`ctx.mailer` sends email over SMTP. You create a mailer — a plain object holding the SMTP connection details, just like an HTTP client or a WebSocket connection — and call `:send` on it. The mailer is backed by a pooled, TLS-capable transport, so a single mailer is safe to share across coroutines and reuse for many messages.
+`ctx.mailer` sends email over SMTP. You create a mailer, an object that holds the SMTP connection details like an HTTP client or a WebSocket connection does, and call `:send` on it. A mailer keeps a pool of connections and supports TLS, so you can share one mailer across coroutines and reuse it for many messages.
 
-**Required permission:** `net:<host>` — the SMTP server host, same slug family as HTTP and WebSocket. Checked once, when the mailer is created.
+**Required permission:** `net:<host>` for the SMTP server host, the same slug HTTP and WebSocket use. It is checked once, when the mailer is created.
 
 ## Signatures
 
@@ -37,7 +37,7 @@ mailer:send(mail: Mail) -> { ok: true, message_id: string | nil }
 | `port` | `integer` | TCP port. Defaults per `security`: `465` (tls), `587` (starttls), `25` (plaintext). |
 | `user` | `string` | SMTP username. Must be set together with `pass`; setting only one is an error. |
 | `pass` | `string` | SMTP password. |
-| `security` | `string` | `"starttls"` (default), `"tls"` (implicit TLS), or `"plaintext"` (no TLS — dev/test only). |
+| `security` | `string` | `"starttls"` (default), `"tls"` (implicit TLS), or `"plaintext"` (no TLS, for development and testing). |
 | `timeout_ms` | `integer` | Per-operation timeout in milliseconds. Default `30000`. |
 
 ### Mail
@@ -46,7 +46,7 @@ mailer:send(mail: Mail) -> { ok: true, message_id: string | nil }
 |---|---|---|
 | `to` | `string[]` | Primary recipients. |
 | `cc` | `string[]` | Carbon-copy recipients. |
-| `bcc` | `string[]` | Blind-copy recipients — delivered, but never written into the message headers. |
+| `bcc` | `string[]` | Blind-copy recipients. They receive the message and are left out of its headers. |
 | `from` | `string \| nil` | Overrides the mailer's default `from` for this message. |
 | `reply_to` | `string \| nil` | `Reply-To` mailbox. |
 | `subject` | `string` | Subject line. **Required.** |
@@ -62,7 +62,7 @@ Body shape follows from which fields are set: `text` only → `text/plain`; `htm
 |---|---|---|
 | `filename` | `string` | Name shown to the recipient. |
 | `content_type` | `string` | MIME type, e.g. `"application/pdf"`. |
-| `bytes` | `string` | Raw attachment bytes (a binary-safe Lua string — read a file with `ctx.fs`). |
+| `bytes` | `string` | Raw attachment bytes (a binary-safe Lua string; read a file with `ctx.fs`). |
 
 ## Permission
 

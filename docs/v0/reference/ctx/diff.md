@@ -1,8 +1,8 @@
 # ctx.diff: Unified Diffs
 
-`ctx.diff` creates, reads and applies unified diffs, the format `git diff` prints, `git apply` and `patch` accept, and language models write when they change code. It works on text only and never touches files, so it needs no grant. To apply a diff to files on disk, use [`ctx.fs.patch`](/v0/reference/ctx/fs#changing-part-of-a-file).
+Use `ctx.diff` when you want to show a change before you make it, or adjust a diff a model wrote before you apply it. It creates, reads and applies unified diffs, the format that `git diff` prints, that `git apply` and `patch` accept, and that language models write when they change code.
 
-A common use is showing a change before making it, or adjusting a diff a model wrote before applying it.
+`ctx.diff` works on strings in memory and does not read or write files, so it needs no grant. To apply a diff to files on disk, use [`ctx.fs.patch`](/v0/reference/ctx/fs#changing-part-of-a-file).
 
 ## Methods
 
@@ -24,7 +24,7 @@ local files = ctx.diff.parse(diff_text)
 -- files[1].hunks[1]  { old_start, old_lines, new_start, new_lines, lines }
 ```
 
-Each entry in `lines` keeps its first character: a space for an unchanged line, `-` for a removed line, `+` for an added one. You can change the tables and turn them back into text:
+Each entry in `lines` keeps its first character: a space for an unchanged line, `-` for a removed line and `+` for an added one. You can edit these tables and turn them back into text with `format`:
 
 ```lua
 local files = ctx.diff.parse(ctx.diff.create("a\nb\n", "a\nc\n", { path = "notes.txt" }))
@@ -35,7 +35,9 @@ local result = ctx.diff.apply("a\nb\n", adjusted)   -- "a\nz\n"
 
 ## When a diff does not apply
 
-`apply` matches each change exactly, where the diff says or, if the text has shifted, at the one place its lines appear. When a change does not match, the error names the hunk and the line that differs, for example "hunk 1 of `notes.txt` does not apply, line 2 reads `q` but the patch expects `b`". Each line keeps its own ending, so files with Windows line endings stay that way.
+`apply` looks for each change at the line number the diff gives. If the text has shifted, it uses the one place where the change's lines appear. When a change cannot be placed, `apply` raises an error that names the hunk and the line that differs, for example "hunk 1 of `notes.txt` does not apply, line 2 reads `q` but the patch expects `b`".
+
+Each line keeps its own line ending, so a file with Windows line endings keeps them after the diff is applied.
 
 ## See also
 

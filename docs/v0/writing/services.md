@@ -1,12 +1,12 @@
 # Writing Services
 
-A **service** is a long-running background Lua task supervised by the daemon.
-Use services for persistent connections (WebSocket gateways), polling loops,
-or any work that should run continuously alongside your tools and runners.
+A **service** is a long-running Lua task that the daemon runs in the background and restarts when needed. Use services for persistent connections such as WebSocket gateways, for polling loops, or for any work that runs continuously next to your tools and runners.
 
 ## Registration
 
 ### Simple form
+
+Pass a name and a body:
 
 ```lua
 agentd.service("my_poller", function(ctx)
@@ -18,7 +18,9 @@ agentd.service("my_poller", function(ctx)
 end)
 ```
 
-### With supervisor options
+### With restart options
+
+To restart the service when it stops, pass options before the body:
 
 ```lua
 agentd.service("discord_gateway", {
@@ -34,9 +36,9 @@ end)
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `restart` | `"always" \| "on_failure"` | — | When to restart. `"always"` restarts even on a clean return. |
-| `backoff_ms` | `int` | — | Initial delay in milliseconds before the first restart. |
-| `backoff_max_ms` | `int` | — | Maximum delay after repeated failures (exponential back-off). |
+| `restart` | `"always" \| "on_failure"` | none | When to restart. `"always"` restarts even on a clean return. Without it, the service runs once. |
+| `backoff_ms` | `int` | 1000 | Delay in milliseconds before the first restart. |
+| `backoff_max_ms` | `int` | 60000 | Longest delay after repeated failures. The delay doubles after each failure in a row. |
 
 ## The service body
 
@@ -47,10 +49,7 @@ function(ctx)
 end
 ```
 
-The body runs in its own coroutine. When it returns or errors, the supervisor
-restarts it according to the `restart` policy. Long-running services typically
-contain an infinite loop driven by a channel receive, a WebSocket read, or a
-timer.
+The body runs in its own coroutine. When it returns or raises an error, the daemon restarts it according to the `restart` option. A long-running service usually contains a loop that waits on a channel, a WebSocket read, or a timer.
 
 ## Long-running patterns
 
@@ -106,7 +105,7 @@ end)
 
 ## Channels and timers
 
-Services can use the process-wide named channel to coordinate with each other:
+Services can pass messages to each other through named channels. Every service that asks for the same name gets the same channel:
 
 ```lua
 local ch = channel("my_events")   -- create or retrieve by name
@@ -115,20 +114,18 @@ local msg = ch:recv()             -- blocks until a message arrives
 local msg = ch:try_recv()         -- returns nil immediately if empty
 ```
 
-Timers fire callbacks on a background coroutine:
+Timers run a function later, or repeatedly, on a background coroutine:
 
 ```lua
 timer.after(5000, function() ctx.log.info("once after 5 s") end)
 timer.every(10000, function() ctx.log.info("every 10 s") end)
 ```
 
-See [Concurrency reference](/v0/reference/ctx/concurrency) for `async`, `await`,
-`parallel`, and the full Channel API.
+See [Concurrency reference](/v0/reference/ctx/concurrency) for `async`, `await`, `parallel`, and the full channel API.
 
-## Permissions — `[service.<name>]` grants
+## Permissions: `[service.<name>]` grants
 
-Services have their own grant section in `grants.toml`. A service's body cannot
-use a capability unless that capability is listed under `granted`:
+Services have their own grant section in `grants.toml`. A service's body can use the capabilities listed under `granted`:
 
 ```toml
 [service.discord_handler]
@@ -142,22 +139,19 @@ allowed_actions = ["discord.send"]
 ```
 
 ::: warning
-Forgetting a grant causes the capability call to fail at runtime, not at load
-time. Check the trace log (`agentctl trace -f`) if a service exits unexpectedly.
+A missing grant shows up when the call runs. The configuration still loads. If a service exits unexpectedly, check the trace log (`agentctl trace -f`).
 :::
 
-## Ephemeral vs durable state
+## Short-lived and durable state
 
-Inside a service body you have access to both:
+Inside a service body you can use both kinds of storage:
 
 | | API | Survives restart? | Permission |
 |---|---|---|---|
-| Ephemeral | `ctx.state.get/set` | No | none |
+| Short-lived | `ctx.state.get/set` | No | none |
 | Durable | `ctx.memory.create(ns)` | Yes | `memory.read:<ns>` / `memory.write:<ns>` |
 
-The Discord example stores the bot's own user ID in `ctx.state` (lost on restart,
-re-populated on the next READY event) and per-channel history in `ctx.memory`
-(persists across restarts and hot reloads).
+The Discord example keeps the bot's own user ID in `ctx.state`, which is cleared on restart and filled again by the next READY event. It keeps each channel's history in `ctx.memory`, which stays across restarts and hot reloads.
 
 ## See also
 
