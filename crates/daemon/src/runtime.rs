@@ -33,6 +33,9 @@ pub struct Shared {
     pub memory: Arc<RedbStore>,
     pub sessions: Arc<RedbSessionStore>,
     pub file_history: agentd_fs::History,
+    /// What each folder held at the last action call, to find what the next
+    /// one changed.
+    pub file_baseline: agentd_fs::Baseline,
     pub trace: Arc<JsonlSink>,
     pub broker: Arc<agentd_approvals::Broker>,
     pub async_handle: tokio::runtime::Handle,
@@ -117,6 +120,8 @@ pub fn build_runtime(cfg: &Config, shared: &Shared) -> Result<BuiltRuntime> {
     );
     executor.set_max_runner_turns(cfg.max_turns);
     executor.set_sessions(shared.sessions.clone());
+    executor.set_workspace_root(cfg.workspace_root.clone());
+    executor.set_file_capture(shared.file_history.clone(), shared.file_baseline.clone());
 
     // "allow forever" reload pipeline: rebuild the engine from grants.toml,
     // re-applying this build's package desugaring.

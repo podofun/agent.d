@@ -18,6 +18,7 @@
 //! work identically whether the caller is a one-shot HTTP request, an LLM
 //! tool call, or a background Discord gateway loop.
 
+mod capture;
 mod classifier;
 mod runs;
 
@@ -393,6 +394,12 @@ pub struct Executor {
     runs: Arc<runs::Runs>,
     /// Questions the classifier answers at once.
     classifier_slots: tokio::sync::Semaphore,
+    /// File history and the folder baseline used to capture what each
+    /// action call changes. `None` captures nothing.
+    capture: Option<capture::Capture>,
+    /// The folder a call works in when neither its runner nor its session
+    /// names one.
+    workspace_root: Option<std::path::PathBuf>,
 }
 
 /// Removes the session id from the in-flight set when the run ends.
@@ -437,7 +444,22 @@ impl Executor {
             active_sessions: Arc::new(std::sync::Mutex::new(Default::default())),
             runs: Arc::new(runs::Runs::default()),
             classifier_slots: tokio::sync::Semaphore::new(classifier::CLASSIFIER_SLOTS),
+            capture: None,
+            workspace_root: None,
         }
+    }
+
+    /// Capture the files every action call changes into `history`, the same
+    /// history the `ctx.fs` bindings write, using `baseline` to tell what
+    /// changed.
+    pub fn set_file_capture(&mut self, history: agentd_fs::History, baseline: agentd_fs::Baseline) {
+        self.capture = Some(capture::Capture { history, baseline });
+    }
+
+    /// The folder a call works in when neither its runner nor its session
+    /// names one.
+    pub fn set_workspace_root(&mut self, root: std::path::PathBuf) {
+        self.workspace_root = Some(root);
     }
 
     /// Wire the durable session store. `RedbSessionStore` in production,
@@ -506,6 +528,19 @@ impl Executor {
         caller: Caller,
         call: ActionCall,
     ) -> Result<(ActionResult, u128), (RegistryError, u128)> {
+        self.run_with_changes(caller, call)
+            .await
+            .map(|(result, duration, _)| (result, duration))
+    }
+
+    /// Run an action and report the files it changed, however it changed
+    /// them. Each change is also recorded in file history, so it can be
+    /// undone.
+    pub async fn run_with_changes(
+        &self,
+        caller: Caller,
+        call: ActionCall,
+    ) -> Result<(ActionResult, u128, Vec<agentd_ai::FileChange>), (RegistryError, u128)> {
         let action_name = call.action.clone();
         let args = call.args.clone();
         let started = Instant::now();
@@ -659,14 +694,33 @@ impl Executor {
             .and_then(|def| def.cwd)
             .or_else(|| caller.cwd.clone());
 
+        let capturing = self
+            .begin_capture(&caller, inherited_cwd.as_deref(), &effective_grants)
+            .await;
+        let mut call_caller = caller.clone();
+        if let Some(capturing) = &capturing {
+            call_caller
+                .capturing
+                .extend(capturing.roots.iter().cloned());
+        }
         let ctx = CallContext {
-            caller: caller.clone(),
+            caller: call_caller,
             effective_grants,
             call_chain: vec![action_name.clone()],
             cwd: inherited_cwd,
         };
 
         let outcome = self.registry.call(ctx, call).await;
+        let (changes, note) = match (capturing, &self.capture) {
+            (Some(capturing), Some(capture)) => {
+                let actor = agentd_fs::Actor {
+                    action: action_name.clone(),
+                    run_id: caller.run_id.clone(),
+                };
+                capture.finish(capturing, actor).await
+            }
+            _ => (Vec::new(), None),
+        };
         let dur = started.elapsed().as_millis();
         match outcome {
             Ok(res) => {
@@ -674,22 +728,56 @@ impl Executor {
                     .record(
                         TraceEvent::ok(&action_name, args, dur, res.value.clone())
                             .with_execution(execution.clone())
-                            .with_kind("action"),
+                            .with_kind("action")
+                            .with_note(note),
                     )
                     .await;
-                Ok((res, dur))
+                Ok((res, dur, changes))
             }
             Err(e) => {
                 self.trace
                     .record(
                         TraceEvent::err(&action_name, args, dur, e.to_string())
                             .with_execution(execution.clone())
-                            .with_kind("action"),
+                            .with_kind("action")
+                            .with_note(note),
                     )
                     .await;
                 Err((e, dur))
             }
         }
+    }
+
+    /// Hold and scan the folders this call may change, unless no capture is
+    /// set up, the call has no `fs.write` grant in its working folder, or an
+    /// enclosing call is already capturing those folders.
+    async fn begin_capture(
+        &self,
+        caller: &Caller,
+        inherited_cwd: Option<&str>,
+        grants: &PermissionSet,
+    ) -> Option<capture::Started> {
+        let capture = self.capture.as_ref()?;
+        let working = match inherited_cwd.map(std::path::Path::new) {
+            Some(cwd) if cwd.is_absolute() => cwd.to_path_buf(),
+            Some(cwd) => self.workspace_root.as_ref()?.join(cwd),
+            None => self.workspace_root.clone()?,
+        };
+        let working = capture::canonical(&working);
+        let grants = capture::with_cwd(grants, caller.cwd.as_deref());
+        let roots: Vec<_> = capture::capture_roots(&working, &grants)
+            .into_iter()
+            .filter(|root| {
+                !caller
+                    .capturing
+                    .iter()
+                    .any(|held| root.starts_with(held) || held.starts_with(root))
+            })
+            .collect();
+        if roots.is_empty() {
+            return None;
+        }
+        Some(capture.begin(working, roots).await)
     }
 
     // ---------- approval escalation ----------
@@ -2128,27 +2216,33 @@ impl Executor {
                             action: call.name.clone(),
                             args: call.arguments.clone(),
                         };
-                        let result = self.run(tool_caller.clone(), action).await;
+                        let result = self.run_with_changes(tool_caller.clone(), action).await;
                         if let Some(sink) = &sink {
                             let run_id = tool_caller.run_id.as_deref();
-                            let (output, error) = match &result {
-                                Ok((res, _)) => {
-                                    (self.runs.redact_secrets(run_id, &res.value), None)
+                            let (output, error, changes) = match &result {
+                                Ok((res, _, changes)) => (
+                                    self.runs.redact_secrets(run_id, &res.value),
+                                    None,
+                                    changes.clone(),
+                                ),
+                                Err((e, _)) => {
+                                    (serde_json::Value::Null, Some(e.to_string()), Vec::new())
                                 }
-                                Err((e, _)) => (serde_json::Value::Null, Some(e.to_string())),
                             };
                             let _ = sink.send(agentd_ai::StreamEvent::ToolResult {
                                 name: call.name.clone(),
                                 input: self.runs.redact_secrets(run_id, &call.arguments),
                                 output,
                                 error,
-                                changes: Vec::new(),
+                                changes,
                             });
                         }
                         let text = match result {
-                            Ok((res, _)) => serde_json::to_string(&res.value).unwrap_or_else(|e| {
-                                format!("the tool result could not be serialized to JSON ({e})")
-                            }),
+                            Ok((res, _, _)) => {
+                                serde_json::to_string(&res.value).unwrap_or_else(|e| {
+                                    format!("the tool result could not be serialized to JSON ({e})")
+                                })
+                            }
                             Err((e, _)) => format!("tool call failed ({e})"),
                         };
                         req.messages.push(agentd_ai::Message::tool_result(id, text));

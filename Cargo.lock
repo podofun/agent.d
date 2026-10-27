@@ -131,6 +131,7 @@ name = "agentd-executor"
 version = "0.10.0-alpha"
 dependencies = [
  "agentd-ai",
+ "agentd-fs",
  "agentd-mcp",
  "agentd-permissions",
  "agentd-runners",
@@ -138,6 +139,7 @@ dependencies = [
  "agentd-secrets",
  "agentd-services",
  "agentd-sessions",
+ "agentd-shell",
  "agentd-skills",
  "agentd-trace",
  "agentd-types",

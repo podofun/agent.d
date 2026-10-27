@@ -61,6 +61,10 @@ pub struct Baseline {
 #[derive(Default)]
 struct Inner {
     roots: Mutex<HashMap<PathBuf, Arc<Files>>>,
+    /// Folders locked by a call that is capturing its changes.
+    held: Mutex<Vec<PathBuf>>,
+    released: tokio::sync::Notify,
+    scans: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     hashes: std::sync::atomic::AtomicUsize,
 }
@@ -94,10 +98,71 @@ impl Entry {
     }
 }
 
+/// Holds folders for one call until dropped. See [`Baseline::lock`].
+pub struct FolderLock {
+    inner: Arc<Inner>,
+    roots: Vec<PathBuf>,
+}
+
+impl Drop for FolderLock {
+    fn drop(&mut self) {
+        if let Ok(mut held) = self.inner.held.lock() {
+            for root in &self.roots {
+                if let Some(at) = held.iter().position(|h| h == root) {
+                    held.swap_remove(at);
+                }
+            }
+        }
+        self.inner.released.notify_waiters();
+    }
+}
+
+fn overlaps(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
 impl Baseline {
+    /// Wait until no other holder has any of `roots`, a folder inside one of
+    /// them, or a folder containing one, then hold them until the returned
+    /// lock is dropped. Calls that change files in the same folder take
+    /// turns this way, so each one's changes are told apart.
+    pub async fn lock(&self, roots: Vec<PathBuf>) -> FolderLock {
+        loop {
+            let released = self.inner.released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            {
+                let mut held = self
+                    .inner
+                    .held
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !roots
+                    .iter()
+                    .any(|root| held.iter().any(|h| overlaps(h, root)))
+                {
+                    held.extend(roots.iter().cloned());
+                    return FolderLock {
+                        inner: self.inner.clone(),
+                        roots,
+                    };
+                }
+            }
+            released.await;
+        }
+    }
+
+    /// How many scans have run, for tests and diagnostics.
+    pub fn scans(&self) -> usize {
+        self.inner.scans.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Scan `root`, keep what it holds, and return what changed since the
     /// last scan of the same root. The first scan of a root returns nothing.
     pub fn refresh(&self, root: &Path, limits: ScanLimits) -> Result<Vec<ScanChange>, FsError> {
+        self.inner
+            .scans
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let previous = self
             .inner
             .roots
@@ -258,6 +323,25 @@ mod tests {
     fn age(path: &Path) {
         let file = std::fs::File::options().write(true).open(path).unwrap();
         file.set_modified(SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn overlapping_folders_take_turns() {
+        let baseline = Baseline::default();
+        let outer = baseline.lock(vec![PathBuf::from("/w")]).await;
+        // A sibling folder is not held up.
+        let _sibling = baseline.lock(vec![PathBuf::from("/x")]).await;
+        let waiting = {
+            let baseline = baseline.clone();
+            tokio::spawn(async move { baseline.lock(vec![PathBuf::from("/w/sub")]).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+        drop(outer);
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
             .unwrap();
     }
 

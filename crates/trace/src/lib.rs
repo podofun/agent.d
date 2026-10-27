@@ -27,6 +27,10 @@ pub struct TraceEvent {
     /// group an execution into its action call + per-agent runner runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Something worth knowing about the call that is not an error, such as
+    /// a folder too large to track file changes in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Replace every leaf value with a `<type:size>` placeholder so secrets
@@ -62,6 +66,7 @@ impl TraceEvent {
             error: None,
             execution: None,
             kind: None,
+            note: None,
         }
     }
     /// An approval decision. The request is redacted like any args; the
@@ -77,6 +82,7 @@ impl TraceEvent {
             error: None,
             execution: None,
             kind: Some("approval".into()),
+            note: None,
         }
     }
     pub fn err(action: &str, args: serde_json::Value, dur_ms: u128, err: String) -> Self {
@@ -89,6 +95,7 @@ impl TraceEvent {
             error: Some(err),
             execution: None,
             kind: None,
+            note: None,
         }
     }
     /// Chainable: stamp the correlation id (no-op when `None`).
@@ -99,6 +106,11 @@ impl TraceEvent {
     /// Chainable: tag the event class.
     pub fn with_kind(mut self, kind: &str) -> Self {
         self.kind = Some(kind.to_string());
+        self
+    }
+    /// Chainable: attach a note (no-op when `None`).
+    pub fn with_note(mut self, note: Option<String>) -> Self {
+        self.note = note;
         self
     }
 }

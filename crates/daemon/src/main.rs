@@ -227,6 +227,7 @@ async fn run(cli: Cli, env_secrets: agentd_secrets::EnvStore) -> Result<()> {
         memory: Arc::new(memory),
         sessions: Arc::new(sessions),
         file_history: agentd_fs::History::default(),
+        file_baseline: agentd_fs::Baseline::default(),
         trace: Arc::new(trace),
         broker: broker.clone(),
         async_handle: tokio::runtime::Handle::current(),

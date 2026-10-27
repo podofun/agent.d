@@ -245,6 +245,11 @@ pub struct Caller {
     /// behaves as [`ApprovalSetting::Human`].
     #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub approval: Option<ApprovalSetting>,
+    /// Folders an enclosing action call is already capturing file changes
+    /// in, so a call nested inside it leaves those folders to it. Set by the
+    /// executor only, never read from or written to the wire.
+    #[serde(skip)]
+    pub capturing: Vec<std::path::PathBuf>,
 }
 
 /// Who answers a run's questions. Ordered from strict to loose, so the
