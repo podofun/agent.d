@@ -870,7 +870,7 @@ mod tests {
                     !cell.modifier.contains(ratatui::style::Modifier::UNDERLINED),
                     "hover never underlines"
                 );
-                cell.symbol() == "g" && cell.fg == ui::PRIMARY
+                cell.symbol() == "g" && cell.fg == ratatui::style::Color::Reset
             })
         };
         assert!(highlighted(&terminal));

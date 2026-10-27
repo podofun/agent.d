@@ -997,15 +997,15 @@ pub(in crate::tui) fn clickable_at(
         .find(|(header, _)| line == *header)
 }
 
-/// Marks a clickable row as under the mouse: its title and its open or
-/// closed marker take the primary color. A changed file's line has no
+/// Marks a clickable row as under the mouse: its muted title and its open
+/// or closed marker take the plain text color. A changed file's line has no
 /// marker, so its path does.
 fn hovered(line: &mut Line<'static>) {
     let mut started = false;
     for span in &mut line.spans {
         let text = span.content.trim();
         if matches!(text, OPEN | CLOSED) {
-            span.style = span.style.fg(PRIMARY);
+            span.style = span.style.fg(Color::Reset);
             return;
         }
         if text.is_empty() || (!started && matches!(text, "✦" | "±")) {
@@ -1015,7 +1015,7 @@ fn hovered(line: &mut Line<'static>) {
             continue;
         }
         started = true;
-        span.style = span.style.fg(PRIMARY);
+        span.style = span.style.fg(Color::Reset);
     }
 }
 
