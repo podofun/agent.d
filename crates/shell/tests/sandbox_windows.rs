@@ -744,7 +744,7 @@ fn tree_req(dir: &std::path::Path, timeout_ms: Option<u64>) -> ExecRequest {
     let mut r = req(
         powershell(),
         ps(format!(
-            "$p = Start-Process -FilePath ping.exe -ArgumentList '-n','120','127.0.0.1' -WindowStyle Hidden -PassThru; \
+            "$p = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 120' -WindowStyle Hidden -PassThru; \
              Set-Content -Path '{}' -Value $p.Id; Start-Sleep -Seconds 120",
             pid_file.display()
         )),
@@ -790,6 +790,7 @@ async fn timeout_kills_the_command_and_its_children() {
     let dir = tempfile::tempdir().unwrap();
     let task = tokio::spawn(exec(tree_req(dir.path(), Some(30_000))));
     let grandchild = read_pid(dir.path()).await;
+    assert!(running(grandchild), "the grandchild should be running before the timeout");
     let res = task.await.unwrap().expect("a timeout is a result");
     assert!(res.timed_out, "{res:?}");
     assert_stops(grandchild).await;
