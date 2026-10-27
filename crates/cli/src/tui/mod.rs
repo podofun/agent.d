@@ -166,6 +166,10 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
             {
                 app.selection = None;
                 app.drag = None;
+                app.press = ui::tool_at(app, area, mouse.column, mouse.row);
+                if app.press.is_some() {
+                    return Ok(Handled::Redraw);
+                }
                 if let Some(index) = ui::suggestion_at(app, area, mouse.column, mouse.row) {
                     let execute = picker_title(app.input.text()).is_some()
                         && app.suggestions()[index].execute;
@@ -190,6 +194,12 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
             }
             MouseEventKind::Up(MouseButton::Left) if app.tab == Tab::Chat => {
                 app.drag = None;
+                if let Some(pressed) = app.press.take() {
+                    if ui::tool_at(app, area, mouse.column, mouse.row) == Some(pressed) {
+                        ui::toggle_tool(app, area, pressed);
+                    }
+                    return Ok(Handled::Redraw);
+                }
                 // A press and release on the same cell is a click, not a
                 // selection: toggle the tool row under it, if any.
                 if app.selection.is_some_and(|selection| selection.is_click()) {
@@ -819,6 +829,10 @@ mod tests {
         assert!(
             !app.entries[1].expanded,
             "nothing happens until the button is released"
+        );
+        assert!(
+            app.selection.is_none(),
+            "pressing on a tool row does not start a selection"
         );
         handle_event(
             &mut app,
