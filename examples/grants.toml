@@ -61,3 +61,10 @@ allowed_actions = ["git.diff", "git.status"]
 # [approval]
 # classifier = "approval_classifier"
 # skip = []
+
+# Folders chat sessions may work in without asking. When `agentctl chat`
+# starts in a folder that is not listed, you are asked once, and "Always
+# trust" adds it here. Globs and `~` work: `~/code/**` trusts every folder
+# under ~/code.
+# [folders]
+# trusted = ["~/code/**"]
