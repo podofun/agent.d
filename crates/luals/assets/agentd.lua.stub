@@ -32,38 +32,127 @@
 ---@field actions? agentd.ActionName[]
 
 ---@class agentd.ServiceOpts
----@field restart? "always"|"on_failure"
+---@field restart? "always"|"on_failure"|"never"
 ---@field backoff_ms? integer
 ---@field backoff_max_ms? integer
 
----@class agentd.Skills
----@field load fun(path: string): string   Load one Markdown skill file; returns the skill name.
----@field dir fun(path: string): integer   Load every `*.md` under a directory; returns the count.
+-- Handles: every registration returns a live handle on what it registered.
+-- Reading a property returns the current value; assigning one changes the
+-- registered item (checked like registration). List properties are live, so
+-- `table.insert(runner.skills, "tdd")` works. Assigning `name` renames.
+
+---@class agentd.Runner
+---@field name string
+---@field model? string                    `<provider>/<model_id>`.
+---@field system? string
+---@field skills string[]
+---@field allowed_actions agentd.ActionName[]
+---@field actions agentd.ActionName[]      Same list as `allowed_actions`.
+---@field cwd? string
+---@field compact? table|false
+---@field remove fun(self: agentd.Runner)
+
+---@class agentd.Skill
+---@field name string
+---@field description? string
+---@field system string
+---@field actions agentd.ActionName[]
+---@field source? string
+---@field remove fun(self: agentd.Skill)
+
+---@class agentd.Service
+---@field name string
+---@field tool? string
+---@field source? string
+---@field restart? "always"|"on_failure"|"never"
+---@field backoff_ms? integer
+---@field backoff_max_ms? integer
+---@field handler fun(ctx: Ctx)
+---@field remove fun(self: agentd.Service)
+
+---@class agentd.Action
+---@field name string
+---@field tool? string
+---@field requires string[]
+---@field confirm boolean
+---@field cwd? string
+---@field input? table                     Reads back as the compiled JSON Schema.
+---@field output? table                    Reads back as the compiled JSON Schema.
+---@field handler fun(args: table, ctx: Ctx): any
+---@field remove fun(self: agentd.Action)
+
+---@class agentd.Tool
+---@field name string
+---@field requires string[]
+---@field remove fun(self: agentd.Tool)
+
+-- Collections: `find` takes a predicate, or a table whose keys must all match
+-- (`*` wildcards for strings; a string matches any item of a list property).
+
+---@class agentd.Runners
 ---@field list fun(): string[]
+---@field get fun(name: string): agentd.Runner?
+---@field find fun(query: table|fun(runner: agentd.Runner): boolean): agentd.Runner[]
+---@field remove fun(name: string)
+
+---@class agentd.Skills
+---@field load fun(path: string): agentd.Skill     Load one Markdown skill file.
+---@field dir fun(path: string): agentd.Skill[]    Load every `*.md` under a directory.
+---@field list fun(): string[]
+---@field get fun(name: string): agentd.Skill?
+---@field find fun(query: table|fun(skill: agentd.Skill): boolean): agentd.Skill[]
+---@field remove fun(name: string)
+
+---@class agentd.Services
+---@field list fun(): string[]
+---@field get fun(name: string): agentd.Service?
+---@field find fun(query: table|fun(service: agentd.Service): boolean): agentd.Service[]
+---@field remove fun(name: string)
+
+---@class agentd.Actions
+---@field list fun(): string[]
+---@field get fun(name: string): agentd.Action?
+---@field find fun(query: table|fun(action: agentd.Action): boolean): agentd.Action[]
+---@field remove fun(name: string)
+
+---@class agentd.Tools
+---@field list fun(): string[]
+---@field get fun(name: string): agentd.Tool?
+---@field find fun(query: table|fun(tool: agentd.Tool): boolean): agentd.Tool[]
+---@field remove fun(name: string)
 
 ---@class agentd.Lib
 ---@field skills agentd.Skills
+---@field runners agentd.Runners
+---@field services agentd.Services
+---@field actions agentd.Actions
+---@field tools agentd.Tools
 agentd = {}
 
 ---Register an action (table form), or the short `(name, handler)` form.
----@overload fun(name: string, handler: fun(args: table, ctx: Ctx): any)
+---@overload fun(name: string, handler: fun(args: table, ctx: Ctx): any): agentd.Action
 ---@param spec agentd.ActionSpec
+---@return agentd.Action
 function agentd.action(spec) end
 
 ---@param spec agentd.ToolSpec
+---@return agentd.Tool
 function agentd.tool(spec) end
 
 ---@param spec agentd.RunnerSpec
+---@return agentd.Runner
 function agentd.runner(spec) end
 
 ---@param spec agentd.SkillSpec
+---@return agentd.Skill
 function agentd.skill(spec) end
 
 ---Register a long-running service. `(name, fn)` or `(name, opts, fn)`.
----@overload fun(name: string, body: fun(ctx: Ctx))
+---@overload fun(name: string, body: fun(ctx: Ctx)): agentd.Service
 ---@param name string
 ---@param opts agentd.ServiceOpts
 ---@param body fun(ctx: Ctx)
+---@return agentd.Service
 function agentd.service(name, opts, body) end
 
 -- Globals
