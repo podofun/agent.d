@@ -40,7 +40,7 @@ The error names the denial.
 To use a denial and an agent together, use a provider that agent.d controls, such as `anthropic` or `openai`.
 See [What a denial guarantees](/v0/security/denials#ai-providers).
 
-The Codex provider has a 180-second turn timeout. Runner calls also have a whole-run deadline, which defaults to 120 seconds; see [runner request limits](/v0/reference/protocol#runners-run).
+The Codex provider has a 180-second turn timeout. Runner calls outside a session also have a whole-run deadline, which defaults to 120 seconds; see [runner request limits](/v0/reference/protocol#runners-run).
 
 ## Use the provider with a runner
 

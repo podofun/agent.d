@@ -74,7 +74,7 @@ agentd.action({
 During a runner call, the `anthropic`, `openai`, and custom API providers can ask agent.d to call an action.
 After agent.d calls a permitted action, it sends the result to the provider in a new turn.
 
-The `runtime.max_turns` value limits this loop to 16 turns by default, and a value of `0` gives a one-turn limit.
+The `runtime.max_turns` value limits this loop to 16 turns by default, and a value of `0` gives a one-turn limit. The limit applies to runs outside a session. A run in a session has no turn limit, because it is a conversation that can be cancelled at any time.
 
 ```toml
 [runtime]

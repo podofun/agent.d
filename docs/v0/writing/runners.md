@@ -119,8 +119,7 @@ From the CLI:
 agentctl runner run backend_reviewer "Review the staged changes."
 ```
 
-`runtime.max_turns` (default 16) caps the tool-use loop per runner call for
-executor-owned providers.
+`runtime.max_turns` (default 16) caps the tool-use loop for executor-owned providers when a run is outside a session. A run in a session has no turn limit and keeps going until the model is done or the run is cancelled.
 
 ## Compaction
 
