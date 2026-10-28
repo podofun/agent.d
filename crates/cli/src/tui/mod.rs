@@ -19,7 +19,7 @@ use crossterm::event::{
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -121,7 +121,9 @@ pub(crate) async fn run(
         }
         tokio::select! {
             _ = frames.tick(), if app.script.waiting() => {
-                if app.play_frames() {
+                let size = screen.0.size()?;
+                let area = Rect::new(0, 0, size.width, size.height);
+                if keep_view(&mut app, area, App::play_frames) {
                     app.sync_script();
                     dirty = true;
                 }
@@ -141,18 +143,28 @@ pub(crate) async fn run(
                 }
             }
             event = events.next() => {
-                let Some(event) = event else { break };
-                let size = screen.0.size()?;
-                let area = Rect::new(0, 0, size.width, size.height);
-                match handle_event(&mut app, event?, area).await? {
-                    Handled::Quit => break,
-                    Handled::Redraw => {
-                        // Picking a runner sends what waited for one.
-                        app.send_queued().await;
-                        app.sync_script();
-                        dirty = true;
+                let Some(mut event) = event else { break };
+                // Wheel ticks and mouse moves come in bursts: handle every
+                // event already waiting, then draw once.
+                let mut redraw = false;
+                for _ in 0..BURST {
+                    let size = screen.0.size()?;
+                    let area = Rect::new(0, 0, size.width, size.height);
+                    match handle_event(&mut app, event?, area).await? {
+                        Handled::Quit => return Ok(()),
+                        Handled::Redraw => redraw = true,
+                        Handled::Ignored => {}
                     }
-                    Handled::Ignored => {}
+                    match events.next().now_or_never() {
+                        Some(Some(next)) => event = next,
+                        _ => break,
+                    }
+                }
+                if redraw {
+                    // Picking a runner sends what waited for one.
+                    app.send_queued().await;
+                    app.sync_script();
+                    dirty = true;
                 }
             }
             _ = spinner.tick(), if app.pending || app.animating() || app.drag.is_some() => {
@@ -167,6 +179,9 @@ pub(crate) async fn run(
     }
     Ok(())
 }
+
+/// The most input events handled before the screen is drawn again.
+const BURST: usize = 64;
 
 enum Handled {
     Quit,
@@ -722,15 +737,24 @@ fn drag_selection(app: &mut App, screen: Rect) {
 /// Apply streamed updates. At the bottom, the view follows new lines. Scrolled
 /// up, it stays on the lines being read while the reply grows below them.
 fn apply_updates(app: &mut App, screen: Rect, updates: Vec<app::Update>) {
+    keep_view(app, screen, |app| {
+        for update in updates {
+            app.apply(update);
+        }
+    });
+}
+
+/// Make a change that may add or drop lines, keeping a scrolled up view on
+/// the same lines.
+fn keep_view<T>(app: &mut App, screen: Rect, change: impl FnOnce(&mut App) -> T) -> T {
     let held = app.scroll > 0;
     let before = if held { ui::max_scroll(app, screen) } else { 0 };
-    for update in updates {
-        app.apply(update);
-    }
+    let result = change(app);
     if held && app.scroll > 0 {
         let after = ui::max_scroll(app, screen);
         app.scroll = (app.scroll + after).saturating_sub(before);
     }
+    result
 }
 
 /// Scroll up, stopping at the first line. Without the stop, extra scrolling
@@ -1218,6 +1242,39 @@ mod tests {
         assert_eq!(app.scroll, top);
         scroll_down(&mut app, 3);
         assert_eq!(app.scroll, top - 3, "scrolling down moves at once");
+    }
+
+    #[tokio::test]
+    async fn scrolling_a_long_chat_draws_without_building_it_again() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        let reply = "Some **text**.\n\n```rust\nfn main() {\n    run();\n}\n```\n";
+        for turn in 0..200 {
+            app.push(EntryKind::User, format!("question {turn}"));
+            app.push_tool("git.diff", "line\n".repeat(20));
+            app.push_markdown(EntryKind::Agent, reply);
+        }
+        let screen = Rect::new(0, 0, 100, 40);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+        let builds = || ui::BUILDS.with(std::cell::Cell::get);
+        let before = builds();
+        for _ in 0..10 {
+            handle_event(&mut app, mouse(MouseEventKind::ScrollUp, 10, 10), screen)
+                .await
+                .unwrap();
+        }
+        terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+        assert_eq!(app.scroll, 30);
+        assert_eq!(builds(), before, "scrolling reuses the built conversation");
+
+        // A change to an entry builds it again, and keeps the view in place.
+        let top = ui::max_scroll(&app, screen) - app.scroll;
+        let last = app.entries.len() - 2;
+        keep_view(&mut app, screen, |app| app.entries[last].set_expanded(true));
+        terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+        assert_eq!(builds(), before + 1);
+        assert_eq!(ui::max_scroll(&app, screen) - app.scroll, top);
     }
 
     #[tokio::test]

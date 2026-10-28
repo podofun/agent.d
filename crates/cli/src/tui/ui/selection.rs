@@ -119,20 +119,26 @@ fn covers(range: &Range<usize>, col: usize, width: usize) -> bool {
 }
 
 /// Reverse the selected cells of `lines` in place.
+///
+/// `lines` are the conversation's lines from line `first` on.
 pub(super) fn highlight(
     lines: &mut [Line<'static>],
+    first: usize,
     selectable: &[Range<usize>],
     selection: &Selection,
 ) {
     let (start, end) = selection.ordered();
-    for index in start.line..=end.line.min(lines.len().saturating_sub(1)) {
+    for (index, line) in (first..).zip(lines.iter_mut()) {
+        if index < start.line || index > end.line {
+            continue;
+        }
         let range = intersect(selection.columns(index), selectable[index].clone());
         if range.is_empty() {
             continue;
         }
         let mut col = 0;
         let mut spans = Vec::new();
-        for span in lines[index].spans.drain(..) {
+        for span in line.spans.drain(..) {
             let mut run = String::new();
             let mut run_selected = None;
             for grapheme in span.content.graphemes(true) {
@@ -149,7 +155,7 @@ pub(super) fn highlight(
                 spans.push(styled(run, span.style, run_selected));
             }
         }
-        lines[index].spans = spans;
+        line.spans = spans;
     }
 }
 
@@ -180,7 +186,7 @@ mod tests {
         app
     }
 
-    fn conversation(app: &App, width: usize) -> Conversation {
+    fn conversation(app: &App, width: usize) -> std::rc::Rc<Conversation> {
         conversation_for(app, width)
     }
 

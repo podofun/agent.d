@@ -17,8 +17,12 @@ mod markdown;
 mod script;
 mod selection;
 
+#[cfg(test)]
+pub(super) use conversation::BUILDS;
 pub(super) use conversation::conversation_inner;
-pub(super) use conversation::{clickable_at, max_scroll, suggestion_at, toggle_tool, tool_at};
+pub(super) use conversation::{
+    ConversationCache, clickable_at, max_scroll, suggestion_at, toggle_tool, tool_at,
+};
 pub(super) use logo::SPIN as LEAF_SPIN;
 pub(super) use script::{element_lines, hit as script_hit, terminals as script_terminals};
 #[cfg(test)]

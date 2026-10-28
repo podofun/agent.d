@@ -89,6 +89,13 @@ pub(super) struct Entry {
     /// How a script asked for this entry to be shown.
     pub(super) decoration: Option<agentd_ui::EntryDecoration>,
     rendered: RefCell<Option<(usize, Vec<Line<'static>>)>>,
+    /// Changes whenever the rendered lines are dropped, unique across entries.
+    revision: u64,
+}
+
+fn next_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// One file a tool call changed, as the daemon reports it on `tool_result`.
@@ -252,6 +259,8 @@ pub(super) struct App {
     pub(super) received: mpsc::UnboundedReceiver<Update>,
     /// What scripts in the daemon show in this chat.
     pub(super) script: ScriptUi,
+    /// The conversation as last built, for scrolling and hovering.
+    pub(super) conversation: ui::ConversationCache,
 }
 
 impl App {
@@ -314,6 +323,7 @@ impl App {
             updates,
             received,
             script: ScriptUi::default(),
+            conversation: ui::ConversationCache::default(),
         }
     }
 
@@ -1184,7 +1194,7 @@ impl App {
             && last.body == name
         {
             last.text = text;
-            last.rendered.get_mut().take();
+            last.changed();
             return;
         }
         self.push(EntryKind::Setting, text);
@@ -1262,6 +1272,7 @@ impl Entry {
             output: None,
             decoration: None,
             rendered: RefCell::new(None),
+            revision: next_revision(),
         }
     }
 
@@ -1272,12 +1283,12 @@ impl Entry {
 
     pub(super) fn set_changes(&mut self, changes: Vec<FileChange>) {
         self.changes = changes;
-        self.rendered.get_mut().take();
+        self.changed();
     }
 
     pub(super) fn set_decoration(&mut self, decoration: Option<agentd_ui::EntryDecoration>) {
         self.decoration = decoration;
-        self.rendered.get_mut().take();
+        self.changed();
     }
 
     pub(super) fn hidden(&self) -> bool {
@@ -1336,9 +1347,19 @@ impl Entry {
         hasher.finish()
     }
 
+    /// Drop the rendered lines, so the next draw renders the entry again.
+    pub(super) fn changed(&mut self) {
+        self.rendered.get_mut().take();
+        self.revision = next_revision();
+    }
+
+    pub(super) fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub(super) fn set_expanded(&mut self, expanded: bool) {
         self.expanded = expanded;
-        self.rendered.get_mut().take();
+        self.changed();
     }
 
     /// Rendered lines for `width`, computed once and reused until the entry changes.
@@ -1400,7 +1421,7 @@ fn output_object(output: &Value) -> Option<Value> {
 fn set_input(entry: &mut Entry, input: &Value) {
     let empty = input.is_null() || input.as_object().is_some_and(serde_json::Map::is_empty);
     entry.input = (!empty).then(|| input.clone());
-    entry.rendered.get_mut().take();
+    entry.changed();
 }
 
 fn append_output(entry: &mut Entry, output: &str) {
@@ -1408,7 +1429,7 @@ fn append_output(entry: &mut Entry, output: &str) {
         entry.body.push_str("\n\n");
     }
     entry.body.push_str(output);
-    entry.rendered.get_mut().take();
+    entry.changed();
 }
 
 /// A short chat name from its first message, unique among known chats.

@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -21,9 +24,14 @@ pub(super) fn draw_conversation(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     }
     let inner = conversation_inner(area);
-    let mut conversation = conversation_for(app, inner.width.saturating_sub(1).max(1) as usize);
+    let conversation = conversation_for(app, inner.width.saturating_sub(1).max(1) as usize);
+    // Only the lines on screen go to the widget: laying out every line
+    // above them cost more than the rest of the frame.
+    let offset = conversation.offset(inner.height, app.scroll);
+    let end = (offset + inner.height as usize).min(conversation.lines.len());
+    let mut lines = conversation.lines[offset..end].to_vec();
     if let Some(selection) = app.selection.as_ref().filter(|s| !s.is_click()) {
-        selection::highlight(&mut conversation.lines, &conversation.selectable, selection);
+        selection::highlight(&mut lines, offset, &conversation.selectable, selection);
     }
     // The whole row is clickable, but only its header reacts to the mouse:
     // what the row holds keeps its own colors.
@@ -32,27 +40,64 @@ pub(super) fn draw_conversation(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .tool_headers
             .iter()
             .find(|(_, target)| *target == row)
-        && let Some(line) = conversation.lines.get_mut(header)
+        && let Some(line) = header.checked_sub(offset).and_then(|i| lines.get_mut(i))
     {
         hovered(line);
     }
-    let offset = conversation.offset(inner.height, app.scroll);
-    frame.render_widget(
-        Paragraph::new(conversation.lines).scroll((offset.min(u16::MAX as usize) as u16, 0)),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
-pub(super) struct Conversation {
+pub(in crate::tui) struct Conversation {
     pub(super) lines: Vec<Line<'static>>,
     /// Selectable column range of each line, parallel to `lines`.
     pub(super) selectable: Vec<std::ops::Range<usize>>,
     tool_headers: Vec<(usize, ToolRow)>,
 }
 
+/// The last conversation built, kept while nothing it shows changes, so
+/// scrolling and moving the mouse do not build it again.
+#[derive(Default)]
+pub(in crate::tui) struct ConversationCache(RefCell<Option<(u64, Rc<Conversation>)>>);
+
 /// The rendered conversation at `width` text columns.
-pub(super) fn conversation_for(app: &App, width: usize) -> Conversation {
-    conversation_lines(app, width)
+pub(super) fn conversation_for(app: &App, width: usize) -> Rc<Conversation> {
+    let key = fingerprint(app, width);
+    let mut cache = app.conversation.0.borrow_mut();
+    if let (Some(key), Some((cached, conversation))) = (key, cache.as_ref())
+        && key == *cached
+    {
+        return conversation.clone();
+    }
+    let conversation = Rc::new(conversation_lines(app, width));
+    *cache = key.map(|key| (key, conversation.clone()));
+    conversation
+}
+
+/// Everything `conversation_lines` reads, hashed. Each entry stands in by
+/// its revision, which changes whenever its rendered lines are dropped.
+/// `None` when script elements are attached to entries: those can change
+/// with no trace here, so the conversation is built every time.
+fn fingerprint(app: &App, width: usize) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    (width, app.entries.len(), app.actions.len()).hash(&mut hasher);
+    for entry in &app.entries {
+        if entry
+            .decoration
+            .as_ref()
+            .is_some_and(|d| !d.before.is_empty() || !d.after.is_empty())
+        {
+            return None;
+        }
+        (entry.revision(), entry.group_open).hash(&mut hasher);
+    }
+    app.pending.hash(&mut hasher);
+    if app.pending {
+        let elapsed = app.started_at().map(|started| started.elapsed().as_secs());
+        (spinner_frame(app), elapsed, &app.streamed).hash(&mut hasher);
+    }
+    (&app.queue, app.queue_held).hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 impl Conversation {
@@ -121,7 +166,15 @@ fn with_gutter(glyph: &str, color: Color, body: Vec<Line<'static>>) -> Vec<Line<
     lines
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Conversations built on this thread, so a test can see the cache work.
+    pub(in crate::tui) static BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn conversation_lines(app: &App, width: usize) -> Conversation {
+    #[cfg(test)]
+    BUILDS.with(|builds| builds.set(builds.get() + 1));
     let body_width = width.saturating_sub(GUTTER).max(1);
     let mut lines = Vec::new();
     let mut selectable = Vec::new();
@@ -1107,7 +1160,7 @@ fn output_preview(body: &str, width: usize, rows: usize) -> Vec<Line<'static>> {
 /// How far the conversation can scroll up on `screen`.
 pub(in crate::tui) fn max_scroll(app: &App, screen: Rect) -> usize {
     let inner = conversation_inner(screen_rows(screen, app)[1]);
-    conversation_lines(app, inner.width.saturating_sub(1).max(1) as usize)
+    conversation_for(app, inner.width.saturating_sub(1).max(1) as usize)
         .lines
         .len()
         .saturating_sub(inner.height as usize)
@@ -1129,12 +1182,13 @@ pub(in crate::tui) fn clickable_at(
     if x < inner.x || x >= inner.right() || y < inner.y || y >= inner.bottom() {
         return None;
     }
-    let conversation = conversation_lines(app, inner.width.saturating_sub(1).max(1) as usize);
+    let conversation = conversation_for(app, inner.width.saturating_sub(1).max(1) as usize);
     let line = conversation.offset(inner.height, app.scroll) + usize::from(y - inner.y);
     conversation
         .tool_headers
-        .into_iter()
+        .iter()
         .find(|(header, _)| line == *header)
+        .copied()
 }
 
 /// Marks a clickable row as under the mouse, in the same color an open row
@@ -1162,7 +1216,7 @@ fn active(line: &mut Line<'static>) {
 pub(in crate::tui) fn toggle_tool(app: &mut App, screen: Rect, row: ToolRow) {
     let inner = conversation_inner(screen_rows(screen, app)[1]);
     let width = inner.width.saturating_sub(1).max(1) as usize;
-    let before = conversation_lines(app, width).offset(inner.height, app.scroll);
+    let before = conversation_for(app, width).offset(inner.height, app.scroll);
     match row {
         ToolRow::Entry(index) => {
             if !app
@@ -1183,7 +1237,7 @@ pub(in crate::tui) fn toggle_tool(app: &mut App, screen: Rect, row: ToolRow) {
         }
     }
     app.selection = None;
-    let after = conversation_lines(app, width);
+    let after = conversation_for(app, width);
     let Some(&(header, _)) = after.tool_headers.iter().find(|(_, target)| *target == row) else {
         return;
     };
