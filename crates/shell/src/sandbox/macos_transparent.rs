@@ -470,7 +470,10 @@ async fn admit_dst(ip: IpAddr, set: &SharedSet, host_grants: &[Permission]) -> b
 ///   reverse DNS (the common case); hosts without matching PTR records are the
 ///   one place macOS is less capable than Linux's direct DNS interception.
 fn resolve_admit(ip: IpAddr, host_grants: &[Permission]) -> bool {
-    use crate::dns_pin::{Resolve, SystemResolver, name_allowed};
+    use crate::dns_pin::{Resolve, SystemResolver, host_bound, name_allowed};
+    if host_bound(ip) {
+        return false;
+    }
     let resolver = SystemResolver;
     let mut has_wildcard = false;
     for g in host_grants {

@@ -59,6 +59,25 @@ pub fn split_grants(net_hosts: &[Permission]) -> (Vec<Permission>, Vec<IpAddr>) 
 /// Whether any host grant covers `name`, using the exact `Permission::covers`
 /// semantics the permission engine uses (so `net:*.example.com`, `net:*`, and
 /// exact matches behave identically to `ctx.http`).
+/// An address a name must never lead to: the host itself, the link, or
+/// nowhere. A `net:example.com` grant means the Internet host by that name;
+/// a name that resolves to 127.0.0.1 or 169.254.169.254 would otherwise hand
+/// the child the daemon's own API, local databases or cloud metadata. Such
+/// addresses are reachable only through a literal `net:<ip>` grant.
+pub fn host_bound(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => host_bound(IpAddr::V4(v4)),
+            None => {
+                v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || v6.is_unicast_link_local()
+            }
+        },
+    }
+}
+
 pub fn name_allowed(host_grants: &[Permission], name: &str) -> bool {
     let want = Permission::new(format!("net:{}", name.to_ascii_lowercase()));
     host_grants.iter().any(|g| g.covers(&want))

@@ -47,7 +47,8 @@ pub fn handle_dns(
     if !name_allowed(host_grants, &q.name) {
         return Some(dns_wire::build_nxdomain(&q));
     }
-    let ips = resolver.resolve(&q.name).unwrap_or_default();
+    let mut ips = resolver.resolve(&q.name).unwrap_or_default();
+    ips.retain(|ip| !crate::dns_pin::host_bound(*ip));
     if !ips.is_empty() {
         let mut s = set.lock().unwrap();
         let now = Instant::now();
@@ -88,6 +89,26 @@ mod tests {
     }
     fn shared() -> SharedSet {
         Arc::new(Mutex::new(PermitSet::new(SetConfig::default())))
+    }
+
+    #[test]
+    fn names_never_lead_to_the_host_itself() {
+        let set = shared();
+        let mut map = HashMap::new();
+        map.insert(
+            "rebind.example.com".to_string(),
+            vec![ip("127.0.0.1"), ip("169.254.169.254"), ip("::1"), ip("93.184.216.34")],
+        );
+        let up = MapResolver(map);
+        let q = build_query(1, "rebind.example.com", TYPE_A);
+
+        let resp = handle_dns(&q, &[perm("net:*")], &set, &up, Duration::from_secs(60)).unwrap();
+
+        assert!(!admit(ip("127.0.0.1"), &set));
+        assert!(!admit(ip("169.254.169.254"), &set));
+        assert!(!admit(ip("::1"), &set));
+        assert!(admit(ip("93.184.216.34"), &set));
+        assert_eq!(parse_answers(&resp), vec![ip("93.184.216.34")]);
     }
 
     #[test]
