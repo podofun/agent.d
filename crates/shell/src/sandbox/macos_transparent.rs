@@ -20,7 +20,6 @@
 
 #![cfg(target_os = "macos")]
 
-use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -289,8 +288,8 @@ pub(crate) async fn run_contained(
     }
     let out_task = tokio::task::spawn_blocking(move || read_fd_to_end(stdout_rd));
     let err_task = tokio::task::spawn_blocking(move || read_fd_to_end(stderr_rd));
-    let stdout = String::from_utf8_lossy(&out_task.await.unwrap_or_default()).into_owned();
-    let stderr_text = String::from_utf8_lossy(&err_task.await.unwrap_or_default()).into_owned();
+    let stdout = out_task.await.unwrap_or_default().into_text();
+    let stderr_text = err_task.await.unwrap_or_default().into_text();
 
     // Child's stdio closed → reap it via the broker for the exit code. The
     // broker blocks until the child exits, so wait off the async workers. After
@@ -390,14 +389,12 @@ fn demap(a: SocketAddr) -> SocketAddr {
     }
 }
 
-fn read_fd_to_end(fd: RawFd) -> Vec<u8> {
+fn read_fd_to_end(fd: RawFd) -> crate::output::Capped {
     // SAFETY: `fd` is a stdout/stderr read end received from the broker via
     // SCM_RIGHTS and owned here; adopting it into a File gives buffered reads
     // and RAII close. No safe constructor exists for an out-of-band fd.
-    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mut v = Vec::new();
-    let _ = f.read_to_end(&mut v);
-    v
+    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+    crate::output::Capped::read_sync(f)
 }
 
 /// Receive `n` file descriptors via `SCM_RIGHTS` (plus the broker's dummy byte).
