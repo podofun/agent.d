@@ -353,7 +353,7 @@ async fn handle_browser_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Tab | KeyCode::Right => app.tab = app.tab.next(),
         KeyCode::BackTab | KeyCode::Left => app.tab = app.tab.previous(),
-        KeyCode::F(5) => app.refresh().await,
+        KeyCode::F(5) => app.refresh_in_background(),
         KeyCode::Up => app.move_selection(-1, true),
         KeyCode::Down => app.move_selection(1, true),
         KeyCode::PageUp => app.move_selection(-10, false),
@@ -416,7 +416,7 @@ async fn handle_chat_key(app: &mut App, key: KeyEvent, screen: Rect) -> Result<O
             app.jump_to_bottom();
         }
         KeyCode::End if app.input.is_empty() => app.jump_to_bottom(),
-        KeyCode::F(5) => app.refresh().await,
+        KeyCode::F(5) => app.refresh_in_background(),
         KeyCode::BackTab => {
             if let Err(error) = app.cycle_approval_mode().await {
                 app.fail(error.to_string());
