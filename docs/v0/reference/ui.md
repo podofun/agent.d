@@ -30,8 +30,6 @@ ui.on("chat", function(chat, ctx)
 end)
 ```
 
-The button's program needs a grant, like any `ctx.shell` call. UI handlers use the grants in `[tool.ui]`, described under [Permissions](#permissions).
-
 ## Chats and documents
 
 A chat is one connected client window. Your handlers receive it as `chat`:
@@ -59,7 +57,7 @@ A chat is one connected client window. Your handlers receive it as `chat`:
 | `session` | `fn(chat, ctx)` | A chat opens another session or starts a new one |
 | `entry` | `fn(entry, chat, ctx)` | A chat shows a conversation entry, including when it reopens a session |
 
-The `ctx` a handler receives acts for that chat: `ctx.caller` names its interface, user and session, relative paths start in the chat's folder, and `{cwd}` grants point at that folder.
+The `ctx` a handler receives acts for that chat: `ctx.caller` names its interface, user and session, and relative paths start in the chat's folder.
 
 ## Elements
 
@@ -289,20 +287,13 @@ agentd.ui.on("chat", function(chat)
 end)
 ```
 
-The program starts in the chat's folder, on the daemon's machine, in the same sandbox as `ctx.shell`, with the same denials and approval questions, and keeps running until its element is destroyed or the chat closes. A chat that has not chosen a folder yet opens its terminals after the first message. Clients receive the screen as a grid of characters and colours, so a program's output reaches your terminal only as text. Click a pane to type into it, and press Ctrl+Q to leave it.
+The program starts in the chat's folder when it has one, on the daemon's machine, and keeps running until its element is destroyed or the chat closes. Clients receive the screen as a grid of characters and colours, so a program's output reaches your terminal only as text. Click a pane to type into it, and press Ctrl+Q to leave it.
 
-Terminal panes run on Linux and macOS. A pane cannot reach the network inside the sandbox, so a program that needs a `net:` grant is refused with a note.
+Terminal panes run on Linux, macOS and Windows.
 
 ## Permissions
 
-Using `agentd.ui` needs no grant. What handlers and terminal panes do with `ctx` uses the grants in `[tool.ui]`, where `{cwd}` is the chat's folder:
-
-```toml
-[tool.ui]
-granted = ["shell.exec:git", "shell.exec:lazygit", "fs.read:{cwd}/**", "fs.write:{cwd}/**"]
-```
-
-Anything else asks you first, as it would for an action, and "allow from now on" adds it to `[tool.ui]`.
+UI code is code you write to customize your client, so nothing restricts it. Using `agentd.ui` needs no grant, and handlers and terminal panes run without grants, sandbox or approval questions. Grants and the sandbox are for what the agent calls.
 
 ## Errors and hot reload
 
