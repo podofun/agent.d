@@ -4757,36 +4757,35 @@ impl Registry for LuaHost {
         let svc_name = name.to_string();
         // Services don't declare a cwd of their own yet; inherit the caller's
         // (usually none → falls back to the workspace root at resolve time).
-        let cwd = {
-            let lua_g = lua.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let ws = lua_g
-                .app_data_ref::<WorkspaceRoot>()
-                .and_then(|w| w.0.clone());
-            ctx.cwd
-                .clone()
-                .map(|s| resolve_cwd(ws.as_deref(), &s))
-                .or(ws)
-        };
-        let ctx_for_drive = ActiveContext {
-            caller: ctx.caller.clone(),
-            effective_grants: normalize_path_grants(&resolve_relative_grants(
-                &substitute_cwd(&ctx.effective_grants, ctx.caller.cwd.as_deref()),
-                cwd.as_deref(),
-            )),
-            call_chain: ctx.call_chain.clone(),
-            grant_kind: Some("service".to_string()),
-            grant_name: Some(svc_name.clone()),
-            cwd,
-            cwd_stack: Vec::new(),
-            ..Default::default()
-        };
-
-        let thread = {
+        // Everything that needs the Lua mutex happens off the runtime: a
+        // long step elsewhere would otherwise pin this worker thread.
+        let (thread, ctx_for_drive) = {
             let lua = lua.clone();
             let catalog = catalog.clone();
             let svc_name = svc_name.clone();
-            tokio::task::spawn_blocking(move || -> Result<mlua::Thread, RegistryError> {
+            tokio::task::spawn_blocking(move || -> Result<(mlua::Thread, ActiveContext), RegistryError> {
                 let lua_g = lua.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let ws = lua_g
+                    .app_data_ref::<WorkspaceRoot>()
+                    .and_then(|w| w.0.clone());
+                let cwd = ctx
+                    .cwd
+                    .clone()
+                    .map(|s| resolve_cwd(ws.as_deref(), &s))
+                    .or(ws);
+                let ctx_for_drive = ActiveContext {
+                    caller: ctx.caller.clone(),
+                    effective_grants: normalize_path_grants(&resolve_relative_grants(
+                        &substitute_cwd(&ctx.effective_grants, ctx.caller.cwd.as_deref()),
+                        cwd.as_deref(),
+                    )),
+                    call_chain: ctx.call_chain.clone(),
+                    grant_kind: Some("service".to_string()),
+                    grant_name: Some(svc_name.clone()),
+                    cwd,
+                    cwd_stack: Vec::new(),
+                    ..Default::default()
+                };
                 let cat = catalog.read().unwrap();
                 let key = cat
                     .services
@@ -4797,7 +4796,7 @@ impl Registry for LuaHost {
                     .map_err(|e| RegistryError::Invocation(e.to_string()))?;
                 let thread = ctx_thread(&lua_g, func, false)
                     .map_err(|e| RegistryError::Invocation(e.to_string()))?;
-                Ok(thread)
+                Ok((thread, ctx_for_drive))
             })
             .await
             .map_err(|e| RegistryError::Invocation(format!("the Lua execution task ended unexpectedly ({e}) — this is a bug in agentd, please report it")))??

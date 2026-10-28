@@ -234,7 +234,10 @@ async fn run(cli: Cli, env_secrets: agentd_secrets::EnvStore) -> Result<()> {
         packages_root,
     };
 
-    let built = build_runtime(&cfg, &shared)?;
+    // init.lua may block at top level (await, channel recv, shell). Those
+    // bindings call Handle::block_on, which panics inside an async context,
+    // so evaluate it on a blocking thread.
+    let built = tokio::task::block_in_place(|| build_runtime(&cfg, &shared))?;
     tracing::debug!(
         init = %cfg.init_file.display(),
         actions = built.host.list().len(),
