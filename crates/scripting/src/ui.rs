@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use agentd_permissions::{Caller, PermissionSet};
+use agentd_permissions::Caller;
 use agentd_shell::ExecRequest;
 use agentd_ui::{
     CORE_ELEMENTS, Chat, ChatId, EntryDecoration, EntryInfo, Event, Hub, NodeId, Op, Props, parts,
@@ -19,17 +19,13 @@ use mlua::{
 
 use crate::{ActiveContext, CtxTable, scheduler};
 
-/// The grants UI handlers act with: those of `[tool.ui]`.
-pub type UiGrants = Arc<dyn Fn() -> PermissionSet + Send + Sync>;
-
-/// Set by the daemon: the hub every chat lives in, and the grants a chat's
-/// `ctx` acts with.
+/// Set by the daemon: the hub every chat lives in.
 #[derive(Clone, Default)]
-pub(crate) struct UiLink(Option<(Arc<Hub>, UiGrants)>);
+pub(crate) struct UiLink(Option<Arc<Hub>>);
 
 impl UiLink {
-    pub(crate) fn new(hub: Arc<Hub>, grants: UiGrants) -> Self {
-        Self(Some((hub, grants)))
+    pub(crate) fn new(hub: Arc<Hub>) -> Self {
+        Self(Some(hub))
     }
 }
 
@@ -88,7 +84,7 @@ pub(crate) fn frames_guard(lua: &Lua) -> mlua::Result<()> {
 
 fn hub(lua: &Lua) -> mlua::Result<Arc<Hub>> {
     lua.app_data_ref::<UiLink>()
-        .and_then(|l| l.0.as_ref().map(|(hub, _)| hub.clone()))
+        .and_then(|l| l.0.clone())
         .ok_or_else(|| fail("agentd.ui needs the daemon, so it is not available here"))
 }
 
@@ -144,8 +140,9 @@ fn ctx_table(lua: &Lua) -> mlua::Result<Table> {
 }
 
 /// The `ctx` a chat's handlers act with: its interface, user, session and
-/// folder, and the grants of `[tool.ui]` with `{cwd}` set to the folder.
-fn chat_context(lua: &Lua, chat: &Chat) -> ActiveContext {
+/// folder. UI code is written by people to customize a client, so nothing
+/// restricts it: no grants, no sandbox and no denials.
+fn chat_context(chat: &Chat) -> ActiveContext {
     let info = chat.info();
     let mut caller = Caller::interface(info.interface.as_str())
         .with_session(info.session.clone().unwrap_or(info.connection.clone()));
@@ -154,24 +151,11 @@ fn chat_context(lua: &Lua, chat: &Chat) -> ActiveContext {
     }
     caller.session_id = info.session.clone();
     caller.cwd = info.folder.clone();
-    let granted = lua
-        .app_data_ref::<UiLink>()
-        .and_then(|l| l.0.as_ref().map(|(_, grants)| grants()))
-        .unwrap_or_default();
-    let cwd = info.folder.as_ref().map(PathBuf::from).or_else(|| {
-        lua.app_data_ref::<crate::WorkspaceRoot>()
-            .and_then(|w| w.0.clone())
-    });
     ActiveContext {
-        effective_grants: crate::normalize_path_grants(&crate::resolve_relative_grants(
-            &crate::substitute_cwd(&granted, info.folder.as_deref()),
-            cwd.as_deref(),
-        )),
         call_chain: vec!["ui".into()],
-        grant_kind: Some("tool".into()),
-        grant_name: Some("ui".into()),
+        cwd: info.folder.as_ref().map(PathBuf::from),
         caller,
-        cwd,
+        unrestricted: true,
         ..Default::default()
     }
 }
@@ -644,7 +628,7 @@ fn open_terminal(lua: &Lua, chat: &Chat, node: NodeId) -> mlua::Result<()> {
     let _ = spawner.send(scheduler::AsyncTask {
         thread,
         state: scheduler::AsyncHandleState::new(),
-        ctx: chat_context(lua, chat),
+        ctx: chat_context(chat),
     });
     Ok(())
 }
@@ -666,21 +650,16 @@ fn terminal_open_binding(lua: &Lua, (chat_id, node): (ChatId, NodeId)) -> mlua::
         )
     })?;
     let argv = argv.ok_or_else(|| fail(format!("there is no terminal named `{name}`")))?;
-    let Some(folder) = chat.info().folder else {
-        return Err(fail(
-            "This chat has no folder yet, so the terminal opens after the first message.",
-        ));
-    };
-    let mut req = ExecRequest {
+    // A terminal pane is UI code, so it runs unrestricted.
+    let req = ExecRequest {
         bin: argv[0].clone(),
         args: argv[1..].to_vec(),
-        cwd: Some(PathBuf::from(folder)),
+        cwd: chat.info().folder.map(PathBuf::from),
         stdin: None,
         separate_stderr: false,
         timeout_ms: None,
         sandbox: None,
     };
-    crate::prepare_exec(lua, &mut req)?;
     let (width, height) = size.unwrap_or((80, 24));
     let pty = agentd_shell::spawn_pty(&req, width, height).map_err(|e| fail(e.to_string()))?;
     chat.open_terminal(
@@ -1229,7 +1208,7 @@ impl LuaUi {
                 tokio::task::spawn_blocking(move || {
                     let lua = lua.lock().unwrap();
                     let threads = prepare(&lua, &chat, job);
-                    (threads, chat_context(&lua, &chat))
+                    (threads, chat_context(&chat))
                 })
                 .await
             };

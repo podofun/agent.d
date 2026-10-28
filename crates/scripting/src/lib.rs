@@ -35,7 +35,6 @@ use async_trait::async_trait;
 use mlua::{Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Table, Value};
 use walkdir::WalkDir;
 
-pub use ui::UiGrants;
 
 #[derive(Debug, Clone, Default)]
 struct ActionMeta {
@@ -99,6 +98,15 @@ pub(crate) struct ActiveContext {
     /// Secrets read in this execution, as `(name, value)`, replaced by their
     /// names in any question it raises.
     pub(crate) secrets_read: Vec<(String, String)>,
+    /// Code a person wrote to customize a client (`agentd.ui` handlers):
+    /// no grants, no sandbox and no denials apply to it.
+    pub(crate) unrestricted: bool,
+}
+
+/// Whether the running code is a person's UI code, which nothing restricts.
+pub(crate) fn unrestricted(lua: &Lua) -> bool {
+    lua.app_data_ref::<ActiveContext>()
+        .is_some_and(|active| active.unrestricted)
 }
 
 /// Where `import("name")` resolves installed packages. Set by the daemon.
@@ -431,11 +439,10 @@ impl LuaHost {
         lua.set_app_data(scheduler::AsyncTaskSpawner(tx));
     }
 
-    /// Connect `agentd.ui` to the daemon's chats. `grants` gives the grants
-    /// a chat's handlers act with, those of `[tool.ui]`.
-    pub fn set_ui(&self, hub: Arc<agentd_ui::Hub>, grants: UiGrants) {
+    /// Connect `agentd.ui` to the daemon's chats.
+    pub fn set_ui(&self, hub: Arc<agentd_ui::Hub>) {
         let lua = self.lua.lock().unwrap();
-        lua.set_app_data(ui::UiLink::new(hub, grants));
+        lua.set_app_data(ui::UiLink::new(hub));
     }
 
     /// This runtime's scripts, for [`agentd_ui::Hub::set_script`].
@@ -2292,6 +2299,16 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
 /// The checks every program goes through before it starts: denials, the
 /// grant for its binary (or a question), and the sandbox it runs in.
 pub(crate) fn prepare_exec(lua: &Lua, req: &mut ExecRequest) -> mlua::Result<()> {
+    if unrestricted(lua) {
+        ui::frames_guard(lua)?;
+        if req.cwd.is_none() {
+            req.cwd = lua
+                .app_data_ref::<ActiveContext>()
+                .and_then(|active| active.cwd.clone());
+        }
+        req.sandbox = None;
+        return Ok(());
+    }
     // Per-binary scoping. A bare `shell.exec` grant authorizes any binary
     // (legacy/broad); a scoped `shell.exec:<bin>` (or holder wildcard like
     // `shell.exec:*`) authorizes just that binary. Allow if EITHER is held —
@@ -3112,9 +3129,13 @@ fn redirect_check(lua: &Lua) -> mlua::Result<RedirectCheck> {
         .app_data_ref::<ActiveContext>()
         .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state. This is a bug in agentd, please report it"))?;
     let grants = active.effective_grants.clone();
+    let unrestricted = active.unrestricted;
     drop(active);
     let denied = denials(lua);
     Ok(Arc::new(move |url: &str| {
+        if unrestricted {
+            return Ok(());
+        }
         let host = host_of(url).map_err(|e| e.to_string())?;
         let needed = Permission::new(format!("net:{host}"));
         if denied
@@ -4394,6 +4415,9 @@ const HOST_FIX: &str = "A sandbox cannot tell a denied host apart from the hosts
 
 pub(crate) fn refuse_if_denied(lua: &Lua, req: &Permission) -> mlua::Result<()> {
     ui::frames_guard(lua)?;
+    if unrestricted(lua) {
+        return Ok(());
+    }
     match denials(lua) {
         Some(d) if is_denied(d.as_ref(), req) => Err(hard_denial(&format!("`{}`", req.as_str()))),
         _ => Ok(()),
@@ -4434,6 +4458,9 @@ fn check_inline(
     what: &str,
 ) -> mlua::Result<()> {
     ui::frames_guard(lua)?;
+    if unrestricted(lua) {
+        return Ok(());
+    }
     refuse_if_denied(lua, req)?;
     let key = pass_key(req, detail.as_ref());
     {
