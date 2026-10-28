@@ -167,7 +167,7 @@ fn chat_context(lua: &Lua, chat: &Chat) -> ActiveContext {
             &crate::substitute_cwd(&granted, info.folder.as_deref()),
             cwd.as_deref(),
         )),
-        call_chain: vec![format!("ui:{}", info.interface)],
+        call_chain: vec!["ui".into()],
         grant_kind: Some("tool".into()),
         grant_name: Some("ui".into()),
         caller,
@@ -222,7 +222,8 @@ pub(crate) fn install(lua: &Lua, agentd: &Table) -> mlua::Result<()> {
     let open = crate::yieldable_wrap(lua, lua.create_function(terminal_open_binding)?)?;
     let note = lua.create_function(|lua, (chat_id, text): (ChatId, String)| {
         if let Ok(chat) = chat(lua, chat_id) {
-            chat.note(&format!("A terminal did not start. {text}"));
+            let (message, _) = crate::luaerr::split_lua_error(&text);
+            chat.note(&format!("A terminal did not start. {message}"));
         }
         Ok(())
     })?;
@@ -667,7 +668,7 @@ fn terminal_open_binding(lua: &Lua, (chat_id, node): (ChatId, NodeId)) -> mlua::
     let argv = argv.ok_or_else(|| fail(format!("there is no terminal named `{name}`")))?;
     let Some(folder) = chat.info().folder else {
         return Err(fail(
-            "this chat has no folder yet, so it opens once the chat has one",
+            "This chat has no folder yet, so the terminal opens after the first message.",
         ));
     };
     let mut req = ExecRequest {
