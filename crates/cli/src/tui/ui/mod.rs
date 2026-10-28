@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use unicode_width::UnicodeWidthStr;
 
-use super::app::{App, Tab};
+use super::app::{App, Request, Tab};
 
 mod approval;
 mod browser;
@@ -46,9 +46,14 @@ pub(super) fn palette() -> markdown::Palette {
 }
 
 pub(super) fn spinner_frame(app: &App) -> &'static str {
-    let tick = app
-        .started_at()
-        .map_or(0, |started| started.elapsed().as_millis() / 120);
+    // Outside a run, such as while a chat loads, it turns with the clock.
+    let millis = match app.started_at() {
+        Some(started) => started.elapsed().as_millis(),
+        None => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis()),
+    };
+    let tick = millis / 120;
     SPINNER[(tick % SPINNER.len() as u128) as usize]
 }
 
@@ -134,14 +139,16 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ));
     }
     let offline = Line::styled("  offline  ", Style::default().fg(ERROR));
-    let reserved = if app.connected {
+    // Not offline yet while the first lists load.
+    let offline_shown = !app.connected && !app.loading(Request::Lists);
+    let reserved = if !offline_shown {
         0
     } else {
         offline.width() as u16
     };
     let main = Rect::new(area.x, area.y, area.width.saturating_sub(reserved), 1);
     frame.render_widget(Paragraph::new(Line::from(spans)), main);
-    if !app.connected && reserved < area.width {
+    if offline_shown && reserved < area.width {
         frame.render_widget(
             Paragraph::new(offline),
             Rect::new(main.right(), area.y, reserved, 1),
@@ -209,7 +216,9 @@ fn draw_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
             1,
         ),
     );
-    let hints: &[&str] = if app.connected {
+    let hints: &[&str] = if !app.connected && app.loading(Request::Lists) {
+        &["Connecting…"]
+    } else if app.connected {
         &[
             "Type a message to start",
             "Ctrl+P picks a runner or resumes a chat",

@@ -24,7 +24,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 
-use app::{App, Tab};
+use app::{App, Request, Tab};
 use commands::picker_title;
 
 struct Screen(Terminal<CrosstermBackend<std::io::Stdout>>);
@@ -81,11 +81,9 @@ pub(crate) async fn run(
         return Err(anyhow!("interactive chat needs a terminal"));
     }
     let mut app = App::new(base, timeout, runner);
-    app.refresh().await;
-    if let Some(id) = session
-        && let Err(error) = app.open_session(&id).await
-    {
-        app.fail(format!("Could not open session: {error:#}"));
+    app.refresh();
+    if let Some(id) = session {
+        app.open(&id);
     }
     control::start(
         base.to_owned(),
@@ -167,7 +165,10 @@ pub(crate) async fn run(
                     dirty = true;
                 }
             }
-            _ = spinner.tick(), if app.pending || app.animating() || app.drag.is_some() => {
+            _ = spinner.tick(), if app.pending
+                || app.animating()
+                || app.drag.is_some()
+                || app.loading(Request::Open) => {
                 // A drag held above or below the conversation keeps scrolling.
                 if app.drag.is_some() {
                     let size = screen.0.size()?;
@@ -334,7 +335,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, screen: Rect) -> Result<bool> 
         return Ok(false);
     }
     if app.tab != Tab::Chat {
-        handle_browser_key(app, key).await;
+        handle_browser_key(app, key);
         return Ok(false);
     }
     if handle_suggestion_key(app, key) {
@@ -583,7 +584,7 @@ fn handle_approval_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-async fn handle_browser_key(app: &mut App, key: KeyEvent) {
+fn handle_browser_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc if !app.query.is_empty() => app.set_query(String::new()),
         KeyCode::Esc => app.tab = Tab::Chat,
@@ -599,14 +600,14 @@ async fn handle_browser_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Tab | KeyCode::Right => app.tab = app.tab.next(),
         KeyCode::BackTab | KeyCode::Left => app.tab = app.tab.previous(),
-        KeyCode::F(5) => app.refresh().await,
+        KeyCode::F(5) => app.refresh(),
         KeyCode::Up => app.move_selection(-1, true),
         KeyCode::Down => app.move_selection(1, true),
         KeyCode::PageUp => app.move_selection(-10, false),
         KeyCode::PageDown => app.move_selection(10, false),
         KeyCode::Home => app.move_selection(isize::MIN / 2, false),
         KeyCode::End => app.move_selection(isize::MAX / 2, false),
-        KeyCode::Enter => app.activate_selected().await,
+        KeyCode::Enter => app.activate_selected(),
         _ => {}
     }
 }
@@ -662,12 +663,8 @@ async fn handle_chat_key(app: &mut App, key: KeyEvent, screen: Rect) -> Result<O
             app.jump_to_bottom();
         }
         KeyCode::End if app.input.is_empty() => app.jump_to_bottom(),
-        KeyCode::F(5) => app.refresh().await,
-        KeyCode::BackTab => {
-            if let Err(error) = app.cycle_approval_mode().await {
-                app.fail(error.to_string());
-            }
-        }
+        KeyCode::F(5) => app.refresh(),
+        KeyCode::BackTab => app.cycle_approval_mode(),
         KeyCode::PageUp => scroll_up(app, screen, 8),
         KeyCode::PageDown => scroll_down(app, 8),
         KeyCode::Char('n') if control => {
@@ -1242,6 +1239,61 @@ mod tests {
         assert_eq!(app.scroll, top);
         scroll_down(&mut app, 3);
         assert_eq!(app.scroll, top - 3, "scrolling down moves at once");
+    }
+
+    #[tokio::test]
+    async fn opening_a_chat_shows_it_loading_and_the_newest_open_wins() {
+        let mut app = App::new("http://127.0.0.1:9", 1000, None);
+        app.sessions = vec![serde_json::json!({ "id": "first", "label": "First" })];
+        app.tab = Tab::Sessions;
+        let screen = Rect::new(0, 0, 80, 24);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.tab, Tab::Chat, "the browser closes at once");
+        let text: String = render(&app, 80, 24)
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Loading conversation…"), "{text}");
+
+        let first = app.requests[&Request::Open].0;
+        app.submit("/open second").await.unwrap();
+        let second = app.requests[&Request::Open].0;
+        let session = |id: &str| {
+            Ok(app::Loaded::Session(serde_json::json!({
+                "id": id,
+                "turns": [{ "role": "user", "content": format!("hi from {id}") }],
+            })))
+        };
+        app.apply(app::Update::Loaded {
+            request: Request::Open,
+            id: first,
+            result: session("first"),
+        });
+        assert!(app.session.is_none(), "a replaced open is dropped");
+        app.apply(app::Update::Loaded {
+            request: Request::Open,
+            id: second,
+            result: session("second"),
+        });
+        assert_eq!(app.session.as_deref(), Some("second"));
+        assert!(!app.loading(Request::Open));
+        assert_eq!(app.entries[0].text, "hi from second");
+
+        app.open("third");
+        let third = app.requests[&Request::Open].0;
+        app.apply(app::Update::Loaded {
+            request: Request::Open,
+            id: third,
+            result: Err(anyhow!("session not found")),
+        });
+        assert!(!app.loading(Request::Open));
+        assert_eq!(
+            app.entries.last().unwrap().text,
+            "Could not open the chat: session not found"
+        );
     }
 
     #[tokio::test]

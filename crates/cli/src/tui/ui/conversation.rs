@@ -10,7 +10,7 @@ use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::super::app::{App, Entry, EntryKind, FileChange, ToolRow};
+use super::super::app::{App, Entry, EntryKind, FileChange, Request, ToolRow};
 use super::super::commands;
 use super::super::presentation;
 use super::{
@@ -19,7 +19,8 @@ use super::{
 };
 
 pub(super) fn draw_conversation(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    if app.entries.is_empty() && app.queue.is_empty() && !app.pending {
+    if app.entries.is_empty() && app.queue.is_empty() && !app.pending && !app.loading(Request::Open)
+    {
         super::draw_welcome(frame, app, area);
         return;
     }
@@ -91,8 +92,9 @@ fn fingerprint(app: &App, width: usize) -> Option<u64> {
         }
         (entry.revision(), entry.group_open).hash(&mut hasher);
     }
-    app.pending.hash(&mut hasher);
-    if app.pending {
+    let opening = app.loading(Request::Open);
+    (app.pending, opening).hash(&mut hasher);
+    if app.pending || opening {
         let elapsed = app.started_at().map(|started| started.elapsed().as_secs());
         (spinner_frame(app), elapsed, &app.streamed).hash(&mut hasher);
     }
@@ -274,6 +276,15 @@ fn conversation_lines(app: &App, width: usize) -> Conversation {
         // The live block changes every tick, so it is never selectable.
         selectable.extend(live.iter().map(|_| 0..0));
         lines.extend(live);
+    }
+    if app.loading(Request::Open) {
+        let loading = vec![Line::styled(
+            "Loading conversation…",
+            Style::default().fg(MUTED),
+        )];
+        let loading = with_gutter(spinner_frame(app), WARNING, loading);
+        selectable.extend(loading.iter().map(|_| 0..0));
+        lines.extend(loading);
     }
     for queued in &app.queue {
         lines.push(Line::raw(""));

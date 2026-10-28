@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use agentd_types::ApprovalRequest;
 use anyhow::{Context, Result, anyhow};
@@ -152,7 +152,50 @@ pub(super) enum Update {
     },
     /// A fresh session list for the browser.
     Sessions(Vec<Value>),
+    /// A request started with `App::start` finished.
+    Loaded {
+        request: Request,
+        id: u64,
+        result: Result<Loaded>,
+    },
 }
+
+/// A daemon request the chat waits for without holding up the keys. One
+/// of each runs at a time: a new one replaces the one still running.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) enum Request {
+    Lists,
+    Open,
+    Rename,
+    Approval,
+    Skill,
+}
+
+pub(super) enum Loaded {
+    Lists(Box<Lists>),
+    Session(Value),
+    Renamed {
+        response: Value,
+        name: String,
+        sessions: Option<Value>,
+    },
+    Approval(Option<&'static str>),
+    Skill(Value),
+}
+
+/// What the browser lists, as the daemon answered each list.
+pub(super) struct Lists {
+    branch: Option<String>,
+    runners: Result<WsResponse>,
+    sessions: Result<WsResponse>,
+    actions: Result<WsResponse>,
+    services: Result<WsResponse>,
+    skills: Result<WsResponse>,
+}
+
+const RENAMING: &str = "Renaming…";
+const CHANGING_APPROVAL: &str = "Changing approval…";
+const LOADING_SKILL: &str = "Loading skill…";
 
 pub(super) struct Decision {
     pub(super) id: u64,
@@ -261,6 +304,11 @@ pub(super) struct App {
     pub(super) script: ScriptUi,
     /// The conversation as last built, for scrolling and hovering.
     pub(super) conversation: ui::ConversationCache,
+    /// Requests in flight, each with its id and a handle to stop it.
+    pub(super) requests: HashMap<Request, (u64, tokio::task::AbortHandle)>,
+    next_request: u64,
+    /// The approval mode a running request is changing to.
+    approval_target: Option<Option<&'static str>>,
 }
 
 impl App {
@@ -324,6 +372,9 @@ impl App {
             received,
             script: ScriptUi::default(),
             conversation: ui::ConversationCache::default(),
+            requests: HashMap::new(),
+            next_request: 0,
+            approval_target: None,
         }
     }
 
@@ -461,10 +512,6 @@ impl App {
         self.suggestion_dismissed = None;
     }
 
-    async fn call(&self, method: &str, params: Value) -> Result<Value> {
-        daemon_call(&self.base, self.timeout, method, params).await
-    }
-
     /// Whether a second Ctrl+C now quits.
     pub(super) fn quit_armed(&self) -> bool {
         self.quit_pressed
@@ -477,16 +524,76 @@ impl App {
         self.runners.iter().find(|item| item["name"] == runner)?["model"].as_str()
     }
 
-    pub(super) async fn refresh(&mut self) {
-        self.branch = current_branch().await;
+    /// Run `work` in the background and report back with `Update::Loaded`,
+    /// stopping any request of the same kind still running.
+    fn start(
+        &mut self,
+        request: Request,
+        work: impl std::future::Future<Output = Result<Loaded>> + Send + 'static,
+    ) {
+        self.next_request += 1;
+        let id = self.next_request;
+        let tx = self.updates.clone();
+        let task = tokio::spawn(async move {
+            let result = work.await;
+            let _ = tx.send(Update::Loaded {
+                request,
+                id,
+                result,
+            });
+        });
+        if let Some((_, old)) = self.requests.insert(request, (id, task.abort_handle())) {
+            old.abort();
+        }
+    }
+
+    pub(super) fn loading(&self, request: Request) -> bool {
+        self.requests.contains_key(&request)
+    }
+
+    fn stop(&mut self, request: Request) {
+        if let Some((_, task)) = self.requests.remove(&request) {
+            task.abort();
+        }
+    }
+
+    /// Load the browser lists and the folder's branch.
+    pub(super) fn refresh(&mut self) {
+        let base = self.base.clone();
+        let timeout = self.timeout;
+        self.start(Request::Lists, async move {
+            let (branch, (runners, sessions, actions, services, skills)) =
+                tokio::join!(current_branch(), async {
+                    tokio::join!(
+                        ws_call(&base, timeout, "runners.list", Value::Null),
+                        ws_call(&base, timeout, "sessions.list", json!({})),
+                        ws_call(&base, timeout, "tools.list", Value::Null),
+                        ws_call(&base, timeout, "services.list", Value::Null),
+                        ws_call(&base, timeout, "skills.list", Value::Null),
+                    )
+                });
+            Ok(Loaded::Lists(Box::new(Lists {
+                branch,
+                runners,
+                sessions,
+                actions,
+                services,
+                skills,
+            })))
+        });
+    }
+
+    fn lists_loaded(&mut self, lists: Lists) {
+        let Lists {
+            branch,
+            runners,
+            sessions,
+            actions,
+            services,
+            skills,
+        } = lists;
+        self.branch = branch;
         let mut errors = Vec::new();
-        let (runners, sessions, actions, services, skills) = tokio::join!(
-            ws_call(&self.base, self.timeout, "runners.list", Value::Null),
-            ws_call(&self.base, self.timeout, "sessions.list", json!({})),
-            ws_call(&self.base, self.timeout, "tools.list", Value::Null),
-            ws_call(&self.base, self.timeout, "services.list", Value::Null),
-            ws_call(&self.base, self.timeout, "skills.list", Value::Null),
-        );
         for (method, target, result) in [
             ("runners.list", &mut self.runners, runners),
             ("sessions.list", &mut self.sessions, sessions),
@@ -596,7 +703,7 @@ impl App {
         };
     }
 
-    pub(super) async fn activate_selected(&mut self) {
+    pub(super) fn activate_selected(&mut self) {
         let Some((section, item)) = self
             .rows()
             .get(self.selected_index())
@@ -621,11 +728,7 @@ impl App {
                     return;
                 }
                 if let Some(id) = item["id"].as_str() {
-                    if let Err(error) = self.open_session(id).await {
-                        self.fail(error.to_string());
-                    } else {
-                        self.tab = Tab::Chat;
-                    }
+                    self.open(id);
                 }
             }
             Tab::Actions => {
@@ -636,10 +739,14 @@ impl App {
             }
             Tab::Skills => {
                 if let Some(name) = item["name"].as_str() {
-                    match self.call("skills.inspect", json!({ "name": name })).await {
-                        Ok(value) => self.push(EntryKind::Info, presentation::value(&value)),
-                        Err(error) => self.fail(error.to_string()),
-                    }
+                    let (base, timeout) = (self.base.clone(), self.timeout);
+                    let params = json!({ "name": name });
+                    self.notice = Some(LOADING_SKILL.into());
+                    self.start(Request::Skill, async move {
+                        daemon_call(&base, timeout, "skills.inspect", params)
+                            .await
+                            .map(Loaded::Skill)
+                    });
                     self.tab = Tab::Chat;
                 }
             }
@@ -648,6 +755,10 @@ impl App {
     }
 
     pub(super) fn new_chat(&mut self) {
+        for request in [Request::Open, Request::Rename, Request::Approval] {
+            self.stop(request);
+        }
+        self.approval_target = None;
         self.queue.clear();
         self.queue_held = false;
         self.session = None;
@@ -671,8 +782,21 @@ impl App {
         self.setting("runner", format!("Switched to {name}"));
     }
 
-    pub(super) async fn open_session(&mut self, id: &str) -> Result<()> {
-        let value = self.call("sessions.get", json!({ "id": id })).await?;
+    /// Show the chat with session `id`. The chat clears at once and shows
+    /// it loading; the session fills it in when it arrives.
+    pub(super) fn open(&mut self, id: &str) {
+        self.new_chat();
+        self.tab = Tab::Chat;
+        let (base, timeout) = (self.base.clone(), self.timeout);
+        let params = json!({ "id": id });
+        self.start(Request::Open, async move {
+            daemon_call(&base, timeout, "sessions.get", params)
+                .await
+                .map(Loaded::Session)
+        });
+    }
+
+    fn session_loaded(&mut self, value: Value) -> Result<()> {
         let session = value["id"]
             .as_str()
             .context("session has no id")?
@@ -680,7 +804,10 @@ impl App {
         if let Some(runner) = value["runner"].as_str() {
             self.runner = Some(runner.to_owned());
         }
+        // Messages typed while it loaded go to this chat.
+        let queue = std::mem::take(&mut self.queue);
         self.new_chat();
+        self.queue = queue;
         self.session = Some(session);
         self.session_label = value["label"].as_str().map(str::to_owned);
         self.approval_mode = match value["approval"].as_str() {
@@ -746,7 +873,7 @@ impl App {
             return self.command(command).await;
         }
         // Wait for the reply, or for a runner, and send it then.
-        if self.pending || self.runner.is_none() {
+        if self.pending || self.runner.is_none() || self.loading(Request::Open) {
             self.queue.push_back(input.to_owned());
             const NO_RUNNER: &str = "No runner selected. Pick one with Ctrl+P.";
             let shown = self.entries.last().is_some_and(|entry| {
@@ -875,12 +1002,6 @@ impl App {
             .unwrap_or(base)
     }
 
-    async fn refresh_sessions(&mut self) {
-        if let Ok(Value::Array(items)) = self.call("sessions.list", json!({})).await {
-            self.sessions = items;
-        }
-    }
-
     async fn command(&mut self, command: &str) -> Result<()> {
         let (verb, argument) = command.split_once(' ').unwrap_or((command, ""));
         let argument = argument.trim();
@@ -902,7 +1023,7 @@ impl App {
                         return Err(anyhow!("usage: /approval human|classifier|nobody|default"));
                     }
                 };
-                self.set_approval_mode(mode).await?;
+                self.set_approval_mode(mode);
             }
             "runner" => {
                 if self.pending {
@@ -921,15 +1042,21 @@ impl App {
                 if argument.is_empty() {
                     return Err(anyhow!("usage: /rename NAME"));
                 }
-                let renamed = self
-                    .call(
-                        "sessions.rename",
-                        json!({ "id": session, "label": argument }),
-                    )
-                    .await?;
-                self.session_label = renamed["label"].as_str().map(str::to_owned);
-                self.setting("name", format!("Renamed to {argument}"));
-                self.refresh_sessions().await;
+                let (base, timeout) = (self.base.clone(), self.timeout);
+                let params = json!({ "id": session, "label": argument });
+                let name = argument.to_owned();
+                self.notice = Some(RENAMING.into());
+                self.start(Request::Rename, async move {
+                    let response = daemon_call(&base, timeout, "sessions.rename", params).await?;
+                    let sessions = daemon_call(&base, timeout, "sessions.list", json!({}))
+                        .await
+                        .ok();
+                    Ok(Loaded::Renamed {
+                        response,
+                        name,
+                        sessions,
+                    })
+                });
             }
             "open" => {
                 if self.pending {
@@ -938,7 +1065,7 @@ impl App {
                 if argument.is_empty() {
                     return Err(anyhow!("usage: /open ID"));
                 }
-                self.open_session(argument).await?;
+                self.open(argument);
             }
             "call" => {
                 let (name, args) = argument.split_once(' ').unwrap_or((argument, "{}"));
@@ -1029,6 +1156,18 @@ impl App {
                 self.queue_held = true;
             }
             Update::Sessions(items) => self.sessions = items,
+            Update::Loaded {
+                request,
+                id,
+                result,
+            } => {
+                // A request that was replaced or stopped has nothing to say.
+                if self.requests.get(&request).map(|(current, _)| *current) != Some(id) {
+                    return;
+                }
+                self.requests.remove(&request);
+                self.loaded(request, result);
+            }
             Update::Ui(Remote::Ready(ready)) => self.script.ready(ready),
             Update::Ui(Remote::Frame(frame)) => {
                 self.script.receive(frame);
@@ -1144,7 +1283,11 @@ impl App {
     /// Whether the queue goes out now: a runner is set, no reply is running,
     /// and the queue did not just fail.
     pub(super) fn queue_ready(&self) -> bool {
-        !self.queue.is_empty() && !self.pending && !self.queue_held && self.runner.is_some()
+        !self.queue.is_empty()
+            && !self.pending
+            && !self.queue_held
+            && self.runner.is_some()
+            && !self.loading(Request::Open)
     }
 
     /// Send every queued message as one prompt, once a reply finished or a
@@ -1161,14 +1304,22 @@ impl App {
 
     /// Set who answers this chat's approval requests. Stored on the chat's
     /// session, so it applies to the next reply and survives reopening.
-    pub(super) async fn set_approval_mode(&mut self, mode: Option<&'static str>) -> Result<()> {
-        if let Some(session) = &self.session {
-            self.call(
-                "sessions.set_approval",
-                json!({ "id": session, "approval": mode }),
-            )
-            .await?;
-        }
+    pub(super) fn set_approval_mode(&mut self, mode: Option<&'static str>) {
+        let Some(session) = self.session.clone() else {
+            self.approval_changed(mode);
+            return;
+        };
+        let (base, timeout) = (self.base.clone(), self.timeout);
+        let params = json!({ "id": session, "approval": mode });
+        self.approval_target = Some(mode);
+        self.notice = Some(CHANGING_APPROVAL.into());
+        self.start(Request::Approval, async move {
+            daemon_call(&base, timeout, "sessions.set_approval", params).await?;
+            Ok(Loaded::Approval(mode))
+        });
+    }
+
+    fn approval_changed(&mut self, mode: Option<&'static str>) {
         self.approval_mode = mode;
         let label = match mode {
             Some("classifier") => "Auto mode",
@@ -1177,7 +1328,55 @@ impl App {
             None => "Default approval",
         };
         self.setting("approval", format!("Approval: {label}"));
-        Ok(())
+    }
+
+    /// Show what a finished request brought, or why it failed.
+    fn loaded(&mut self, request: Request, result: Result<Loaded>) {
+        let notice = match request {
+            Request::Rename => Some(RENAMING),
+            Request::Approval => Some(CHANGING_APPROVAL),
+            Request::Skill => Some(LOADING_SKILL),
+            Request::Lists | Request::Open => None,
+        };
+        if notice.is_some() && self.notice.as_deref() == notice {
+            self.notice = None;
+        }
+        if request == Request::Approval {
+            self.approval_target = None;
+        }
+        let result = result.and_then(|loaded| match loaded {
+            Loaded::Lists(lists) => {
+                self.lists_loaded(*lists);
+                Ok(())
+            }
+            Loaded::Session(value) => self.session_loaded(value),
+            Loaded::Renamed {
+                response,
+                name,
+                sessions,
+            } => {
+                self.session_label = response["label"].as_str().map(str::to_owned);
+                self.setting("name", format!("Renamed to {name}"));
+                if let Some(Value::Array(items)) = sessions {
+                    self.sessions = items;
+                }
+                Ok(())
+            }
+            Loaded::Approval(mode) => {
+                self.approval_changed(mode);
+                Ok(())
+            }
+            Loaded::Skill(value) => {
+                self.push(EntryKind::Info, presentation::value(&value));
+                Ok(())
+            }
+        });
+        if let Err(error) = result {
+            match request {
+                Request::Open => self.fail(format!("Could not open the chat: {error}")),
+                _ => self.fail(error.to_string()),
+            }
+        }
     }
 
     /// Show an error in the conversation.
@@ -1204,13 +1403,15 @@ impl App {
     }
 
     /// Shift+Tab: human, then classifier, then nobody, then back.
-    pub(super) async fn cycle_approval_mode(&mut self) -> Result<()> {
-        let next = match self.approval_mode {
+    pub(super) fn cycle_approval_mode(&mut self) {
+        // From the mode a request is changing to, so quick presses step on.
+        let current = self.approval_target.unwrap_or(self.approval_mode);
+        let next = match current {
             None | Some("human") => "classifier",
             Some("classifier") => "nobody",
             _ => "human",
         };
-        self.set_approval_mode(Some(next)).await
+        self.set_approval_mode(Some(next));
     }
 
     pub(super) fn cancel_run(&mut self) {
@@ -1988,9 +2189,9 @@ mod tests {
 
         app.submit("/approval nobody").await.unwrap();
         assert_eq!(app.approval_mode, Some("nobody"));
-        app.cycle_approval_mode().await.unwrap();
+        app.cycle_approval_mode();
         assert_eq!(app.approval_mode, Some("human"));
-        app.cycle_approval_mode().await.unwrap();
+        app.cycle_approval_mode();
         assert_eq!(app.approval_mode, Some("classifier"));
         app.submit("/approval default").await.unwrap();
         assert_eq!(app.approval_mode, None);
