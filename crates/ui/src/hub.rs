@@ -261,6 +261,7 @@ async fn frame_loop(hub: Arc<Hub>, chat: Arc<Chat>, tx: mpsc::Sender<Frame>) {
     let mut seq = 0u64;
     let mut backlog: Option<Frame> = None;
     let mut ahead_until = 0u64;
+    let mut resume = false;
     let mut touched: BTreeSet<(NodeId, bool, String)> = BTreeSet::new();
     loop {
         tick.tick().await;
@@ -280,9 +281,10 @@ async fn frame_loop(hub: Arc<Hub>, chat: Arc<Chat>, tx: mpsc::Sender<Frame>) {
         };
         if cancel || reset {
             touched.clear();
-            // Draw the animation again from this very moment, so it carries
-            // on where it was instead of jumping.
+            // Draw the animation again from the next frame after this
+            // moment: the client may already show the frame at `now`.
             ahead_until = now.saturating_sub(1000);
+            resume = true;
         }
         ops.append(&mut chat.immediate.lock().unwrap());
         if reset || cancel || !ops.is_empty() || backlog.is_some() {
@@ -318,7 +320,13 @@ async fn frame_loop(hub: Arc<Hub>, chat: Arc<Chat>, tx: mpsc::Sender<Frame>) {
             continue;
         };
         let step = 1000 / u64::from(fps.clamp(1, 60));
-        if ahead_until + step < now {
+        if resume {
+            resume = false;
+            // The last frame on the animation's own grid at or before now,
+            // so the next one drawn is the next frame after it.
+            let since = now.saturating_sub(chat.started);
+            ahead_until = chat.started + since - since % step;
+        } else if ahead_until + step < now {
             ahead_until = now - step;
         }
         while ahead_until + step <= now + LEAD_MS {
@@ -442,8 +450,10 @@ mod tests {
             }
         };
         assert!(
-            next.at <= cancel.at + 100,
-            "the animation carries on from the click, not later"
+            next.at > cancel.at && next.at <= cancel.at + 100,
+            "the animation carries on with the next frame after the click: {} after {}",
+            next.at,
+            cancel.at
         );
     }
 }
