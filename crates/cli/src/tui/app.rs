@@ -272,6 +272,9 @@ pub(super) struct App {
     /// The clickable row the left button went down on, and where. Releasing
     /// on the same row opens or closes it; dragging selects from there.
     pub(super) press: Option<(ToolRow, u16, u16)>,
+    /// Where the left button went down on a script element; dragging from
+    /// there selects its text.
+    pub(super) script_press: Option<(u16, u16)>,
     /// When a drag past the conversation's edge last scrolled it.
     pub(super) drag_scrolled: Option<std::time::Instant>,
     /// Terminal size from the last event, for selection math.
@@ -344,6 +347,7 @@ impl App {
             started: None,
             scroll: 0,
             selection: None,
+            script_press: None,
             hover: None,
             drag: None,
             press: None,

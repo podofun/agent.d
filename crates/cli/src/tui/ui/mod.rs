@@ -24,10 +24,14 @@ pub(super) use conversation::{
     ConversationCache, clickable_at, max_scroll, suggestion_at, toggle_tool, tool_at,
 };
 pub(super) use logo::SPIN as LEAF_SPIN;
-pub(super) use script::{element_lines, hit as script_hit, terminals as script_terminals};
+pub(super) use script::{
+    Placed, element_lines, hit as script_hit, point_at as script_point_at,
+    scroll_at as script_scroll_at, scroll_region as script_scroll_region,
+    terminals as script_terminals,
+};
 #[cfg(test)]
 pub(super) use selection::Point;
-pub(super) use selection::{Selection, point_at, selected_text};
+pub(super) use selection::{Region, Selection, point_at, selected_text};
 
 pub(super) const PRIMARY: Color = Color::Rgb(177, 124, 245);
 pub(super) const SECONDARY: Color = Color::Rgb(122, 180, 234);
@@ -672,6 +676,7 @@ mod tests {
         assert!(!header(&app).contains("Approval connection"));
         assert!(rendered(&app, 100, 24).contains("Approval connection closed"));
         app.selection = Some(super::Selection {
+            region: super::Region::Conversation,
             anchor: super::Point { line: 0, col: 0 },
             head: super::Point { line: 0, col: 1 },
         });

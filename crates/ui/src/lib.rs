@@ -16,7 +16,7 @@ use serde_json::Value;
 
 pub use doc::Document;
 pub use hub::{Chat, ChatInfo, Hub, Script, Subscription};
-pub use layout::{Rect, Size, border_width, layout};
+pub use layout::{Rect, Size, border_width, layout, scrolls};
 pub use terminal::{TerminalIo, TerminalResize};
 pub use tree::{Node, Tree};
 

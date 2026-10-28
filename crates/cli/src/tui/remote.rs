@@ -107,6 +107,8 @@ pub(super) struct ScriptUi {
     clock: Option<(u64, Instant)>,
     pub(super) focus: Option<NodeId>,
     pub(super) hover: Option<NodeId>,
+    /// How far down each scrolled container is, by the user's wheel.
+    pub(super) scroll: HashMap<NodeId, u16>,
     out: Option<Outgoing>,
     /// Sizes of terminal elements as last sent.
     sizes: HashMap<NodeId, (u16, u16)>,
@@ -123,6 +125,7 @@ impl Default for ScriptUi {
             clock: None,
             focus: None,
             hover: None,
+            scroll: HashMap::new(),
             out: None,
             sizes: HashMap::new(),
             sent_session: None,
@@ -204,6 +207,7 @@ impl ScriptUi {
                 self.tree = Tree::default();
                 self.focus = None;
                 self.hover = None;
+                self.scroll.clear();
                 self.sizes.clear();
                 out.push(None);
             }

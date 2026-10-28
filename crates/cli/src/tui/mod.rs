@@ -226,8 +226,10 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
             {
                 app.selection = None;
                 app.drag = None;
+                app.script_press = None;
                 if let Some(node) = ui::script_hit(app, area, mouse.column, mouse.row) {
                     click_script(app, node);
+                    app.script_press = Some((mouse.column, mouse.row));
                     return Ok(Handled::Redraw);
                 }
                 if app.script.focus.is_some() {
@@ -255,9 +257,14 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if app.tab == Tab::Chat => {
-                // A drag that began on a tool row selects its text instead.
+                // A drag that began on a tool row selects its text instead,
+                // and so does one that began on a script element.
                 if let Some((_, x, y)) = app.press.take() {
                     app.selection = ui::point_at(app, area, x, y).map(ui::Selection::at);
+                }
+                if let Some((x, y)) = app.script_press.take() {
+                    app.selection = ui::script_point_at(app, area, x, y)
+                        .map(|(node, point)| ui::Selection::in_element(node, point));
                 }
                 if app.selection.is_some() {
                     app.drag = Some((mouse.column, mouse.row));
@@ -266,6 +273,7 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
             }
             MouseEventKind::Up(MouseButton::Left) if app.tab == Tab::Chat => {
                 app.drag = None;
+                app.script_press = None;
                 if let Some((pressed, _, _)) = app.press.take() {
                     if ui::tool_at(app, area, mouse.column, mouse.row) == Some(pressed) {
                         ui::toggle_tool(app, area, pressed);
@@ -302,7 +310,9 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                 if app.approval.is_some() {
                     app.approval_scroll = app.approval_scroll.saturating_sub(3);
                 } else if app.tab == Tab::Chat {
-                    scroll_up(app, area, 3);
+                    if !ui::script_scroll_at(app, area, mouse.column, mouse.row, -3) {
+                        scroll_up(app, area, 3);
+                    }
                     app.hover = ui::clickable_at(app, area, mouse.column, mouse.row);
                 } else {
                     app.move_selection(-1, false);
@@ -312,7 +322,9 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                 if app.approval.is_some() {
                     app.approval_scroll = app.approval_scroll.saturating_add(3);
                 } else if app.tab == Tab::Chat {
-                    scroll_down(app, 3);
+                    if !ui::script_scroll_at(app, area, mouse.column, mouse.row, 3) {
+                        scroll_down(app, 3);
+                    }
                     app.hover = ui::clickable_at(app, area, mouse.column, mouse.row);
                 } else {
                     app.move_selection(1, false);
@@ -708,6 +720,10 @@ fn drag_selection(app: &mut App, screen: Rect) {
         app.drag = None;
         return;
     };
+    if let Some(ui::Region::Element(node)) = app.selection.map(|s| s.region) {
+        drag_element_selection(app, screen, node, x, y);
+        return;
+    }
     let inner = ui::conversation_inner(ui::screen_rows(screen, app)[1]);
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -742,6 +758,36 @@ fn drag_selection(app: &mut App, screen: Rect) {
         }
         row -= 1;
     };
+    if let (Some(selection), Some(point)) = (app.selection.as_mut(), point) {
+        selection.head = point;
+    }
+}
+
+/// Extend a selection in a script element to the dragged position, scrolling
+/// the element a row at a time past its edges.
+fn drag_element_selection(app: &mut App, screen: Rect, node: agentd_ui::NodeId, x: u16, y: u16) {
+    let Some(viewport) = ui::Placed::new(app, screen).viewport(node) else {
+        return;
+    };
+    if viewport.width == 0 || viewport.height == 0 {
+        return;
+    }
+    let distance = if y < viewport.y {
+        viewport.y - y
+    } else {
+        (y + 1).saturating_sub(viewport.bottom())
+    };
+    let interval = std::time::Duration::from_millis(100 / u64::from(distance.clamp(1, 4)));
+    let due = app
+        .drag_scrolled
+        .is_none_or(|scrolled| scrolled.elapsed() >= interval);
+    if distance > 0 && due {
+        ui::script_scroll_region(app, screen, node, if y < viewport.y { -1 } else { 1 });
+        app.drag_scrolled = Some(std::time::Instant::now());
+    }
+    let x = x.clamp(viewport.x, viewport.right() - 1);
+    let y = y.clamp(viewport.y, viewport.bottom() - 1);
+    let point = ui::Placed::new(app, screen).point_in(node, x, y);
     if let (Some(selection), Some(point)) = (app.selection.as_mut(), point) {
         selection.head = point;
     }
@@ -915,6 +961,80 @@ mod tests {
         assert!(header.ends_with("☐ 2/5  "), "{header:?}");
         let area = ratatui::layout::Rect::new(0, 0, 60, 20);
         assert_eq!(ui::script_hit(&app, area, 55, 0), Some(100));
+    }
+
+    #[tokio::test]
+    async fn a_scrolled_box_moves_with_the_wheel_and_its_text_selects() {
+        let mut app = talking();
+        scripted(&mut app, true, agentd_ui::Tree::default_chat().snapshot());
+        let mut props = agentd_ui::Props::new();
+        props.insert("width".into(), serde_json::json!(20));
+        props.insert("scroll".into(), serde_json::json!(true));
+        let mut ops = vec![
+            agentd_ui::Op::Create {
+                node: 100,
+                kind: "box".into(),
+                props,
+                style: Default::default(),
+            },
+            agentd_ui::Op::Insert {
+                parent: agentd_ui::parts::MAIN,
+                node: 100,
+                index: 1,
+            },
+        ];
+        for n in 0..30u64 {
+            let mut props = agentd_ui::Props::new();
+            props.insert("text".into(), serde_json::json!(format!("line {n}")));
+            ops.push(agentd_ui::Op::Create {
+                node: 101 + n,
+                kind: "text".into(),
+                props,
+                style: Default::default(),
+            });
+            ops.push(agentd_ui::Op::Insert {
+                parent: 100,
+                node: 101 + n,
+                index: n as usize,
+            });
+        }
+        scripted(&mut app, false, ops);
+        let screen = Rect::new(0, 0, 60, 20);
+        app.resized(screen);
+        let row = |app: &App, y: u16| -> String {
+            let buffer = render(app, 60, 20);
+            (40..60)
+                .map(|x| buffer[(x, y)].symbol().to_owned())
+                .collect()
+        };
+        assert!(row(&app, 2).starts_with("line 0"), "{}", row(&app, 2));
+        handle_event(&mut app, mouse(MouseEventKind::ScrollDown, 45, 5), screen)
+            .await
+            .unwrap();
+        assert!(row(&app, 2).starts_with("line 3"), "{}", row(&app, 2));
+        // The conversation did not scroll instead.
+        assert_eq!(app.scroll, 0);
+        for event in [
+            mouse(MouseEventKind::Down(MouseButton::Left), 40, 2),
+            mouse(MouseEventKind::Drag(MouseButton::Left), 45, 3),
+            mouse(MouseEventKind::Up(MouseButton::Left), 45, 3),
+        ] {
+            handle_event(&mut app, event, screen).await.unwrap();
+        }
+        assert_eq!(app.selected_text().as_deref(), Some("line 3\nline 4"));
+        let buffer = render(&app, 60, 20);
+        assert!(
+            buffer[(40, 2)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(
+            !buffer[(50, 2)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
     }
 
     #[test]
@@ -1486,6 +1606,7 @@ mod tests {
         let (mut app, screen, x, y) = chat_with_tool();
         let select = |app: &mut App| {
             app.selection = Some(ui::Selection {
+                region: ui::Region::Conversation,
                 anchor: ui::Point { line: 0, col: 3 },
                 head: ui::Point { line: 0, col: 7 },
             });

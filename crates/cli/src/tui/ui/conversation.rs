@@ -35,7 +35,11 @@ pub(super) fn draw_conversation(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let offset = conversation.offset(inner.height, app.scroll);
     let end = (offset + inner.height as usize).min(conversation.lines.len());
     let mut lines = conversation.lines[offset..end].to_vec();
-    if let Some(selection) = app.selection.as_ref().filter(|s| !s.is_click()) {
+    if let Some(selection) = app
+        .selection
+        .as_ref()
+        .filter(|s| s.region == selection::Region::Conversation && !s.is_click())
+    {
         selection::highlight(&mut lines, offset, &conversation.selectable, selection);
     }
     // The whole row is clickable, but only its header reacts to the mouse:

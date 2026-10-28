@@ -92,6 +92,12 @@ fn is_container(node: &Node) -> bool {
     matches!(node.kind.as_str(), "box" | "list")
 }
 
+/// Whether a container scrolls: its children are laid out at the height
+/// they need, and the client shows a window onto them.
+pub fn scrolls(node: &Node) -> bool {
+    is_container(node) && node.props.get("scroll") == Some(&Value::Bool(true))
+}
+
 fn is_row(node: &Node) -> bool {
     node.props.get("direction").and_then(Value::as_str) == Some("row")
 }
@@ -130,7 +136,12 @@ fn place(
     if !is_container(node) {
         return;
     }
-    let inner = area.inset(border_width(node) + number(node, "padding"));
+    let mut inner = area.inset(border_width(node) + number(node, "padding"));
+    if scrolls(node) {
+        // Children run past the bottom; the client scrolls them into view.
+        let content = content_size(tree, node, area.width, measure).height;
+        inner.height = inner.height.max(content);
+    }
     let row = is_row(node);
     let gap = number(node, "gap");
     let kids: Vec<(NodeId, &Node)> = node
@@ -274,6 +285,22 @@ fn natural(
         };
     }
     let edge = 2 * (border_width(node) + number(node, "padding"));
+    let content = content_size(tree, node, width, measure);
+    Size {
+        width: fixed("width").unwrap_or(content.width.saturating_add(edge)),
+        height: fixed("height").unwrap_or(content.height.saturating_add(edge)),
+    }
+}
+
+/// What a container's children need together, inside its border and
+/// padding, when the container is `width` wide.
+fn content_size(
+    tree: &Tree,
+    node: &Node,
+    width: u16,
+    measure: &dyn Fn(NodeId, &Node, u16) -> Size,
+) -> Size {
+    let edge = 2 * (border_width(node) + number(node, "padding"));
     let gap = number(node, "gap");
     let row = is_row(node);
     let mut main = 0u16;
@@ -294,11 +321,8 @@ fn natural(
         count += 1;
     }
     main = main.saturating_add(gap.saturating_mul(count.saturating_sub(1)));
-    let (w, h) = if row { (main, cross) } else { (cross, main) };
-    Size {
-        width: fixed("width").unwrap_or(w.saturating_add(edge)),
-        height: fixed("height").unwrap_or(h.saturating_add(edge)),
-    }
+    let (width, height) = if row { (main, cross) } else { (cross, main) };
+    Size { width, height }
 }
 
 #[cfg(test)]
@@ -430,5 +454,53 @@ mod tests {
         let rects = layout(&tree, Rect::new(0, 0, 100, 24), &measure);
         assert!(rects.iter().all(|(n, _)| *n != 100 && *n != 101));
         assert_eq!(rect_of(&rects, parts::CONVERSATION).width, 75);
+    }
+
+    #[test]
+    fn a_scrolling_box_lays_its_children_out_past_its_bottom() {
+        let mut tree = Tree::default_chat();
+        let mut props = Props::new();
+        props.insert("width".into(), json!(20));
+        props.insert("scroll".into(), json!(true));
+        tree.apply(&Op::Create {
+            node: 100,
+            kind: "box".into(),
+            props,
+            style: Props::new(),
+        });
+        tree.apply(&Op::Insert {
+            parent: parts::MAIN,
+            node: 100,
+            index: 1,
+        });
+        for node in 101..141 {
+            tree.apply(&Op::Create {
+                node,
+                kind: "text".into(),
+                props: Props::new(),
+                style: Props::new(),
+            });
+            tree.apply(&Op::Insert {
+                parent: 100,
+                node,
+                index: 99,
+            });
+        }
+        let rects = layout(&tree, Rect::new(0, 0, 80, 24), &measure);
+        assert_eq!(rect_of(&rects, 100), Rect::new(60, 2, 20, 17));
+        assert_eq!(rect_of(&rects, 101), Rect::new(60, 2, 20, 1));
+        assert_eq!(rect_of(&rects, 140), Rect::new(60, 41, 20, 1));
+        tree.apply(&Op::Set {
+            node: 100,
+            key: "scroll".into(),
+            value: json!(false),
+        });
+        let rects = layout(&tree, Rect::new(0, 0, 80, 24), &measure);
+        assert!(
+            rects
+                .iter()
+                .all(|(n, r)| *n < 100 || r.height == 0 || r.y < 19),
+            "clipped at the bottom"
+        );
     }
 }

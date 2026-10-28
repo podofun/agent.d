@@ -1,16 +1,23 @@
 //! Drawing the scripted UI: chat's own parts where the layout puts them,
 //! and script elements around them. All script text is drawn as text.
+//! A container with `scroll` shows a window onto its children, moved with
+//! the mouse wheel, and text in script elements selects like the
+//! conversation's: by the cells on screen.
+
+use std::collections::HashMap;
 
 use agentd_ui::{NodeId, Props, Size, Tree, parts, sanitize};
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
 use super::super::app::{App, Tab};
+use super::selection::{Point, Region, Selection};
 use super::{ERROR, MUTED, PRIMARY, SECONDARY, SUCCESS, WARNING, conversation};
 
 fn to_ui(r: Rect) -> agentd_ui::Rect {
@@ -212,18 +219,200 @@ pub(super) fn part_rects(app: &App, screen: Rect) -> Option<[Rect; 5]> {
     ])
 }
 
+/// Where the script elements are on `screen`, with the scroll offsets the
+/// user gave their containers.
+pub(in crate::tui) struct Placed<'a> {
+    tree: &'a Tree,
+    rects: HashMap<NodeId, Rect>,
+    scroll: &'a HashMap<NodeId, u16>,
+}
+
+impl<'a> Placed<'a> {
+    pub(in crate::tui) fn new(app: &'a App, screen: Rect) -> Self {
+        Self {
+            tree: &app.script.tree,
+            rects: layout(app, screen).into_iter().collect(),
+            scroll: &app.script.scroll,
+        }
+    }
+
+    fn node(&self, id: NodeId) -> Option<(&'a agentd_ui::Node, Rect)> {
+        Some((self.tree.get(id)?, *self.rects.get(&id)?))
+    }
+
+    /// The window a scroll container shows its children through, or the
+    /// inside of any other element.
+    pub(in crate::tui) fn viewport(&self, id: NodeId) -> Option<Rect> {
+        let (node, rect) = self.node(id)?;
+        Some(inner(node, rect))
+    }
+
+    /// Rows a container's children take, from the top of its viewport.
+    pub(in crate::tui) fn content_height(&self, id: NodeId) -> u16 {
+        let Some((node, rect)) = self.node(id) else {
+            return 0;
+        };
+        let top = inner(node, rect).y;
+        node.children
+            .iter()
+            .filter_map(|c| self.rects.get(c))
+            .map(|r| r.bottom().saturating_sub(top))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The rows a container is scrolled down by, within what it holds.
+    pub(in crate::tui) fn offset(&self, id: NodeId) -> u16 {
+        let Some(viewport) = self.viewport(id) else {
+            return 0;
+        };
+        let most = self.content_height(id).saturating_sub(viewport.height);
+        self.scroll.get(&id).copied().unwrap_or(0).min(most)
+    }
+
+    /// The deepest element under `(x, y)`, looking through scrolled
+    /// containers.
+    fn hit(&self, id: NodeId, x: u16, y: u16) -> Option<NodeId> {
+        let (node, rect) = self.node(id)?;
+        if !rect.contains(ratatui::layout::Position::new(x, y)) {
+            return None;
+        }
+        let mut y = y;
+        if agentd_ui::scrolls(node) {
+            let viewport = inner(node, rect);
+            if !viewport.contains(ratatui::layout::Position::new(x, y)) {
+                return Some(id);
+            }
+            y = y.saturating_add(self.offset(id));
+        }
+        node.children
+            .iter()
+            .rev()
+            .find_map(|child| self.hit(*child, x, y))
+            .or(Some(id))
+    }
+
+    /// The region text under `(x, y)` is selected in: the innermost
+    /// scrolled container, or else the outermost script element.
+    fn region_at(&self, id: NodeId, x: u16, y: u16, outer: Option<NodeId>) -> Option<NodeId> {
+        let (node, rect) = self.node(id)?;
+        if !rect.contains(ratatui::layout::Position::new(x, y)) {
+            return None;
+        }
+        let mut y = y;
+        let mut outer = outer.or((id >= parts::FIRST_FREE).then_some(id));
+        if agentd_ui::scrolls(node) {
+            if !inner(node, rect).contains(ratatui::layout::Position::new(x, y)) {
+                return None;
+            }
+            y = y.saturating_add(self.offset(id));
+            outer = Some(id);
+        }
+        node.children
+            .iter()
+            .rev()
+            .find_map(|child| self.region_at(*child, x, y, outer))
+            .or(outer)
+    }
+
+    /// The scrolled container whose viewport is under `(x, y)`, the
+    /// innermost one.
+    fn scroller_at(&self, id: NodeId, x: u16, y: u16) -> Option<NodeId> {
+        let (node, rect) = self.node(id)?;
+        if !rect.contains(ratatui::layout::Position::new(x, y)) {
+            return None;
+        }
+        let mut y = y;
+        let mut found = None;
+        if agentd_ui::scrolls(node) {
+            if !inner(node, rect).contains(ratatui::layout::Position::new(x, y)) {
+                return None;
+            }
+            y = y.saturating_add(self.offset(id));
+            found = Some(id);
+        }
+        node.children
+            .iter()
+            .rev()
+            .find_map(|child| self.scroller_at(*child, x, y))
+            .or(found)
+    }
+
+    /// Where a region's cell under `(x, y)` is, in the region's own rows.
+    pub(in crate::tui) fn point_in(&self, id: NodeId, x: u16, y: u16) -> Option<Point> {
+        let viewport = self.viewport(id)?;
+        if !viewport.contains(ratatui::layout::Position::new(x, y)) {
+            return None;
+        }
+        let line = usize::from(y - viewport.y) + usize::from(self.offset(id));
+        (line < usize::from(self.content_height(id).max(viewport.height))).then_some(Point {
+            line,
+            col: usize::from(x - viewport.x),
+        })
+    }
+}
+
+fn script_active(app: &App) -> bool {
+    app.script.custom() && app.approval.is_none() && app.tab == Tab::Chat
+}
+
 /// The script element under `(x, y)`, the deepest one, never chat's own
 /// parts or what is drawn over them.
 pub(in crate::tui) fn hit(app: &App, screen: Rect, x: u16, y: u16) -> Option<NodeId> {
-    if !app.script.custom() || app.approval.is_some() || app.tab != Tab::Chat {
+    if !script_active(app) {
         return None;
     }
-    layout(app, screen)
-        .into_iter()
-        .rev()
-        .find(|(_, r)| x >= r.x && y >= r.y && x < r.right() && y < r.bottom())
-        .map(|(n, _)| n)
+    let placed = Placed::new(app, screen);
+    placed
+        .hit(app.script.tree.root?, x, y)
         .filter(|n| *n >= parts::FIRST_FREE)
+}
+
+/// The script region and the cell in it under `(x, y)`, for a selection.
+pub(in crate::tui) fn point_at(app: &App, screen: Rect, x: u16, y: u16) -> Option<(NodeId, Point)> {
+    if !script_active(app) {
+        return None;
+    }
+    let placed = Placed::new(app, screen);
+    let region = placed.region_at(app.script.tree.root?, x, y, None)?;
+    Some((region, placed.point_in(region, x, y)?))
+}
+
+/// Scroll the container under `(x, y)` by `delta` rows. False when there
+/// is none, so the conversation may scroll instead.
+pub(in crate::tui) fn scroll_at(app: &mut App, screen: Rect, x: u16, y: u16, delta: i32) -> bool {
+    if !script_active(app) {
+        return false;
+    }
+    let placed = Placed::new(app, screen);
+    let Some(id) = app
+        .script
+        .tree
+        .root
+        .and_then(|root| placed.scroller_at(root, x, y))
+    else {
+        return false;
+    };
+    let offset = placed.offset(id);
+    let most = placed
+        .content_height(id)
+        .saturating_sub(placed.viewport(id).map_or(0, |v| v.height));
+    let next = (i32::from(offset) + delta).clamp(0, i32::from(most)) as u16;
+    app.script.scroll.insert(id, next);
+    true
+}
+
+/// Scroll a region by `delta` rows while a selection is dragged past it.
+pub(in crate::tui) fn scroll_region(app: &mut App, screen: Rect, id: NodeId, delta: i32) {
+    let placed = Placed::new(app, screen);
+    if !placed.node(id).is_some_and(|(n, _)| agentd_ui::scrolls(n)) {
+        return;
+    }
+    let most = placed
+        .content_height(id)
+        .saturating_sub(placed.viewport(id).map_or(0, |v| v.height));
+    let next = (i32::from(placed.offset(id)) + delta).clamp(0, i32::from(most)) as u16;
+    app.script.scroll.insert(id, next);
 }
 
 /// Inner sizes of terminal elements on `screen`.
@@ -245,7 +434,7 @@ pub(in crate::tui) fn terminals(app: &App, screen: Rect) -> Vec<(NodeId, u16, u1
 
 /// Draw the border, title and background a node's style asks for, and
 /// return what is inside.
-fn decorate(frame: &mut Frame<'_>, node: &agentd_ui::Node, rect: Rect) -> Rect {
+fn decorate(buf: &mut Buffer, node: &agentd_ui::Node, rect: Rect) -> Rect {
     let style = style_of(&node.style);
     let border = prop(&node.style, "border");
     let border_fg = prop(&node.style, "border_fg").and_then(color);
@@ -266,127 +455,370 @@ fn decorate(frame: &mut Frame<'_>, node: &agentd_ui::Node, rect: Rect) -> Rect {
         }
     }
     if style.bg.is_some() || border.is_some() {
-        frame.render_widget(block, rect);
+        block.render(rect, buf);
     }
     inner(node, rect)
+}
+
+/// What a frame draws into: the screen, or a buffer for the children of a
+/// scrolled container, which are drawn whole and shown through a window.
+enum Target<'a, 'b> {
+    Screen(&'a mut Frame<'b>),
+    Buffer(&'a mut Buffer),
+}
+
+impl Target<'_, '_> {
+    fn buffer(&mut self) -> &mut Buffer {
+        match self {
+            Target::Screen(frame) => frame.buffer_mut(),
+            Target::Buffer(buf) => buf,
+        }
+    }
+
+    fn render<W: Widget>(&mut self, widget: W, area: Rect) {
+        widget.render(area, self.buffer());
+    }
+
+    fn cursor(&mut self, x: u16, y: u16) {
+        if let Target::Screen(frame) = self {
+            frame.set_cursor_position((x, y));
+        }
+    }
 }
 
 /// Draw chat with the layout scripts gave it.
 pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
     let screen = frame.area();
     let rows = super::screen_rows(screen, app);
-    let tree = &app.script.tree;
-    let rects = layout(app, screen);
+    let placed = Placed::new(app, screen);
     // Columns from what scripts put in the header to the right edge.
-    let header_right = rects
-        .iter()
-        .find(|(n, _)| *n == parts::HEADER_RIGHT)
-        .filter(|(_, r)| r.width > 0)
-        .map_or(0, |(_, r)| screen.right().saturating_sub(r.x));
-    for (id, rect) in rects {
-        let Some(node) = tree.get(id) else { continue };
-        let style = style_of(&node.style);
-        match node.kind.as_str() {
-            "chat.header" => {
-                decorate(frame, node, rect);
-                super::draw_header(frame, app, rows[0], header_right);
+    let header_right = placed
+        .rects
+        .get(&parts::HEADER_RIGHT)
+        .filter(|r| r.width > 0)
+        .map_or(0, |r| screen.right().saturating_sub(r.x));
+    let Some(root) = app.script.tree.root else {
+        return;
+    };
+    let mut target = Target::Screen(frame);
+    let frame = DrawFrame {
+        app,
+        placed: &placed,
+        rows: &rows,
+        header_right,
+    };
+    draw_node(&mut target, &frame, root);
+}
+
+struct DrawFrame<'a> {
+    app: &'a App,
+    placed: &'a Placed<'a>,
+    rows: &'a [Rect; 5],
+    header_right: u16,
+}
+
+fn draw_node(target: &mut Target<'_, '_>, frame: &DrawFrame<'_>, id: NodeId) {
+    let app = frame.app;
+    let Some((node, rect)) = frame.placed.node(id) else {
+        return;
+    };
+    let style = style_of(&node.style);
+    match node.kind.as_str() {
+        "chat.header" => {
+            decorate(target.buffer(), node, rect);
+            if let Target::Screen(f) = target {
+                super::draw_header(f, app, frame.rows[0], frame.header_right);
             }
-            "chat.conversation" => {
-                decorate(frame, node, rect);
-                conversation::draw_conversation(frame, app, rows[1]);
-                conversation::draw_suggestions(frame, app, rows[2]);
+            for child in &node.children {
+                draw_node(target, frame, *child);
             }
-            "chat.prompt" => {
-                decorate(frame, node, rect);
-                let border = prop(&node.style, "border_fg")
-                    .or(prop(&node.style, "fg"))
-                    .and_then(color);
-                super::draw_composer(frame, app, rows[3], border);
+        }
+        "chat.conversation" => {
+            decorate(target.buffer(), node, rect);
+            if let Target::Screen(f) = target {
+                conversation::draw_conversation(f, app, frame.rows[1]);
+                conversation::draw_suggestions(f, app, frame.rows[2]);
             }
-            "chat.status" => {
-                decorate(frame, node, rect);
-                super::draw_status(frame, app, rows[4]);
+        }
+        "chat.prompt" => {
+            decorate(target.buffer(), node, rect);
+            let border = prop(&node.style, "border_fg")
+                .or(prop(&node.style, "fg"))
+                .and_then(color);
+            if let Target::Screen(f) = target {
+                super::draw_composer(f, app, frame.rows[3], border);
             }
-            "box" | "list" | "spacer" => {
-                decorate(frame, node, rect);
+        }
+        "chat.status" => {
+            decorate(target.buffer(), node, rect);
+            if let Target::Screen(f) = target {
+                super::draw_status(f, app, frame.rows[4]);
             }
-            "text" => {
-                let area = decorate(frame, node, rect);
-                frame.render_widget(
-                    Paragraph::new(shown_text(node))
-                        .style(style)
-                        .wrap(Wrap { trim: false }),
-                    area,
-                );
-            }
-            "button" | "checkbox" => {
-                let area = decorate(frame, node, rect);
-                let mut style = style;
-                if app.script.focus == Some(id) {
-                    style = style.add_modifier(Modifier::REVERSED);
-                } else if app.script.hover == Some(id) {
-                    style = style.add_modifier(Modifier::BOLD);
+        }
+        "box" | "list" | "spacer" => {
+            let viewport = decorate(target.buffer(), node, rect);
+            if agentd_ui::scrolls(node) {
+                draw_scrolled(target, frame, id, node, viewport);
+            } else {
+                for child in &node.children {
+                    draw_node(target, frame, *child);
                 }
-                frame.render_widget(Paragraph::new(label(node)).style(style), area);
+                highlight_selected_item(target.buffer(), frame, id, node);
+                highlight_selection(target.buffer(), app, id, viewport);
             }
-            "input" => {
-                let area = decorate(frame, node, rect);
-                let value = sanitize(prop(&node.props, "value").unwrap_or_default());
-                let line = if value.is_empty() {
-                    Line::styled(
-                        sanitize(prop(&node.props, "placeholder").unwrap_or_default()),
-                        Style::default().fg(MUTED),
-                    )
-                } else {
-                    Line::styled(value.clone(), style)
-                };
-                frame.render_widget(
-                    Paragraph::new(line).style(Style::default().add_modifier(Modifier::UNDERLINED)),
-                    area,
-                );
-                if app.script.focus == Some(id) && area.width > 0 && area.height > 0 {
-                    let x = area.x + (value.width() as u16).min(area.width - 1);
-                    frame.set_cursor_position((x, area.y));
-                }
+        }
+        "text" => {
+            let area = decorate(target.buffer(), node, rect);
+            target.render(
+                Paragraph::new(shown_text(node))
+                    .style(style)
+                    .wrap(Wrap { trim: false }),
+                area,
+            );
+            highlight_selection(target.buffer(), app, id, area);
+        }
+        "button" | "checkbox" => {
+            let area = decorate(target.buffer(), node, rect);
+            let mut style = style;
+            if app.script.focus == Some(id) {
+                style = style.add_modifier(Modifier::REVERSED);
+            } else if app.script.hover == Some(id) {
+                style = style.add_modifier(Modifier::BOLD);
             }
-            "terminal" => {
-                let area = decorate(frame, node, rect);
-                draw_terminal(frame, app, id, area);
+            target.render(Paragraph::new(label(node)).style(style), area);
+        }
+        "input" => {
+            let area = decorate(target.buffer(), node, rect);
+            let value = sanitize(prop(&node.props, "value").unwrap_or_default());
+            let line = if value.is_empty() {
+                Line::styled(
+                    sanitize(prop(&node.props, "placeholder").unwrap_or_default()),
+                    Style::default().fg(MUTED),
+                )
+            } else {
+                Line::styled(value.clone(), style)
+            };
+            target.render(
+                Paragraph::new(line).style(Style::default().add_modifier(Modifier::UNDERLINED)),
+                area,
+            );
+            if app.script.focus == Some(id) && area.width > 0 && area.height > 0 {
+                let x = area.x + (value.width() as u16).min(area.width - 1);
+                target.cursor(x, area.y);
             }
-            _ => {}
+        }
+        "terminal" => {
+            let area = decorate(target.buffer(), node, rect);
+            draw_terminal(target, app, id, area);
+        }
+        _ => {}
+    }
+}
+
+/// Draw a scrolled container's children whole, then show the rows the
+/// user scrolled to through its viewport.
+fn draw_scrolled(
+    target: &mut Target<'_, '_>,
+    frame: &DrawFrame<'_>,
+    id: NodeId,
+    node: &agentd_ui::Node,
+    viewport: Rect,
+) {
+    if viewport.width == 0 || viewport.height == 0 {
+        return;
+    }
+    let height = frame.placed.content_height(id).max(viewport.height);
+    let content = Rect::new(viewport.x, viewport.y, viewport.width, height);
+    let mut buf = Buffer::empty(content);
+    if let Some(bg) = style_of(&node.style).bg {
+        buf.set_style(content, Style::default().bg(bg));
+    }
+    let mut inner_target = Target::Buffer(&mut buf);
+    for child in &node.children {
+        draw_node(&mut inner_target, frame, *child);
+    }
+    highlight_selected_item(&mut buf, frame, id, node);
+    let offset = frame.placed.offset(id);
+    highlight_selection(&mut buf, frame.app, id, content);
+    let out = target.buffer();
+    for row in 0..viewport.height {
+        let from = viewport.y + offset + row;
+        if from >= content.bottom() {
+            break;
+        }
+        for x in viewport.x..viewport.right() {
+            out[(x, viewport.y + row)] = buf[(x, from)].clone();
         }
     }
-    // The selected item of each list stands out.
-    for (id, node) in tree.reachable() {
-        if node.kind != "list" {
-            continue;
-        }
-        let Some(selected) = node.props.get("selected").and_then(Value::as_u64) else {
-            continue;
-        };
-        let child = node
-            .children
-            .get((selected as usize).saturating_sub(1))
-            .copied();
-        if let Some((_, rect)) = layout(app, screen)
-            .into_iter()
-            .find(|(n, _)| Some(*n) == child)
-        {
-            let highlight = if app.script.focus == Some(id) {
-                Modifier::REVERSED
-            } else {
-                Modifier::BOLD
-            };
-            frame
-                .buffer_mut()
-                .set_style(rect, Style::default().add_modifier(highlight));
+    // A thumb in the last column shows where the window is, when there is
+    // more than it shows.
+    if height > viewport.height {
+        let span = u32::from(viewport.height);
+        let thumb = (span * span / u32::from(height)).max(1) as u16;
+        let top = u32::from(offset) * u32::from(viewport.height - thumb)
+            / u32::from(height - viewport.height);
+        let x = viewport.right() - 1;
+        for row in 0..thumb {
+            let cell = &mut out[(x, viewport.y + top as u16 + row)];
+            cell.set_symbol("▕");
+            cell.set_style(Style::default().fg(MUTED));
         }
     }
 }
 
-fn draw_terminal(frame: &mut Frame<'_>, app: &App, id: NodeId, area: Rect) {
+/// The selected item of a list stands out.
+fn highlight_selected_item(
+    buf: &mut Buffer,
+    frame: &DrawFrame<'_>,
+    id: NodeId,
+    node: &agentd_ui::Node,
+) {
+    if node.kind != "list" {
+        return;
+    }
+    let Some(selected) = node.props.get("selected").and_then(Value::as_u64) else {
+        return;
+    };
+    let Some(child) = node.children.get((selected as usize).saturating_sub(1)) else {
+        return;
+    };
+    let Some((_, rect)) = frame.placed.node(*child) else {
+        return;
+    };
+    let highlight = if frame.app.script.focus == Some(id) {
+        Modifier::REVERSED
+    } else {
+        Modifier::BOLD
+    };
+    if let Some(rect) = clip(rect, buf.area) {
+        buf.set_style(rect, Style::default().add_modifier(highlight));
+    }
+}
+
+fn clip(rect: Rect, within: Rect) -> Option<Rect> {
+    let x = rect.x.max(within.x);
+    let y = rect.y.max(within.y);
+    let right = rect.right().min(within.right());
+    let bottom = rect.bottom().min(within.bottom());
+    (right > x && bottom > y).then(|| Rect::new(x, y, right - x, bottom - y))
+}
+
+/// Reverse the cells of the mouse selection when it is in region `id`.
+/// `area` is where the region's rows are in `buf`, the first row first.
+fn highlight_selection(buf: &mut Buffer, app: &App, id: NodeId, area: Rect) {
+    let Some(selection) = app
+        .selection
+        .as_ref()
+        .filter(|s| s.region == Region::Element(id) && !s.is_click())
+    else {
+        return;
+    };
+    let Some(area) = clip(area, buf.area) else {
+        return;
+    };
+    for row in 0..area.height {
+        let y = area.y + row;
+        let range = selection.columns(usize::from(row));
+        if range.is_empty() {
+            continue;
+        }
+        let end = row_end(buf, area, y);
+        let mut col = 0;
+        let mut x = area.x;
+        while x < area.right() {
+            let width = buf[(x, y)].symbol().width().max(1);
+            if col < end && col < range.end && col + width > range.start {
+                for dx in 0..width as u16 {
+                    if x + dx < area.right() {
+                        let cell = &mut buf[(x + dx, y)];
+                        cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                    }
+                }
+            }
+            col += width;
+            x += width as u16;
+        }
+    }
+}
+
+/// One past the last cell on row `y` of `area` that shows something.
+fn row_end(buf: &Buffer, area: Rect, y: u16) -> usize {
+    let mut end = 0;
+    let mut col = 0;
+    let mut x = area.x;
+    while x < area.right() {
+        let symbol = buf[(x, y)].symbol();
+        let width = symbol.width().max(1);
+        if !symbol.trim().is_empty() {
+            end = col + width;
+        }
+        col += width;
+        x += width as u16;
+    }
+    end
+}
+
+/// The text of a selection in a script region, as shown on screen.
+pub(in crate::tui) fn selected_text(app: &App, screen: Rect, selection: &Selection) -> String {
+    let Region::Element(id) = selection.region else {
+        return String::new();
+    };
+    if !app.script.custom() {
+        return String::new();
+    }
+    let placed = Placed::new(app, screen);
+    let Some((node, _)) = placed.node(id) else {
+        return String::new();
+    };
+    let Some(viewport) = placed.viewport(id) else {
+        return String::new();
+    };
+    let height = placed.content_height(id).max(viewport.height);
+    let content = Rect::new(viewport.x, viewport.y, viewport.width, height);
+    if content.width == 0 || content.height == 0 {
+        return String::new();
+    }
+    let mut buf = Buffer::empty(content);
+    let rows = super::screen_rows(screen, app);
+    let frame = DrawFrame {
+        app,
+        placed: &placed,
+        rows: &rows,
+        header_right: 0,
+    };
+    let mut target = Target::Buffer(&mut buf);
+    if agentd_ui::scrolls(node) {
+        for child in &node.children {
+            draw_node(&mut target, &frame, *child);
+        }
+    } else {
+        draw_node(&mut target, &frame, id);
+    }
+    let (start, end) = selection.ordered();
+    let mut out = String::new();
+    for line in start.line..=end.line.min(usize::from(height) - 1) {
+        let y = content.y + line as u16;
+        let range = selection.columns(line);
+        let row_end = row_end(&buf, content, y);
+        let mut col = 0;
+        let mut x = content.x;
+        while x < content.right() {
+            let symbol = buf[(x, y)].symbol();
+            let width = symbol.width().max(1);
+            if col < row_end && col < range.end && col + width > range.start {
+                out.push_str(symbol);
+            }
+            col += width;
+            x += width as u16;
+        }
+        out.push('\n');
+    }
+    out.trim_end_matches('\n').to_owned()
+}
+
+fn draw_terminal(target: &mut Target<'_, '_>, app: &App, id: NodeId, area: Rect) {
     let Some(screen) = app.script.tree.screens.get(&id) else {
-        frame.render_widget(
+        target.render(
             Paragraph::new("starting…").style(Style::default().fg(MUTED)),
             area,
         );
@@ -422,13 +854,13 @@ fn draw_terminal(frame: &mut Frame<'_>, app: &App, id: NodeId, area: Rect) {
             )
         })
         .collect();
-    frame.render_widget(Paragraph::new(lines), area);
+    target.render(Paragraph::new(lines), area);
     if app.script.focus == Some(id)
         && let Some((x, y)) = screen.cursor
         && x < area.width
         && y < area.height
     {
-        frame.set_cursor_position((area.x + x, area.y + y));
+        target.cursor(area.x + x, area.y + y);
     }
 }
 
