@@ -581,12 +581,7 @@ fn resolve_ws_token(cfg: &Config) -> Result<Option<String>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, &token)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    write_private(&path, &token)?;
     tracing::debug!(token_file = %path.display(), "minted /ws auth token");
     Ok(Some(token))
 }
@@ -607,14 +602,31 @@ fn resolve_admin_token(cfg: &Config) -> Result<Option<String>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, &token)?;
+    write_private(&path, &token)?;
+    tracing::debug!(admin_token_file = %path.display(), "minted /control admin token");
+    Ok(Some(token))
+}
+
+/// Write a token file that is owner-only from the moment it exists. Creating
+/// it with the umask and chmod-ing afterwards leaves a window where another
+/// local user can open it and keep the descriptor.
+fn write_private(path: &std::path::Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(contents.as_bytes())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    tracing::debug!(admin_token_file = %path.display(), "minted /control admin token");
-    Ok(Some(token))
+    Ok(())
 }
 
 /// 256 bits of OS randomness, hex-encoded.
