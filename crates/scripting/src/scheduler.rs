@@ -356,10 +356,14 @@ async fn perform(op: Op) -> Result<serde_json::Value, String> {
             Ok(serde_json::Value::Null)
         }
         Op::Await(state) => loop {
+            // Register the waiter before reading the slot: `notify_waiters`
+            // only wakes futures that already exist, so the other order can
+            // lose the wakeup and hang `await(h)` forever.
+            let notified = state.notify.notified();
             if let Some(v) = state.read() {
                 return v;
             }
-            state.notify.notified().await;
+            notified.await;
         },
         Op::ChannelRecv(state) => {
             let rx = state.rx();

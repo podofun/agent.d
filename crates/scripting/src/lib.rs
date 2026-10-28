@@ -1265,10 +1265,11 @@ fn await_internal(lua: &Lua, handle: mlua::AnyUserData) -> mlua::Result<Value> {
         .map_err(|e| mlua::Error::external(format!("`await` was called outside the daemon runtime ({e}) — this is a bug in agentd, please report it")))?;
     let result = handle_rt.block_on(async move {
         loop {
+            let notified = state.notify.notified();
             if let Some(v) = state.read() {
                 return v;
             }
-            state.notify.notified().await;
+            notified.await;
         }
     });
     match result {
