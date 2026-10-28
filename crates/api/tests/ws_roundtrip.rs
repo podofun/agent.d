@@ -71,6 +71,7 @@ async fn boot_with_auth(auth_token: Option<String>) -> (String, Option<String>) 
             std::time::Duration::from_secs(30),
         )),
         webhooks: Arc::new(HashMap::new()),
+        ui: agentd_ui::Hub::new(),
     };
     tokio::spawn(async move {
         let _ = serve(listener, router(state)).await;
@@ -271,6 +272,7 @@ async fn boot_runner_with_tokens(
             std::time::Duration::from_secs(30),
         )),
         webhooks: Arc::new(HashMap::new()),
+        ui: agentd_ui::Hub::new(),
     };
     tokio::spawn(async move {
         let _ = serve(listener, router(state)).await;

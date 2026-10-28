@@ -498,6 +498,16 @@ impl Executor {
         self.max_runner_turns = turns.max(1);
     }
 
+    /// What `[interface.<name>]` grants, for code acting for that interface.
+    pub fn interface_grants(&self, name: &str) -> PermissionSet {
+        self.engine
+            .load()
+            .grants()
+            .interface(name)
+            .map(|g| g.granted.clone())
+            .unwrap_or_else(PermissionSet::empty)
+    }
+
     pub fn registry(&self) -> &Arc<dyn Registry> {
         &self.registry
     }

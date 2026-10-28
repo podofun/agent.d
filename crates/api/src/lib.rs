@@ -31,6 +31,10 @@
 //! | `skills.list`     | none                                       | `[{name, description, actions}]`    |
 //! | `skills.inspect`  | `{ name }`                                 | `SkillDef`                          |
 //! | `services.list`   | none                                       | `[ServiceStatus]`                   |
+//! | `ui.subscribe`    | `{ client, version?, session?, folder?, user? }` | streams `ui.ready`, `ui.frame` |
+//! | `ui.event`        | `{ chat, node?, type, ... }`               | `{}`                                |
+//! | `ui.session`      | `{ chat, session? }`                       | `{ folder }`                        |
+//! | `ui.entry`        | `{ chat, entry }`                          | `{}`                                |
 //!
 //! Caller identity: every connection gets a session id `ws-<n>`; `actions.call`
 //! and `runners.run` accept optional `session` / `user` params so bridging
@@ -196,6 +200,8 @@ pub struct AppState {
     pub broker: Arc<agentd_approvals::Broker>,
     /// Named routes served at `/webhooks/<name>`.
     pub webhooks: Arc<HashMap<String, Webhook>>,
+    /// Every chat subscribed to scripted UI, across hot reloads.
+    pub ui: Arc<agentd_ui::Hub>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -547,7 +553,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, interface: String
                 let id = req.id;
                 let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
                 let is_runner = req.method == "runners.run";
-                active.insert(id, is_runner.then_some(cancel_tx));
+                let is_ui = req.method == "ui.subscribe";
+                active.insert(id, (is_runner || is_ui).then_some(cancel_tx));
                 tasks.push(Box::pin(async move {
                     let response = if is_runner {
                         match serde_json::from_value::<RunParams>(req.params) {
@@ -555,6 +562,16 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, interface: String
                                 tokio::select! {
                                     result = handle_run(&state, id, p, &conn, &tx) => result,
                                     _ = cancel_rx => err(id, "cancelled", "runner cancelled; completed side effects are not undone"),
+                                }
+                            }
+                            Err(e) => bad_params(id, e),
+                        }
+                    } else if is_ui {
+                        match serde_json::from_value::<agentd_ui::SubscribeParams>(req.params) {
+                            Ok(p) => {
+                                tokio::select! {
+                                    result = handle_ui(&state, id, p, &conn, &tx) => result,
+                                    _ = cancel_rx => ok(id, json!({ "closed": true })),
                                 }
                             }
                             Err(e) => bad_params(id, e),
@@ -602,6 +619,119 @@ async fn handle_run(
             }
         }
     }
+}
+
+/// Stream one chat's UI: `ui.ready`, then a `ui.frame` for every frame,
+/// until the client cancels or disconnects, which closes the chat.
+async fn handle_ui(
+    state: &AppState,
+    id: u64,
+    p: agentd_ui::SubscribeParams,
+    conn: &ConnIdentity,
+    outbound: &tokio::sync::mpsc::Sender<Outbound>,
+) -> WsResponse {
+    if let Some(version) = p.version
+        && version > agentd_ui::PROTOCOL_VERSION
+    {
+        return err(
+            id,
+            "ui_version",
+            format!(
+                "this daemon speaks UI protocol {}, older than the {version} the client asked for",
+                agentd_ui::PROTOCOL_VERSION
+            ),
+        );
+    }
+    let executor = state.executor.load_full();
+    let caller = ws_caller(conn, None, p.user.clone());
+    let folder = chat_folder(
+        &executor,
+        conn,
+        &caller,
+        p.session.as_deref(),
+        p.folder.as_deref(),
+    );
+    let mut sub = state.ui.subscribe(agentd_ui::ChatInfo {
+        interface: conn.interface.clone(),
+        user: p.user,
+        connection: conn.session.clone(),
+        session: p.session,
+        folder,
+        client: p.client,
+    });
+    let ready = json!({ "event": "ui.ready", "id": id, "ready": sub.ready });
+    if outbound
+        .send(Outbound {
+            frame: ready,
+            finished: None,
+        })
+        .await
+        .is_err()
+    {
+        return err(id, "slow_consumer", "the UI stream could not be sent");
+    }
+    while let Some(frame) = sub.frames.recv().await {
+        let frame = json!({ "event": "ui.frame", "id": id, "frame": frame });
+        if outbound
+            .send(Outbound {
+                frame,
+                finished: None,
+            })
+            .await
+            .is_err()
+        {
+            return err(id, "slow_consumer", "the UI stream could not keep up");
+        }
+    }
+    ok(id, json!({ "closed": true }))
+}
+
+/// Where a chat works: its session's folder, or before it has one, the
+/// folder a local client runs in when the user trusts it.
+fn chat_folder(
+    executor: &Executor,
+    conn: &ConnIdentity,
+    caller: &Caller,
+    session: Option<&str>,
+    folder: Option<&str>,
+) -> Option<String> {
+    if let Some(session) = session {
+        return executor
+            .sessions()
+            .and_then(|store| {
+                store
+                    .get_in(&conn_scope(conn, caller), session)
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|meta| meta.cwd);
+    }
+    if conn.interface != "ws" && !conn.admin {
+        return None;
+    }
+    let real = std::fs::canonicalize(folder?).map(plain_path).ok()?;
+    (real.is_dir() && real.parent().is_some() && executor.trusts_folder(&real))
+        .then(|| real.to_string_lossy().into_owned())
+}
+
+/// The chat `id`, when this connection opened it.
+fn own_chat(
+    state: &AppState,
+    conn: &ConnIdentity,
+    id: u64,
+    chat: u64,
+) -> Result<Arc<agentd_ui::Chat>, Box<WsResponse>> {
+    state
+        .ui
+        .chat(chat)
+        .filter(|c| c.info().connection == conn.session)
+        .ok_or_else(|| {
+            Box::new(err(
+                id,
+                "ui_chat_not_found",
+                "that chat is not open on this connection",
+            ))
+        })
 }
 
 /// Control-plane socket. Any authenticated control connection IS an approver:
@@ -1004,6 +1134,41 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
             }
         }
 
+        "ui.event" => match serde_json::from_value::<agentd_ui::EventParams>(req.params) {
+            Ok(p) => match own_chat(&state, conn, id, p.chat) {
+                Ok(chat) => {
+                    state.ui.event(&chat, p.node, p.event);
+                    ok(id, json!({}))
+                }
+                Err(response) => *response,
+            },
+            Err(e) => bad_params(id, e),
+        },
+        "ui.session" => match serde_json::from_value::<agentd_ui::SessionParams>(req.params) {
+            Ok(p) => match own_chat(&state, conn, id, p.chat) {
+                Ok(chat) => {
+                    let caller = ws_caller(conn, None, chat.info().user);
+                    let folder = match &p.session {
+                        Some(session) => chat_folder(&executor, conn, &caller, Some(session), None),
+                        None => None,
+                    };
+                    state.ui.session(&chat, p.session, folder.clone());
+                    ok(id, json!({ "folder": chat.info().folder }))
+                }
+                Err(response) => *response,
+            },
+            Err(e) => bad_params(id, e),
+        },
+        "ui.entry" => match serde_json::from_value::<agentd_ui::EntryParams>(req.params) {
+            Ok(p) => match own_chat(&state, conn, id, p.chat) {
+                Ok(chat) => {
+                    state.ui.entry(&chat, p.entry);
+                    ok(id, json!({}))
+                }
+                Err(response) => *response,
+            },
+            Err(e) => bad_params(id, e),
+        },
         other => err(id, "unknown_method", format!("unknown method `{other}`")),
     }
 }

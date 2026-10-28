@@ -58,6 +58,7 @@ async fn boot() -> Booted {
         interface_tokens: Arc::new(std::collections::HashMap::new()),
         broker: broker.clone(),
         webhooks: Arc::new(HashMap::new()),
+        ui: agentd_ui::Hub::new(),
     };
     tokio::spawn(async move {
         let _ = serve(listener, router(state)).await;

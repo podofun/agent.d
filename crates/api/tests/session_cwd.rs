@@ -73,6 +73,7 @@ async fn boot(grants_toml: &str) -> Booted {
         interface_tokens: Arc::new(HashMap::from([("bot-tok".into(), "bot".into())])),
         broker,
         webhooks: Arc::new(HashMap::new()),
+        ui: agentd_ui::Hub::new(),
     };
     tokio::spawn(async move {
         let _ = serve(listener, router(state)).await;

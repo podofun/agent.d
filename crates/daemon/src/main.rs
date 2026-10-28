@@ -232,9 +232,11 @@ async fn run(cli: Cli, env_secrets: agentd_secrets::EnvStore) -> Result<()> {
         broker: broker.clone(),
         async_handle: tokio::runtime::Handle::current(),
         packages_root,
+        ui: agentd_ui::Hub::new(),
     };
 
     let built = build_runtime(&cfg, &shared)?;
+    let ui = shared.ui.clone();
     tracing::debug!(
         init = %cfg.init_file.display(),
         actions = built.host.list().len(),
@@ -287,6 +289,7 @@ async fn run(cli: Cli, env_secrets: agentd_secrets::EnvStore) -> Result<()> {
         interface_tokens: Arc::new(interface_tokens),
         broker,
         webhooks: Arc::new(webhooks),
+        ui,
     };
 
     println!("{}", startup.render());
