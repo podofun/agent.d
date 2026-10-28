@@ -1,8 +1,12 @@
-//! Programs on a pseudo-terminal, for terminal panes. They run under the
-//! same sandbox as `exec`, without a timeout. Where the sandbox cannot wrap
-//! a terminal, the program is refused.
+//! Programs on a pseudo-terminal, for terminal panes. A pane is UI code a
+//! person wrote, so its program runs unrestricted and without a timeout, on
+//! Linux, macOS and Windows (ConPTY).
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::io::{Read, Write};
+use std::sync::Mutex;
+
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{ExecRequest, ShellError};
 
@@ -15,91 +19,92 @@ pub struct PtyChild {
     pub child: Box<dyn Send>,
 }
 
-/// Start `req` on a new pseudo-terminal of `width` by `height` cells.
-#[cfg(unix)]
+/// Kills the program when the pane goes away.
+struct KillOnDrop(Box<dyn portable_pty::Child + Send + Sync>);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+    }
+}
+
+fn size(width: u16, height: u16) -> PtySize {
+    PtySize {
+        rows: height.max(1),
+        cols: width.max(2),
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
+/// Start `req` on a new pseudo-terminal of `width` by `height` cells. Must be
+/// called inside a Tokio runtime: the terminal's blocking reads and writes
+/// run on their own threads and reach the caller through async pipes.
 pub fn spawn_pty(req: &ExecRequest, width: u16, height: u16) -> Result<PtyChild, ShellError> {
-    use std::os::fd::AsRawFd;
-
-    // A program on a terminal opens its own terminal again, as `/dev/tty`.
-    let policy = req.sandbox.clone().map(|mut p| {
-        p.write_paths
-            .extend(["/dev/tty", "/dev/pts"].map(std::path::PathBuf::from));
-        p
-    });
-    let sandboxed = policy.as_ref().filter(|p| !p.unrestricted);
-    if let Some(policy) = sandboxed {
-        if !crate::sandbox::is_supported() {
-            return Err(ShellError::SandboxUnavailable);
-        }
-        if policy.allow_net {
-            return Err(ShellError::Terminal(format!(
-                "a terminal pane cannot reach the network inside the sandbox, so `{}` needs grants without `net:`",
-                req.bin
-            )));
-        }
-    }
-    #[cfg(target_os = "macos")]
-    let (bin, args): (String, Vec<String>) = match sandboxed {
-        Some(p) => crate::sandbox::wrap_argv(p, &req.bin, &req.args),
-        None => (req.bin.clone(), req.args.clone()),
+    let failed = |e: &dyn std::fmt::Display| {
+        ShellError::Terminal(format!("could not open a terminal ({e})"))
     };
-    #[cfg(not(target_os = "macos"))]
-    let (bin, args): (String, Vec<String>) = (req.bin.clone(), req.args.clone());
-
-    let (pty, pts) = pty_process::open()
-        .map_err(|e| ShellError::Terminal(format!("could not open a terminal ({e})")))?;
-    pty.resize(pty_process::Size::new(height.max(1), width.max(2)))
-        .map_err(|e| ShellError::Terminal(format!("could not open a terminal ({e})")))?;
-    let mut cmd = pty_process::Command::new(&bin)
-        .args(&args)
-        .env("TERM", "xterm-256color")
-        .kill_on_drop(true);
+    let pair = native_pty_system()
+        .openpty(size(width, height))
+        .map_err(|e| failed(&e))?;
+    let mut cmd = CommandBuilder::new(&req.bin);
+    cmd.args(&req.args);
+    cmd.env("TERM", "xterm-256color");
     if let Some(cwd) = &req.cwd {
-        cmd = cmd.current_dir(cwd);
+        cmd.cwd(cwd);
     }
-    #[cfg(target_os = "linux")]
-    if let Some(policy) = sandboxed.cloned() {
-        cmd = unsafe {
-            cmd.pre_exec(move || {
-                crate::sandbox::apply(&policy)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
-            })
-        };
-    }
-    let child = cmd.spawn(pts).map_err(|e| ShellError::Spawn {
-        bin: req.bin.clone(),
-        source: std::io::Error::other(e),
-    })?;
-    let fd = pty.as_raw_fd();
-    let (reader, writer) = pty.into_split();
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| ShellError::Spawn {
+            bin: req.bin.clone(),
+            source: std::io::Error::other(e.to_string()),
+        })?;
+    drop(pair.slave);
+    let mut output = pair.master.try_clone_reader().map_err(|e| failed(&e))?;
+    let mut input = pair.master.take_writer().map_err(|e| failed(&e))?;
+    let runtime = tokio::runtime::Handle::current();
+
+    // Program output: a blocking thread copies it into an async pipe.
+    let (reader, mut out_pipe) = tokio::io::duplex(64 * 1024);
+    let out_runtime = runtime.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = output.read(&mut buf) {
+            if n == 0 || out_runtime.block_on(out_pipe.write_all(&buf[..n])).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Keys: an async pipe a blocking thread copies into the program.
+    let (mut in_pipe, writer) = tokio::io::duplex(16 * 1024);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = runtime.block_on(in_pipe.read(&mut buf)) {
+            if n == 0
+                || input
+                    .write_all(&buf[..n])
+                    .and_then(|_| input.flush())
+                    .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let master = Mutex::new(pair.master);
     let resize = Box::new(move |width: u16, height: u16| {
-        let size = libc::winsize {
-            ws_row: height.max(1),
-            ws_col: width.max(2),
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        // The descriptor lives as long as the reader and writer, which are
-        // dropped together with this closure.
-        unsafe {
-            libc::ioctl(fd, libc::TIOCSWINSZ, &size);
+        if let Ok(master) = master.lock() {
+            let _ = master.resize(size(width, height));
         }
     });
     Ok(PtyChild {
         reader: Box::new(reader),
         writer: Box::new(writer),
         resize,
-        child: Box::new(child),
+        child: Box::new(KillOnDrop(child)),
     })
-}
-
-/// Windows has no sandbox that can wrap a terminal yet.
-#[cfg(not(unix))]
-pub fn spawn_pty(req: &ExecRequest, _width: u16, _height: u16) -> Result<PtyChild, ShellError> {
-    Err(ShellError::Terminal(format!(
-        "terminal panes are not available on this system yet, so `{}` was not started",
-        req.bin
-    )))
 }
 
 #[cfg(all(test, unix))]
@@ -107,7 +112,7 @@ mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_program_prints_to_its_terminal() {
         let req = ExecRequest {
             bin: "/bin/sh".into(),
