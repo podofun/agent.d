@@ -11,6 +11,7 @@ use super::clipboard;
 use super::commands;
 use super::editor::Editor;
 use super::presentation;
+use super::remote::{Remote, ScriptUi};
 use super::search;
 use super::ui::{self, Selection};
 use crate::ws::{WsResponse, ws_call, ws_call_streaming_cancelable};
@@ -85,11 +86,13 @@ pub(super) struct Entry {
     /// On a tool row: the call's output as the tool returned it, when it is
     /// an object, so the row can lay its fields out instead of flat text.
     pub(super) output: Option<Value>,
+    /// How a script asked for this entry to be shown.
+    pub(super) decoration: Option<agentd_ui::EntryDecoration>,
     rendered: RefCell<Option<(usize, Vec<Line<'static>>)>>,
 }
 
 /// One file a tool call changed, as the daemon reports it on `tool_result`.
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub(super) struct FileChange {
     pub(super) path: String,
     /// `created`, `modified`, or `removed`.
@@ -132,6 +135,8 @@ pub(super) enum Update {
         /// The messages that started the chat, shown once it exists.
         messages: Vec<String>,
     },
+    /// From the scripted UI connection.
+    Ui(Remote),
     /// The session could not be created, so `messages` go back to the queue
     /// for the next message to carry.
     SessionFailed {
@@ -245,6 +250,8 @@ pub(super) struct App {
     pub(super) decisions_rx: Option<mpsc::UnboundedReceiver<Decision>>,
     pub(super) updates: mpsc::UnboundedSender<Update>,
     pub(super) received: mpsc::UnboundedReceiver<Update>,
+    /// What scripts in the daemon show in this chat.
+    pub(super) script: ScriptUi,
 }
 
 impl App {
@@ -306,6 +313,7 @@ impl App {
             decisions_rx: Some(decisions_rx),
             updates,
             received,
+            script: ScriptUi::default(),
         }
     }
 
@@ -1011,6 +1019,11 @@ impl App {
                 self.queue_held = true;
             }
             Update::Sessions(items) => self.sessions = items,
+            Update::Ui(Remote::Ready(ready)) => self.script.ready(ready),
+            Update::Ui(Remote::Frame(frame)) => {
+                self.script.receive(frame);
+                self.play_frames();
+            }
             Update::ActionFinished { name, result } => {
                 self.notice = None;
                 match result.and_then(response_result) {
@@ -1035,6 +1048,67 @@ impl App {
         }
         if self.scroll == 0 {
             self.unread = false;
+        }
+    }
+
+    /// Show the scripted UI frames that are due. Returns whether any were.
+    pub(super) fn play_frames(&mut self) -> bool {
+        let Some(ops) = self.script.play() else {
+            return false;
+        };
+        for op in ops {
+            match op {
+                None => {
+                    for entry in &mut self.entries {
+                        entry.set_decoration(None);
+                    }
+                    self.script.sent_entries.clear();
+                }
+                Some(agentd_ui::Op::Note { text }) => {
+                    self.notice = Some(agentd_ui::sanitize(&text));
+                }
+                Some(agentd_ui::Op::Entry { key, decoration }) => {
+                    if let Some(entry) = key
+                        .strip_prefix('e')
+                        .and_then(|i| i.parse::<usize>().ok())
+                        .and_then(|i| self.entries.get_mut(i))
+                    {
+                        let none = decoration == agentd_ui::EntryDecoration::default();
+                        entry.set_decoration((!none).then_some(decoration));
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        true
+    }
+
+    /// Tell the scripts which session the chat shows and every entry that
+    /// is new or changed since they last heard.
+    pub(super) fn sync_script(&mut self) {
+        if self.script.chat.is_none() {
+            return;
+        }
+        if self.script.sent_session.as_ref() != Some(&self.session)
+            || self.script.sent_entries.len() > self.entries.len()
+        {
+            self.script
+                .send("ui.session", json!({ "session": self.session }));
+            self.script.sent_session = Some(self.session.clone());
+            self.script.sent_entries.clear();
+        }
+        for (index, entry) in self.entries.iter().enumerate() {
+            let signature = entry.signature();
+            if self.script.sent_entries.get(index) == Some(&signature) {
+                continue;
+            }
+            let info = entry.info(format!("e{index}"));
+            self.script.send("ui.entry", json!({ "entry": info }));
+            if index < self.script.sent_entries.len() {
+                self.script.sent_entries[index] = signature;
+            } else {
+                self.script.sent_entries.push(signature);
+            }
         }
     }
 
@@ -1138,7 +1212,12 @@ impl App {
 
     /// The run of tool rows that `index` belongs to, as `start..end`.
     pub(super) fn tool_run(&self, index: usize) -> std::ops::Range<usize> {
-        let is_tool = |entry: &Entry| matches!(entry.kind, EntryKind::Tool);
+        // A row a script summarized or hid stands on its own.
+        let is_tool =
+            |entry: &Entry| matches!(entry.kind, EntryKind::Tool) && entry.decoration.is_none();
+        if !is_tool(&self.entries[index]) {
+            return index..index + 1;
+        }
         let start = self.entries[..index]
             .iter()
             .rposition(|entry| !is_tool(entry))
@@ -1181,6 +1260,7 @@ impl Entry {
             changes: Vec::new(),
             failed: false,
             output: None,
+            decoration: None,
             rendered: RefCell::new(None),
         }
     }
@@ -1193,6 +1273,67 @@ impl Entry {
     pub(super) fn set_changes(&mut self, changes: Vec<FileChange>) {
         self.changes = changes;
         self.rendered.get_mut().take();
+    }
+
+    pub(super) fn set_decoration(&mut self, decoration: Option<agentd_ui::EntryDecoration>) {
+        self.decoration = decoration;
+        self.rendered.get_mut().take();
+    }
+
+    pub(super) fn hidden(&self) -> bool {
+        self.decoration.as_ref().is_some_and(|d| d.hidden)
+    }
+
+    /// The one-line summary a script set for this tool row.
+    pub(super) fn summary(&self) -> Option<&str> {
+        self.decoration.as_ref().and_then(|d| d.summary.as_deref())
+    }
+
+    /// What scripts may read about this entry.
+    fn info(&self, key: String) -> agentd_ui::EntryInfo {
+        let kind = match self.kind {
+            EntryKind::User => "user",
+            EntryKind::Agent => "agent",
+            EntryKind::Tool => "tool",
+            EntryKind::Info => "info",
+            EntryKind::Error => "error",
+            EntryKind::Setting => "setting",
+        };
+        let tool = matches!(self.kind, EntryKind::Tool);
+        agentd_ui::EntryInfo {
+            key,
+            kind: kind.into(),
+            text: (!tool).then(|| self.text.clone()),
+            name: tool.then(|| self.text.clone()),
+            input: self.input.clone(),
+            result: self
+                .output
+                .clone()
+                .or_else(|| (!self.body.is_empty()).then(|| Value::String(self.body.clone()))),
+            failed: self.failed,
+            changes: self
+                .changes
+                .iter()
+                .filter_map(|c| serde_json::to_value(c).ok())
+                .collect(),
+        }
+    }
+
+    /// Changes whenever what scripts can read about the entry changes.
+    fn signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        (
+            self.kind as u8,
+            self.text.len(),
+            self.body.len(),
+            self.input.is_some(),
+            self.output.is_some(),
+            self.failed,
+            self.changes.len(),
+        )
+            .hash(&mut hasher);
+        hasher.finish()
     }
 
     pub(super) fn set_expanded(&mut self, expanded: bool) {

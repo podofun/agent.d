@@ -167,6 +167,24 @@ fn conversation_lines(app: &App, width: usize) -> Conversation {
                 }
             }
         } else {
+            if entry.hidden() {
+                index = run.end;
+                continue;
+            }
+            let attached = |nodes: &[agentd_ui::NodeId]| -> Vec<Line<'static>> {
+                nodes
+                    .iter()
+                    .flat_map(|node| super::element_lines(&app.script.tree, *node, body_width))
+                    .map(indented)
+                    .collect()
+            };
+            let (before, after) = entry
+                .decoration
+                .as_ref()
+                .map(|d| (attached(&d.before), attached(&d.after)))
+                .unwrap_or_default();
+            selectable.extend(before.iter().map(|_| 0..0));
+            lines.extend(before);
             let block = entry.lines(body_width, || entry_lines(entry, body_width));
             tool_headers.extend(
                 toggle_rows(entry, &block).map(|row| (lines.len() + row, ToolRow::Entry(index))),
@@ -178,6 +196,8 @@ fn conversation_lines(app: &App, width: usize) -> Conversation {
                     .map(|(row, line)| selectable_range(entry, row, line)),
             );
             lines.extend(block);
+            selectable.extend(after.iter().map(|_| 0..0));
+            lines.extend(after);
         }
         lines.push(Line::raw(""));
         selectable.push(0..0);
@@ -304,6 +324,20 @@ fn selectable_range(entry: &Entry, row: usize, line: &Line<'static>) -> std::ops
 }
 
 fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
+    let lines = kind_lines(entry, width);
+    match entry.decoration.as_ref().filter(|d| !d.style.is_empty()) {
+        Some(decoration) => {
+            let style = super::script::style_of(&decoration.style);
+            lines
+                .into_iter()
+                .map(|line| line.patch_style(style))
+                .collect()
+        }
+        None => lines,
+    }
+}
+
+fn kind_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
     let body = if entry.markdown {
         markdown::render(&entry.text, width, palette())
     } else {
@@ -386,6 +420,15 @@ fn tool_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
         header.iter_mut().for_each(active);
     }
     let mut lines = with_gutter("✦", WARNING, header);
+    if !entry.expanded
+        && let Some(summary) = entry.summary()
+    {
+        lines.push(indented(Line::styled(
+            format!("  {}", agentd_ui::sanitize(summary)),
+            Style::default().fg(MUTED),
+        )));
+        return lines;
+    }
     let inner = width.saturating_sub(2);
     if !entry.expanded {
         if changes.is_empty() {

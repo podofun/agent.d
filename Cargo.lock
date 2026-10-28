@@ -93,6 +93,7 @@ dependencies = [
  "agentd-packages",
  "agentd-secrets",
  "agentd-types",
+ "agentd-ui",
  "anyhow",
  "arboard",
  "clap",

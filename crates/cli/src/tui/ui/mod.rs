@@ -14,11 +14,13 @@ mod conversation;
 mod highlight;
 mod logo;
 mod markdown;
+mod script;
 mod selection;
 
 pub(super) use conversation::conversation_inner;
 pub(super) use conversation::{clickable_at, max_scroll, suggestion_at, toggle_tool, tool_at};
 pub(super) use logo::SPIN as LEAF_SPIN;
+pub(super) use script::{element_lines, hit as script_hit, terminals as script_terminals};
 #[cfg(test)]
 pub(super) use selection::Point;
 pub(super) use selection::{Selection, point_at, selected_text};
@@ -47,13 +49,17 @@ pub(super) fn spinner_frame(app: &App) -> &'static str {
 }
 
 pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
-    let area = frame.area();
-    let rows = screen_rows(area, app);
-    draw_header(frame, app, rows[0]);
-    conversation::draw_conversation(frame, app, rows[1]);
-    conversation::draw_suggestions(frame, app, rows[2]);
-    draw_composer(frame, app, rows[3]);
-    draw_status(frame, app, rows[4]);
+    if app.script.custom() {
+        script::draw(frame, app);
+    } else {
+        let area = frame.area();
+        let rows = screen_rows(area, app);
+        draw_header(frame, app, rows[0]);
+        conversation::draw_conversation(frame, app, rows[1]);
+        conversation::draw_suggestions(frame, app, rows[2]);
+        draw_composer(frame, app, rows[3], None);
+        draw_status(frame, app, rows[4]);
+    }
     if app.tab != Tab::Chat {
         browser::draw_browser(frame, app);
     }
@@ -63,6 +69,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
 }
 
 pub(super) fn screen_rows(area: Rect, app: &App) -> [Rect; 5] {
+    if let Some(rows) = script::part_rects(app, area) {
+        return rows;
+    }
     let composer_lines = app
         .input
         .layout(area.width.saturating_sub(6).max(1) as usize)
@@ -305,14 +314,15 @@ pub(super) fn truncate(text: &str, width: usize) -> String {
     out
 }
 
-fn draw_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let border = if !app.connected {
+/// The prompt. A script may colour its border.
+fn draw_composer(frame: &mut Frame<'_>, app: &App, area: Rect, border: Option<Color>) {
+    let border = border.unwrap_or(if !app.connected {
         MUTED
     } else if app.pending {
         WARNING
     } else {
         SECONDARY
-    };
+    });
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)

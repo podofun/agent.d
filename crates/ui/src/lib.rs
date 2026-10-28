@@ -16,9 +16,9 @@ use serde_json::Value;
 
 pub use doc::Document;
 pub use hub::{Chat, ChatInfo, Hub, Script, Subscription};
-pub use layout::{Rect, Size, layout};
+pub use layout::{Rect, Size, border_width, layout};
 pub use terminal::{TerminalIo, TerminalResize};
-pub use tree::Tree;
+pub use tree::{Node, Tree};
 
 /// Version of the wire protocol. A client sends the version it speaks in
 /// `ui.subscribe`; the daemon answers with its own in `ui.ready`.

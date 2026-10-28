@@ -4,6 +4,7 @@ mod commands;
 mod control;
 mod editor;
 mod presentation;
+mod remote;
 mod search;
 mod ui;
 
@@ -93,15 +94,38 @@ pub(crate) async fn run(
         app.decisions_rx.take().expect("control receiver"),
     );
     let mut screen = Screen::open()?;
+    let size = screen.0.size()?;
+    let hello = serde_json::json!({
+        "version": agentd_ui::PROTOCOL_VERSION,
+        "client": { "kind": "tui", "width": size.width, "height": size.height, "supports": [] },
+        "session": app.session,
+        "folder": std::env::current_dir().ok(),
+    });
+    app.script.connect(remote::start(
+        base.to_owned(),
+        timeout,
+        hello,
+        app.updates.clone(),
+    ));
     let mut events = EventStream::new();
     let mut spinner = tokio::time::interval(Duration::from_millis(60));
+    let mut frames = tokio::time::interval(Duration::from_millis(16));
     let mut dirty = true;
     loop {
         if dirty {
             screen.0.draw(|frame| ui::draw(frame, &app))?;
             dirty = false;
+            let size = screen.0.size()?;
+            let terminals = ui::script_terminals(&app, Rect::new(0, 0, size.width, size.height));
+            app.script.terminal_sizes(terminals);
         }
         tokio::select! {
+            _ = frames.tick(), if app.script.waiting() => {
+                if app.play_frames() {
+                    app.sync_script();
+                    dirty = true;
+                }
+            }
             update = app.received.recv() => {
                 if let Some(update) = update {
                     let size = screen.0.size()?;
@@ -112,6 +136,7 @@ pub(crate) async fn run(
                     }
                     apply_updates(&mut app, area, updates);
                     app.send_queued().await;
+                    app.sync_script();
                     dirty = true;
                 }
             }
@@ -124,6 +149,7 @@ pub(crate) async fn run(
                     Handled::Redraw => {
                         // Picking a runner sends what waited for one.
                         app.send_queued().await;
+                        app.sync_script();
                         dirty = true;
                     }
                     Handled::Ignored => {}
@@ -152,8 +178,10 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
     app.resized(area);
     match event {
         Event::Paste(text) if app.tab == Tab::Chat && app.approval.is_none() => {
-            app.input.insert(&text);
-            app.input_changed();
+            if !paste_into_script(app, &text) {
+                app.input.insert(&text);
+                app.input_changed();
+            }
         }
         Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
             if handle_key(app, key, area).await? {
@@ -166,6 +194,13 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
             {
                 app.selection = None;
                 app.drag = None;
+                if let Some(node) = ui::script_hit(app, area, mouse.column, mouse.row) {
+                    click_script(app, node);
+                    return Ok(Handled::Redraw);
+                }
+                if app.script.focus.is_some() {
+                    blur_script(app);
+                }
                 app.press = ui::tool_at(app, area, mouse.column, mouse.row)
                     .map(|row| (row, mouse.column, mouse.row));
                 if app.press.is_some() {
@@ -215,13 +250,20 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                 }
             }
             MouseEventKind::Moved => {
-                // Redraw only when the row under the mouse changes.
+                // Redraw only when what is under the mouse changes.
                 let hover = (app.tab == Tab::Chat && app.approval.is_none())
                     .then(|| ui::clickable_at(app, area, mouse.column, mouse.row))
                     .flatten();
-                if hover == app.hover {
+                let element = ui::script_hit(app, area, mouse.column, mouse.row);
+                if hover == app.hover && element == app.script.hover {
                     return Ok(Handled::Ignored);
                 }
+                if element != app.script.hover
+                    && let Some(node) = element
+                {
+                    app.script.event(Some(node), agentd_ui::Event::Hover);
+                }
+                app.script.hover = element;
                 app.hover = hover;
             }
             MouseEventKind::ScrollUp => {
@@ -246,7 +288,11 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
             }
             _ => return Ok(Handled::Ignored),
         },
-        Event::Resize(width, height) => app.resized(Rect::new(0, 0, width, height)),
+        Event::Resize(width, height) => {
+            app.resized(Rect::new(0, 0, width, height));
+            app.script
+                .event(None, agentd_ui::Event::Resize { width, height });
+        }
         _ => return Ok(Handled::Ignored),
     }
     Ok(Handled::Redraw)
@@ -259,6 +305,9 @@ async fn handle_key(app: &mut App, key: KeyEvent, screen: Rect) -> Result<bool> 
     }
     if app.approval.is_some() {
         handle_approval_key(app, key);
+        return Ok(false);
+    }
+    if app.tab == Tab::Chat && handle_script_key(app, key) {
         return Ok(false);
     }
     if key.code == KeyCode::Char('p') && control {
@@ -290,6 +339,198 @@ async fn handle_key(app: &mut App, key: KeyEvent, screen: Rect) -> Result<bool> 
         app.input_changed();
     }
     Ok(false)
+}
+
+/// Keys for the focused script element, or a shortcut a script bound.
+/// Ctrl+C, the approval window and Shift+Tab never get here. Returns true
+/// when the key was used.
+fn handle_script_key(app: &mut App, key: KeyEvent) -> bool {
+    use agentd_ui::Event;
+    if key.code == KeyCode::BackTab {
+        return false;
+    }
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    if let Some(focus) = app.script.focus {
+        let kind = app
+            .script
+            .tree
+            .get(focus)
+            .map(|n| n.kind.clone())
+            .unwrap_or_default();
+        if (key.code == KeyCode::Char('q') && control)
+            || (key.code == KeyCode::Esc && kind != "terminal")
+        {
+            blur_script(app);
+            return true;
+        }
+        match (kind.as_str(), key.code) {
+            ("terminal", _) => {
+                if let Some(data) = remote::key_bytes(&key) {
+                    app.script.event(Some(focus), Event::Input { data });
+                }
+                return true;
+            }
+            ("input", code) => {
+                let mut value = app
+                    .script
+                    .tree
+                    .get(focus)
+                    .and_then(|n| n.props.get("value"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                match code {
+                    KeyCode::Char(c) if !control => value.push(c),
+                    KeyCode::Backspace => {
+                        value.pop();
+                    }
+                    _ => {
+                        if let Some(name) = remote::key_name(&key) {
+                            app.script.event(Some(focus), Event::Key { key: name });
+                        }
+                        return true;
+                    }
+                }
+                set_script_value(app, focus, "value", serde_json::json!(value));
+                return true;
+            }
+            ("button" | "checkbox", KeyCode::Enter | KeyCode::Char(' ')) => {
+                click_script(app, focus);
+                return true;
+            }
+            ("list", KeyCode::Up | KeyCode::Down) => {
+                let Some(node) = app.script.tree.get(focus) else {
+                    return true;
+                };
+                let count = node.children.len() as i64;
+                let selected = node
+                    .props
+                    .get("selected")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let step = if key.code == KeyCode::Up { -1 } else { 1 };
+                let next = (selected + step).clamp(1, count.max(1));
+                set_script_value(app, focus, "selected", serde_json::json!(next));
+                return true;
+            }
+            ("list", KeyCode::Enter) => {
+                let child = app.script.tree.get(focus).and_then(|n| {
+                    let selected = n.props.get("selected")?.as_u64()? as usize;
+                    n.children.get(selected.checked_sub(1)?).copied()
+                });
+                if let Some(child) = child {
+                    app.script.event(Some(child), Event::Click);
+                }
+                return true;
+            }
+            _ => blur_script(app),
+        }
+    }
+    if let Some(name) = remote::key_name(&key)
+        && !agentd_ui::is_reserved_key(&name)
+        && app.script.tree.bindings.contains(&name)
+    {
+        app.script.event(None, Event::Key { key: name });
+        return true;
+    }
+    false
+}
+
+/// Change a value the user edits, here and for the scripts.
+fn set_script_value(app: &mut App, node: agentd_ui::NodeId, key: &str, value: serde_json::Value) {
+    app.script.tree.apply(&agentd_ui::Op::Set {
+        node,
+        key: key.into(),
+        value: value.clone(),
+    });
+    app.script
+        .event(Some(node), agentd_ui::Event::Change { value });
+}
+
+fn blur_script(app: &mut App) {
+    if let Some(old) = app.script.focus.take() {
+        app.script.event(Some(old), agentd_ui::Event::Blur);
+    }
+}
+
+/// A click on a script element: focus what takes focus, select a list
+/// item, tick a checkbox, and tell the scripts.
+fn click_script(app: &mut App, node: agentd_ui::NodeId) {
+    const FOCUSABLE: [&str; 5] = ["input", "terminal", "button", "checkbox", "list"];
+    let tree = &app.script.tree;
+    let mut focus = None;
+    let mut list_pick = None;
+    let mut at = Some(node);
+    let mut below = None;
+    while let Some(n) = at {
+        let Some(el) = tree.get(n) else { break };
+        if focus.is_none() && FOCUSABLE.contains(&el.kind.as_str()) {
+            focus = Some(n);
+        }
+        if el.kind == "list"
+            && list_pick.is_none()
+            && let Some(child) = below
+            && let Some(index) = el.children.iter().position(|c| *c == child)
+        {
+            list_pick = Some((n, index + 1));
+        }
+        below = Some(n);
+        at = el.parent;
+    }
+    if focus != app.script.focus {
+        blur_script(app);
+        if let Some(f) = focus {
+            app.script.focus = Some(f);
+            app.script.event(Some(f), agentd_ui::Event::Focus);
+        }
+    }
+    if let Some((list, index)) = list_pick {
+        set_script_value(app, list, "selected", serde_json::json!(index));
+    }
+    if app
+        .script
+        .tree
+        .get(node)
+        .is_some_and(|n| n.kind == "checkbox")
+    {
+        let checked = app
+            .script
+            .tree
+            .get(node)
+            .and_then(|n| n.props.get("checked"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        set_script_value(app, node, "checked", serde_json::json!(!checked));
+    }
+    app.script.event(Some(node), agentd_ui::Event::Click);
+}
+
+/// Paste into a focused terminal or input. Returns whether it went there.
+fn paste_into_script(app: &mut App, text: &str) -> bool {
+    let Some(focus) = app.script.focus else {
+        return false;
+    };
+    match app.script.tree.get(focus).map(|n| n.kind.as_str()) {
+        Some("terminal") => {
+            app.script
+                .event(Some(focus), agentd_ui::Event::Input { data: text.into() });
+            true
+        }
+        Some("input") => {
+            let mut value = app
+                .script
+                .tree
+                .get(focus)
+                .and_then(|n| n.props.get("value"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            value.push_str(&text.replace(['\n', '\r'], " "));
+            set_script_value(app, focus, "value", serde_json::json!(value));
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Ctrl+C: deny, cancel, copy, clear, or quit, in that order of relevance.
@@ -529,6 +770,178 @@ async fn submit_draft(app: &mut App) -> Result<bool> {
 mod tests {
     use super::*;
     use app::{EntryKind, ToolRow};
+
+    fn render(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Feed ops to the chat as the daemon would, shown at once.
+    fn scripted(app: &mut App, reset: bool, ops: Vec<agentd_ui::Op>) {
+        if app.script.chat.is_none() {
+            app.script.ready(agentd_ui::Ready {
+                version: 1,
+                chat: 1,
+                clock: 0,
+            });
+        }
+        app.apply(app::Update::Ui(remote::Remote::Frame(agentd_ui::Frame {
+            seq: 0,
+            at: 0,
+            reset,
+            cancel_ahead: false,
+            ops,
+        })));
+    }
+
+    fn text_element(node: u64, text: &str) -> Vec<agentd_ui::Op> {
+        let mut props = agentd_ui::Props::new();
+        props.insert("text".into(), serde_json::json!(text));
+        vec![
+            agentd_ui::Op::Create {
+                node,
+                kind: "text".into(),
+                props,
+                style: Default::default(),
+            },
+            agentd_ui::Op::Insert {
+                parent: agentd_ui::parts::MAIN,
+                node,
+                index: 1,
+            },
+        ]
+    }
+
+    fn talking() -> App {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, Some("coder".into()));
+        app.connected = true;
+        app.push(EntryKind::User, "hello");
+        app.push(EntryKind::Agent, "Hi! **What** shall we build?");
+        app.push_tool("files.read", "fn main() {}");
+        app
+    }
+
+    #[test]
+    fn chat_looks_the_same_with_only_the_default_view() {
+        let plain = talking();
+        let mut default = talking();
+        scripted(
+            &mut default,
+            true,
+            agentd_ui::Tree::default_chat().snapshot(),
+        );
+        assert!(!default.script.custom());
+        assert_eq!(render(&plain, 90, 24), render(&default, 90, 24));
+
+        // Bindings alone change nothing on screen.
+        scripted(
+            &mut default,
+            false,
+            vec![agentd_ui::Op::Bindings {
+                keys: vec!["ctrl+g".into()],
+            }],
+        );
+        assert_eq!(render(&plain, 90, 24), render(&default, 90, 24));
+
+        let mut panel = talking();
+        scripted(&mut panel, true, agentd_ui::Tree::default_chat().snapshot());
+        scripted(&mut panel, false, text_element(100, "todo panel"));
+        assert!(panel.script.custom());
+        let shown: String = render(&panel, 90, 24)
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            shown.contains("todo panel") && shown.contains("What"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn script_text_cannot_reach_the_terminal_as_escapes() {
+        let mut app = talking();
+        scripted(&mut app, true, agentd_ui::Tree::default_chat().snapshot());
+        scripted(
+            &mut app,
+            false,
+            text_element(100, "a\x1b[2Jb\x07c\u{9b}31md"),
+        );
+        let buffer = render(&app, 90, 24);
+        let shown: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(!shown.chars().any(|c| c.is_control()), "{shown:?}");
+        assert!(shown.contains('a') && shown.contains("[2Jb"));
+    }
+
+    #[tokio::test]
+    async fn chat_keeps_ctrl_c_and_the_approval_keys_whatever_scripts_bind() {
+        let (out, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = talking();
+        app.script.connect(out);
+        scripted(&mut app, true, agentd_ui::Tree::default_chat().snapshot());
+        let mut ops = text_element(100, "pane");
+        ops[0] = agentd_ui::Op::Create {
+            node: 100,
+            kind: "terminal".into(),
+            props: Default::default(),
+            style: Default::default(),
+        };
+        ops.push(agentd_ui::Op::Bindings {
+            keys: vec!["ctrl+c".into(), "o".into(), "backtab".into()],
+        });
+        scripted(&mut app, false, ops);
+        app.script.focus = Some(100);
+        let screen = Rect::new(0, 0, 90, 24);
+        while sent.try_recv().is_ok() {}
+
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        handle_key(&mut app, ctrl_c, screen).await.unwrap();
+        assert!(app.quit_armed(), "Ctrl+C reached chat");
+        assert!(
+            sent.try_recv().is_err(),
+            "Ctrl+C was not sent to the script"
+        );
+
+        let request: agentd_types::ApprovalRequest = serde_json::from_value(serde_json::json!({
+            "id": 7, "kind": "missing_grant", "action": "shell.run", "tool": null,
+            "requires": [], "missing": [], "reason": "", "caller": {}
+        }))
+        .unwrap();
+        app.apply(app::Update::Approval(Box::new(request)));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('o')), screen)
+            .await
+            .unwrap();
+        assert!(
+            app.approval.is_none(),
+            "the approval key answered the approval"
+        );
+        assert!(sent.try_recv().is_err());
+
+        // The approval window draws over whatever the script shows.
+        let request: agentd_types::ApprovalRequest = serde_json::from_value(serde_json::json!({
+            "id": 8, "kind": "missing_grant", "action": "shell.run", "tool": null,
+            "requires": [], "missing": [], "reason": "", "caller": {}
+        }))
+        .unwrap();
+        app.apply(app::Update::Approval(Box::new(request)));
+        scripted(
+            &mut app,
+            false,
+            vec![agentd_ui::Op::Set {
+                node: agentd_ui::parts::CONVERSATION,
+                key: "visible".into(),
+                value: serde_json::json!(false),
+            }],
+        );
+        let shown: String = render(&app, 90, 24)
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(shown.contains("shell.run"), "{shown}");
+    }
 
     #[tokio::test]
     async fn typing_in_the_browser_filters_and_esc_clears_before_closing() {
