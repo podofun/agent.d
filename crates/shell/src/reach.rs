@@ -89,6 +89,8 @@ pub struct Reach {
     write: Vec<PathBuf>,
     /// The hosts the child may connect to, or `None` without network.
     net: Option<Vec<Permission>>,
+    /// The mount table, read once per policy rather than once per path asked.
+    mounts: Vec<mounts::Mount>,
 }
 
 impl Reach {
@@ -111,6 +113,7 @@ impl Reach {
             read,
             write,
             net: policy.allow_net.then(|| policy.net_hosts.clone()),
+            mounts: mounts::table(),
         }
     }
 
@@ -124,8 +127,8 @@ impl Reach {
         if let Some(folder) = folders.iter().find(|f| nested(f, &target)) {
             return Some(Overlap::Folder(folder.clone()));
         }
-        let mounts = mounts::table();
-        mounts::overlap(&mounts, folders, &target).or_else(|| hard_link(folders, &target, &mounts))
+        let mounts = &self.mounts;
+        mounts::overlap(mounts, folders, &target).or_else(|| hard_link(folders, &target, mounts))
     }
 }
 
