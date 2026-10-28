@@ -413,10 +413,18 @@ impl LuaHost {
     pub fn start_async_runtime(&self, handle: tokio::runtime::Handle) {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<scheduler::AsyncTask>();
         let lua_handle = self.lua.clone();
+        // A script that calls `async(f)` in a loop must not spawn a task per
+        // call without limit. Later tasks wait their turn in the queue.
+        const MAX_IN_FLIGHT: usize = 256;
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
         handle.spawn(async move {
             while let Some(task) = rx.recv().await {
+                let Ok(slot) = slots.clone().acquire_owned().await else {
+                    break;
+                };
                 let lua = lua_handle.clone();
                 tokio::spawn(async move {
+                    let _slot = slot;
                     let result = scheduler::drive(lua, task.thread, vec![], task.ctx).await;
                     task.state.set(match result {
                         Ok(v) => Ok(v),
