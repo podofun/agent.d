@@ -56,12 +56,37 @@ impl Permission {
         match (hs, rs) {
             (None, None) => true,
             (None, Some(_)) | (Some(_), None) => false,
-            (Some(h), Some(r)) if file_paths_ignore_case && hd.starts_with("fs.") => {
-                match_spec(&h.to_lowercase(), &r.to_lowercase())
+            (Some(h), Some(r)) if hd.starts_with("fs.") => {
+                // A grant on a folder is a plain prefix test, so a required
+                // path that climbs out of it must fail closed. Every caller
+                // resolves paths before asking; one that does not gets nothing.
+                if !normal_path(r) {
+                    return false;
+                }
+                if file_paths_ignore_case {
+                    match_spec(&h.to_lowercase(), &r.to_lowercase())
+                } else {
+                    match_spec(h, r)
+                }
             }
             (Some(h), Some(r)) => match_spec(h, r),
         }
     }
+}
+
+/// A file path with no `.` or `..` components, either separator.
+fn normal_path(path: &str) -> bool {
+    !path
+        .split(['/', '\\'])
+        .any(|component| component == "." || component == "..")
+}
+
+/// A path that only makes sense on Windows: a drive letter or a UNC share.
+/// Only these fold `\` into `/`; on Unix a backslash is an ordinary byte in a
+/// file name, and folding it would let `proj\evil` pass as `proj/evil`.
+fn windows_path(spec: &str) -> bool {
+    let b = spec.as_bytes();
+    (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':') || spec.starts_with("\\\\")
 }
 
 /// Whether this platform's default file systems ignore letter case in paths
@@ -101,17 +126,22 @@ fn match_spec(holder: &str, required: &str) -> bool {
     // `C:\dir\**`, while a resolved slug uses native backslashes). Treat `\` and
     // `/` as equivalent so the `/`-based glob logic below matches either form.
     // No-op for specifiers without backslashes (hosts, bare binaries, ...).
-    if holder.contains('\\') || required.contains('\\') {
+    if (holder.contains('\\') || required.contains('\\'))
+        && (windows_path(holder) || windows_path(required))
+    {
         return match_spec(&holder.replace('\\', "/"), &required.replace('\\', "/"));
     }
     if let Some(prefix) = holder.strip_suffix("/**") {
-        return required == prefix || required.starts_with(&format!("{prefix}/"));
+        return required == prefix
+            || required
+                .strip_prefix(prefix)
+                .is_some_and(|tail| tail.starts_with('/'));
     }
     if let Some(prefix) = holder.strip_suffix("/*") {
-        if let Some(tail) = required.strip_prefix(&format!("{prefix}/")) {
-            return !tail.contains('/');
-        }
-        return false;
+        return required
+            .strip_prefix(prefix)
+            .and_then(|tail| tail.strip_prefix('/'))
+            .is_some_and(|name| !name.contains('/'));
     }
     if let Some(prefix) = holder.strip_suffix('*') {
         return required.starts_with(prefix);
@@ -343,8 +373,22 @@ impl Denial {
     pub fn denies_action(&self, name: &str) -> bool {
         self.actions.contains(name)
     }
+    /// A denied file path also denies everything inside it, so an operator
+    /// who writes `fs.read:/home/me/.ssh` (with or without a trailing slash)
+    /// gets what they meant without having to know the `/**` form.
     pub fn denies_permission(&self, p: &Permission) -> bool {
-        self.permissions.contains(p)
+        self.permissions.iter().any(|h| {
+            if h.covers(p) {
+                return true;
+            }
+            let (domain, spec) = h.parts();
+            let Some(spec) = spec else { return false };
+            if !domain.starts_with("fs.") || spec.ends_with('*') {
+                return false;
+            }
+            let folder = spec.trim_end_matches(['/', '\\']);
+            Permission::new(format!("{domain}:{folder}/**")).covers(p)
+        })
     }
 }
 
@@ -507,6 +551,35 @@ mod tests {
             !Permission::new(r"fs.read:C:\Users\me\**")
                 .covers(&Permission::new(r"fs.read:C:\Users\other\a.txt"))
         );
+    }
+
+    #[test]
+    fn unix_backslash_is_a_file_name_byte_not_a_separator() {
+        assert!(
+            !Permission::new("fs.write:/home/me/proj/**")
+                .covers(&Permission::new(r"fs.write:/home/me/proj\evil"))
+        );
+    }
+
+    #[test]
+    fn a_path_that_climbs_out_is_never_covered() {
+        let grant = Permission::new("fs.write:/work/**");
+        assert!(!grant.covers(&Permission::new("fs.write:/work/../etc/passwd")));
+        assert!(!grant.covers(&Permission::new("fs.write:/work/./a")));
+        assert!(grant.covers(&Permission::new("fs.write:/work/a..b/..c")));
+    }
+
+    #[test]
+    fn a_denied_folder_covers_what_is_inside_it() {
+        let denial = Denial {
+            permissions: PermissionSet::from_iter(["fs.read:/home/me/.ssh", "fs.write:/etc/"]),
+            ..Default::default()
+        };
+        assert!(denial.denies_permission(&Permission::new("fs.read:/home/me/.ssh")));
+        assert!(denial.denies_permission(&Permission::new("fs.read:/home/me/.ssh/id_rsa")));
+        assert!(denial.denies_permission(&Permission::new("fs.write:/etc/passwd")));
+        assert!(!denial.denies_permission(&Permission::new("fs.read:/home/me/.sshx")));
+        assert!(!denial.denies_permission(&Permission::new("fs.write:/home/me/.ssh/id_rsa")));
     }
 
     #[test]

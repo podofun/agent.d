@@ -424,6 +424,9 @@ impl Editor {
             (KeyCode::Backspace, _, _) => self.backspace(),
             (KeyCode::Delete, _, _) => self.delete(),
             (KeyCode::Char(character), false, false) => self.insert(&character.to_string()),
+            // AltGr reaches us as Control+Alt on Windows: `@`, `{`, `€` and
+            // the like on most European layouts. That is text, not a chord.
+            (KeyCode::Char(character), true, true) => self.insert(&character.to_string()),
             _ => return Edit::Ignored,
         }
         Edit::Consumed

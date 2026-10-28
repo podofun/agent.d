@@ -1052,17 +1052,17 @@ mod imp {
     }
 
     fn drain(read: HANDLE) -> String {
-        let mut out: Vec<u8> = Vec::new();
-        let mut buf = [0u8; 4096];
+        let mut out = crate::output::Capped::default();
+        let mut buf = [0u8; 64 * 1024];
         loop {
             let mut got = 0u32;
             let ok = unsafe { ReadFile(read, Some(&mut buf), Some(&mut got), None) };
             if ok.is_err() || got == 0 {
                 break;
             }
-            out.extend_from_slice(&buf[..got as usize]);
+            out.push(&buf[..got as usize]);
         }
-        String::from_utf8_lossy(&out).into_owned()
+        out.into_text()
     }
 
     /// Build the `internetClient` capability (S-1-15-3-1) so the AppContainer

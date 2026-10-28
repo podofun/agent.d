@@ -19,6 +19,7 @@ use crate::policy::SandboxError;
 // classic-BPF opcodes (linux/filter.h)
 const LD_W_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
 const JEQ_K: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
+const JGE_K: u16 = 0x35; // BPF_JMP | BPF_JGE | BPF_K
 const RET_K: u16 = 0x06; // BPF_RET | BPF_K
 
 // seccomp return actions (linux/seccomp.h)
@@ -48,6 +49,16 @@ fn stmt(code: u16, k: u32) -> libc::sock_filter {
     }
 }
 
+/// Jump when `A >= k`.
+fn jge(k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+    libc::sock_filter {
+        code: JGE_K,
+        jt,
+        jf,
+        k,
+    }
+}
+
 fn jeq(k: u32, jt: u8, jf: u8) -> libc::sock_filter {
     libc::sock_filter {
         code: JEQ_K,
@@ -63,27 +74,43 @@ fn jeq(k: u32, jt: u8, jf: u8) -> libc::sock_filter {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn deny_ip_sockets() -> Result<(), SandboxError> {
     let errno_eacces: u32 = RET_ERRNO | (libc::EACCES as u32 & 0x0000_ffff);
+    let errno_eperm: u32 = RET_ERRNO | (libc::EPERM as u32 & 0x0000_ffff);
     let sys_socket = libc::SYS_socket as u32;
+    // io_uring can open sockets (IORING_OP_SOCKET) without a socket(2) call
+    // ever passing this filter. 425 on x86_64 and aarch64 alike.
+    let sys_io_uring_setup = libc::SYS_io_uring_setup as u32;
     let af_inet = libc::AF_INET as u32;
     let af_inet6 = libc::AF_INET6 as u32;
     let af_packet = libc::AF_PACKET as u32;
+    // x32 system calls report AUDIT_ARCH_X86_64 but carry this bit in their
+    // number, so `nr == socket` never matches them. No native number is this
+    // large on either supported architecture.
+    const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
     // 0: A = arch
     // 1: if arch == native -> idx3, else fall to KILL
     // 2: RET KILL_PROCESS
     // 3: A = nr
-    // 4: if nr == socket -> fall, else -> ALLOW(idx10)
-    // 5: A = domain (args[0])
-    // 6: if domain == AF_INET   -> ERRNO(idx9)
-    // 7: if domain == AF_INET6  -> ERRNO(idx9)
-    // 8: if domain == AF_PACKET -> ERRNO(idx9), else ALLOW(idx10)
-    // 9: RET ERRNO(EACCES)
-    // 10: RET ALLOW
-    let prog: [libc::sock_filter; 11] = [
+    // 4: if nr >= x32 bit -> fall to KILL, else idx6
+    // 5: RET KILL_PROCESS
+    // 6: if nr == io_uring_setup -> fall to EPERM, else idx8
+    // 7: RET ERRNO(EPERM)
+    // 8: if nr == socket -> fall, else -> ALLOW(idx14)
+    // 9: A = domain (args[0])
+    // 10: if domain == AF_INET   -> ERRNO(idx13)
+    // 11: if domain == AF_INET6  -> ERRNO(idx13)
+    // 12: if domain == AF_PACKET -> ERRNO(idx13), else ALLOW(idx14)
+    // 13: RET ERRNO(EACCES)
+    // 14: RET ALLOW
+    let prog: [libc::sock_filter; 15] = [
         stmt(LD_W_ABS, OFF_ARCH),
         jeq(AUDIT_ARCH_NATIVE, 1, 0),
         stmt(RET_K, RET_KILL_PROCESS),
         stmt(LD_W_ABS, OFF_NR),
+        jge(X32_SYSCALL_BIT, 0, 1),
+        stmt(RET_K, RET_KILL_PROCESS),
+        jeq(sys_io_uring_setup, 0, 1),
+        stmt(RET_K, errno_eperm),
         jeq(sys_socket, 0, 5),
         stmt(LD_W_ABS, OFF_ARG0),
         jeq(af_inet, 2, 0),

@@ -36,11 +36,17 @@ pub(super) fn draw_conversation(frame: &mut Frame<'_>, app: &App, area: Rect) {
     {
         hovered(line);
     }
+    // Hand the widget only the rows on screen. `Paragraph::scroll` takes a
+    // u16, so a transcript past 65,535 lines could never reach its end, and
+    // the widget walked every skipped line on each frame.
     let offset = conversation.offset(inner.height, app.scroll);
-    frame.render_widget(
-        Paragraph::new(conversation.lines).scroll((offset.min(u16::MAX as usize) as u16, 0)),
-        inner,
-    );
+    let visible: Vec<Line<'static>> = conversation
+        .lines
+        .into_iter()
+        .skip(offset)
+        .take(inner.height as usize)
+        .collect();
+    frame.render_widget(Paragraph::new(visible), inner);
 }
 
 pub(super) struct Conversation {

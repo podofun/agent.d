@@ -58,7 +58,10 @@ fn sbpl_fs(policy: &SandboxPolicy) -> String {
         .chain(user_baseline.iter().flat_map(|p| path_forms(p)))
         .chain(policy.read_paths.iter().flat_map(|p| path_forms(p)))
     {
-        sbpl.push_str(&format!("(allow file-read* (subpath \"{r}\"))\n"));
+        sbpl.push_str(&format!(
+            "(allow file-read* (subpath \"{}\"))\n",
+            sbpl_string(&r)
+        ));
     }
     for w in policy
         .write_paths
@@ -66,9 +69,30 @@ fn sbpl_fs(policy: &SandboxPolicy) -> String {
         .flat_map(|p| path_forms(p))
         .chain(WRITE_SCRATCH.iter().map(|s| s.to_string()))
     {
-        sbpl.push_str(&format!("(allow file-write* (subpath \"{w}\"))\n"));
+        sbpl.push_str(&format!(
+            "(allow file-write* (subpath \"{}\"))\n",
+            sbpl_string(&w)
+        ));
     }
     sbpl
+}
+
+/// A path inside an SBPL string literal. A quote or a backslash in a folder
+/// name would otherwise end the literal and let the rest of the name add
+/// rules of its own.
+fn sbpl_string(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            '\\' | '"' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Generate SBPL and return the rewritten (bin, args) running under

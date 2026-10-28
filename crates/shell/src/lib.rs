@@ -19,6 +19,7 @@ mod kill_tree;
 #[cfg(target_os = "windows")]
 pub mod netbroker;
 pub mod netfilter;
+mod output;
 pub mod policy;
 mod program;
 mod reach;
@@ -129,6 +130,10 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
     }
     let tree = kill_tree::KillSwitch::default();
     let deadline = req.timeout_ms.map(std::time::Duration::from_millis);
+    // A confined command must not leave anything behind holding its grants,
+    // so once it is done the rest of its tree goes too. Unconfined commands
+    // may daemonize on purpose and keep that freedom.
+    let confined = req.sandbox.as_ref().is_some_and(|p| !p.unrestricted);
     let run = run(req, tree.clone());
     tokio::pin!(run);
     // Declared after `run`, so on drop it fires first, while the backend still
@@ -137,11 +142,19 @@ pub async fn exec(req: ExecRequest) -> Result<ExecResult, ShellError> {
 
     let Some(deadline) = deadline else {
         let res = run.await;
+        if res.is_err() || confined {
+            tree.fire();
+        }
         guard.defuse();
         return res;
     };
     let res = match tokio::time::timeout(deadline, &mut run).await {
-        Ok(res) => res,
+        Ok(res) => {
+            if res.is_err() || confined {
+                tree.fire();
+            }
+            res
+        }
         Err(_) => {
             tree.fire();
             let collected = tokio::time::timeout(OUTPUT_GRACE, &mut run).await;
@@ -292,17 +305,38 @@ async fn run(req: ExecRequest, tree: kill_tree::KillSwitch) -> Result<ExecResult
         tree.arm(job.into_kill())?;
     }
 
-    if let (Some(input), Some(mut stdin)) = (req.stdin.as_ref(), child.stdin.take()) {
-        stdin.write_all(input.as_bytes()).await?;
-        stdin.shutdown().await?;
-    } else {
-        drop(child.stdin.take());
+    // Feed stdin while draining both outputs. Doing them one after another
+    // deadlocks once the input and the output both exceed the pipe buffer:
+    // the child blocks writing, we block writing, nobody reads.
+    let stdin_pipe = child.stdin.take();
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let feed = async {
+        if let (Some(input), Some(mut stdin)) = (req.stdin.as_ref(), stdin_pipe) {
+            match stdin.write_all(input.as_bytes()).await {
+                Ok(()) => stdin.shutdown().await?,
+                // The program exited, or closed stdin, before reading it all.
+                // That is its business; its exit code tells the story.
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    async fn drain<R: tokio::io::AsyncRead + Unpin>(
+        pipe: Option<R>,
+    ) -> std::io::Result<output::Capped> {
+        match pipe {
+            Some(p) => output::Capped::read_async(p).await,
+            None => Ok(output::Capped::default()),
+        }
     }
-
-    let output = child.wait_with_output().await?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr_text = String::from_utf8_lossy(&output.stderr).into_owned();
-    let exit_code = output.status.code().unwrap_or(-1);
+    let (fed, out, err) = tokio::join!(feed, drain(stdout_pipe), drain(stderr_pipe));
+    fed?;
+    let stdout = out?.into_text();
+    let stderr_text = err?.into_text();
+    let status = child.wait().await?;
+    let exit_code = status.code().unwrap_or(-1);
 
     let (stdout, stderr) = if req.separate_stderr {
         (stdout, stderr_text)

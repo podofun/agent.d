@@ -140,6 +140,8 @@ pub(super) enum Update {
     },
     /// A fresh session list for the browser.
     Sessions(Vec<Value>),
+    /// Everything F5 fetches, gathered off the event loop.
+    Refreshed(Box<Refreshed>),
 }
 
 pub(super) struct Decision {
@@ -459,16 +461,31 @@ impl App {
         self.runners.iter().find(|item| item["name"] == runner)?["model"].as_str()
     }
 
+    /// Fetch everything and apply it, waiting for the daemon. Used at
+    /// startup, before there is a screen to keep responsive.
     pub(super) async fn refresh(&mut self) {
-        self.branch = current_branch().await;
+        let fetched = Refreshed::fetch(self.base.clone(), self.timeout).await;
+        self.apply_refresh(fetched);
+    }
+
+    /// Fetch everything in the background; the result comes back as an
+    /// update. Five daemon calls on the event loop froze keys, resize and
+    /// the spinner for up to the timeout each when the daemon was slow.
+    pub(super) fn refresh_in_background(&mut self) {
+        self.notice = Some(REFRESHING.to_owned());
+        let base = self.base.clone();
+        let timeout = self.timeout;
+        let tx = self.updates.clone();
+        tokio::spawn(async move {
+            let fetched = Refreshed::fetch(base, timeout).await;
+            let _ = tx.send(Update::Refreshed(Box::new(fetched)));
+        });
+    }
+
+    fn apply_refresh(&mut self, fetched: Refreshed) {
+        self.branch = fetched.branch;
         let mut errors = Vec::new();
-        let (runners, sessions, actions, services, skills) = tokio::join!(
-            ws_call(&self.base, self.timeout, "runners.list", Value::Null),
-            ws_call(&self.base, self.timeout, "sessions.list", json!({})),
-            ws_call(&self.base, self.timeout, "tools.list", Value::Null),
-            ws_call(&self.base, self.timeout, "services.list", Value::Null),
-            ws_call(&self.base, self.timeout, "skills.list", Value::Null),
-        );
+        let [runners, sessions, actions, services, skills] = fetched.lists;
         for (method, target, result) in [
             ("runners.list", &mut self.runners, runners),
             ("sessions.list", &mut self.sessions, sessions),
@@ -1011,6 +1028,12 @@ impl App {
                 self.queue_held = true;
             }
             Update::Sessions(items) => self.sessions = items,
+            Update::Refreshed(fetched) => {
+                if self.notice.as_deref() == Some(REFRESHING) {
+                    self.notice = None;
+                }
+                self.apply_refresh(*fetched);
+            }
             Update::ActionFinished { name, result } => {
                 self.notice = None;
                 match result.and_then(response_result) {
@@ -1288,6 +1311,32 @@ fn title(message: &str) -> String {
         length += words;
     }
     title.chars().take(MAX).collect()
+}
+
+const REFRESHING: &str = "Refreshing…";
+
+/// What one refresh brought back: the git branch and the five daemon lists,
+/// in the order runners, sessions, actions, services, skills.
+pub(super) struct Refreshed {
+    branch: Option<String>,
+    lists: [Result<WsResponse>; 5],
+}
+
+impl Refreshed {
+    async fn fetch(base: String, timeout: u64) -> Self {
+        let (branch, runners, sessions, actions, services, skills) = tokio::join!(
+            current_branch(),
+            ws_call(&base, timeout, "runners.list", Value::Null),
+            ws_call(&base, timeout, "sessions.list", json!({})),
+            ws_call(&base, timeout, "tools.list", Value::Null),
+            ws_call(&base, timeout, "services.list", Value::Null),
+            ws_call(&base, timeout, "skills.list", Value::Null),
+        );
+        Self {
+            branch,
+            lists: [runners, sessions, actions, services, skills],
+        }
+    }
 }
 
 async fn current_branch() -> Option<String> {

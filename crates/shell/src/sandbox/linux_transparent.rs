@@ -30,7 +30,7 @@ use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{Pid, close, getgid, getuid, read, write};
 use serde::{Deserialize, Serialize};
 
-use super::linux_net::{make_pipe, set_cloexec, supervisor_path, write_file};
+use super::linux_net::{make_pipe, supervisor_path, write_file};
 use crate::gateway::{SharedSet, admit, handle_dns};
 use crate::kill_tree::{KillSwitch, kill_group};
 use crate::netfilter::{PermitSet, SetConfig};
@@ -461,11 +461,23 @@ mod supervisor {
             unsafe { libc::_exit(126) };
         }
 
-        let bin = CString::new(cfg.bin.as_str()).unwrap();
+        let nul = |what: &str| {
+            report(
+                cfg.status_fd,
+                format!("the {what} contains a NUL byte, which no program can receive").as_bytes(),
+            );
+            unsafe { libc::_exit(126) };
+        };
+        let Ok(bin) = CString::new(cfg.bin.as_str()) else {
+            nul("program path")
+        };
         let mut argv: Vec<CString> = Vec::with_capacity(cfg.args.len() + 1);
         argv.push(bin.clone());
         for a in &cfg.args {
-            argv.push(CString::new(a.as_str()).unwrap_or_default());
+            let Ok(a) = CString::new(a.as_str()) else {
+                nul("argument list")
+            };
+            argv.push(a);
         }
         let err = execvp(&bin, &argv).unwrap_err();
         report(
@@ -539,7 +551,7 @@ fn reap(child: libc::pid_t, tree: &KillSwitch) -> Option<WaitStatus> {
 fn socketpair(ty: SockType) -> std::io::Result<(RawFd, RawFd)> {
     use nix::sys::socket::{AddressFamily, SockFlag, socketpair};
     use std::os::fd::IntoRawFd;
-    let (a, b) = socketpair(AddressFamily::Unix, ty, None, SockFlag::empty())?;
+    let (a, b) = socketpair(AddressFamily::Unix, ty, None, SockFlag::SOCK_CLOEXEC)?;
     Ok((a.into_raw_fd(), b.into_raw_fd()))
 }
 
@@ -561,19 +573,13 @@ fn run_contained_blocking(
     // the supervisor end closes, so the host DNS loop unblocks on teardown.
     let (dns_host, dns_sup) = socketpair(SockType::SeqPacket).map_err(|e| sb(e.to_string()))?;
     let (udp_host, udp_sup) = socketpair(SockType::SeqPacket).map_err(|e| sb(e.to_string()))?;
-    set_cloexec(ctrl_host, true);
-    set_cloexec(ctrl_sup, false);
-    set_cloexec(dns_host, true);
-    set_cloexec(dns_sup, false);
-    set_cloexec(udp_host, true);
-    set_cloexec(udp_sup, false);
-
+    // Every descriptor stays close-on-exec in the daemon. Other commands fork
+    // concurrently, and one that inherited this command's stdout pipe would
+    // hold it open and stall this command's output until it exited. The
+    // forked child below clears the flag on the ends the supervisor needs.
     let out = make_pipe().map_err(|e| sb(e.to_string()))?;
     let err = make_pipe().map_err(|e| sb(e.to_string()))?;
     let sin = make_pipe().map_err(|e| sb(e.to_string()))?;
-    set_cloexec(out.wr, false);
-    set_cloexec(err.wr, false);
-    set_cloexec(sin.rd, false);
 
     let s1 = make_pipe().map_err(|e| sb(e.to_string()))?; // child->parent "unshared"
     let s2 = make_pipe().map_err(|e| sb(e.to_string()))?; // parent->child "maps written"
@@ -605,7 +611,17 @@ fn run_contained_blocking(
             .collect(),
     };
     let cfg_json = serde_json::to_string(&cfg).map_err(|e| sb(e.to_string()))?;
-    let (argv, envp) = build_exec_args_tproxy(sup_path, &cfg_json);
+    let exec_args = build_exec_args_tproxy(sup_path, &cfg_json).map_err(sb)?;
+    let (argv, envp) = exec_args.pointers();
+    let inherited = [
+        ctrl_sup,
+        dns_sup,
+        udp_sup,
+        out.wr,
+        err.wr,
+        if req.stdin.is_some() { sin.rd } else { -1 },
+        st.wr,
+    ];
 
     let uid = getuid().as_raw();
     let gid = getgid().as_raw();
@@ -636,8 +652,10 @@ fn run_contained_blocking(
             if libc::read(s2.rd, b.as_mut_ptr() as *mut _, 1) != 1 {
                 libc::_exit(125);
             }
-            if libc::fcntl(st.wr, libc::F_SETFD, 0) != 0 {
-                libc::_exit(125);
+            for fd in inherited {
+                if fd >= 0 && libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                    libc::_exit(125);
+                }
             }
             libc::execve(argv[0], argv.as_ptr(), envp.as_ptr());
             libc::_exit(127);
@@ -750,19 +768,10 @@ fn run_contained_blocking(
 
     // Drain stdio. SAFETY: the parent owns the read ends of these pipes; adopt
     // them into `File`s that close on drop.
-    use std::io::Read;
     let mut out_file = unsafe { std::fs::File::from_raw_fd(out.rd) };
     let mut err_file = unsafe { std::fs::File::from_raw_fd(err.rd) };
-    let out_join = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = out_file.read_to_end(&mut v);
-        v
-    });
-    let err_join = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = err_file.read_to_end(&mut v);
-        v
-    });
+    let out_join = std::thread::spawn(move || crate::output::Capped::read_sync(&mut out_file));
+    let err_join = std::thread::spawn(move || crate::output::Capped::read_sync(&mut err_file));
     if let Some(input) = &req.stdin {
         // SAFETY: parent owns the write end of the stdin pipe; adopt it.
         let mut sf = unsafe { std::fs::File::from_raw_fd(sin.wr) };
@@ -775,8 +784,8 @@ fn run_contained_blocking(
     // Drain the output before reaping: until the supervisor is reaped its
     // group can still be killed, which matters when a background process keeps
     // the pipes open after the command itself has exited.
-    let stdout = String::from_utf8_lossy(&out_join.join().unwrap_or_default()).into_owned();
-    let stderr_text = String::from_utf8_lossy(&err_join.join().unwrap_or_default()).into_owned();
+    let stdout = out_join.join().unwrap_or_default().into_text();
+    let stderr_text = err_join.join().unwrap_or_default().into_text();
     let exit_code = match reap(child, tree) {
         Some(WaitStatus::Exited(_, code)) => code,
         _ => -1,
@@ -805,30 +814,54 @@ fn run_contained_blocking(
     })
 }
 
-/// Like `linux_net::build_exec_args` but injects the `TPROXY_ENV` instead.
-fn build_exec_args_tproxy(
-    sup_path: &str,
-    cfg_json: &str,
-) -> (Vec<*const libc::c_char>, Vec<*const libc::c_char>) {
-    let argv0 = CString::new(sup_path).unwrap();
-    let mut argv: Vec<*const libc::c_char> = vec![argv0.as_ptr()];
-    std::mem::forget(argv0);
-    argv.push(std::ptr::null());
+/// The supervisor's argv and environment, owned by the parent for as long
+/// as the forked child may read them. Leaking them per exec used to cost the
+/// size of the daemon's environment every network command.
+struct ExecArgs {
+    argv: Vec<CString>,
+    envp: Vec<CString>,
+}
 
-    let mut envp: Vec<*const libc::c_char> = Vec::new();
-    for (k, v) in std::env::vars() {
-        if k == TPROXY_ENV {
+impl ExecArgs {
+    /// NULL-terminated pointer tables for `execve`, valid while `self` lives.
+    fn pointers(&self) -> (Vec<*const libc::c_char>, Vec<*const libc::c_char>) {
+        let table = |v: &[CString]| {
+            let mut p: Vec<*const libc::c_char> = v.iter().map(|c| c.as_ptr()).collect();
+            p.push(std::ptr::null());
+            p
+        };
+        (table(&self.argv), table(&self.envp))
+    }
+}
+
+/// Like `linux_net::build_exec_args` but injects the `TPROXY_ENV` instead.
+/// Environment entries are passed as raw bytes: the daemon's environment need
+/// not be UTF-8, and a variable holding a NUL cannot be passed, so it is
+/// skipped rather than silently replaced by an empty string.
+fn build_exec_args_tproxy(sup_path: &str, cfg_json: &str) -> Result<ExecArgs, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let argv0 = CString::new(sup_path)
+        .map_err(|_| "the sandbox supervisor path contains a NUL byte".to_string())?;
+    let mut envp: Vec<CString> = Vec::new();
+    for (k, v) in std::env::vars_os() {
+        if k.as_bytes() == TPROXY_ENV.as_bytes() {
             continue;
         }
-        let e = CString::new(format!("{k}={v}")).unwrap_or_default();
-        envp.push(e.as_ptr());
-        std::mem::forget(e);
+        let mut entry = Vec::with_capacity(k.len() + v.len() + 1);
+        entry.extend_from_slice(k.as_bytes());
+        entry.push(b'=');
+        entry.extend_from_slice(v.as_bytes());
+        if let Ok(e) = CString::new(entry) {
+            envp.push(e);
+        }
     }
-    let sup_env = CString::new(format!("{TPROXY_ENV}={cfg_json}")).unwrap();
-    envp.push(sup_env.as_ptr());
-    std::mem::forget(sup_env);
-    envp.push(std::ptr::null());
-    (argv, envp)
+    let sup_env = CString::new(format!("{TPROXY_ENV}={cfg_json}"))
+        .map_err(|_| "the sandbox configuration contains a NUL byte".to_string())?;
+    envp.push(sup_env);
+    Ok(ExecArgs {
+        argv: vec![argv0],
+        envp,
+    })
 }
 
 /// Receive intercepted TCP fds + original dst; relay each to the real dst iff

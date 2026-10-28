@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use landlock::{
     ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
-    RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+    RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
 };
 
 use crate::policy::{READ_BASELINE, SandboxError, SandboxPolicy, WRITE_SCRATCH};
@@ -36,13 +36,20 @@ pub fn net_supported() -> bool {
 /// Build and enforce the ruleset on the current thread. Call from the forked
 /// child so only the child is confined.
 pub fn apply(policy: &SandboxPolicy) -> Result<(), SandboxError> {
-    let abi = ABI::V5;
+    let abi = ABI::V6;
     let read = AccessFs::from_read(abi);
     let all = AccessFs::from_all(abi);
 
+    // Scopes (ABI v6, Linux 6.12) keep the child from signalling processes
+    // outside the sandbox, the daemon included, and from reaching abstract
+    // Unix sockets such as X11's. Best effort on older kernels, like the rest.
     let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(all)
+        .map_err(apply_err)?
+        .scope(Scope::Signal)
+        .map_err(apply_err)?
+        .scope(Scope::AbstractUnixSocket)
         .map_err(apply_err)?;
 
     // Coarse network: when not allowed, handle the TCP accesses and add no port

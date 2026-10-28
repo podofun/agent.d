@@ -32,6 +32,16 @@ use agentd_shell::{ExecRequest, ExecResult, exec as shell_exec};
 use agentd_types::RunnerDispatcher;
 use mlua::{Function, Lua, MultiValue, Table, Thread, ThreadStatus, Value};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// How long one resume may run before the instruction hook stops it. A step
+/// is the Lua between two yields; sleep, await, http and the other async
+/// bindings all yield, so only a loop that never reaches one hits this.
+pub(crate) const STEP_LIMIT: Duration = Duration::from_secs(30);
+
+/// When the step now running must be done, kept in Lua app data for the
+/// instruction hook. Absent while init.lua loads, which is not a step.
+pub(crate) struct StepDeadline(pub(crate) Instant);
 use tokio::sync::Notify;
 
 /// Restores `ActiveContext::default()` on Lua app-data when dropped, so a
@@ -238,12 +248,15 @@ pub async fn drive(
 
         let step = tokio::task::spawn_blocking(
             move || -> Result<(StepOutcome, crate::ActiveContext), mlua::Error> {
-                let lua = lua_handle.lock().unwrap();
+                let lua = lua_handle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 // Bind THIS coroutine's ActiveContext for the duration of this
                 // resume. Restored to default at the end of the step so a
                 // concurrent runner / service that resumes between our yields
                 // can swap in its own context without seeing leftover state.
                 lua.set_app_data(ctx_step);
+                lua.set_app_data(StepDeadline(Instant::now() + STEP_LIMIT));
                 let _restore = AppDataGuard::new(&lua);
                 let args = json_to_multivalue(&lua, args_in)?;
                 let yielded: MultiValue = thread_handle.resume(args)?;
@@ -356,10 +369,14 @@ async fn perform(op: Op) -> Result<serde_json::Value, String> {
             Ok(serde_json::Value::Null)
         }
         Op::Await(state) => loop {
+            // Register the waiter before reading the slot: `notify_waiters`
+            // only wakes futures that already exist, so the other order can
+            // lose the wakeup and hang `await(h)` forever.
+            let notified = state.notify.notified();
             if let Some(v) = state.read() {
                 return v;
             }
-            state.notify.notified().await;
+            notified.await;
         },
         Op::ChannelRecv(state) => {
             let rx = state.rx();

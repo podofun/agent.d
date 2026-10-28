@@ -6,6 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -151,6 +152,47 @@ impl Eq for Stamp {}
 struct Image {
     bytes: Option<Vec<u8>>,
     permissions: Option<Permissions>,
+    /// Size and modification time of the file this image was read from.
+    disk: Option<DiskHint>,
+}
+
+/// A change made within this long of a file's modification time may share
+/// that time with a later one, so such a hint is not trusted.
+const HINT_WINDOW: Duration = Duration::from_secs(2);
+
+/// What the file looked like on disk when history last read or wrote it.
+/// While the size and modification time still match, the content does too,
+/// and acknowledging the file needs no read and no hash.
+#[derive(Clone, Copy)]
+struct DiskHint {
+    len: u64,
+    modified: SystemTime,
+    noted: SystemTime,
+}
+
+impl DiskHint {
+    fn of(metadata: &fs::Metadata) -> Option<Self> {
+        Some(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok()?,
+            noted: SystemTime::now(),
+        })
+    }
+
+    fn at(path: &Path) -> Option<Self> {
+        fs::symlink_metadata(path)
+            .ok()
+            .filter(|m| m.is_file())
+            .as_ref()
+            .and_then(Self::of)
+    }
+
+    fn still(&self, metadata: &fs::Metadata) -> bool {
+        metadata.is_file()
+            && metadata.len() == self.len
+            && metadata.modified().ok() == Some(self.modified)
+            && self.modified + HINT_WINDOW < self.noted
+    }
 }
 
 impl Image {
@@ -162,6 +204,7 @@ impl Image {
                 return Ok(Self {
                     bytes: None,
                     permissions: None,
+                    disk: None,
                 });
             }
             Err(e) => return Err(e.into()),
@@ -184,6 +227,7 @@ impl Image {
         Ok(Self {
             bytes: Some(bytes),
             permissions: Some(metadata.permissions()),
+            disk: DiskHint::of(&metadata),
         })
     }
 
@@ -224,6 +268,10 @@ struct Timeline {
     changes: Vec<Change>,
     current: usize,
     redo: Vec<usize>,
+    /// The file on disk as of the last time history knew it matched
+    /// `expected`. Cleared by every push; set again once disk and history
+    /// agree.
+    seen: std::cell::Cell<Option<DiskHint>>,
     /// Every move of `current`, as its order among all changes and the
     /// revision it moved from, so a caller can see where a file was at a
     /// given moment.
@@ -314,6 +362,7 @@ impl Timeline {
         let mut after = Image {
             bytes,
             permissions: before.permissions.clone(),
+            disk: None,
         };
         let created_dirs = commit(path, &mut after)?;
         let id = revision.id;
@@ -332,6 +381,7 @@ impl Timeline {
         });
         self.current = id;
         self.redo.clear();
+        self.seen.set(DiskHint::at(path));
         Ok(id)
     }
 
@@ -549,6 +599,7 @@ impl Timeline {
         let mut image = Image {
             bytes,
             permissions: None,
+            disk: None,
         };
         for id in chain.iter().rev() {
             apply(&mut image, &self.changes[id - 1], true);
@@ -564,9 +615,16 @@ impl Timeline {
         let Some(expected) = self.expected().cloned() else {
             return Ok(());
         };
+        if let Some(hint) = self.seen.get()
+            && let Ok(metadata) = fs::symlink_metadata(path)
+            && hint.still(&metadata)
+        {
+            return Ok(());
+        }
         let image = Image::read(path)?;
         let stamp = image.stamp();
         if stamp == expected {
+            self.seen.set(image.disk);
             return Ok(());
         }
         let revision = Revision {
@@ -593,6 +651,7 @@ impl Timeline {
             created_dirs: Vec::new(),
             seq: next_seq(),
         });
+        self.seen.set(image.disk);
         Ok(())
     }
 
@@ -611,6 +670,7 @@ impl Timeline {
     }
 
     fn push(&mut self, change: Change) -> usize {
+        self.seen.set(None);
         let id = change.diff.revision.id;
         self.moves.push((change.seq, self.current));
         self.changes.push(change);

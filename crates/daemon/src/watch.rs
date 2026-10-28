@@ -103,7 +103,7 @@ async fn watch_loop(
         while rx.try_recv().is_ok() {}
 
         let started = Instant::now();
-        match build_runtime(&cfg, &shared) {
+        match tokio::task::block_in_place(|| build_runtime(&cfg, &shared)) {
             Ok(new) => {
                 // Re-arm to the new used set (a new import widens it) and publish
                 // it to the callback before swapping.
