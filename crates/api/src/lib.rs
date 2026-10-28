@@ -768,8 +768,10 @@ async fn handle_control_socket(mut socket: WebSocket, state: AppState) {
                     },
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => continue,
+                    // A client that quits without a closing handshake, as
+                    // chat does on exit, has simply gone: not worth a warning.
                     Some(Err(e)) => {
-                        tracing::warn!(error = %e, "control recv error");
+                        tracing::debug!(error = %e, "control connection ended");
                         break;
                     }
                 };
