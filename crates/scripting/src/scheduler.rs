@@ -238,7 +238,7 @@ pub async fn drive(
 
         let step = tokio::task::spawn_blocking(
             move || -> Result<(StepOutcome, crate::ActiveContext), mlua::Error> {
-                let lua = lua_handle.lock().unwrap();
+                let lua = lua_handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 // Bind THIS coroutine's ActiveContext for the duration of this
                 // resume. Restored to default at the end of the step so a
                 // concurrent runner / service that resumes between our yields
