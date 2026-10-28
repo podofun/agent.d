@@ -84,12 +84,6 @@ A chat works in the folder you start `agentctl chat` from. The first time you us
 
 Press Ctrl+P to open the browser, a search across your chats, runners, skills, actions and services. Start typing to filter the list. The left and right arrows (or Tab) move between sections, and the up and down arrows move through the results. Enter opens the selected item: it resumes a chat, switches to a runner, shows a skill or puts an action in the composer. The panel beside the list shows details of the selected item, including how many tokens a chat has used. Esc clears the search, and a second Esc returns to the chat.
 
-#### Panels and views from your scripts
-
-Your configuration can add to what chat shows with [`agentd.ui`](/v0/reference/ui): a panel beside the conversation, a summary on a tool row, a shortcut, or a terminal running lazygit. Chat picks these up when it starts, and they change as the scripts change them. Without such scripts, or when the daemon cannot be reached, chat looks as described above.
-
-Click a button, checkbox or list item to use it, and click an input or a terminal pane to type into it. Esc leaves an input, and Ctrl+Q leaves a terminal pane, since the program inside may use Esc itself. Ctrl+C, the approval window and its keys, Shift+Tab and sending with Enter always work as described above, whatever the scripts bind. When a script fails, its error shows in the conversation and the rest of chat keeps working.
-
 ---
 
 ### `agentctl health`
