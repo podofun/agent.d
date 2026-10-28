@@ -127,6 +127,7 @@
 ---@field services agentd.Services
 ---@field actions agentd.Actions
 ---@field tools agentd.Tools
+---@field ui agentd.Ui
 agentd = {}
 
 ---Register an action (table form), or the short `(name, handler)` form.
@@ -154,6 +155,218 @@ function agentd.skill(spec) end
 ---@param body fun(ctx: Ctx)
 ---@return agentd.Service
 function agentd.service(name, opts, body) end
+
+-- UI: scripts build each chat's screen from elements. All of it runs in the
+-- daemon; clients draw what it sends and report what the user does.
+
+---A size: a number of cells, `"fill"`, or a percentage such as `"30%"`.
+---@alias agentd.ui.Size integer|"fill"|string
+
+---Colours are names (`red`), hex (`#ff8800`) or theme tokens: `accent`,
+---`secondary`, `muted`, `success`, `warning`, `error`, `text`.
+---@class agentd.ui.Style
+---@field fg? string
+---@field bg? string
+---@field bold? boolean
+---@field italic? boolean
+---@field underline? boolean
+---@field dim? boolean
+---@field border? "none"|"line"|"rounded"
+---@field border_fg? string
+---@field title? string
+
+---@alias agentd.ui.EventName "click"|"key"|"change"|"focus"|"blur"|"hover"
+
+---@class agentd.ui.Event
+---@field type agentd.ui.EventName|"resize"
+---@field target? agentd.ui.Element
+---@field key? string       For `key`: a name such as `ctrl+g` or `enter`.
+---@field value? any        For `change`: the new value.
+---@field width? integer    For `resize`.
+---@field height? integer   For `resize`.
+
+---@alias agentd.ui.Handler fun(event: agentd.ui.Event, chat: agentd.ui.Chat, ctx: Ctx)
+
+---Properties of any element. Unknown properties are kept and sent on, so
+---clients that understand them can use them.
+---@class agentd.ui.Props
+---@field id? string
+---@field visible? boolean
+---@field width? agentd.ui.Size
+---@field height? agentd.ui.Size
+---@field direction? "row"|"column"   For `box` and `list`.
+---@field padding? integer
+---@field gap? integer
+---@field text? string                For `text`.
+---@field label? string               For `button` and `checkbox`.
+---@field value? string               For `input`.
+---@field placeholder? string         For `input`.
+---@field checked? boolean            For `checkbox`.
+---@field selected? integer           For `list`.
+---@field name? string                For `terminal`: a name from `agentd.ui.terminal`.
+---@field items? table                For `list`: items to draw with `render`.
+---@field render? fun(item: any, index: integer, chat: agentd.ui.Chat): agentd.ui.Element
+---@field style? agentd.ui.Style
+---@field children? agentd.ui.Element[]
+---@field on? table<agentd.ui.EventName, agentd.ui.Handler>
+
+---An element. Read and assign its properties directly: `el.text = "hi"`,
+---`el.style.fg = "accent"`, `el.visible = false`.
+---@class agentd.ui.Element: agentd.ui.Props
+---@field kind string
+---@field parent? agentd.ui.Element
+---@field children agentd.ui.Element[]
+---@field style agentd.ui.Style
+local Element = {}
+---@param child agentd.ui.Element
+function Element:append(child) end
+---@param child agentd.ui.Element
+function Element:prepend(child) end
+---Insert (or move) `child` to position `index`, counting from 1.
+---@param child agentd.ui.Element
+---@param index integer
+function Element:insert(child, index) end
+---Detach from its parent; it can be appended again.
+function Element:remove() end
+---Remove for good, with everything under it.
+function Element:destroy() end
+---@param event agentd.ui.EventName
+---@param handler agentd.ui.Handler
+function Element:on(event, handler) end
+---@param event agentd.ui.EventName
+function Element:off(event) end
+---@param id string
+---@return agentd.ui.Element?
+function Element:find(id) end
+---Redraw a bound list after changing its items in place.
+function Element:refresh() end
+
+---A chat's elements. Chat's own parts are `header`, `main` (the row that
+---holds `conversation`), `prompt` and `status`.
+---@class agentd.ui.Document
+---@field root agentd.ui.Element
+local Document = {}
+---Create an element or a component by name.
+---@param kind string
+---@param props? agentd.ui.Props|table
+---@return agentd.ui.Element
+function Document:create(kind, props) end
+---@param id string
+---@return agentd.ui.Element?
+function Document:get(id) end
+---@param props? agentd.ui.Props
+---@return agentd.ui.Element
+function Document:box(props) end
+---@param props? agentd.ui.Props
+---@return agentd.ui.Element
+function Document:text(props) end
+---@param props? agentd.ui.Props
+---@return agentd.ui.Element
+function Document:button(props) end
+---@param props? agentd.ui.Props
+---@return agentd.ui.Element
+function Document:input(props) end
+---@param props? agentd.ui.Props
+---@return agentd.ui.Element
+function Document:list(props) end
+---@param props? agentd.ui.Props
+---@return agentd.ui.Element
+function Document:checkbox(props) end
+---@param props? agentd.ui.Props
+---@return agentd.ui.Element
+function Document:terminal(props) end
+---@param props? agentd.ui.Props
+---@return agentd.ui.Element
+function Document:spacer(props) end
+
+---@class agentd.ui.Client
+---@field kind string               `tui` for `agentctl chat`.
+---@field width integer
+---@field height integer
+---@field extras string[]
+---@field supports fun(element: string): boolean
+
+---@class agentd.ui.Entry
+---@field key string
+---@field kind "user"|"agent"|"tool"|"info"|"error"|"setting"
+---@field text? string
+---@field name? string         On a tool row: the action or tool.
+---@field input? any
+---@field result? any
+---@field failed boolean
+---@field changes table[]
+---@field summary? string      A one-line summary shown instead of the output.
+---@field hidden boolean
+---@field style agentd.ui.Style
+local Entry = {}
+---@param el agentd.ui.Element
+function Entry:attach_before(el) end
+---@param el agentd.ui.Element
+function Entry:attach_after(el) end
+function Entry:detach() end
+
+---@class agentd.ui.Frames
+---@field stop fun(self: agentd.ui.Frames)
+
+---@class agentd.ui.Chat
+---@field id integer
+---@field session? string
+---@field folder? string
+---@field user? string
+---@field interface string
+---@field client agentd.ui.Client
+---@field document agentd.ui.Document
+---@field view string           Assign to switch views.
+local Chat = {}
+---@param event "session"|"entry"|"key"|"resize"
+---@param handler function
+function Chat:on(event, handler) end
+---@param view string
+function Chat:show(view) end
+---Run `fn(t)` ahead of time for animation. It may only change elements.
+---@param fps integer
+---@param fn fun(t: number, chat: agentd.ui.Chat)
+---@return agentd.ui.Frames
+function Chat:frames(fps, fn) end
+---@param text string
+function Chat:note(text) end
+---@param key string
+---@return agentd.ui.Entry?
+function Chat:entry(key) end
+
+---@class agentd.Ui
+local Ui = {}
+---Run for every chat that connects (`chat`), switches session (`session`)
+---or shows a conversation entry (`entry`).
+---@overload fun(event: "chat"|"session", handler: fun(chat: agentd.ui.Chat, ctx: Ctx))
+---@param event "entry"
+---@param handler fun(entry: agentd.ui.Entry, chat: agentd.ui.Chat, ctx: Ctx)
+function Ui.on(event, handler) end
+---Bind a shortcut such as `ctrl+g`. Ctrl+C, Shift+Tab and Enter belong to chat.
+---@param key string
+---@param handler fun(chat: agentd.ui.Chat, ctx: Ctx)
+function Ui.bind(key, handler) end
+---@return agentd.ui.Chat[]
+function Ui.chats() end
+---@param name string
+---@param build fun(props: table, chat: agentd.ui.Chat): agentd.ui.Element
+function Ui.component(name, build) end
+---@param name string
+---@param build fun(chat: agentd.ui.Chat, ctx: Ctx): agentd.ui.Element
+function Ui.view(name, build) end
+---@param fps integer
+---@param fn fun(t: number, chat: agentd.ui.Chat)
+---@return agentd.ui.Frames
+function Ui.frames(fps, fn) end
+---Declare a program a `terminal` element can open in the chat's folder.
+---@param name string
+---@param argv string[]
+function Ui.terminal(name, argv) end
+---A table that redraws the lists bound to it when written.
+---@generic T: table
+---@param items? T
+---@return T
+function Ui.data(items) end
 
 -- Globals
 

@@ -17,6 +17,7 @@ agentd-services.workspace = true
 agentd-shell.workspace = true
 agentd-skills.workspace = true
 agentd-types.workspace = true
+agentd-ui.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 mlua = { workspace = true, features = ["serialize"] }

@@ -171,8 +171,8 @@ fn place(
         sizes.push(size);
     }
     let left = available.saturating_sub(used);
-    let share = if fills > 0 { left / fills } else { 0 };
-    let mut extra = if fills > 0 { left % fills } else { 0 };
+    let share = left.checked_div(fills).unwrap_or(0);
+    let mut extra = left.checked_rem(fills).unwrap_or(0);
 
     let mut at = if row { inner.x } else { inner.y };
     let end = if row {

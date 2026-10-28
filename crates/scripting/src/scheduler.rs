@@ -507,6 +507,7 @@ pub(crate) fn is_in_coroutine(lua: &Lua) -> bool {
 /// is illegal in Lua 5.4 ("attempt to yield across a C-call boundary"), so
 /// we hand the marker out and let Lua do the yield.
 pub(crate) fn build_marker(lua: &Lua, op: Op) -> mlua::Result<Value> {
+    crate::ui::frames_guard(lua)?;
     let ud = lua.create_userdata(OpMarker::new(op))?;
     Ok(Value::UserData(ud))
 }

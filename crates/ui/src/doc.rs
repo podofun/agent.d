@@ -56,7 +56,9 @@ impl Document {
         self.tree.apply(&op);
         match self.capture.as_mut() {
             Some(captured) => captured.push(op),
-            None if !self.reset => self.pending.push(op),
+            // Before the first frame only notes wait: the snapshot carries
+            // everything else.
+            None if !self.reset || matches!(op, Op::Note { .. }) => self.pending.push(op),
             None => {}
         }
     }
@@ -65,8 +67,13 @@ impl Document {
     /// the client's copy must be rebuilt.
     pub fn take_pending(&mut self) -> (bool, Vec<Op>) {
         if std::mem::take(&mut self.reset) {
-            self.pending.clear();
-            return (true, self.tree.snapshot());
+            let mut ops = self.tree.snapshot();
+            ops.extend(
+                self.pending
+                    .drain(..)
+                    .filter(|op| matches!(op, Op::Note { .. })),
+            );
+            return (true, ops);
         }
         (false, std::mem::take(&mut self.pending))
     }
@@ -139,6 +146,16 @@ impl Document {
             return;
         }
         self.record(Op::Set {
+            node,
+            key: key.to_string(),
+            value,
+        });
+    }
+
+    /// Take a value the client already shows, such as typed text, without
+    /// sending it back.
+    pub fn sync(&mut self, node: NodeId, key: &str, value: Value) {
+        self.tree.apply(&Op::Set {
             node,
             key: key.to_string(),
             value,
