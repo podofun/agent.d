@@ -31,7 +31,9 @@ use crate::scheduler;
 /// Backing state for one channel. Cloneable handle (`Arc`); both ends share
 /// the same `tx` and the same locked `rx`.
 pub(crate) struct ChannelState {
-    tx: mpsc::UnboundedSender<serde_json::Value>,
+    /// Dropped on `close` so a receiver parked in `recv` wakes with `None`
+    /// once the queue drains instead of waiting forever.
+    tx: std::sync::Mutex<Option<mpsc::UnboundedSender<serde_json::Value>>>,
     rx: Arc<Mutex<mpsc::UnboundedReceiver<serde_json::Value>>>,
     closed: Arc<AtomicBool>,
 }
@@ -40,10 +42,25 @@ impl ChannelState {
     fn new() -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         Arc::new(Self {
-            tx,
+            tx: std::sync::Mutex::new(Some(tx)),
             rx: Arc::new(Mutex::new(rx)),
             closed: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    fn send(&self, payload: serde_json::Value) -> Result<(), &'static str> {
+        let guard = self.tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match guard.as_ref() {
+            None => Err("this channel is closed, so nothing more can be sent on it"),
+            Some(tx) => tx.send(payload).map_err(|_| {
+                "the receiving end of this channel is gone, so the message cannot be delivered"
+            }),
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
     }
 
     pub(crate) fn rx(&self) -> Arc<Mutex<mpsc::UnboundedReceiver<serde_json::Value>>> {
@@ -176,16 +193,7 @@ fn channel_send_internal(lua: &Lua, args: MultiValue) -> mlua::Result<()> {
         .from_value(msg)
         .map_err(|e| mlua::Error::external(format!("the message passed to `channel.send` cannot be serialized ({e}) — only JSON-compatible values are supported")))?;
     let handle = ud.borrow::<ChannelHandle>()?;
-    if handle.0.closed() {
-        return Err(mlua::Error::external(
-            "this channel is closed, so nothing more can be sent on it",
-        ));
-    }
-    handle.0.tx.send(payload).map_err(|_| {
-        mlua::Error::external(
-            "the receiving end of this channel is gone, so the message cannot be delivered",
-        )
-    })?;
+    handle.0.send(payload).map_err(mlua::Error::external)?;
     Ok(())
 }
 
@@ -216,12 +224,14 @@ fn channel_recv_internal(lua: &Lua, ud: AnyUserData) -> mlua::Result<Value> {
 fn channel_try_recv_internal(lua: &Lua, ud: AnyUserData) -> mlua::Result<Value> {
     let state = ud.borrow::<ChannelHandle>()?.0.clone();
     let rx = state.rx();
-    let handle_rt = tokio::runtime::Handle::try_current()
-        .map_err(|e| mlua::Error::external(format!("`channel.try_recv` was called outside the daemon runtime ({e}) — this is a bug in agentd, please report it")))?;
-    let outcome = handle_rt.block_on(async move {
-        let mut guard = rx.lock().await;
-        guard.try_recv()
-    });
+    // Never wait for the receiver lock here: this runs with the Lua mutex
+    // held, and the lock is owned by a coroutine parked in `recv` whose
+    // message can only come from Lua. Waiting would deadlock every coroutine.
+    // A held lock also means that receiver drains the queue, so `nil` is right.
+    let outcome = match rx.try_lock() {
+        Ok(mut guard) => guard.try_recv(),
+        Err(_) => return Ok(Value::Nil),
+    };
     match outcome {
         Ok(v) => Ok(lua.to_value(&v)?),
         Err(mpsc::error::TryRecvError::Empty) => Ok(Value::Nil),
@@ -233,7 +243,7 @@ fn channel_try_recv_internal(lua: &Lua, ud: AnyUserData) -> mlua::Result<Value> 
 
 fn channel_close_internal(_lua: &Lua, ud: AnyUserData) -> mlua::Result<()> {
     let state = ud.borrow::<ChannelHandle>()?.0.clone();
-    state.closed.store(true, Ordering::SeqCst);
+    state.close();
     Ok(())
 }
 
