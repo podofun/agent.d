@@ -214,6 +214,9 @@ pub(super) struct App {
     pub(super) hover: Option<(usize, ToolRow)>,
     /// Where the mouse is while it drags a selection.
     pub(super) drag: Option<(u16, u16)>,
+    /// The clickable row the left button went down on, and where. Releasing
+    /// on the same row opens or closes it; dragging selects from there.
+    pub(super) press: Option<(ToolRow, u16, u16)>,
     /// When a drag past the conversation's edge last scrolled it.
     pub(super) drag_scrolled: Option<std::time::Instant>,
     /// Terminal size from the last event, for selection math.
@@ -279,6 +282,7 @@ impl App {
             selection: None,
             hover: None,
             drag: None,
+            press: None,
             drag_scrolled: None,
             screen: Rect::new(0, 0, 80, 24),
             truecolor: std::env::var("COLORTERM")
@@ -359,14 +363,7 @@ impl App {
         entry.output = output_object(&value["output"]);
         set_input(entry, &value["input"]);
         append_output(entry, &output);
-        let changes = value["changes"]
-            .as_array()
-            .map_or_else(Vec::new, |changes| {
-                changes
-                    .iter()
-                    .filter_map(|change| serde_json::from_value(change.clone()).ok())
-                    .collect()
-            });
+        let changes = file_changes(&value["changes"]);
         if !changes.is_empty() {
             entry.set_changes(changes);
         }
@@ -695,6 +692,10 @@ impl App {
                         }
                     };
                     self.entries[index].output = output_object(&turn["content"]);
+                    let changes = file_changes(&turn["changes"]);
+                    if !changes.is_empty() {
+                        self.entries[index].set_changes(changes);
+                    }
                 }
                 role => {
                     let kind = match role {
@@ -1235,6 +1236,17 @@ fn call_failed(value: &Value) -> bool {
 }
 
 /// A call's output when it is an object, whether sent as one or as JSON text.
+/// The files a call changed, from a tool result or a saved tool turn. A
+/// change that does not parse is skipped, so the rest still show.
+fn file_changes(value: &Value) -> Vec<FileChange> {
+    value.as_array().map_or_else(Vec::new, |changes| {
+        changes
+            .iter()
+            .filter_map(|change| serde_json::from_value(change.clone()).ok())
+            .collect()
+    })
+}
+
 fn output_object(output: &Value) -> Option<Value> {
     let parsed = match output {
         Value::String(text) => serde_json::from_str(text).ok()?,
@@ -1569,6 +1581,22 @@ mod tests {
         );
         assert_eq!(app.entries[1].body, "+line");
         assert_eq!(app.entries[1].input, Some(json!({ "staged": true })));
+    }
+
+    #[test]
+    fn a_reopened_chat_shows_the_files_each_call_changed() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.load_turns(&json!([
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "name": "files.write", "arguments": { "path": "a.txt", "content": "hi\n" } }
+            ] },
+            { "role": "tool", "content": "{\"path\":\"a.txt\"}", "changes": [
+                { "path": "a.txt", "operation": "created", "diff": "@@ -0,0 +1 @@\n+hi\n",
+                  "binary": false, "added": 1, "removed": 0 }
+            ] }
+        ]));
+        assert_eq!(app.entries[0].changes.len(), 1);
+        assert_eq!(app.entries[0].changes[0].path, "a.txt");
     }
 
     #[test]

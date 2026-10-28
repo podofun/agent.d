@@ -255,7 +255,9 @@ History messages require a valid `role` (`system`, `user`, `assistant`, or `tool
 
 `session` and `user` describe the caller for permission checks. To have the daemon keep conversation history, create a session with `sessions.create` and pass its id as `session_id`.
 
-A session runs one run at a time, and a second run on a busy session returns `session_busy`. When a model run fails, the exchange is not added to the session, and a compaction that finished before the failure stays stored.
+A session runs one run at a time, and a second run on a busy session returns `session_busy`. When a run fails or is cancelled, the session keeps the prompt and every step whose tool calls all returned, followed by an assistant message saying the reply stopped before it finished. A compaction that finished before the failure stays stored.
+
+Saved tool messages (role `tool`) carry the files the call changed, in `changes`, and how many more were left out, in `more`, in the same shape as on `tool_result` deltas below. Neither field is sent to a model.
 
 The daemon runs up to 32 runners at once, counting all connections and nested Lua calls. A run over that limit returns `busy` immediately, without waiting in a queue.
 
@@ -276,11 +278,24 @@ Provider HTTP failures include `provider_status` and, when the provider sent a n
 { "event": "runner.delta", "id": 6, "delta": { "type": "text_delta", "text": "LG" } }
 { "event": "runner.delta", "id": 6, "delta": { "type": "text_delta", "text": "TM." } }
 { "event": "runner.delta", "id": 6, "delta": { "type": "tool_call", "name": "git.diff" } }
+{ "event": "runner.delta", "id": 6, "delta": { "type": "tool_result", "name": "git.diff", "input": {}, "output": "+one line" } }
 { "event": "runner.delta", "id": 6, "delta": { "type": "turn_end" } }
 { "id": 6, "ok": true, "result": { "text": "LGTM.", "provider": "anthropic", "model": "claude-opus-4-7", "stop_reason": "end_turn" } }
 ```
 
-Delta types are `text_delta` (a chunk of assistant text, in order), `tool_call` (the model asked for a tool) and `turn_end` (one provider turn finished). Event frames carry the request `id`, so a client with several requests in flight can route them. Providers without incremental output send no deltas, and the final envelope still arrives.
+Delta types are `text_delta` (a chunk of assistant text, in order), `tool_call` (the model asked for a tool), `tool_result` (the tool finished) and `turn_end` (one provider turn finished).
+
+A `tool_result` carries the tool's `name`, the `input` the model passed, and its `output`, or an `error` when it failed. Secrets the run read appear as `<secret name>` in all of them. When the call changed files, by `ctx.fs` or by any program it ran, `changes` lists them, newest last and at most 200, with `more` counting the rest:
+
+| Field | Type | Description |
+|---|---|---|
+| `path` | string | The file, relative to the call's folder |
+| `operation` | string | `created`, `modified`, or `removed` |
+| `revision` | integer or null | The file's history revision this change made, when it can be undone |
+| `diff` | string or null | A unified diff, with secrets replaced. Absent for binary files and files too large to show |
+| `binary` | boolean | The file is not text |
+| `added` | integer | Lines added |
+| `removed` | integer | Lines removed | Event frames carry the request `id`, so a client with several requests in flight can route them. Providers without incremental output send no deltas, and the final envelope still arrives.
 
 Streaming buffers are bounded. If a consumer cannot keep up, the run fails with `slow_consumer`; socket writes have a five-second deadline. Disconnecting drops in-flight runner futures and stops further model turns. Cancellation and disconnect do not undo tools already dispatched or external side effects.
 

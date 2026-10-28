@@ -8,12 +8,12 @@
 
 ```lua
 -- Short form
-ctx.shell(bin: string, args?: string[], opts?: { cwd?: string, stdin?: string, separate_stderr?: boolean })
-  -> { stdout: string, stderr: string, exit_code: integer }
+ctx.shell(bin: string, args?: string[], opts?: { cwd?: string, stdin?: string, separate_stderr?: boolean, timeout_ms?: integer })
+  -> { stdout: string, stderr: string, exit_code: integer?, timed_out: boolean }
 
 -- Structured form
-ctx.shell({ bin: string, args?: string[], cwd?: string, stdin?: string, separate_stderr?: boolean })
-  -> { stdout: string, stderr: string, exit_code: integer }
+ctx.shell({ bin: string, args?: string[], cwd?: string, stdin?: string, separate_stderr?: boolean, timeout_ms?: integer })
+  -> { stdout: string, stderr: string, exit_code: integer?, timed_out: boolean }
 ```
 
 Both forms are identical in behavior; use whichever is cleaner at the call site.
@@ -24,9 +24,10 @@ Both forms are identical in behavior; use whichever is cleaner at the call site.
 |---|---|---|---|
 | `bin` | `string` | required | The binary name or absolute path to execute. |
 | `args` | `string[]` | `{}` | Argument vector (not a shell string). |
-| `cwd` | `string` | inherited | Working directory for the child process. |
+| `cwd` | `string` | inherited | Working directory for the child process. Without it, the program starts in the action's working directory: the chat's folder, the runner's `cwd`, or the configuration folder. |
 | `stdin` | `string` | none | Data piped to the child's standard input. |
 | `separate_stderr` | `boolean` | `true` | When `true`, stderr is captured separately in `result.stderr`. When `false`, stderr is merged into `result.stdout`. |
+| `timeout_ms` | `integer` | none | Stop the program after this many milliseconds. Must be a whole number of at least 1. |
 
 ## Return value
 
@@ -34,9 +35,23 @@ Both forms are identical in behavior; use whichever is cleaner at the call site.
 |---|---|---|
 | `stdout` | `string` | Captured standard output. |
 | `stderr` | `string` | Captured standard error (empty when `separate_stderr` is `false`). |
-| `exit_code` | `integer` | Process exit code. Zero means success. |
+| `exit_code` | `integer` or `nil` | Process exit code. Zero means success. `nil` when the program was stopped by `timeout_ms`. |
+| `timed_out` | `boolean` | `true` when `timeout_ms` ran out and the program was stopped. |
 
 A non-zero exit does not raise an error, so check `result.exit_code` yourself.
+
+## Stopping a program
+
+With `timeout_ms`, agent.d stops the program when the time runs out, together with every program it started, and returns what it printed until then with `timed_out = true`. The same happens when the run that called `ctx.shell` is cancelled. Without `timeout_ms`, a program can run as long as it likes.
+
+```lua
+local result = ctx.shell("cargo", { "test" }, { timeout_ms = 120000 })
+if result.timed_out then
+  return { error = "the tests did not finish in two minutes", output = result.stdout }
+end
+```
+
+A program that starts its own session, for example with `setsid`, leaves the group agent.d stops, and keeps running.
 
 ## Permission
 

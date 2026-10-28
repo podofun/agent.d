@@ -818,7 +818,7 @@ impl Executor {
     /// classifier never allows forever.
     async fn decide(
         &self,
-        req: agentd_types::ApprovalRequest,
+        mut req: agentd_types::ApprovalRequest,
         key: Option<String>,
     ) -> runs::Answered {
         self.runs
@@ -841,6 +841,8 @@ impl Executor {
                             };
                         }
                         classifier::ClassifierAnswer::Unsure(reason) => {
+                            // The person who answers sees why it came to them.
+                            req.reason = format!("The classifier was unsure: {reason}");
                             unsure = Some(format!("the classifier was unsure: {reason}"));
                         }
                     }
@@ -1758,6 +1760,38 @@ impl Executor {
         result
     }
 
+    /// What a person wrote, for the classifier: their last messages in the
+    /// session and this run's prompt. Only a run a person started through
+    /// an interface has any; services, webhooks and nested runs do not.
+    fn user_said(
+        &self,
+        caller: &Caller,
+        options: &RunOptions,
+        session: Option<&agentd_sessions::SessionMeta>,
+    ) -> Vec<String> {
+        const KEPT: usize = 5;
+        const LONGEST: usize = 2000;
+        if caller.run_id.is_some() || caller.interface.is_none() {
+            return Vec::new();
+        }
+        let mut said: Vec<String> = match (session, &self.sessions) {
+            (Some(meta), Some(store)) => store
+                .turns(&meta.id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|m| m.role == agentd_ai::Role::User)
+                .map(|m| m.content)
+                .collect(),
+            _ => Vec::new(),
+        };
+        said.extend(options.prompt.clone());
+        let start = said.len().saturating_sub(KEPT);
+        said.drain(..start);
+        said.into_iter()
+            .map(|text| text.chars().take(LONGEST).collect())
+            .collect()
+    }
+
     /// Fix who answers this run's questions and give the run its ids. Runs
     /// once, when the run starts; the values ride on the caller, which every
     /// check inside the run sees.
@@ -1798,7 +1832,10 @@ impl Executor {
             "run-{}",
             RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        let guard = self.runs.start(&run_id, caller.run_id.as_deref());
+        let user_said = self.user_said(&caller, options, session);
+        let guard = self
+            .runs
+            .start(&run_id, caller.run_id.as_deref(), user_said);
         caller.approval = Some(approval);
         caller.run_id = Some(run_id);
         caller.session_id = session.map(|m| m.id.clone());
@@ -1820,7 +1857,9 @@ impl Executor {
     ) -> Result<RunnerOutcome, RunnerError> {
         let Some(session_id) = options.session_id.take() else {
             let (caller, _run) = self.start_run(caller, runner_name, &options, None)?;
-            let (out, _) = self.run_model(caller, runner_name, options, sink).await?;
+            let (out, _) = self
+                .run_model(caller, runner_name, options, sink, None)
+                .await?;
             return Ok(out);
         };
         let store = self.sessions.clone().ok_or_else(|| {
@@ -1880,7 +1919,16 @@ impl Executor {
             }
         }
         options.messages = Some(history);
-        let (mut out, new_turns) = self.run_model(caller, runner_name, options, sink).await?;
+        let mut partial = KeepPartial {
+            store: store.clone(),
+            session_id: session_id.clone(),
+            progress: Progress::default(),
+            finished: false,
+        };
+        let (mut out, new_turns) = self
+            .run_model(caller, runner_name, options, sink, Some(&partial.progress))
+            .await?;
+        partial.finished = true;
         store
             .append(
                 &session_id,
@@ -1978,6 +2026,8 @@ impl Executor {
                 },
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                changes: Vec::new(),
+                more: 0,
             })
             .collect();
         req.messages
@@ -2039,6 +2089,7 @@ impl Executor {
         runner_name: &str,
         options: RunOptions,
         sink: Option<agentd_ai::StreamSink>,
+        progress: Option<&Progress>,
     ) -> Result<(RunnerOutcome, Vec<agentd_ai::Message>), RunnerError> {
         let RunOptions {
             prompt,
@@ -2104,6 +2155,9 @@ impl Executor {
             && !p.is_empty()
         {
             req.messages.push(agentd_ai::Message::user(p));
+        }
+        if let Some(progress) = progress {
+            *progress.lock().unwrap() = req.messages[base_len..].to_vec();
         }
         if req.messages.is_empty() {
             return Err(RunnerError::Provider {
@@ -2227,6 +2281,8 @@ impl Executor {
                         content: resp.text.clone(),
                         tool_calls: resp.tool_calls.clone(),
                         tool_call_id: None,
+                        changes: Vec::new(),
+                        more: 0,
                     });
                     for call in resp.tool_calls {
                         let id = call.id.clone();
@@ -2247,25 +2303,28 @@ impl Executor {
                             args: call.arguments.clone(),
                         };
                         let result = self.run_with_changes(tool_caller.clone(), action).await;
+                        let run_id = tool_caller.run_id.as_deref();
+                        // Kept on the saved tool message too, so a reopened
+                        // session shows the same files and diffs.
+                        let (changes, more) = match &result {
+                            Ok((_, _, changes)) => {
+                                capture::cap_changes(self.redact_changes(run_id, changes))
+                            }
+                            Err(_) => (Vec::new(), 0),
+                        };
                         if let Some(sink) = &sink {
-                            let run_id = tool_caller.run_id.as_deref();
-                            let (output, error, all_changes) = match &result {
-                                Ok((res, _, changes)) => (
-                                    self.runs.redact_secrets(run_id, &res.value),
-                                    None,
-                                    self.redact_changes(run_id, changes),
-                                ),
-                                Err((e, _)) => {
-                                    (serde_json::Value::Null, Some(e.to_string()), Vec::new())
+                            let (output, error) = match &result {
+                                Ok((res, _, _)) => {
+                                    (self.runs.redact_secrets(run_id, &res.value), None)
                                 }
+                                Err((e, _)) => (serde_json::Value::Null, Some(e.to_string())),
                             };
-                            let (changes, more) = capture::cap_changes(all_changes);
                             let _ = sink.send(agentd_ai::StreamEvent::ToolResult {
                                 name: call.name.clone(),
                                 input: self.runs.redact_secrets(run_id, &call.arguments),
                                 output,
                                 error,
-                                changes,
+                                changes: changes.clone(),
                                 more,
                             });
                         }
@@ -2277,10 +2336,55 @@ impl Executor {
                             }
                             Err((e, _)) => format!("tool call failed ({e})"),
                         };
-                        req.messages.push(agentd_ai::Message::tool_result(id, text));
+                        req.messages.push(agentd_ai::Message {
+                            changes,
+                            more,
+                            ..agentd_ai::Message::tool_result(id, text)
+                        });
+                    }
+                    // Every call of this step has its result, so the history
+                    // up to here stays valid if the run stops now.
+                    if let Some(progress) = progress {
+                        *progress.lock().unwrap() = req.messages[base_len..].to_vec();
                     }
                 }
             }
+        }
+    }
+}
+
+/// The messages of a run so far, kept at each point where the history is
+/// valid: after the prompt, and after every step whose calls all returned.
+type Progress = std::sync::Mutex<Vec<agentd_ai::Message>>;
+
+/// Saves what a session run did when it stops before finishing: cancelled,
+/// failed, or dropped when the daemon shuts down. The prompt and every
+/// finished step are kept, closed by a note, so the next message starts
+/// from what really happened.
+struct KeepPartial {
+    store: Arc<dyn SessionStore>,
+    session_id: String,
+    progress: Progress,
+    finished: bool,
+}
+
+impl Drop for KeepPartial {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut turns = std::mem::take(&mut *self.progress.lock().unwrap());
+        if turns.is_empty() {
+            return;
+        }
+        turns.push(agentd_ai::Message::assistant(
+            "(This reply was stopped before it finished.)",
+        ));
+        if let Err(e) = self
+            .store
+            .append(&self.session_id, &turns, &Default::default())
+        {
+            tracing::warn!(session = %self.session_id, error = %e, "could not keep a stopped run's progress");
         }
     }
 }

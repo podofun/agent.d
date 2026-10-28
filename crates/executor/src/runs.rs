@@ -24,6 +24,10 @@ struct RunRecord {
     /// never widen what a shell child's sandbox may reach.
     allows: HashSet<String>,
     secrets: Secrets,
+    /// What the person who started the run wrote: their recent messages in
+    /// the chat and this run's prompt. A nested run keeps its parent's,
+    /// since its own prompt was written by an agent.
+    user_said: Arc<Vec<String>>,
 }
 
 /// Run records keyed by run id. Created when a run starts, removed when it
@@ -61,24 +65,40 @@ impl Drop for RunGuard {
 
 impl Runs {
     /// Start a run's record. A nested run (`parent` still in flight) starts
-    /// with no allows of its own but shares its parent's secrets.
-    pub(crate) fn start(self: &Arc<Self>, id: &str, parent: Option<&str>) -> RunGuard {
+    /// with no allows of its own but shares its parent's secrets and what
+    /// its person said; a top-level run keeps `user_said`.
+    pub(crate) fn start(
+        self: &Arc<Self>,
+        id: &str,
+        parent: Option<&str>,
+        user_said: Vec<String>,
+    ) -> RunGuard {
         let mut records = self.records.lock().unwrap();
-        let secrets = parent
-            .and_then(|p| records.get(p))
-            .map(|r| r.secrets.clone())
-            .unwrap_or_default();
+        let parent = parent.and_then(|p| records.get(p));
+        let secrets = parent.map(|r| r.secrets.clone()).unwrap_or_default();
+        let user_said = parent.map_or_else(|| Arc::new(user_said), |r| r.user_said.clone());
         records.insert(
             id.to_string(),
             RunRecord {
                 allows: HashSet::new(),
                 secrets,
+                user_said,
             },
         );
         RunGuard {
             runs: self.clone(),
             id: id.to_string(),
         }
+    }
+
+    /// What the person behind a run wrote, oldest first.
+    pub(crate) fn user_said(&self, run_id: &str) -> Vec<String> {
+        self.records
+            .lock()
+            .unwrap()
+            .get(run_id)
+            .map(|r| r.user_said.as_ref().clone())
+            .unwrap_or_default()
     }
 
     pub(crate) fn allows(&self, run_id: &str, permission: &str) -> bool {
@@ -281,8 +301,8 @@ mod tests {
     #[test]
     fn secrets_are_replaced_by_their_names_and_nested_runs_share_them() {
         let runs = Arc::new(Runs::default());
-        let _parent = runs.start("run-1", None);
-        let _child = runs.start("run-2", Some("run-1"));
+        let _parent = runs.start("run-1", None, Vec::new());
+        let _child = runs.start("run-2", Some("run-1"), Vec::new());
         runs.record_secret("run-2", "gh_token", "ghp_abc123");
         let detail = json!({ "argv": ["curl", "-H", "Bearer ghp_abc123"] });
         let want = json!({ "argv": ["curl", "-H", "Bearer <secret gh_token>"] });
@@ -305,7 +325,7 @@ mod tests {
     #[test]
     fn tool_values_keep_their_full_length_but_not_secrets() {
         let runs = Arc::new(Runs::default());
-        let _run = runs.start("run-1", None);
+        let _run = runs.start("run-1", None, Vec::new());
         runs.record_secret("run-1", "key", "s3cret");
         let long = "x".repeat(MAX_DETAIL_STRING * 2) + " s3cret";
         let many: Vec<u32> = (0..100).collect();
@@ -321,7 +341,7 @@ mod tests {
     #[test]
     fn only_files_and_hosts_cover_the_rest_of_the_run() {
         let runs = Arc::new(Runs::default());
-        let guard = runs.start("run-1", None);
+        let guard = runs.start("run-1", None, Vec::new());
         runs.allow("run-1", "fs.read:/proj/a.txt");
         runs.allow("run-1", "net:api.example.com");
         runs.allow("run-1", "shell.exec:cargo");
@@ -376,5 +396,16 @@ mod tests {
         for p in ["shell.exec:cargo", "shell.exec:git", "fs.read:/bin/sh"] {
             assert!(interpreter_warning(p).is_none(), "{p}");
         }
+    }
+
+    #[test]
+    fn a_nested_run_keeps_what_its_person_said() {
+        let runs = Arc::new(Runs::default());
+        let _parent = runs.start("run-1", None, vec!["delete them both".into()]);
+        let _child = runs.start("run-2", Some("run-1"), vec!["agent text".into()]);
+        assert_eq!(
+            runs.user_said("run-2"),
+            vec!["delete them both".to_string()]
+        );
     }
 }

@@ -166,6 +166,11 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
             {
                 app.selection = None;
                 app.drag = None;
+                app.press = ui::tool_at(app, area, mouse.column, mouse.row)
+                    .map(|row| (row, mouse.column, mouse.row));
+                if app.press.is_some() {
+                    return Ok(Handled::Redraw);
+                }
                 if let Some(index) = ui::suggestion_at(app, area, mouse.column, mouse.row) {
                     let execute = picker_title(app.input.text()).is_some()
                         && app.suggestions()[index].execute;
@@ -183,6 +188,10 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if app.tab == Tab::Chat => {
+                // A drag that began on a tool row selects its text instead.
+                if let Some((_, x, y)) = app.press.take() {
+                    app.selection = ui::point_at(app, area, x, y).map(ui::Selection::at);
+                }
                 if app.selection.is_some() {
                     app.drag = Some((mouse.column, mouse.row));
                     drag_selection(app, area);
@@ -190,6 +199,12 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
             }
             MouseEventKind::Up(MouseButton::Left) if app.tab == Tab::Chat => {
                 app.drag = None;
+                if let Some((pressed, _, _)) = app.press.take() {
+                    if ui::tool_at(app, area, mouse.column, mouse.row) == Some(pressed) {
+                        ui::toggle_tool(app, area, pressed);
+                    }
+                    return Ok(Handled::Redraw);
+                }
                 // A press and release on the same cell is a click, not a
                 // selection: toggle the tool row under it, if any.
                 if app.selection.is_some_and(|selection| selection.is_click()) {
@@ -820,6 +835,10 @@ mod tests {
             !app.entries[1].expanded,
             "nothing happens until the button is released"
         );
+        assert!(
+            app.selection.is_none(),
+            "pressing on a tool row does not start a selection"
+        );
         handle_event(
             &mut app,
             mouse(MouseEventKind::Up(MouseButton::Left), x + 4, header),
@@ -849,14 +868,17 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(screen.width, screen.height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
-        let underlined = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+        let highlighted = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
             (0..screen.width).any(|column| {
-                terminal.backend().buffer()[(column, header)]
-                    .modifier
-                    .contains(ratatui::style::Modifier::UNDERLINED)
+                let cell = &terminal.backend().buffer()[(column, header)];
+                assert!(
+                    !cell.modifier.contains(ratatui::style::Modifier::UNDERLINED),
+                    "hover never underlines"
+                );
+                cell.symbol() == "g" && cell.fg != ui::MUTED
             })
         };
-        assert!(underlined(&terminal));
+        assert!(highlighted(&terminal));
 
         let handled = handle_event(&mut app, moved(x + 5, header), screen)
             .await
@@ -870,7 +892,7 @@ mod tests {
             .unwrap();
         assert_eq!(app.hover, None);
         terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
-        assert!(!underlined(&terminal));
+        assert!(!highlighted(&terminal));
     }
 
     #[tokio::test]

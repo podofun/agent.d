@@ -43,7 +43,9 @@ If you have one runner, chat selects it for you. Otherwise, pick one with `/runn
 
 Enter sends your message and Shift+Enter adds a new line. You can keep typing while the agent works: when you press Enter, your message waits in the conversation, marked "queued", and chat sends it when the current reply finishes. If the reply fails or you cancel it, queued messages go back into your draft. Ctrl+C stops a running reply. When nothing is running and the draft is empty, press Ctrl+C twice to leave chat.
 
-When an agent calls several actions in a row, chat shows them as one line, for example "Used 14 actions and 1 tool". Click it, or press Ctrl+E, to see each call.
+Each action the agent calls gets a row with its name and short arguments, such as the file it reads or the command it runs. When a call changes files, the row lists each one with its line counts, for example `± src/app.rs  +12 -3`, whatever made the change: a file action, a formatter, or a script. Click anywhere on a row, or press Ctrl+E for the latest one, to open it. An open row shows each file's diff, with added lines on green and removed lines on red, and the changed words marked. Click the row again to close it.
+
+When an agent calls several actions in a row, chat shows them as one line, for example "Used 14 actions and 1 tool". Open it the same way to see each call. A reopened chat shows the same rows and diffs, because they are kept with the chat.
 
 Code in replies is highlighted by language with your terminal's own colors, so it reads well on light and dark themes. To copy text from the conversation, drag with the mouse to select it and press Ctrl+C.
 
@@ -62,7 +64,7 @@ Type `/` to see what you can do:
 
 #### Approving requests
 
-When a runner needs a permission it has not been granted, chat shows the request in the conversation, and you allow or deny it there.
+When a runner needs a permission it has not been granted, chat shows the request in a window over the conversation: the action, what it is about to do, such as the command it runs or the file it removes, and the permission it needs. When the classifier passed the request to you, the window also says why. Press `o` to allow it once, `f` to allow it from now on, or `d` (or Esc) to deny it.
 
 Each chat has an approval mode that decides who answers these requests. Press Shift+Tab to cycle through the three modes, or use `/approval`:
 

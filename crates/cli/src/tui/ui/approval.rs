@@ -96,6 +96,12 @@ fn approval_body(request: &ApprovalRequest) -> Vec<Line<'static>> {
                     Style::default().fg(WARNING),
                 ));
             }
+            if request.reason.starts_with("The classifier was unsure") {
+                lines.push(Line::styled(
+                    request.reason.clone(),
+                    Style::default().fg(MUTED),
+                ));
+            }
         }
         ApprovalKind::Confirm => {
             lines.push(Line::raw("This action requires your confirmation."));
@@ -117,6 +123,11 @@ fn approval_body(request: &ApprovalRequest) -> Vec<Line<'static>> {
             ));
         }
     }
+    let what = detail_lines(request.detail.as_ref());
+    if !what.is_empty() {
+        lines.push(Line::raw(""));
+        lines.extend(what);
+    }
     if let Some(caller) = caller_summary(request) {
         lines.push(Line::raw(""));
         lines.push(Line::styled(caller, Style::default().fg(Color::Gray)));
@@ -124,12 +135,51 @@ fn approval_body(request: &ApprovalRequest) -> Vec<Line<'static>> {
     lines
 }
 
+/// What the call is about to do, one argument per line: the file it
+/// removes, the command it runs. Long text shows its first lines.
+fn detail_lines(detail: Option<&serde_json::Value>) -> Vec<Line<'static>> {
+    const ROWS: usize = 6;
+    let Some(serde_json::Value::Object(fields)) = detail else {
+        return Vec::new();
+    };
+    let label = Style::default().fg(MUTED);
+    let mut lines = Vec::new();
+    for (key, value) in fields {
+        let key = if key == "path" { "file" } else { key.as_str() };
+        let text = match value {
+            serde_json::Value::Null => continue,
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Array(items) if items.iter().all(|item| item.is_string()) => items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+            other => other.to_string(),
+        };
+        let mut rows = text.lines();
+        let first = rows.next().unwrap_or_default().to_owned();
+        lines.push(Line::from(vec![
+            Span::styled(format!("{key}  "), label),
+            Span::styled(first, Style::default().add_modifier(Modifier::BOLD)),
+        ]));
+        let rest: Vec<&str> = rows.collect();
+        for row in rest.iter().take(ROWS) {
+            lines.push(Line::raw(format!("  {row}")));
+        }
+        if rest.len() > ROWS {
+            lines.push(Line::styled(
+                format!("  … {} more lines", rest.len() - ROWS),
+                label,
+            ));
+        }
+    }
+    lines
+}
+
 fn caller_summary(request: &ApprovalRequest) -> Option<String> {
     let caller = &request.caller;
+    // The runner is left out: in a chat it is always the one you talk to.
     let mut parts = Vec::new();
-    if let Some(runner) = &caller.runner {
-        parts.push(format!("Runner {}", runner.as_str()));
-    }
     if let Some(service) = &caller.service {
         parts.push(format!("Service {}", service.as_str()));
     }
@@ -176,7 +226,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("fs.read:/work/**"));
-        assert!(rendered.contains("Runner review"));
+        assert!(!rendered.contains("Runner review"));
         assert!(!rendered.contains("future runs"));
         assert!(!rendered.contains("Client ws"));
         assert!(!rendered.contains("Session ws-6"));
