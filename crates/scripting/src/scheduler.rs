@@ -32,6 +32,16 @@ use agentd_shell::{ExecRequest, ExecResult, exec as shell_exec};
 use agentd_types::RunnerDispatcher;
 use mlua::{Function, Lua, MultiValue, Table, Thread, ThreadStatus, Value};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// How long one resume may run before the instruction hook stops it. A step
+/// is the Lua between two yields; sleep, await, http and the other async
+/// bindings all yield, so only a loop that never reaches one hits this.
+pub(crate) const STEP_LIMIT: Duration = Duration::from_secs(30);
+
+/// When the step now running must be done, kept in Lua app data for the
+/// instruction hook. Absent while init.lua loads, which is not a step.
+pub(crate) struct StepDeadline(pub(crate) Instant);
 use tokio::sync::Notify;
 
 /// Restores `ActiveContext::default()` on Lua app-data when dropped, so a
@@ -244,6 +254,7 @@ pub async fn drive(
                 // concurrent runner / service that resumes between our yields
                 // can swap in its own context without seeing leftover state.
                 lua.set_app_data(ctx_step);
+                lua.set_app_data(StepDeadline(Instant::now() + STEP_LIMIT));
                 let _restore = AppDataGuard::new(&lua);
                 let args = json_to_multivalue(&lua, args_in)?;
                 let yielded: MultiValue = thread_handle.resume(args)?;

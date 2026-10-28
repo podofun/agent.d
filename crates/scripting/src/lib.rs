@@ -342,6 +342,7 @@ impl LuaHost {
         install_agentd_globals(&lua, &catalog)?;
         load_helpers(&lua)?;
         sandbox::lock_down(&lua).context("lock down lua sandbox")?;
+        limit_lua(&lua)?;
 
         Ok(Self {
             lua: Arc::new(Mutex::new(lua)),
@@ -4806,6 +4807,33 @@ impl Registry for LuaHost {
 
         outcome.map(|_| ()).map_err(script_err)
     }
+}
+
+/// Keep one script from taking the whole runtime down. Every handler shares
+/// this Lua state behind one mutex, so a `while true do end` would park every
+/// other action behind it forever, and an unbounded `string.rep` would grow
+/// the daemon until the OS killed it. The hook runs every few thousand
+/// instructions and fails the step once its deadline has passed.
+fn limit_lua(lua: &Lua) -> Result<()> {
+    const MEMORY_LIMIT: usize = 1024 * 1024 * 1024;
+    lua.set_memory_limit(MEMORY_LIMIT)
+        .context("set the Lua memory limit")?;
+    lua.set_global_hook(
+        mlua::HookTriggers::new().every_nth_instruction(20_000),
+        |lua, _| {
+            if let Some(deadline) = lua.app_data_ref::<scheduler::StepDeadline>()
+                && std::time::Instant::now() > deadline.0
+            {
+                return Err(mlua::Error::runtime(format!(
+                    "this handler ran for {} seconds without yielding, so it was stopped. Break long loops up with sleep or await",
+                    scheduler::STEP_LIMIT.as_secs()
+                )));
+            }
+            Ok(mlua::VmState::Continue)
+        },
+    )
+    .context("install the Lua step limit")?;
+    Ok(())
 }
 
 /// Map a drive outcome into a structured registry error: Lua failures split
