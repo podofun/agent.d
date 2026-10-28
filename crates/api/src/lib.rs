@@ -414,7 +414,7 @@ async fn control_upgrade(
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
-        if presented != Some(token.as_str()) {
+        if !presented.is_some_and(|p| token_eq(p, token)) {
             return (axum::http::StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
     }
