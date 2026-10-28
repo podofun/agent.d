@@ -115,57 +115,54 @@ pub(super) fn screen_rows(area: Rect, app: &App) -> [Rect; 5] {
     [rows[0], rows[1], rows[2], rows[3], rows[4]]
 }
 
-/// The chat's name on the left. The last `right` columns belong to what
-/// scripts put there; `offline` sits just before them.
+/// One quiet line: a dot that shows the chat's state, the chat's name,
+/// then what is worth knowing right now, in muted text. The last `right`
+/// columns belong to what scripts put there. The row below stays empty.
 fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, right: u16) {
-    let session = app.session_label.as_deref().unwrap_or("new chat");
-    let mut spans = vec![Span::styled(
-        format!("  {session}"),
-        Style::default().fg(SECONDARY).add_modifier(Modifier::BOLD),
-    )];
+    if area.height == 0 {
+        return;
+    }
+    // Not offline yet while the first lists load.
+    let offline = !app.connected && !app.loading(Request::Lists);
+    let (dot, dot_color) = if offline {
+        ("●", ERROR)
+    } else if app.pending {
+        (spinner_frame(app), WARNING)
+    } else {
+        ("●", PRIMARY)
+    };
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(dot, Style::default().fg(dot_color)),
+        Span::raw(" "),
+    ];
+    match app.session_label.as_deref() {
+        Some(name) => spans.push(Span::styled(
+            name.to_owned(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        None => spans.push(Span::styled("new chat", Style::default().fg(MUTED))),
+    }
+    let mut notes: Vec<(&str, Color)> = Vec::new();
+    if offline {
+        notes.push(("offline", ERROR));
+    }
     if app.selection.is_some_and(|selection| !selection.is_click()) {
-        spans.push(Span::styled(
-            "  ·  Ctrl+C copies, Esc clears",
-            Style::default().fg(SECONDARY),
-        ));
+        notes.push(("Ctrl+C copies, Esc clears", MUTED));
     } else if app.quit_armed() {
-        spans.push(Span::styled(
-            "  ·  Ctrl+C again to quit",
-            Style::default().fg(WARNING),
-        ));
+        notes.push(("Ctrl+C again to quit", WARNING));
     }
     if app.has_unread() {
-        spans.push(Span::styled("  ·  ↓ new", Style::default().fg(SECONDARY)));
+        notes.push(("↓ new", SECONDARY));
+    }
+    for (note, color) in notes {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(note, Style::default().fg(color)));
     }
     // Two columns keep script elements off the name.
     let right = if right > 0 { right + 2 } else { 0 };
-    let offline = Line::styled("  offline  ", Style::default().fg(ERROR));
-    // Not offline yet while the first lists load.
-    let offline_shown = !app.connected && !app.loading(Request::Lists);
-    let reserved = if offline_shown {
-        offline.width() as u16
-    } else {
-        0
-    };
-    let main = Rect::new(
-        area.x,
-        area.y,
-        area.width.saturating_sub(reserved + right),
-        1,
-    );
-    frame.render_widget(Paragraph::new(Line::from(spans)), main);
-    if offline_shown && reserved + right < area.width {
-        frame.render_widget(
-            Paragraph::new(offline),
-            Rect::new(main.right(), area.y, reserved, 1),
-        );
-    }
-    frame.render_widget(
-        Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(MUTED)),
-        Rect::new(area.x, area.y + 1, area.width, 1),
-    );
+    let line = Rect::new(area.x, area.y, area.width.saturating_sub(right), 1);
+    frame.render_widget(Paragraph::new(Line::from(spans)), line);
 }
 
 /// Where the welcome leaf sits on `screen`, or `None` when it is not shown.
@@ -649,17 +646,20 @@ mod tests {
             let row = |from: usize| screen[from..from + 100].iter().collect::<String>();
             (row(screen.len() - 200), row(screen.len() - 100))
         };
-        assert!(header(&app).starts_with("  new chat"));
+        assert!(header(&app).starts_with("  ● new chat"), "{}", header(&app));
         assert!(!header(&app).contains("review"));
         let (place, mode) = status(&app);
         assert!(place.starts_with("  agent.d main "), "{place}");
         assert!(place.ends_with("review anthropic/claude  "), "{place}");
         assert_eq!(mode.trim_end(), "  Default approval");
         app.session_label = Some("bugfix".into());
-        assert!(header(&app).starts_with("  bugfix"));
+        assert!(header(&app).starts_with("  ● bugfix"));
         app.pending = true;
         app.push(EntryKind::User, "go");
         let busy = rendered(&app, 100, 24);
+        // The dot turns while the agent works.
+        assert!(!header(&app).starts_with("  ●"), "{}", header(&app));
+        assert!(header(&app).contains(" bugfix"));
         // Working shows inline in the conversation, not under the input.
         assert!(busy.contains("working"));
         assert!(!status(&app).0.contains("working"));
@@ -682,6 +682,13 @@ mod tests {
         });
         assert!(header(&app).contains("Ctrl+C copies, Esc clears"));
         app.connected = false;
-        assert!(rendered(&app, 100, 24).contains("offline"));
+        assert!(header(&app).contains("offline"));
+        // No rule under the header: the row below it is empty.
+        let second: String = rendered(&app, 100, 24)
+            .chars()
+            .skip(100)
+            .take(100)
+            .collect();
+        assert_eq!(second.trim(), "");
     }
 }

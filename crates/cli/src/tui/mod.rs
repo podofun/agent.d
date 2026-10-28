@@ -957,7 +957,7 @@ mod tests {
         scripted(&mut app, false, ops);
         let buffer = render(&app, 60, 20);
         let header: String = (0..60).map(|x| buffer[(x, 0)].symbol()).collect();
-        assert!(header.starts_with("  bugfix"), "{header}");
+        assert!(header.starts_with("  ● bugfix"), "{header}");
         assert!(header.ends_with("☐ 2/5  "), "{header:?}");
         let area = ratatui::layout::Rect::new(0, 0, 60, 20);
         assert_eq!(ui::script_hit(&app, area, 55, 0), Some(100));
