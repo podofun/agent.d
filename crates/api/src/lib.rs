@@ -893,7 +893,7 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
                         .runner(p.runner)
                         .approval(p.approval)
                         .cwd(cwd);
-                    match store.create(new) {
+                    match off_runtime(store, move |s| s.create(new)).await {
                         Ok(meta) => ok_ser(id, &meta),
                         Err(e) => session_error(id, e),
                     }
@@ -975,7 +975,7 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
                         }
                         Err(e) => return session_error(id, e),
                     }
-                    match store.relabel(&p.id, p.label) {
+                    match off_runtime(store, move |s| s.relabel(&p.id, p.label)).await {
                         Ok(meta) => ok_ser(id, &meta),
                         Err(e) => session_error(id, e),
                     }
@@ -1006,7 +1006,7 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
                         }
                         Err(e) => return session_error(id, e),
                     }
-                    match store.set_approval(&p.id, p.approval) {
+                    match off_runtime(store, move |s| s.set_approval(&p.id, p.approval)).await {
                         Ok(meta) => ok_ser(id, &meta),
                         Err(e) => session_error(id, e),
                     }
@@ -1029,7 +1029,7 @@ async fn dispatch(state: AppState, req: WsRequest, conn: &ConnIdentity) -> WsRes
                     if !visible {
                         return ok(id, json!({ "deleted": false }));
                     }
-                    match store.delete(&p.id) {
+                    match off_runtime(store, move |s| s.delete(&p.id)).await {
                         Ok(deleted) => ok(id, json!({ "deleted": deleted })),
                         Err(e) => session_error(id, e),
                     }
@@ -1147,6 +1147,22 @@ fn no_sessions(id: u64) -> WsResponse {
         "sessions_unavailable",
         "no session store is configured on this daemon",
     )
+}
+
+/// Run a session store write on a blocking thread. Every write commits and
+/// fsyncs, which would otherwise stall a runtime worker for every other
+/// connection while the disk catches up.
+async fn off_runtime<T: Send + 'static>(
+    store: &Arc<dyn agentd_sessions::SessionStore>,
+    work: impl FnOnce(&dyn agentd_sessions::SessionStore) -> agentd_sessions::Result<T> + Send + 'static,
+) -> agentd_sessions::Result<T> {
+    let store = store.clone();
+    match tokio::task::spawn_blocking(move || work(store.as_ref())).await {
+        Ok(result) => result,
+        Err(e) => Err(agentd_sessions::SessionError::Backend(format!(
+            "the session store task ended unexpectedly ({e})"
+        ))),
+    }
 }
 
 fn session_error(id: u64, e: agentd_sessions::SessionError) -> WsResponse {
