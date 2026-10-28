@@ -335,10 +335,19 @@ impl Document {
         }
     }
 
-    /// A note for the user, such as a script error.
+    /// A note for the user.
     pub fn note(&mut self, text: &str) {
         self.record(Op::Note {
             text: crate::sanitize(text),
+            error: false,
+        });
+    }
+
+    /// A failure to show the user, such as a script error.
+    pub fn error(&mut self, text: &str) {
+        self.record(Op::Note {
+            text: crate::sanitize(text),
+            error: true,
         });
     }
 }

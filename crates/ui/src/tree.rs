@@ -26,13 +26,20 @@ pub struct Tree {
 }
 
 impl Tree {
-    /// The `chat` view as chat draws it today: a header, the conversation
-    /// in a row named `main`, the prompt and the status line.
+    /// The `chat` view as chat draws it today: a header with an empty row
+    /// at its right, the conversation in a row named `main`, the prompt and
+    /// the status line.
     pub fn default_chat() -> Self {
         let mut tree = Tree::default();
         let parts = [
             (parts::CHAT, "box", "chat", json!({ "direction": "column" })),
             (parts::HEADER, "chat.header", "header", json!({})),
+            (
+                parts::HEADER_RIGHT,
+                "box",
+                "header.right",
+                json!({ "direction": "row", "gap": 1 }),
+            ),
             (
                 parts::MAIN,
                 "box",
@@ -60,6 +67,7 @@ impl Tree {
         }
         for (parent, node, index) in [
             (parts::CHAT, parts::HEADER, 0),
+            (parts::HEADER, parts::HEADER_RIGHT, 0),
             (parts::CHAT, parts::MAIN, 1),
             (parts::MAIN, parts::CONVERSATION, 0),
             (parts::CHAT, parts::PROMPT, 2),

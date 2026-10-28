@@ -63,7 +63,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
     } else {
         let area = frame.area();
         let rows = screen_rows(area, app);
-        draw_header(frame, app, rows[0]);
+        draw_header(frame, app, rows[0], 0);
         conversation::draw_conversation(frame, app, rows[1]);
         conversation::draw_suggestions(frame, app, rows[2]);
         draw_composer(frame, app, rows[3], None);
@@ -111,7 +111,9 @@ pub(super) fn screen_rows(area: Rect, app: &App) -> [Rect; 5] {
     [rows[0], rows[1], rows[2], rows[3], rows[4]]
 }
 
-fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
+/// The chat's name on the left. The last `right` columns belong to what
+/// scripts put there; `offline` sits just before them.
+fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, right: u16) {
     let session = app.session_label.as_deref().unwrap_or("new chat");
     let mut spans = vec![Span::styled(
         format!("  {session}"),
@@ -131,24 +133,24 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if app.has_unread() {
         spans.push(Span::styled("  ·  ↓ new", Style::default().fg(SECONDARY)));
     }
-    if let Some(notice) = &app.notice {
-        let first = notice.lines().next().unwrap_or_default();
-        spans.push(Span::styled(
-            format!("  ·  {first}"),
-            Style::default().fg(MUTED),
-        ));
-    }
+    // Two columns keep script elements off the name.
+    let right = if right > 0 { right + 2 } else { 0 };
     let offline = Line::styled("  offline  ", Style::default().fg(ERROR));
     // Not offline yet while the first lists load.
     let offline_shown = !app.connected && !app.loading(Request::Lists);
-    let reserved = if !offline_shown {
-        0
-    } else {
+    let reserved = if offline_shown {
         offline.width() as u16
+    } else {
+        0
     };
-    let main = Rect::new(area.x, area.y, area.width.saturating_sub(reserved), 1);
+    let main = Rect::new(
+        area.x,
+        area.y,
+        area.width.saturating_sub(reserved + right),
+        1,
+    );
     frame.render_widget(Paragraph::new(Line::from(spans)), main);
-    if offline_shown && reserved < area.width {
+    if offline_shown && reserved + right < area.width {
         frame.render_widget(
             Paragraph::new(offline),
             Rect::new(main.right(), area.y, reserved, 1),
@@ -660,9 +662,15 @@ mod tests {
         app.approval_mode = Some("classifier");
         assert_eq!(status(&app).1.trim_end(), "  Auto mode");
         assert!(!header(&app).contains("auto"));
+        // Short status shows in the conversation, and errors join it there.
         app.notice = Some("Cancelling…\nmore".into());
-        assert!(header(&app).contains("Cancelling") && !header(&app).contains("more"));
+        let screen = rendered(&app, 100, 24);
+        assert!(!header(&app).contains("Cancelling"));
+        assert!(screen.contains("Cancelling") && !screen.contains("more"));
         app.notice = None;
+        app.fail("Approval connection closed");
+        assert!(!header(&app).contains("Approval connection"));
+        assert!(rendered(&app, 100, 24).contains("Approval connection closed"));
         app.selection = Some(super::Selection {
             anchor: super::Point { line: 0, col: 0 },
             head: super::Point { line: 0, col: 1 },

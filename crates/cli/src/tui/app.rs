@@ -1140,11 +1140,11 @@ impl App {
             } => {
                 self.session = Some(id);
                 self.session_label = label;
-                if notice.is_some() {
-                    self.notice = notice;
-                }
                 for message in &messages {
                     self.push(EntryKind::User, message.as_str());
+                }
+                if let Some(notice) = notice {
+                    self.fail(notice);
                 }
             }
             Update::SessionFailed { error, messages } => {
@@ -1213,8 +1213,13 @@ impl App {
                     }
                     self.script.sent_entries.clear();
                 }
-                Some(agentd_ui::Op::Note { text }) => {
-                    self.notice = Some(agentd_ui::sanitize(&text));
+                Some(agentd_ui::Op::Note { text, error }) => {
+                    let text = agentd_ui::sanitize(&text);
+                    if error {
+                        self.fail(text);
+                    } else {
+                        self.push(EntryKind::Info, text);
+                    }
                 }
                 Some(agentd_ui::Op::Entry { key, decoration }) => {
                     if let Some(entry) = key
@@ -1788,7 +1793,10 @@ mod tests {
         );
         assert_eq!(app.session.as_deref(), Some("s1"));
         assert_eq!(app.session_label.as_deref(), Some("hello"));
-        assert_eq!(app.notice.as_deref(), Some("Working without a folder: no"));
+        let last = app.entries.last().unwrap();
+        assert!(matches!(last.kind, EntryKind::Error));
+        assert_eq!(last.text, "Working without a folder: no");
+        assert!(app.notice.is_none());
     }
 
     #[test]

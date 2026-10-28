@@ -365,7 +365,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, screen: Rect) -> Result<bool> 
         .input
         .handle(key, screen.width.saturating_sub(6) as usize)
     {
-        app.notice = Some(notice);
+        app.fail(notice);
     }
     if app.input.text() != previous {
         app.input_changed();
@@ -895,6 +895,54 @@ mod tests {
             shown.contains("todo panel") && shown.contains("What"),
             "{shown}"
         );
+    }
+
+    #[test]
+    fn a_script_element_sits_at_the_right_of_the_header() {
+        let mut app = talking();
+        app.session_label = Some("bugfix".into());
+        scripted(&mut app, true, agentd_ui::Tree::default_chat().snapshot());
+        let mut ops = text_element(100, "☐ 2/5");
+        ops[1] = agentd_ui::Op::Insert {
+            parent: agentd_ui::parts::HEADER_RIGHT,
+            node: 100,
+            index: 0,
+        };
+        scripted(&mut app, false, ops);
+        let buffer = render(&app, 60, 20);
+        let header: String = (0..60).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(header.starts_with("  bugfix"), "{header}");
+        assert!(header.ends_with("☐ 2/5  "), "{header:?}");
+        let area = ratatui::layout::Rect::new(0, 0, 60, 20);
+        assert_eq!(ui::script_hit(&app, area, 55, 0), Some(100));
+    }
+
+    #[test]
+    fn script_notes_and_errors_show_in_the_conversation_not_the_header() {
+        let mut app = talking();
+        scripted(&mut app, true, agentd_ui::Tree::default_chat().snapshot());
+        scripted(
+            &mut app,
+            false,
+            vec![
+                agentd_ui::Op::Note {
+                    text: "Saved".into(),
+                    error: false,
+                },
+                agentd_ui::Op::Note {
+                    text: "A UI script failed. boom".into(),
+                    error: true,
+                },
+            ],
+        );
+        let last = &app.entries[app.entries.len() - 2..];
+        assert!(matches!(last[0].kind, EntryKind::Info) && last[0].text == "Saved");
+        assert!(matches!(last[1].kind, EntryKind::Error) && last[1].text.contains("boom"));
+        let buffer = render(&app, 90, 24);
+        let header: String = (0..90).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(!header.contains("boom"), "{header}");
+        let shown: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(shown.contains("A UI script failed. boom"), "{shown}");
     }
 
     #[test]

@@ -42,6 +42,8 @@ pub mod parts {
     pub const CONVERSATION: NodeId = 4;
     pub const PROMPT: NodeId = 5;
     pub const STATUS: NodeId = 6;
+    /// A row at the right of the header, empty until a script adds to it.
+    pub const HEADER_RIGHT: NodeId = 7;
     /// Script elements are numbered from here.
     pub const FIRST_FREE: NodeId = 100;
 }
@@ -144,8 +146,13 @@ pub enum Op {
     },
     /// The screen of a `terminal` element.
     Screen { node: NodeId, screen: Screen },
-    /// A message for the user, such as a script error.
-    Note { text: String },
+    /// A message for the user. `error` marks a failure, such as a script
+    /// error.
+    Note {
+        text: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        error: bool,
+    },
 }
 
 /// All changes that land together, shown at `at` (daemon milliseconds).

@@ -123,6 +123,10 @@ fn place(
 ) {
     let Some(node) = tree.get(id) else { return };
     out.push((id, area));
+    if node.kind == "chat.header" {
+        place_header(tree, node, area, measure, out);
+        return;
+    }
     if !is_container(node) {
         return;
     }
@@ -206,6 +210,33 @@ fn place(
         };
         place(tree, *kid, rect, measure, out);
         at = at.saturating_add(main).saturating_add(gap);
+    }
+}
+
+/// The header's children sit at the right end of its first line, each as
+/// wide as it needs, the last one two cells from the edge as the chat's name
+/// is on the left.
+fn place_header(
+    tree: &Tree,
+    node: &Node,
+    area: Rect,
+    measure: &dyn Fn(NodeId, &Node, u16) -> Size,
+    out: &mut Vec<(NodeId, Rect)>,
+) {
+    let mut right = area.x.saturating_add(area.width.saturating_sub(2));
+    let mut placed = Vec::new();
+    for child in node.children.iter().rev() {
+        let Some(n) = tree.get(*child).filter(|n| visible(n)) else {
+            continue;
+        };
+        let width = natural(tree, *child, n, area.width, measure)
+            .width
+            .min(right.saturating_sub(area.x));
+        right -= width;
+        placed.push((*child, Rect::new(right, area.y, width, area.height.min(1))));
+    }
+    for (child, rect) in placed.into_iter().rev() {
+        place(tree, child, rect, measure, out);
     }
 }
 
@@ -309,6 +340,33 @@ mod tests {
         );
         assert_eq!(rect_of(&rects, parts::PROMPT), Rect::new(0, 19, 80, 3));
         assert_eq!(rect_of(&rects, parts::STATUS), Rect::new(0, 22, 80, 2));
+        assert_eq!(rect_of(&rects, parts::HEADER_RIGHT), Rect::new(78, 0, 0, 1));
+    }
+
+    #[test]
+    fn what_a_script_adds_to_the_header_sits_at_its_right() {
+        let mut tree = Tree::default_chat();
+        for node in [100, 101] {
+            tree.apply(&Op::Create {
+                node,
+                kind: "text".into(),
+                props: Props::new(),
+                style: Props::new(),
+            });
+            tree.apply(&Op::Insert {
+                parent: parts::HEADER_RIGHT,
+                node,
+                index: 9,
+            });
+        }
+        let rects = layout(&tree, Rect::new(0, 0, 80, 24), &measure);
+        assert_eq!(
+            rect_of(&rects, parts::HEADER_RIGHT),
+            Rect::new(67, 0, 11, 1)
+        );
+        assert_eq!(rect_of(&rects, 100), Rect::new(67, 0, 5, 1));
+        assert_eq!(rect_of(&rects, 101), Rect::new(73, 0, 5, 1));
+        assert_eq!(rect_of(&rects, parts::CONVERSATION).y, 2);
     }
 
     #[test]

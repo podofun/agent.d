@@ -33,7 +33,7 @@ async fn wait_for(sub: &mut Subscription, seen: &mut Vec<Op>, found: impl Fn(&Op
 }
 
 fn note_containing(op: &Op, text: &str) -> bool {
-    matches!(op, Op::Note { text: t } if t.contains(text))
+    matches!(op, Op::Note { text: t, .. } if t.contains(text))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -100,4 +100,32 @@ async fn a_frame_function_may_only_change_the_ui() {
         |op| matches!(op, Op::Set { key, .. } if key == "text"),
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_adds_to_the_right_of_the_header_and_its_errors_are_errors() {
+    let (hub, loaded, _host) = start(
+        r#"
+        agentd.ui.on("chat", function(chat)
+          local doc = chat.document
+          doc:get("header.right"):append(doc:text{ id = "todo", text = "2/5" })
+          error("boom")
+        end)
+        "#,
+    );
+    loaded.unwrap();
+    let mut sub = hub.subscribe(ChatInfo::default());
+    let mut seen = Vec::new();
+    wait_for(
+        &mut sub,
+        &mut seen,
+        |op| matches!(op, Op::Note { text, error: true } if text.contains("boom")),
+    )
+    .await;
+    let doc = sub.chat.doc();
+    let todo = doc.find("todo").unwrap();
+    assert_eq!(
+        doc.tree().get(todo).unwrap().parent,
+        Some(agentd_ui::parts::HEADER_RIGHT)
+    );
 }

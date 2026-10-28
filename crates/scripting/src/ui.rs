@@ -207,7 +207,7 @@ pub(crate) fn install(lua: &Lua, agentd: &Table) -> mlua::Result<()> {
     let note = lua.create_function(|lua, (chat_id, text): (ChatId, String)| {
         if let Ok(chat) = chat(lua, chat_id) {
             let (message, _) = crate::luaerr::split_lua_error(&text);
-            chat.note(&format!("A terminal did not start. {message}"));
+            chat.error(&format!("A terminal did not start. {message}"));
         }
         Ok(())
     })?;
@@ -1231,7 +1231,7 @@ impl LuaUi {
 fn report(chat: &Chat, raw: &str) {
     let (message, _) = crate::luaerr::split_lua_error(raw);
     tracing::warn!(chat = chat.id, error = %message, "a UI script failed");
-    chat.note(&format!("A UI script failed. {message}"));
+    chat.error(&format!("A UI script failed. {message}"));
 }
 
 fn prepare(lua: &Lua, chat: &Arc<Chat>, job: Job) -> mlua::Result<Vec<Thread>> {

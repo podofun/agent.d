@@ -73,9 +73,14 @@ impl Chat {
         self.doc.lock().unwrap()
     }
 
-    /// Show `text` to the user, as for a script error.
+    /// Show `text` to the user.
     pub fn note(&self, text: &str) {
         self.doc().note(text);
+    }
+
+    /// Show a failure to the user, such as a script error.
+    pub fn error(&self, text: &str) {
+        self.doc().error(text);
     }
 
     /// Run `io` in the `terminal` element `node`, replacing what ran there.

@@ -19,7 +19,11 @@ use super::{
 };
 
 pub(super) fn draw_conversation(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    if app.entries.is_empty() && app.queue.is_empty() && !app.pending && !app.loading(Request::Open)
+    if app.entries.is_empty()
+        && app.queue.is_empty()
+        && !app.pending
+        && !app.loading(Request::Open)
+        && app.notice.is_none()
     {
         super::draw_welcome(frame, app, area);
         return;
@@ -93,8 +97,8 @@ fn fingerprint(app: &App, width: usize) -> Option<u64> {
         (entry.revision(), entry.group_open).hash(&mut hasher);
     }
     let opening = app.loading(Request::Open);
-    (app.pending, opening).hash(&mut hasher);
-    if app.pending || opening {
+    (app.pending, opening, &app.notice).hash(&mut hasher);
+    if app.pending || opening || app.notice.is_some() {
         let elapsed = app.started_at().map(|started| started.elapsed().as_secs());
         (spinner_frame(app), elapsed, &app.streamed).hash(&mut hasher);
     }
@@ -277,14 +281,22 @@ fn conversation_lines(app: &App, width: usize) -> Conversation {
         selectable.extend(live.iter().map(|_| 0..0));
         lines.extend(live);
     }
-    if app.loading(Request::Open) {
-        let loading = vec![Line::styled(
-            "Loading conversation…",
-            Style::default().fg(MUTED),
-        )];
-        let loading = with_gutter(spinner_frame(app), WARNING, loading);
-        selectable.extend(loading.iter().map(|_| 0..0));
-        lines.extend(loading);
+    // What chat is busy with, such as loading or renaming, at the bottom
+    // where its result will show.
+    let busy = app
+        .loading(Request::Open)
+        .then_some("Loading conversation…")
+        .into_iter()
+        .chain(
+            app.notice
+                .as_deref()
+                .and_then(|notice| notice.lines().next()),
+        );
+    for text in busy {
+        let line = vec![Line::styled(text.to_owned(), Style::default().fg(MUTED))];
+        let line = with_gutter(spinner_frame(app), WARNING, line);
+        selectable.extend(line.iter().map(|_| 0..0));
+        lines.extend(line);
     }
     for queued in &app.queue {
         lines.push(Line::raw(""));

@@ -276,13 +276,20 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
     let screen = frame.area();
     let rows = super::screen_rows(screen, app);
     let tree = &app.script.tree;
-    for (id, rect) in layout(app, screen) {
+    let rects = layout(app, screen);
+    // Columns from what scripts put in the header to the right edge.
+    let header_right = rects
+        .iter()
+        .find(|(n, _)| *n == parts::HEADER_RIGHT)
+        .filter(|(_, r)| r.width > 0)
+        .map_or(0, |(_, r)| screen.right().saturating_sub(r.x));
+    for (id, rect) in rects {
         let Some(node) = tree.get(id) else { continue };
         let style = style_of(&node.style);
         match node.kind.as_str() {
             "chat.header" => {
                 decorate(frame, node, rect);
-                super::draw_header(frame, app, rows[0]);
+                super::draw_header(frame, app, rows[0], header_right);
             }
             "chat.conversation" => {
                 decorate(frame, node, rect);
