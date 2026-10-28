@@ -35,8 +35,10 @@ impl Screen {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
-        if let Err(error) = crossterm::execute!(stdout(), EnableBracketedPaste, EnableMouseCapture)
-        {
+        // Legacy Windows consoles have no bracketed paste; the chat still
+        // works without it, so that one is best effort.
+        let _ = crossterm::execute!(stdout(), EnableBracketedPaste);
+        if let Err(error) = crossterm::execute!(stdout(), EnableMouseCapture) {
             let _ = crossterm::execute!(
                 stdout(),
                 DisableMouseCapture,
@@ -94,7 +96,11 @@ pub(crate) async fn run(
     );
     let mut screen = Screen::open()?;
     let mut events = EventStream::new();
-    let mut spinner = tokio::time::interval(Duration::from_millis(60));
+    // The spinner frame changes every 120 ms, so drawing more often than that
+    // repaints an identical screen. After a stall (a slow daemon call) the
+    // missed ticks must not fire back to back, each a full redraw.
+    let mut spinner = tokio::time::interval(Duration::from_millis(120));
+    spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
     loop {
         if dirty {
@@ -336,7 +342,11 @@ async fn handle_browser_key(app: &mut App, key: KeyEvent) {
             query.pop();
             app.set_query(query);
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        // AltGr arrives as Control+Alt on Windows; that is a typed character.
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::ALT) =>
+        {
             let mut query = app.query.clone();
             query.push(c);
             app.set_query(query);
@@ -488,7 +498,7 @@ fn apply_updates(app: &mut App, screen: Rect, updates: Vec<app::Update>) {
     }
     if held && app.scroll > 0 {
         let after = ui::max_scroll(app, screen);
-        app.scroll = (app.scroll + after).saturating_sub(before);
+        app.scroll = (app.scroll + after).saturating_sub(before).min(after);
     }
 }
 
