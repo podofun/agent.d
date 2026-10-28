@@ -276,7 +276,9 @@ async fn frame_loop(hub: Arc<Hub>, chat: Arc<Chat>, tx: mpsc::Sender<Frame>) {
         };
         if cancel || reset {
             touched.clear();
-            ahead_until = now;
+            // Draw the animation again from this very moment, so it carries
+            // on where it was instead of jumping.
+            ahead_until = now.saturating_sub(1000);
         }
         ops.append(&mut chat.immediate.lock().unwrap());
         if reset || cancel || !ops.is_empty() || backlog.is_some() {
@@ -312,7 +314,9 @@ async fn frame_loop(hub: Arc<Hub>, chat: Arc<Chat>, tx: mpsc::Sender<Frame>) {
             continue;
         };
         let step = 1000 / u64::from(fps.clamp(1, 60));
-        ahead_until = ahead_until.max(now);
+        if ahead_until + step < now {
+            ahead_until = now - step;
+        }
         while ahead_until + step <= now + LEAD_MS {
             ahead_until += step;
             let t = ahead_until.saturating_sub(chat.started);

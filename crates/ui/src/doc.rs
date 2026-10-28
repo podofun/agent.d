@@ -16,6 +16,9 @@ pub struct Document {
     /// While set, changes go here instead of `pending`: frames rendered
     /// ahead of time are sent on their own.
     capture: Option<Vec<Op>>,
+    /// While capturing, the ops that put back what the captured frames
+    /// changed, so the document keeps holding the present.
+    undo: Vec<Op>,
     /// Named views and the root each one shows.
     views: BTreeMap<String, NodeId>,
     view: String,
@@ -37,6 +40,7 @@ impl Document {
             pending: Vec::new(),
             reset: true,
             capture: None,
+            undo: Vec::new(),
             views,
             view: "chat".into(),
         }
@@ -53,6 +57,11 @@ impl Document {
     }
 
     fn record(&mut self, op: Op) {
+        if self.capture.is_some()
+            && let Some(back) = self.inverse(&op)
+        {
+            self.undo.push(back);
+        }
         self.tree.apply(&op);
         match self.capture.as_mut() {
             Some(captured) => captured.push(op),
@@ -82,8 +91,38 @@ impl Document {
         self.capture = Some(Vec::new());
     }
 
+    /// The captured frames' ops. Frames are drawn ahead of time, so their
+    /// changes are taken back out of the document: it keeps the present.
     pub fn capture_end(&mut self) -> Vec<Op> {
+        for op in std::mem::take(&mut self.undo).into_iter().rev() {
+            self.tree.apply(&op);
+        }
         self.capture.take().unwrap_or_default()
+    }
+
+    /// The op that undoes setting a property or a style value.
+    fn inverse(&self, op: &Op) -> Option<Op> {
+        let (node, style, key) = match op {
+            Op::Set { node, key, .. } => (*node, false, key),
+            Op::Style { node, key, .. } => (*node, true, key),
+            _ => return None,
+        };
+        let n = self.tree.get(node)?;
+        let map = if style { &n.style } else { &n.props };
+        let value = map.get(key).cloned().unwrap_or(Value::Null);
+        Some(if style {
+            Op::Style {
+                node,
+                key: key.clone(),
+                value,
+            }
+        } else {
+            Op::Set {
+                node,
+                key: key.clone(),
+                value,
+            }
+        })
     }
 
     /// Ops that set each of `keys` back to its current value, for frames
@@ -322,5 +361,24 @@ mod tests {
         assert!(!reset);
         assert_eq!(ops.len(), 3, "{ops:?}");
         assert!(doc.insert(text, parts::MAIN, 0).is_err());
+    }
+
+    #[test]
+    fn frames_drawn_ahead_leave_the_present_in_the_document() {
+        let mut doc = Document::new();
+        doc.take_pending();
+        let text = doc.create("text", Props::new(), Props::new());
+        doc.insert(parts::MAIN, text, 0).unwrap();
+        doc.set(text, "text", json!("now"));
+        doc.take_pending();
+        doc.capture_begin();
+        doc.set(text, "text", json!("later"));
+        let ops = doc.capture_end();
+        assert_eq!(ops.len(), 1, "the frame still carries its change");
+        let current = doc.current(&[(text, false, "text".to_owned())].into_iter().collect());
+        assert!(
+            matches!(&current[0], Op::Set { value, .. } if value == "now"),
+            "{current:?}"
+        );
     }
 }
