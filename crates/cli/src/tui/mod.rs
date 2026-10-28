@@ -19,7 +19,7 @@ use crossterm::event::{
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use futures_util::{FutureExt, StreamExt};
+use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -153,9 +153,9 @@ pub(crate) async fn run(
                         Handled::Redraw => redraw = true,
                         Handled::Ignored => {}
                     }
-                    match events.next().now_or_never() {
-                        Some(Some(next)) => event = next,
-                        _ => break,
+                    match ready_event(&mut events).await {
+                        Some(next) => event = next,
+                        None => break,
                     }
                 }
                 if redraw {
@@ -188,6 +188,22 @@ enum Handled {
     Quit,
     Redraw,
     Ignored,
+}
+
+/// The next terminal event if one is already waiting, without waiting for
+/// one. It polls with this task's own waker: a dummy waker (as
+/// `now_or_never` uses) would swallow crossterm's wake-up for the next
+/// input, and with nothing else to wake the loop, chat would stop reading
+/// keys.
+async fn ready_event<S>(events: &mut S) -> Option<S::Item>
+where
+    S: futures_util::Stream + Unpin,
+{
+    std::future::poll_fn(|cx| match events.poll_next_unpin(cx) {
+        std::task::Poll::Ready(item) => std::task::Poll::Ready(item),
+        std::task::Poll::Pending => std::task::Poll::Ready(None),
+    })
+    .await
 }
 
 async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled> {
