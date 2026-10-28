@@ -322,7 +322,10 @@ pub struct LuaHost {
 impl LuaHost {
     /// Share file history across Lua VM rebuilds and hot reloads.
     pub fn set_file_history(&self, history: fs::History) {
-        self.lua.lock().unwrap().set_app_data(history);
+        self.lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_app_data(history);
     }
 
     pub fn new() -> Result<Self> {
@@ -352,6 +355,7 @@ impl LuaHost {
         install_agentd_globals(&lua, &catalog)?;
         load_helpers(&lua)?;
         sandbox::lock_down(&lua).context("lock down lua sandbox")?;
+        limit_lua(&lua)?;
 
         Ok(Self {
             lua: Arc::new(Mutex::new(lua)),
@@ -365,14 +369,20 @@ impl LuaHost {
     /// Configure the root directory that `import(...)` resolves against.
     /// Without this set, every `import` call errors out.
     pub fn set_root(&self, root: impl Into<PathBuf>) {
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lua.set_app_data(Root(Some(root.into())));
     }
 
     /// Configure where `import("name")` resolves installed packages
     /// (`~/.local/share/agentd/packages`). Set by the daemon before init.lua.
     pub fn set_packages_root(&self, root: impl Into<PathBuf>) {
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lua.set_app_data(PackagesRoot(Some(root.into())));
     }
 
@@ -380,13 +390,19 @@ impl LuaHost {
     /// `fs.*` paths and the anchor for relative grant specs. Set by the daemon
     /// before `init.lua` runs.
     pub fn set_workspace_root(&self, root: impl Into<PathBuf>) {
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lua.set_app_data(WorkspaceRoot(Some(root.into())));
     }
 
     /// Snapshot of every package loaded this session, for grant desugaring.
     pub fn loaded_packages(&self) -> Vec<agentd_packages::LoadedPackage> {
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let scope = match lua.app_data_ref::<PackageScope>() {
             Some(s) => (*s).clone(),
             None => return Vec::new(),
@@ -422,10 +438,18 @@ impl LuaHost {
     pub fn start_async_runtime(&self, handle: tokio::runtime::Handle) {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<scheduler::AsyncTask>();
         let lua_handle = self.lua.clone();
+        // A script that calls `async(f)` in a loop must not spawn a task per
+        // call without limit. Later tasks wait their turn in the queue.
+        const MAX_IN_FLIGHT: usize = 256;
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
         handle.spawn(async move {
             while let Some(task) = rx.recv().await {
+                let Ok(slot) = slots.clone().acquire_owned().await else {
+                    break;
+                };
                 let lua = lua_handle.clone();
                 tokio::spawn(async move {
+                    let _slot = slot;
                     let result = scheduler::drive(lua, task.thread, vec![], task.ctx).await;
                     task.state.set(match result {
                         Ok(v) => Ok(v),
@@ -434,7 +458,10 @@ impl LuaHost {
                 });
             }
         });
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lua.set_app_data(scheduler::AsyncTaskSpawner(tx));
     }
 
@@ -465,7 +492,10 @@ impl LuaHost {
     pub fn load_file(&self, path: &Path) -> Result<()> {
         let src =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lua.load(&src)
             .set_name(path.to_string_lossy())
             .exec()
@@ -483,27 +513,39 @@ impl LuaHost {
     /// Wire a secret store backend. Call before `load_dir` so tool code can
     /// rely on it. `MemoryStore` for tests, `KeyringStore` in production.
     pub fn set_secrets(&self, store: Arc<dyn SecretStore>) {
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lua.set_app_data(SecretsHolder(Some(store)));
     }
 
     /// Wire the memory store backend. `RedbStore` in production,
     /// `MemMemoryStore` in tests. Call before `load_dir`/`load_file`.
     pub fn set_memory(&self, store: Arc<dyn MemoryStore>) {
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lua.set_app_data(MemoryHolder(Some(store)));
     }
 
     /// Wire the session store backend. `RedbSessionStore` in production,
     /// `MemSessionStore` in tests. Call before `load_dir`/`load_file`.
     pub fn set_sessions(&self, store: Arc<dyn SessionStore>) {
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lua.set_app_data(SessionsHolder(Some(store)));
     }
 
     /// Register a named AI provider.
     pub fn set_ai_provider(&self, name: impl Into<String>, provider: Arc<dyn Provider>) {
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut holder: AiHolder = lua
             .app_data_ref::<AiHolder>()
             .map(|h| (*h).clone())
@@ -515,7 +557,10 @@ impl LuaHost {
     /// Pick the default provider name returned when Lua calls
     /// `context.ai.ask` without a `provider` opt.
     pub fn set_default_ai_provider(&self, name: impl Into<String>) {
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut holder: AiHolder = lua
             .app_data_ref::<AiHolder>()
             .map(|h| (*h).clone())
@@ -530,7 +575,10 @@ impl LuaHost {
     /// invokes `ctx.run` — calling it later is also fine, but
     /// scripts that touched the API earlier will have errored out.
     pub fn set_runner_dispatcher(&self, dispatcher: Arc<dyn agentd_types::RunnerDispatcher>) {
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lua.set_app_data(RunnerDispatcherHolder(Some(dispatcher)));
     }
 
@@ -540,21 +588,30 @@ impl LuaHost {
     /// broker) instead of failing immediately. Without it, inline denials
     /// keep the fail-fast behavior.
     pub fn set_inline_approvals(&self, hook: Arc<dyn agentd_types::InlineApprovals>) {
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lua.set_app_data(InlineApprovalsHandle(hook));
     }
 
     /// Wire the operator's hard denials. Inline capability checks and nested
     /// `ctx.call` consult them before anything else.
     pub fn set_denials(&self, denials: Arc<dyn agentd_types::Denials>) {
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lua.set_app_data(DenialsHandle(denials));
     }
 
     /// Drop the denials hook, for the same reason as
     /// [`LuaHost::clear_inline_approvals`].
     pub fn clear_denials(&self) {
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lua.remove_app_data::<DenialsHandle>();
     }
 
@@ -563,7 +620,10 @@ impl LuaHost {
     /// in the Lua app-data, which would otherwise keep the old runtime alive
     /// across a hot reload.
     pub fn clear_inline_approvals(&self) {
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lua.remove_app_data::<InlineApprovalsHandle>();
     }
 
@@ -571,7 +631,10 @@ impl LuaHost {
     /// `import("rel/path.lua")` target, keyed by canonicalized absolute path.
     /// The daemon's `--watch` loop derives its watch set from this.
     pub fn imported_paths(&self) -> Vec<PathBuf> {
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match lua.app_data_ref::<ImportCache>() {
             Some(cache) => cache.0.read().unwrap().iter().cloned().collect(),
             None => Vec::new(),
@@ -583,7 +646,10 @@ impl LuaHost {
     /// app-data; the executor holds `Arc<dyn Registry>` back to this host.
     /// Clearing the dispatcher releases the host's strong ref to the executor.
     pub fn clear_runner_dispatcher(&self) {
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lua.set_app_data(RunnerDispatcherHolder(None));
     }
 
@@ -593,7 +659,10 @@ impl LuaHost {
     /// channel never closes on its own. Dropping the sender closes the receiver,
     /// the driver loop exits, and the old Lua VM can drop on hot reload.
     pub fn shutdown_async_runtime(&self) {
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lua.remove_app_data::<scheduler::AsyncTaskSpawner>();
     }
 
@@ -602,7 +671,10 @@ impl LuaHost {
             tracing::warn!(path = %dir.display(), "tools dir missing");
             return Ok(0);
         }
-        let lua = self.lua.lock().unwrap();
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut count = 0;
         for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
             let path = entry.path();
@@ -1294,10 +1366,11 @@ fn await_internal(lua: &Lua, handle: mlua::AnyUserData) -> mlua::Result<Value> {
         .map_err(|e| mlua::Error::external(format!("`await` was called outside the daemon runtime ({e}) — this is a bug in agentd, please report it")))?;
     let result = handle_rt.block_on(async move {
         loop {
+            let notified = state.notify.notified();
             if let Some(v) = state.read() {
                 return v;
             }
-            state.notify.notified().await;
+            notified.await;
         }
     });
     match result {
@@ -4742,7 +4815,7 @@ impl Registry for LuaHost {
             let action = action.clone();
             tokio::task::spawn_blocking(
                 move || -> Result<(mlua::Thread, Option<String>, Option<PathBuf>), RegistryError> {
-                    let lua_g = lua.lock().unwrap();
+                    let lua_g = lua.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     let cat = catalog.read().unwrap();
                     let key = cat
                         .actions
@@ -4819,36 +4892,35 @@ impl Registry for LuaHost {
         let svc_name = name.to_string();
         // Services don't declare a cwd of their own yet; inherit the caller's
         // (usually none → falls back to the workspace root at resolve time).
-        let cwd = {
-            let lua_g = lua.lock().unwrap();
-            let ws = lua_g
-                .app_data_ref::<WorkspaceRoot>()
-                .and_then(|w| w.0.clone());
-            ctx.cwd
-                .clone()
-                .map(|s| resolve_cwd(ws.as_deref(), &s))
-                .or(ws)
-        };
-        let ctx_for_drive = ActiveContext {
-            caller: ctx.caller.clone(),
-            effective_grants: normalize_path_grants(&resolve_relative_grants(
-                &substitute_cwd(&ctx.effective_grants, ctx.caller.cwd.as_deref()),
-                cwd.as_deref(),
-            )),
-            call_chain: ctx.call_chain.clone(),
-            grant_kind: Some("service".to_string()),
-            grant_name: Some(svc_name.clone()),
-            cwd,
-            cwd_stack: Vec::new(),
-            ..Default::default()
-        };
-
-        let thread = {
+        // Everything that needs the Lua mutex happens off the runtime: a
+        // long step elsewhere would otherwise pin this worker thread.
+        let (thread, ctx_for_drive) = {
             let lua = lua.clone();
             let catalog = catalog.clone();
             let svc_name = svc_name.clone();
-            tokio::task::spawn_blocking(move || -> Result<mlua::Thread, RegistryError> {
-                let lua_g = lua.lock().unwrap();
+            tokio::task::spawn_blocking(move || -> Result<(mlua::Thread, ActiveContext), RegistryError> {
+                let lua_g = lua.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let ws = lua_g
+                    .app_data_ref::<WorkspaceRoot>()
+                    .and_then(|w| w.0.clone());
+                let cwd = ctx
+                    .cwd
+                    .clone()
+                    .map(|s| resolve_cwd(ws.as_deref(), &s))
+                    .or(ws);
+                let ctx_for_drive = ActiveContext {
+                    caller: ctx.caller.clone(),
+                    effective_grants: normalize_path_grants(&resolve_relative_grants(
+                        &substitute_cwd(&ctx.effective_grants, ctx.caller.cwd.as_deref()),
+                        cwd.as_deref(),
+                    )),
+                    call_chain: ctx.call_chain.clone(),
+                    grant_kind: Some("service".to_string()),
+                    grant_name: Some(svc_name.clone()),
+                    cwd,
+                    cwd_stack: Vec::new(),
+                    ..Default::default()
+                };
                 let cat = catalog.read().unwrap();
                 let key = cat
                     .services
@@ -4859,7 +4931,7 @@ impl Registry for LuaHost {
                     .map_err(|e| RegistryError::Invocation(e.to_string()))?;
                 let thread = ctx_thread(&lua_g, func, false)
                     .map_err(|e| RegistryError::Invocation(e.to_string()))?;
-                Ok(thread)
+                Ok((thread, ctx_for_drive))
             })
             .await
             .map_err(|e| RegistryError::Invocation(format!("the Lua execution task ended unexpectedly ({e}) — this is a bug in agentd, please report it")))??
@@ -4869,6 +4941,33 @@ impl Registry for LuaHost {
 
         outcome.map(|_| ()).map_err(script_err)
     }
+}
+
+/// Keep one script from taking the whole runtime down. Every handler shares
+/// this Lua state behind one mutex, so a `while true do end` would park every
+/// other action behind it forever, and an unbounded `string.rep` would grow
+/// the daemon until the OS killed it. The hook runs every few thousand
+/// instructions and fails the step once its deadline has passed.
+fn limit_lua(lua: &Lua) -> Result<()> {
+    const MEMORY_LIMIT: usize = 1024 * 1024 * 1024;
+    lua.set_memory_limit(MEMORY_LIMIT)
+        .context("set the Lua memory limit")?;
+    lua.set_global_hook(
+        mlua::HookTriggers::new().every_nth_instruction(20_000),
+        |lua, _| {
+            if let Some(deadline) = lua.app_data_ref::<scheduler::StepDeadline>()
+                && std::time::Instant::now() > deadline.0
+            {
+                return Err(mlua::Error::runtime(format!(
+                    "this handler ran for {} seconds without yielding, so it was stopped. Break long loops up with sleep or await",
+                    scheduler::STEP_LIMIT.as_secs()
+                )));
+            }
+            Ok(mlua::VmState::Continue)
+        },
+    )
+    .context("install the Lua step limit")?;
+    Ok(())
 }
 
 /// Map a drive outcome into a structured registry error: Lua failures split

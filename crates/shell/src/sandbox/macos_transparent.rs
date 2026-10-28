@@ -20,7 +20,6 @@
 
 #![cfg(target_os = "macos")]
 
-use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -289,8 +288,8 @@ pub(crate) async fn run_contained(
     }
     let out_task = tokio::task::spawn_blocking(move || read_fd_to_end(stdout_rd));
     let err_task = tokio::task::spawn_blocking(move || read_fd_to_end(stderr_rd));
-    let stdout = String::from_utf8_lossy(&out_task.await.unwrap_or_default()).into_owned();
-    let stderr_text = String::from_utf8_lossy(&err_task.await.unwrap_or_default()).into_owned();
+    let stdout = out_task.await.unwrap_or_default().into_text();
+    let stderr_text = err_task.await.unwrap_or_default().into_text();
 
     // Child's stdio closed → reap it via the broker for the exit code. The
     // broker blocks until the child exits, so wait off the async workers. After
@@ -390,14 +389,12 @@ fn demap(a: SocketAddr) -> SocketAddr {
     }
 }
 
-fn read_fd_to_end(fd: RawFd) -> Vec<u8> {
+fn read_fd_to_end(fd: RawFd) -> crate::output::Capped {
     // SAFETY: `fd` is a stdout/stderr read end received from the broker via
     // SCM_RIGHTS and owned here; adopting it into a File gives buffered reads
     // and RAII close. No safe constructor exists for an out-of-band fd.
-    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mut v = Vec::new();
-    let _ = f.read_to_end(&mut v);
-    v
+    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+    crate::output::Capped::read_sync(f)
 }
 
 /// Receive `n` file descriptors via `SCM_RIGHTS` (plus the broker's dummy byte).
@@ -473,7 +470,10 @@ async fn admit_dst(ip: IpAddr, set: &SharedSet, host_grants: &[Permission]) -> b
 ///   reverse DNS (the common case); hosts without matching PTR records are the
 ///   one place macOS is less capable than Linux's direct DNS interception.
 fn resolve_admit(ip: IpAddr, host_grants: &[Permission]) -> bool {
-    use crate::dns_pin::{Resolve, SystemResolver, name_allowed};
+    use crate::dns_pin::{Resolve, SystemResolver, host_bound, name_allowed};
+    if host_bound(ip) {
+        return false;
+    }
     let resolver = SystemResolver;
     let mut has_wildcard = false;
     for g in host_grants {
@@ -592,6 +592,12 @@ async fn relay_loop(
             Ok(x) => x,
             Err(_) => break,
         };
+        // pf only redirects the child's loopback traffic here. The socket is
+        // dual-stack on every interface, so anything from the LAN is a
+        // stranger asking the relay to connect somewhere on its behalf.
+        if !from_this_host(peer) {
+            continue;
+        }
         let local = match inbound.local_addr() {
             Ok(a) => a,
             Err(_) => continue,
@@ -643,6 +649,13 @@ async fn natlook(broker: &Arc<Broker>, peer: SocketAddr, local: SocketAddr) -> O
 
 /// Serve DNS queries from the child: resolve allowed names, commit IPs to the
 /// set BEFORE answering, NXDOMAIN otherwise. Identical policy to Linux.
+/// Whether a relay peer is on this machine. The relay sockets listen on
+/// every interface (pf needs both loopback families), so this is what keeps
+/// them private to the sandboxed child.
+fn from_this_host(peer: SocketAddr) -> bool {
+    peer.ip().to_canonical().is_loopback()
+}
+
 async fn dns_loop(udp: tokio::net::UdpSocket, host_grants: Vec<Permission>, set: SharedSet) {
     let resolver = crate::dns_pin::SystemResolver;
     let mut buf = [0u8; 1500];
@@ -651,6 +664,9 @@ async fn dns_loop(udp: tokio::net::UdpSocket, host_grants: Vec<Permission>, set:
             Ok(x) => x,
             Err(_) => break,
         };
+        if !from_this_host(src) {
+            continue;
+        }
         let resp =
             handle_dns(&buf[..n], &host_grants, &set, &resolver, PIN_TTL).unwrap_or_default();
         if !resp.is_empty() {

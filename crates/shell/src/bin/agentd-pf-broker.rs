@@ -231,6 +231,10 @@ mod macos {
     struct MacBackend {
         pending_fds: Vec<RawFd>,
         conn_fd: RawFd,
+        /// Every `(ace, path)` this session added, so teardown can strip
+        /// exactly those. The uid is pooled: an ACE left behind would hand
+        /// the next session on that uid access it was never granted.
+        stamped: Vec<(String, String)>,
     }
 
     impl MacBackend {
@@ -238,6 +242,7 @@ mod macos {
             MacBackend {
                 pending_fds: Vec::new(),
                 conn_fd,
+                stamped: Vec::new(),
             }
         }
 
@@ -294,14 +299,16 @@ mod macos {
             write: &[String],
         ) -> Result<(), String> {
             for p in read {
-                chmod_acl_add(&user.name, p, "read,execute,search")?;
+                let ace = chmod_acl_add(&user.name, p, "read,execute,search")?;
+                self.stamped.push((ace, p.clone()));
             }
             for p in write {
-                chmod_acl_add(
+                let ace = chmod_acl_add(
                     &user.name,
                     p,
                     "read,write,execute,search,delete,append,add_file,add_subdirectory",
                 )?;
+                self.stamped.push((ace, p.clone()));
             }
             Ok(())
         }
@@ -358,6 +365,11 @@ mod macos {
                     break;
                 }
             }
+            // The command is done, but anything it left in the background
+            // still runs as the pooled uid with this session's ACLs and pf
+            // rules, and would inherit the next session's. The group id is
+            // the leader's pid; nothing else can own it while members remain.
+            unsafe { libc::killpg(pid, libc::SIGKILL) };
             if libc::WIFEXITED(status) {
                 libc::WEXITSTATUS(status)
             } else if libc::WIFSIGNALED(status) {
@@ -380,13 +392,16 @@ mod macos {
             flush_anchor_uid(user.uid);
         }
 
-        fn remove_acls(&mut self, user: &SandboxUser) {
-            // Best-effort: strip every ACE naming this sandbox user from the
-            // granted paths. We re-run chmod -a per recorded path is ideal, but
-            // paths aren't retained here; instead the daemon-facing contract is
-            // that ACLs are inherit-scoped under granted dirs and removed by
-            // clearing the user's ACEs. A full sweep is done at install/teardown.
-            let _ = user;
+        fn remove_acls(&mut self, _user: &SandboxUser) {
+            // Best effort, in reverse: a path that is gone or no longer ours
+            // has nothing left to strip.
+            for (ace, path) in self.stamped.drain(..).rev() {
+                let _ = Command::new("/bin/chmod")
+                    .args(["-a", &ace, &path])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
         }
     }
 
@@ -425,7 +440,8 @@ mod macos {
             .status();
     }
 
-    fn chmod_acl_add(user: &str, path: &str, perms: &str) -> Result<(), String> {
+    /// Add one ACE and return it, so the same text can be removed later.
+    fn chmod_acl_add(user: &str, path: &str, perms: &str) -> Result<String, String> {
         let ace = format!("user:{user} allow {perms},file_inherit,directory_inherit");
         let st = Command::new("/bin/chmod")
             .args(["+a", &ace, path])
@@ -433,7 +449,7 @@ mod macos {
             .output()
             .map_err(|e| format!("could not start `chmod` ({e})"))?;
         if st.status.success() {
-            Ok(())
+            Ok(ace)
         } else {
             Err(format!(
                 "the command `chmod +a {path}` failed ({})",
@@ -525,11 +541,11 @@ mod macos {
                     libc::chdir(c.as_ptr());
                 }
                 // Drop privileges: gid before uid, and setgroups to just the
-                // sandbox gid so no supplementary groups leak.
-                libc::setgid(uid);
+                // sandbox gid so no supplementary groups leak. Any failure
+                // here would leave the child with the broker's root group.
                 let gid = uid as libc::gid_t;
-                libc::setgroups(1, &gid);
-                if libc::setuid(uid) != 0 {
+                if libc::setgid(gid) != 0 || libc::setgroups(1, &gid) != 0 || libc::setuid(uid) != 0
+                {
                     libc::_exit(126);
                 }
                 libc::execv(sandbox_exec.as_ptr(), argv.as_ptr());

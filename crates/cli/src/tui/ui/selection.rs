@@ -108,7 +108,10 @@ pub(in crate::tui) fn selected_text(app: &App, screen: Rect, selection: &Selecti
 /// The selected text, lines joined with newlines.
 pub(in crate::tui) fn text(conversation: &Conversation, selection: &Selection) -> String {
     let (start, end) = selection.ordered();
-    let last = end.line.min(conversation.lines.len().saturating_sub(1));
+    if conversation.lines.is_empty() || start.line >= conversation.lines.len() {
+        return String::new();
+    }
+    let last = end.line.min(conversation.lines.len() - 1);
     let mut out = String::new();
     for index in start.line..=last {
         let range = intersect(

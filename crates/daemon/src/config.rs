@@ -335,7 +335,8 @@ impl Config {
             .trace
             .or(cli.trace_file_compat)
             .or_else(|| daemon.trace_file.as_deref().map(expand_tilde))
-            .unwrap_or_else(|| default_trace_file().expect("trace default"));
+            .map(Ok)
+            .unwrap_or_else(default_trace_file)?;
 
         let log_level = cli
             .log
@@ -372,10 +373,7 @@ impl Config {
                 let init = sibling(&grants, "init.lua");
                 (init, grants)
             }
-            (None, None) => (
-                default_init_file().expect("init default"),
-                default_grants_file().expect("grants default"),
-            ),
+            (None, None) => (default_init_file()?, default_grants_file()?),
         };
 
         // The workspace root is the folder init.lua lives in. It anchors config
@@ -393,6 +391,11 @@ impl Config {
 
         // `--no-auth` (flag/env) wins; otherwise fall back to config.toml.
         let no_auth = cli.no_auth || daemon.no_auth.unwrap_or(false);
+        if no_auth && !binds_loopback(&addr) {
+            anyhow::bail!(
+                "--no-auth only works on a loopback address, but the daemon would listen on {addr}. Bind 127.0.0.1 or set a token"
+            );
+        }
         let auth_token = cli.token.or(daemon.token);
         let admin_token = cli.admin_token.or(daemon.admin_token);
         let approval_timeout_ms = cli
@@ -585,6 +588,21 @@ fn default_config_path() -> Result<PathBuf> {
         .context("could not locate a config directory (XDG) on this system")?
         .join("agentd")
         .join("config.toml"))
+}
+
+/// True when `addr` names a loopback interface, so a tokenless daemon only
+/// answers the local machine.
+fn binds_loopback(addr: &str) -> bool {
+    match addr.parse::<std::net::SocketAddr>() {
+        Ok(sa) => sa.ip().is_loopback(),
+        Err(_) => {
+            let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+            matches!(
+                host.trim_matches(|c| c == '[' || c == ']'),
+                "localhost" | "127.0.0.1" | "::1"
+            )
+        }
+    }
 }
 
 fn default_init_file() -> Result<PathBuf> {

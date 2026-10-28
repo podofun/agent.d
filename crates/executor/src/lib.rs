@@ -416,6 +416,44 @@ impl Drop for SessionGuard {
     }
 }
 
+/// The current grants.toml, or an empty document when there is none yet.
+/// Any other read failure is an error: treating an unreadable file as empty
+/// and writing it back would erase every rule in it, `[denial]` included.
+fn read_grants_text(path: &std::path::Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!(
+            "could not read grants.toml ({e}) — fix that before approving, or the file would be rewritten from scratch"
+        )),
+    }
+}
+
+/// Replace grants.toml in one step: write a sibling file, flush it, rename
+/// it over the original. A crash or a concurrent reload then sees either the
+/// old file or the new one, never a torn one.
+fn write_grants_text(path: &std::path::Path, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".tmp");
+    let tmp = path.with_file_name(name);
+    let io = |e: std::io::Error| {
+        format!("could not write grants.toml ({e}) — check the file permissions")
+    };
+    let mut file = std::fs::File::create(&tmp).map_err(io)?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(io)?;
+    drop(file);
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        io(e)
+    })
+}
+
 impl Executor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1094,7 +1132,7 @@ impl Executor {
 
         let _guard = self.forever_write_lock.lock().await;
 
-        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let text = read_grants_text(path)?;
         let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| {
             format!("grants.toml is not valid TOML ({e}) — fix the syntax and approve again")
         })?;
@@ -1170,9 +1208,7 @@ impl Executor {
             }
         }
 
-        std::fs::write(path, doc.to_string()).map_err(|e| {
-            format!("could not write grants.toml ({e}) — check the file permissions")
-        })?;
+        write_grants_text(path, &doc.to_string())?;
         let fresh = reload()?;
         self.engine.store(Arc::new(fresh));
         Ok(())
@@ -1205,7 +1241,7 @@ impl Executor {
 
         let _guard = self.forever_write_lock.lock().await;
 
-        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let text = read_grants_text(path)?;
         let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| {
             format!("grants.toml is not valid TOML ({e}) — fix the syntax and approve again")
         })?;
@@ -1226,9 +1262,7 @@ impl Executor {
             std::slice::from_ref(&perm.to_string()),
         );
 
-        std::fs::write(path, doc.to_string()).map_err(|e| {
-            format!("could not write grants.toml ({e}) — check the file permissions")
-        })?;
+        write_grants_text(path, &doc.to_string())?;
         let fresh = reload()?;
         self.engine.store(Arc::new(fresh));
         Ok(())

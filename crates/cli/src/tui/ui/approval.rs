@@ -7,6 +7,14 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use super::{ERROR, MUTED, PRIMARY, SUCCESS, WARNING};
 
+/// Agent and network text drawn in the popup, with control characters
+/// removed. The popup is the permission boundary: a `\r` or an escape
+/// sequence in a tool argument could otherwise hide the command being
+/// approved.
+fn shown(text: &str) -> String {
+    super::markdown::printable(text).into_owned()
+}
+
 pub(super) fn draw_approval(frame: &mut Frame<'_>, request: &ApprovalRequest, scroll: usize) {
     let area = frame.area();
     let width = area.width.saturating_sub(4).min(76);
@@ -77,12 +85,12 @@ pub(super) fn draw_approval(frame: &mut Frame<'_>, request: &ApprovalRequest, sc
 
 fn approval_body(request: &ApprovalRequest) -> Vec<Line<'static>> {
     let mut lines = vec![Line::styled(
-        request.action.clone(),
+        shown(&request.action),
         Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
     )];
     if let Some(tool) = &request.tool {
         lines.push(Line::styled(
-            format!("Tool: {tool}"),
+            format!("Tool: {}", shown(tool)),
             Style::default().fg(MUTED),
         ));
     }
@@ -92,13 +100,13 @@ fn approval_body(request: &ApprovalRequest) -> Vec<Line<'static>> {
             lines.push(Line::raw("This action needs access to:"));
             for permission in &request.missing {
                 lines.push(Line::styled(
-                    format!("  • {permission}"),
+                    format!("  • {}", shown(permission)),
                     Style::default().fg(WARNING),
                 ));
             }
             if request.reason.starts_with("The classifier was unsure") {
                 lines.push(Line::styled(
-                    request.reason.clone(),
+                    shown(&request.reason),
                     Style::default().fg(MUTED),
                 ));
             }
@@ -106,13 +114,13 @@ fn approval_body(request: &ApprovalRequest) -> Vec<Line<'static>> {
         ApprovalKind::Confirm => {
             lines.push(Line::raw("This action requires your confirmation."));
             if !request.reason.is_empty() {
-                lines.push(Line::raw(request.reason.clone()));
+                lines.push(Line::raw(shown(&request.reason)));
             }
         }
         ApprovalKind::RunnerAction => {
             lines.push(Line::raw("The runner wants to use this action."));
             if !request.reason.is_empty() {
-                lines.push(Line::raw(request.reason.clone()));
+                lines.push(Line::raw(shown(&request.reason)));
             }
         }
         ApprovalKind::Folder => {
@@ -157,14 +165,14 @@ fn detail_lines(detail: Option<&serde_json::Value>) -> Vec<Line<'static>> {
             other => other.to_string(),
         };
         let mut rows = text.lines();
-        let first = rows.next().unwrap_or_default().to_owned();
+        let first = shown(rows.next().unwrap_or_default());
         lines.push(Line::from(vec![
             Span::styled(format!("{key}  "), label),
             Span::styled(first, Style::default().add_modifier(Modifier::BOLD)),
         ]));
         let rest: Vec<&str> = rows.collect();
         for row in rest.iter().take(ROWS) {
-            lines.push(Line::raw(format!("  {row}")));
+            lines.push(Line::raw(format!("  {}", shown(row))));
         }
         if rest.len() > ROWS {
             lines.push(Line::styled(
@@ -232,6 +240,34 @@ mod tests {
         assert!(!rendered.contains("Session ws-6"));
         assert!(!rendered.contains("{\""));
         assert!(!rendered.contains("has not been granted"));
+    }
+
+    #[test]
+    fn control_characters_from_the_agent_cannot_redraw_the_popup() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        app.approval = Some(serde_json::from_value(json!({
+            "id": 8,
+            "kind": "confirm",
+            "action": "shell\r.exec",
+            "tool": "sh\u{1b}[2J",
+            "requires": [],
+            "missing": [],
+            "reason": "run\u{1b}[1;31m rm -rf\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}ls",
+            "detail": { "cmd": "echo safe\rrm -rf /" },
+            "caller": { "runner": null, "interface": "ws", "session": "ws-1", "user": null, "service": null }
+        })).unwrap());
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.chars().any(|c| c.is_control()), "{rendered}");
+        assert!(rendered.contains("echo saferm -rf /"));
     }
 
     #[test]

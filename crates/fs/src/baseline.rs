@@ -372,8 +372,26 @@ impl Baseline {
         let racy = modified.is_none_or(|m| m + RACY_WINDOW >= started);
         let mut file = open_seen(path, metadata)?;
         if metadata.len() <= limits.max_content_bytes {
+            // The size came from an earlier stat. A file that grew since (a
+            // log being appended to) must not be read whole at any size, so
+            // read one byte past the limit and, when it is there, fall back
+            // to hashing the stream like any large file.
             let mut bytes = Vec::with_capacity(metadata.len() as usize);
-            file.read_to_end(&mut bytes)?;
+            (&mut file)
+                .take(limits.max_content_bytes + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > limits.max_content_bytes {
+                let mut hasher = Sha256::new();
+                hasher.update(&bytes);
+                let size = bytes.len() as u64 + std::io::copy(&mut file, &mut hasher)?;
+                return Ok(Entry {
+                    size,
+                    modified,
+                    digest: hasher.finalize().into(),
+                    content: None,
+                    racy,
+                });
+            }
             let digest: [u8; 32] = Sha256::digest(&bytes).into();
             let binary = bytes[..bytes.len().min(BINARY_PROBE)].contains(&0);
             let size = bytes.len() as u64;

@@ -161,12 +161,14 @@ fn browser_area(screen: Rect) -> Rect {
     let width = if screen.width < 80 {
         screen.width
     } else {
-        (screen.width * 88 / 100).clamp(80, 150)
+        (u32::from(screen.width) * 88 / 100).clamp(80, 150) as u16
     };
     let height = if screen.height < 24 {
         screen.height
     } else {
-        (screen.height * 85 / 100).max(24).min(screen.height)
+        ((u32::from(screen.height) * 85 / 100) as u16)
+            .max(24)
+            .min(screen.height)
     };
     Rect::new(
         screen.x + (screen.width - width) / 2,
@@ -181,7 +183,7 @@ fn browser_area(screen: Rect) -> Rect {
 fn draw_body(frame: &mut Frame<'_>, list: &List<'_, '_>, row: &Row<'_>, body: Rect) {
     if body.width >= SIDE_BY_SIDE {
         let natural = list.matches.iter().map(natural_width).max().unwrap_or(0) as u16;
-        let widest = (body.width * 55 / 100).max(body.width.saturating_sub(40));
+        let widest = ((u32::from(body.width) * 55 / 100) as u16).max(body.width.saturating_sub(40));
         let list_width = natural.clamp(30, widest);
         let area_list = Rect::new(body.x, body.y, list_width, body.height);
         draw_list(frame, list, area_list);
