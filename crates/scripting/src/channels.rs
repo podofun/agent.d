@@ -49,18 +49,24 @@ impl ChannelState {
     }
 
     fn send(&self, payload: serde_json::Value) -> Result<(), &'static str> {
-        let guard = self.tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = self
+            .tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match guard.as_ref() {
             None => Err("this channel is closed, so nothing more can be sent on it"),
-            Some(tx) => tx.send(payload).map_err(|_| {
-                "the receiving end of this channel is gone, so the message cannot be delivered"
-            }),
+            Some(tx) => tx.send(payload).map_err(
+                |_| "the receiving end of this channel is gone, so the message cannot be delivered",
+            ),
         }
     }
 
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
-        self.tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        self.tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 
     pub(crate) fn rx(&self) -> Arc<Mutex<mpsc::UnboundedReceiver<serde_json::Value>>> {

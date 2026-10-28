@@ -22,7 +22,8 @@ impl Capped {
         if chunk.len() > room {
             self.truncated = true;
         }
-        self.bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        self.bytes
+            .extend_from_slice(&chunk[..chunk.len().min(room)]);
     }
 
     /// Read `r` to EOF, keeping at most the cap. Read errors end the stream
@@ -39,7 +40,9 @@ impl Capped {
         out
     }
 
-    pub(crate) async fn read_async<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> std::io::Result<Self> {
+    pub(crate) async fn read_async<R: tokio::io::AsyncRead + Unpin>(
+        mut r: R,
+    ) -> std::io::Result<Self> {
         use tokio::io::AsyncReadExt;
         let mut out = Self::default();
         let mut buf = vec![0u8; 64 * 1024];

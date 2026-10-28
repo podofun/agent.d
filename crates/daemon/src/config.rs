@@ -597,7 +597,10 @@ fn binds_loopback(addr: &str) -> bool {
         Ok(sa) => sa.ip().is_loopback(),
         Err(_) => {
             let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
-            matches!(host.trim_matches(|c| c == '[' || c == ']'), "localhost" | "127.0.0.1" | "::1")
+            matches!(
+                host.trim_matches(|c| c == '[' || c == ']'),
+                "localhost" | "127.0.0.1" | "::1"
+            )
         }
     }
 }

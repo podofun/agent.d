@@ -468,11 +468,15 @@ mod supervisor {
             );
             unsafe { libc::_exit(126) };
         };
-        let Ok(bin) = CString::new(cfg.bin.as_str()) else { nul("program path") };
+        let Ok(bin) = CString::new(cfg.bin.as_str()) else {
+            nul("program path")
+        };
         let mut argv: Vec<CString> = Vec::with_capacity(cfg.args.len() + 1);
         argv.push(bin.clone());
         for a in &cfg.args {
-            let Ok(a) = CString::new(a.as_str()) else { nul("argument list") };
+            let Ok(a) = CString::new(a.as_str()) else {
+                nul("argument list")
+            };
             argv.push(a);
         }
         let err = execvp(&bin, &argv).unwrap_err();
@@ -854,7 +858,10 @@ fn build_exec_args_tproxy(sup_path: &str, cfg_json: &str) -> Result<ExecArgs, St
     let sup_env = CString::new(format!("{TPROXY_ENV}={cfg_json}"))
         .map_err(|_| "the sandbox configuration contains a NUL byte".to_string())?;
     envp.push(sup_env);
-    Ok(ExecArgs { argv: vec![argv0], envp })
+    Ok(ExecArgs {
+        argv: vec![argv0],
+        envp,
+    })
 }
 
 /// Receive intercepted TCP fds + original dst; relay each to the real dst iff

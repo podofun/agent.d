@@ -350,7 +350,10 @@ fn webhook_error(status: StatusCode, message: &'static str) -> Response {
 /// client served from this machine carries a loopback one. Anything else is
 /// cross-site WebSocket hijacking.
 fn foreign_origin(headers: &axum::http::HeaderMap) -> bool {
-    let Some(origin) = headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+    let Some(origin) = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    else {
         return false;
     };
     let origin = origin.trim();
@@ -368,7 +371,9 @@ fn foreign_origin(headers: &axum::http::HeaderMap) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return false;
     }
-    !host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    !host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Constant-time equality so token checks do not leak prefix matches.
@@ -423,7 +428,11 @@ async fn ws_upgrade(
     headers: axum::http::HeaderMap,
 ) -> Response {
     if foreign_origin(&headers) {
-        return (axum::http::StatusCode::FORBIDDEN, "cross-site websocket refused").into_response();
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "cross-site websocket refused",
+        )
+            .into_response();
     }
     let Some((interface, admin)) = resolve_interface(&state, &headers) else {
         return (axum::http::StatusCode::UNAUTHORIZED, "unauthorized").into_response();
@@ -441,7 +450,11 @@ async fn control_upgrade(
     headers: axum::http::HeaderMap,
 ) -> Response {
     if foreign_origin(&headers) {
-        return (axum::http::StatusCode::FORBIDDEN, "cross-site websocket refused").into_response();
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "cross-site websocket refused",
+        )
+            .into_response();
     }
     if let Some(token) = &state.admin_token {
         let presented = headers
@@ -1424,14 +1437,25 @@ mod origin_tests {
 
     #[test]
     fn loopback_origins_pass() {
-        for o in ["http://localhost:5173", "http://127.0.0.1", "https://[::1]:8443", "http://LOCALHOST"] {
+        for o in [
+            "http://localhost:5173",
+            "http://127.0.0.1",
+            "https://[::1]:8443",
+            "http://LOCALHOST",
+        ] {
             assert!(!foreign_origin(&with(o)), "{o}");
         }
     }
 
     #[test]
     fn foreign_and_malformed_origins_fail() {
-        for o in ["https://evil.example", "http://10.0.0.5:80", "null", "garbage", "http://localhost.evil.example"] {
+        for o in [
+            "https://evil.example",
+            "http://10.0.0.5:80",
+            "null",
+            "garbage",
+            "http://localhost.evil.example",
+        ] {
             assert!(foreign_origin(&with(o)), "{o}");
         }
     }

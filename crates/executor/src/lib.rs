@@ -434,12 +434,19 @@ fn read_grants_text(path: &std::path::Path) -> Result<String, String> {
 /// old file or the new one, never a torn one.
 fn write_grants_text(path: &std::path::Path, text: &str) -> Result<(), String> {
     use std::io::Write;
-    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     name.push(".tmp");
     let tmp = path.with_file_name(name);
-    let io = |e: std::io::Error| format!("could not write grants.toml ({e}) — check the file permissions");
+    let io = |e: std::io::Error| {
+        format!("could not write grants.toml ({e}) — check the file permissions")
+    };
     let mut file = std::fs::File::create(&tmp).map_err(io)?;
-    file.write_all(text.as_bytes()).and_then(|()| file.sync_all()).map_err(io)?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(io)?;
     drop(file);
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);

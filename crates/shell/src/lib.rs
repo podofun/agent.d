@@ -16,10 +16,10 @@ pub mod dns_pin;
 pub mod dns_wire;
 pub mod gateway;
 mod kill_tree;
-mod output;
 #[cfg(target_os = "windows")]
 pub mod netbroker;
 pub mod netfilter;
+mod output;
 pub mod policy;
 mod program;
 mod reach;
@@ -323,7 +323,9 @@ async fn run(req: ExecRequest, tree: kill_tree::KillSwitch) -> Result<ExecResult
         }
         Ok::<(), std::io::Error>(())
     };
-    async fn drain<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> std::io::Result<output::Capped> {
+    async fn drain<R: tokio::io::AsyncRead + Unpin>(
+        pipe: Option<R>,
+    ) -> std::io::Result<output::Capped> {
         match pipe {
             Some(p) => output::Capped::read_async(p).await,
             None => Ok(output::Capped::default()),

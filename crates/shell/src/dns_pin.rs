@@ -67,12 +67,19 @@ pub fn split_grants(net_hosts: &[Permission]) -> (Vec<Permission>, Vec<IpAddr>) 
 pub fn host_bound(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast()
+            v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
         }
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => host_bound(IpAddr::V4(v4)),
             None => {
-                v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || v6.is_unicast_link_local()
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    || v6.is_unicast_link_local()
             }
         },
     }

@@ -97,7 +97,12 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             "rebind.example.com".to_string(),
-            vec![ip("127.0.0.1"), ip("169.254.169.254"), ip("::1"), ip("93.184.216.34")],
+            vec![
+                ip("127.0.0.1"),
+                ip("169.254.169.254"),
+                ip("::1"),
+                ip("93.184.216.34"),
+            ],
         );
         let up = MapResolver(map);
         let q = build_query(1, "rebind.example.com", TYPE_A);

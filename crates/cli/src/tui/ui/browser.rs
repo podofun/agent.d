@@ -164,7 +164,9 @@ fn browser_area(screen: Rect) -> Rect {
     let height = if screen.height < 24 {
         screen.height
     } else {
-        ((u32::from(screen.height) * 85 / 100) as u16).max(24).min(screen.height)
+        ((u32::from(screen.height) * 85 / 100) as u16)
+            .max(24)
+            .min(screen.height)
     };
     Rect::new(
         screen.x + (screen.width - width) / 2,
