@@ -4,8 +4,6 @@
 //! [`MAX_OUTPUT_BYTES`] and discards the rest while still draining the pipe,
 //! which keeps the child from blocking on a full buffer.
 
-use std::io::Read;
-
 /// Bytes kept per stream before the rest is dropped.
 pub const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -27,8 +25,10 @@ impl Capped {
     }
 
     /// Read `r` to EOF, keeping at most the cap. Read errors end the stream
-    /// like EOF: what arrived so far is still the program's output.
-    pub(crate) fn read_sync<R: Read>(mut r: R) -> Self {
+    /// like EOF: what arrived so far is still the program's output. The
+    /// Windows backend reads through handles and feeds `push` itself.
+    #[cfg(unix)]
+    pub(crate) fn read_sync<R: std::io::Read>(mut r: R) -> Self {
         let mut out = Self::default();
         let mut buf = [0u8; 64 * 1024];
         loop {
