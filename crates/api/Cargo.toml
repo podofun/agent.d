@@ -12,6 +12,7 @@ agentd-runners.workspace = true
 agentd-sessions.workspace = true
 agentd-skills.workspace = true
 agentd-types.workspace = true
+agentd-ui.workspace = true
 arc-swap = "1.7"
 axum = { version = "0.8.9", features = ["ws"] }
 hex.workspace = true

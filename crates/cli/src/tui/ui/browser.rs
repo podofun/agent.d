@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wr
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::super::app::{App, Tab};
+use super::super::app::{App, Request, Tab};
 use super::super::presentation;
 use super::super::search::{self, Row};
 use super::{ERROR, MUTED, PRIMARY, SECONDARY, SUCCESS, WARNING};
@@ -84,7 +84,9 @@ pub(super) fn draw_browser(frame: &mut Frame<'_>, app: &App) {
             draw_body(frame, &list, row, body);
         }
         None => {
-            let message = if app.query.is_empty() {
+            let message = if app.loading(Request::Lists) && app.query.is_empty() {
+                "Loading…".into()
+            } else if app.query.is_empty() {
                 app.load_error
                     .clone()
                     .unwrap_or_else(|| "Nothing here yet. Press F5 to refresh.".into())

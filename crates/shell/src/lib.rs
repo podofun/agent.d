@@ -22,10 +22,12 @@ pub mod netfilter;
 mod output;
 pub mod policy;
 mod program;
+mod pty;
 mod reach;
 pub mod sandbox;
 pub use policy::{SandboxError, SandboxPolicy};
 pub use program::resolve_program;
+pub use pty::{PtyChild, spawn_pty};
 pub use reach::{Overlap, Reach};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +106,8 @@ pub enum ShellError {
     #[error("{0}")]
     DeniedReach(String),
     /// `timeout_ms` was zero, which would stop the program before it started.
+    #[error("{0}")]
+    Terminal(String),
     #[error("a shell timeout must be at least 1 ms")]
     InvalidTimeout,
     /// The exec was cancelled or timed out before the program started, so it

@@ -4,6 +4,7 @@ mod commands;
 mod control;
 mod editor;
 mod presentation;
+mod remote;
 mod search;
 mod ui;
 
@@ -23,7 +24,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 
-use app::{App, Tab};
+use app::{App, Request, Tab};
 use commands::picker_title;
 
 struct Screen(Terminal<CrosstermBackend<std::io::Stdout>>);
@@ -82,11 +83,9 @@ pub(crate) async fn run(
         return Err(anyhow!("interactive chat needs a terminal"));
     }
     let mut app = App::new(base, timeout, runner);
-    app.refresh().await;
-    if let Some(id) = session
-        && let Err(error) = app.open_session(&id).await
-    {
-        app.fail(format!("Could not open session: {error:#}"));
+    app.refresh();
+    if let Some(id) = session {
+        app.open(&id);
     }
     control::start(
         base.to_owned(),
@@ -95,19 +94,44 @@ pub(crate) async fn run(
         app.decisions_rx.take().expect("control receiver"),
     );
     let mut screen = Screen::open()?;
+    let size = screen.0.size()?;
+    let hello = serde_json::json!({
+        "version": agentd_ui::PROTOCOL_VERSION,
+        "client": { "kind": "tui", "width": size.width, "height": size.height, "supports": [] },
+        "session": app.session,
+        "folder": std::env::current_dir().ok(),
+    });
+    app.script.connect(remote::start(
+        base.to_owned(),
+        timeout,
+        hello,
+        app.updates.clone(),
+    ));
     let mut events = EventStream::new();
-    // The spinner frame changes every 120 ms, so drawing more often than that
-    // repaints an identical screen. After a stall (a slow daemon call) the
-    // missed ticks must not fire back to back, each a full redraw.
-    let mut spinner = tokio::time::interval(Duration::from_millis(120));
+    // After a stall (a slow daemon call), missed ticks must not fire back to
+    // back, each a full redraw.
+    let mut spinner = tokio::time::interval(Duration::from_millis(60));
     spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut frames = tokio::time::interval(Duration::from_millis(16));
+    frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
     loop {
         if dirty {
             screen.0.draw(|frame| ui::draw(frame, &app))?;
             dirty = false;
+            let size = screen.0.size()?;
+            let terminals = ui::script_terminals(&app, Rect::new(0, 0, size.width, size.height));
+            app.script.terminal_sizes(terminals);
         }
         tokio::select! {
+            _ = frames.tick(), if app.script.waiting() => {
+                let size = screen.0.size()?;
+                let area = Rect::new(0, 0, size.width, size.height);
+                if keep_view(&mut app, area, App::play_frames) {
+                    app.sync_script();
+                    dirty = true;
+                }
+            }
             update = app.received.recv() => {
                 if let Some(update) = update {
                     let size = screen.0.size()?;
@@ -118,24 +142,39 @@ pub(crate) async fn run(
                     }
                     apply_updates(&mut app, area, updates);
                     app.send_queued().await;
+                    app.sync_script();
                     dirty = true;
                 }
             }
             event = events.next() => {
-                let Some(event) = event else { break };
-                let size = screen.0.size()?;
-                let area = Rect::new(0, 0, size.width, size.height);
-                match handle_event(&mut app, event?, area).await? {
-                    Handled::Quit => break,
-                    Handled::Redraw => {
-                        // Picking a runner sends what waited for one.
-                        app.send_queued().await;
-                        dirty = true;
+                let Some(mut event) = event else { break };
+                // Wheel ticks and mouse moves come in bursts: handle every
+                // event already waiting, then draw once.
+                let mut redraw = false;
+                for _ in 0..BURST {
+                    let size = screen.0.size()?;
+                    let area = Rect::new(0, 0, size.width, size.height);
+                    match handle_event(&mut app, event?, area).await? {
+                        Handled::Quit => return Ok(()),
+                        Handled::Redraw => redraw = true,
+                        Handled::Ignored => {}
                     }
-                    Handled::Ignored => {}
+                    match ready_event(&mut events).await {
+                        Some(next) => event = next,
+                        None => break,
+                    }
+                }
+                if redraw {
+                    // Picking a runner sends what waited for one.
+                    app.send_queued().await;
+                    app.sync_script();
+                    dirty = true;
                 }
             }
-            _ = spinner.tick(), if app.pending || app.animating() || app.drag.is_some() => {
+            _ = spinner.tick(), if app.pending
+                || app.animating()
+                || app.drag.is_some()
+                || app.loading(Request::Open) => {
                 // A drag held above or below the conversation keeps scrolling.
                 if app.drag.is_some() {
                     let size = screen.0.size()?;
@@ -148,18 +187,39 @@ pub(crate) async fn run(
     Ok(())
 }
 
+/// The most input events handled before the screen is drawn again.
+const BURST: usize = 64;
+
 enum Handled {
     Quit,
     Redraw,
     Ignored,
 }
 
+/// The next terminal event if one is already waiting, without waiting for
+/// one. It polls with this task's own waker: a dummy waker (as
+/// `now_or_never` uses) would swallow crossterm's wake-up for the next
+/// input, and with nothing else to wake the loop, chat would stop reading
+/// keys.
+async fn ready_event<S>(events: &mut S) -> Option<S::Item>
+where
+    S: futures_util::Stream + Unpin,
+{
+    std::future::poll_fn(|cx| match events.poll_next_unpin(cx) {
+        std::task::Poll::Ready(item) => std::task::Poll::Ready(item),
+        std::task::Poll::Pending => std::task::Poll::Ready(None),
+    })
+    .await
+}
+
 async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled> {
     app.resized(area);
     match event {
         Event::Paste(text) if app.tab == Tab::Chat && app.approval.is_none() => {
-            app.input.insert(&text);
-            app.input_changed();
+            if !paste_into_script(app, &text) {
+                app.input.insert(&text);
+                app.input_changed();
+            }
         }
         Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
             if handle_key(app, key, area).await? {
@@ -172,6 +232,15 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
             {
                 app.selection = None;
                 app.drag = None;
+                app.script_press = None;
+                if let Some(node) = ui::script_hit(app, area, mouse.column, mouse.row) {
+                    click_script(app, node);
+                    app.script_press = Some((mouse.column, mouse.row));
+                    return Ok(Handled::Redraw);
+                }
+                if app.script.focus.is_some() {
+                    blur_script(app);
+                }
                 app.press = ui::tool_at(app, area, mouse.column, mouse.row)
                     .map(|row| (row, mouse.column, mouse.row));
                 if app.press.is_some() {
@@ -194,9 +263,14 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if app.tab == Tab::Chat => {
-                // A drag that began on a tool row selects its text instead.
+                // A drag that began on a tool row selects its text instead,
+                // and so does one that began on a script element.
                 if let Some((_, x, y)) = app.press.take() {
                     app.selection = ui::point_at(app, area, x, y).map(ui::Selection::at);
+                }
+                if let Some((x, y)) = app.script_press.take() {
+                    app.selection = ui::script_point_at(app, area, x, y)
+                        .map(|(node, point)| ui::Selection::in_element(node, point));
                 }
                 if app.selection.is_some() {
                     app.drag = Some((mouse.column, mouse.row));
@@ -205,6 +279,7 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
             }
             MouseEventKind::Up(MouseButton::Left) if app.tab == Tab::Chat => {
                 app.drag = None;
+                app.script_press = None;
                 if let Some((pressed, _, _)) = app.press.take() {
                     if ui::tool_at(app, area, mouse.column, mouse.row) == Some(pressed) {
                         ui::toggle_tool(app, area, pressed);
@@ -221,20 +296,29 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                 }
             }
             MouseEventKind::Moved => {
-                // Redraw only when the row under the mouse changes.
+                // Redraw only when what is under the mouse changes.
                 let hover = (app.tab == Tab::Chat && app.approval.is_none())
                     .then(|| ui::clickable_at(app, area, mouse.column, mouse.row))
                     .flatten();
-                if hover == app.hover {
+                let element = ui::script_hit(app, area, mouse.column, mouse.row);
+                if hover == app.hover && element == app.script.hover {
                     return Ok(Handled::Ignored);
                 }
+                if element != app.script.hover
+                    && let Some(node) = element
+                {
+                    app.script.event(Some(node), agentd_ui::Event::Hover);
+                }
+                app.script.hover = element;
                 app.hover = hover;
             }
             MouseEventKind::ScrollUp => {
                 if app.approval.is_some() {
                     app.approval_scroll = app.approval_scroll.saturating_sub(3);
                 } else if app.tab == Tab::Chat {
-                    scroll_up(app, area, 3);
+                    if !ui::script_scroll_at(app, area, mouse.column, mouse.row, -3) {
+                        scroll_up(app, area, 3);
+                    }
                     app.hover = ui::clickable_at(app, area, mouse.column, mouse.row);
                 } else {
                     app.move_selection(-1, false);
@@ -244,7 +328,9 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
                 if app.approval.is_some() {
                     app.approval_scroll = app.approval_scroll.saturating_add(3);
                 } else if app.tab == Tab::Chat {
-                    scroll_down(app, 3);
+                    if !ui::script_scroll_at(app, area, mouse.column, mouse.row, 3) {
+                        scroll_down(app, 3);
+                    }
                     app.hover = ui::clickable_at(app, area, mouse.column, mouse.row);
                 } else {
                     app.move_selection(1, false);
@@ -252,7 +338,11 @@ async fn handle_event(app: &mut App, event: Event, area: Rect) -> Result<Handled
             }
             _ => return Ok(Handled::Ignored),
         },
-        Event::Resize(width, height) => app.resized(Rect::new(0, 0, width, height)),
+        Event::Resize(width, height) => {
+            app.resized(Rect::new(0, 0, width, height));
+            app.script
+                .event(None, agentd_ui::Event::Resize { width, height });
+        }
         _ => return Ok(Handled::Ignored),
     }
     Ok(Handled::Redraw)
@@ -267,6 +357,9 @@ async fn handle_key(app: &mut App, key: KeyEvent, screen: Rect) -> Result<bool> 
         handle_approval_key(app, key);
         return Ok(false);
     }
+    if app.tab == Tab::Chat && handle_script_key(app, key) {
+        return Ok(false);
+    }
     if key.code == KeyCode::Char('p') && control {
         app.tab = if app.tab == Tab::Chat {
             Tab::All
@@ -276,7 +369,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, screen: Rect) -> Result<bool> 
         return Ok(false);
     }
     if app.tab != Tab::Chat {
-        handle_browser_key(app, key).await;
+        handle_browser_key(app, key);
         return Ok(false);
     }
     if handle_suggestion_key(app, key) {
@@ -290,12 +383,204 @@ async fn handle_key(app: &mut App, key: KeyEvent, screen: Rect) -> Result<bool> 
         .input
         .handle(key, screen.width.saturating_sub(6) as usize)
     {
-        app.notice = Some(notice);
+        app.fail(notice);
     }
     if app.input.text() != previous {
         app.input_changed();
     }
     Ok(false)
+}
+
+/// Keys for the focused script element, or a shortcut a script bound.
+/// Ctrl+C, the approval window and Shift+Tab never get here. Returns true
+/// when the key was used.
+fn handle_script_key(app: &mut App, key: KeyEvent) -> bool {
+    use agentd_ui::Event;
+    if key.code == KeyCode::BackTab {
+        return false;
+    }
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    if let Some(focus) = app.script.focus {
+        let kind = app
+            .script
+            .tree
+            .get(focus)
+            .map(|n| n.kind.clone())
+            .unwrap_or_default();
+        if (key.code == KeyCode::Char('q') && control)
+            || (key.code == KeyCode::Esc && kind != "terminal")
+        {
+            blur_script(app);
+            return true;
+        }
+        match (kind.as_str(), key.code) {
+            ("terminal", _) => {
+                if let Some(data) = remote::key_bytes(&key) {
+                    app.script.event(Some(focus), Event::Input { data });
+                }
+                return true;
+            }
+            ("input", code) => {
+                let mut value = app
+                    .script
+                    .tree
+                    .get(focus)
+                    .and_then(|n| n.props.get("value"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                match code {
+                    KeyCode::Char(c) if !control => value.push(c),
+                    KeyCode::Backspace => {
+                        value.pop();
+                    }
+                    _ => {
+                        if let Some(name) = remote::key_name(&key) {
+                            app.script.event(Some(focus), Event::Key { key: name });
+                        }
+                        return true;
+                    }
+                }
+                set_script_value(app, focus, "value", serde_json::json!(value));
+                return true;
+            }
+            ("button" | "checkbox", KeyCode::Enter | KeyCode::Char(' ')) => {
+                click_script(app, focus);
+                return true;
+            }
+            ("list", KeyCode::Up | KeyCode::Down) => {
+                let Some(node) = app.script.tree.get(focus) else {
+                    return true;
+                };
+                let count = node.children.len() as i64;
+                let selected = node
+                    .props
+                    .get("selected")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let step = if key.code == KeyCode::Up { -1 } else { 1 };
+                let next = (selected + step).clamp(1, count.max(1));
+                set_script_value(app, focus, "selected", serde_json::json!(next));
+                return true;
+            }
+            ("list", KeyCode::Enter) => {
+                let child = app.script.tree.get(focus).and_then(|n| {
+                    let selected = n.props.get("selected")?.as_u64()? as usize;
+                    n.children.get(selected.checked_sub(1)?).copied()
+                });
+                if let Some(child) = child {
+                    app.script.event(Some(child), Event::Click);
+                }
+                return true;
+            }
+            _ => blur_script(app),
+        }
+    }
+    if let Some(name) = remote::key_name(&key)
+        && !agentd_ui::is_reserved_key(&name)
+        && app.script.tree.bindings.contains(&name)
+    {
+        app.script.event(None, Event::Key { key: name });
+        return true;
+    }
+    false
+}
+
+/// Change a value the user edits, here and for the scripts.
+fn set_script_value(app: &mut App, node: agentd_ui::NodeId, key: &str, value: serde_json::Value) {
+    app.script.tree.apply(&agentd_ui::Op::Set {
+        node,
+        key: key.into(),
+        value: value.clone(),
+    });
+    app.script
+        .event(Some(node), agentd_ui::Event::Change { value });
+}
+
+fn blur_script(app: &mut App) {
+    if let Some(old) = app.script.focus.take() {
+        app.script.event(Some(old), agentd_ui::Event::Blur);
+    }
+}
+
+/// A click on a script element: focus what takes focus, select a list
+/// item, tick a checkbox, and tell the scripts.
+fn click_script(app: &mut App, node: agentd_ui::NodeId) {
+    const FOCUSABLE: [&str; 5] = ["input", "terminal", "button", "checkbox", "list"];
+    let tree = &app.script.tree;
+    let mut focus = None;
+    let mut list_pick = None;
+    let mut at = Some(node);
+    let mut below = None;
+    while let Some(n) = at {
+        let Some(el) = tree.get(n) else { break };
+        if focus.is_none() && FOCUSABLE.contains(&el.kind.as_str()) {
+            focus = Some(n);
+        }
+        if el.kind == "list"
+            && list_pick.is_none()
+            && let Some(child) = below
+            && let Some(index) = el.children.iter().position(|c| *c == child)
+        {
+            list_pick = Some((n, index + 1));
+        }
+        below = Some(n);
+        at = el.parent;
+    }
+    if focus != app.script.focus {
+        blur_script(app);
+        if let Some(f) = focus {
+            app.script.focus = Some(f);
+            app.script.event(Some(f), agentd_ui::Event::Focus);
+        }
+    }
+    if let Some((list, index)) = list_pick {
+        set_script_value(app, list, "selected", serde_json::json!(index));
+    }
+    if app
+        .script
+        .tree
+        .get(node)
+        .is_some_and(|n| n.kind == "checkbox")
+    {
+        let checked = app
+            .script
+            .tree
+            .get(node)
+            .and_then(|n| n.props.get("checked"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        set_script_value(app, node, "checked", serde_json::json!(!checked));
+    }
+    app.script.event(Some(node), agentd_ui::Event::Click);
+}
+
+/// Paste into a focused terminal or input. Returns whether it went there.
+fn paste_into_script(app: &mut App, text: &str) -> bool {
+    let Some(focus) = app.script.focus else {
+        return false;
+    };
+    match app.script.tree.get(focus).map(|n| n.kind.as_str()) {
+        Some("terminal") => {
+            app.script
+                .event(Some(focus), agentd_ui::Event::Input { data: text.into() });
+            true
+        }
+        Some("input") => {
+            let mut value = app
+                .script
+                .tree
+                .get(focus)
+                .and_then(|n| n.props.get("value"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            value.push_str(&text.replace(['\n', '\r'], " "));
+            set_script_value(app, focus, "value", serde_json::json!(value));
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Ctrl+C: deny, cancel, copy, clear, or quit, in that order of relevance.
@@ -333,7 +618,7 @@ fn handle_approval_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-async fn handle_browser_key(app: &mut App, key: KeyEvent) {
+fn handle_browser_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc if !app.query.is_empty() => app.set_query(String::new()),
         KeyCode::Esc => app.tab = Tab::Chat,
@@ -353,14 +638,14 @@ async fn handle_browser_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Tab | KeyCode::Right => app.tab = app.tab.next(),
         KeyCode::BackTab | KeyCode::Left => app.tab = app.tab.previous(),
-        KeyCode::F(5) => app.refresh_in_background(),
+        KeyCode::F(5) => app.refresh(),
         KeyCode::Up => app.move_selection(-1, true),
         KeyCode::Down => app.move_selection(1, true),
         KeyCode::PageUp => app.move_selection(-10, false),
         KeyCode::PageDown => app.move_selection(10, false),
         KeyCode::Home => app.move_selection(isize::MIN / 2, false),
         KeyCode::End => app.move_selection(isize::MAX / 2, false),
-        KeyCode::Enter => app.activate_selected().await,
+        KeyCode::Enter => app.activate_selected(),
         _ => {}
     }
 }
@@ -416,12 +701,8 @@ async fn handle_chat_key(app: &mut App, key: KeyEvent, screen: Rect) -> Result<O
             app.jump_to_bottom();
         }
         KeyCode::End if app.input.is_empty() => app.jump_to_bottom(),
-        KeyCode::F(5) => app.refresh_in_background(),
-        KeyCode::BackTab => {
-            if let Err(error) = app.cycle_approval_mode().await {
-                app.fail(error.to_string());
-            }
-        }
+        KeyCode::F(5) => app.refresh(),
+        KeyCode::BackTab => app.cycle_approval_mode(),
         KeyCode::PageUp => scroll_up(app, screen, 8),
         KeyCode::PageDown => scroll_down(app, 8),
         KeyCode::Char('n') if control => {
@@ -449,6 +730,10 @@ fn drag_selection(app: &mut App, screen: Rect) {
         app.drag = None;
         return;
     };
+    if let Some(ui::Region::Element(node)) = app.selection.map(|s| s.region) {
+        drag_element_selection(app, screen, node, x, y);
+        return;
+    }
     let inner = ui::conversation_inner(ui::screen_rows(screen, app)[1]);
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -488,18 +773,57 @@ fn drag_selection(app: &mut App, screen: Rect) {
     }
 }
 
+/// Extend a selection in a script element to the dragged position, scrolling
+/// the element a row at a time past its edges.
+fn drag_element_selection(app: &mut App, screen: Rect, node: agentd_ui::NodeId, x: u16, y: u16) {
+    let Some(viewport) = ui::Placed::new(app, screen).viewport(node) else {
+        return;
+    };
+    if viewport.width == 0 || viewport.height == 0 {
+        return;
+    }
+    let distance = if y < viewport.y {
+        viewport.y - y
+    } else {
+        (y + 1).saturating_sub(viewport.bottom())
+    };
+    let interval = std::time::Duration::from_millis(100 / u64::from(distance.clamp(1, 4)));
+    let due = app
+        .drag_scrolled
+        .is_none_or(|scrolled| scrolled.elapsed() >= interval);
+    if distance > 0 && due {
+        ui::script_scroll_region(app, screen, node, if y < viewport.y { -1 } else { 1 });
+        app.drag_scrolled = Some(std::time::Instant::now());
+    }
+    let x = x.clamp(viewport.x, viewport.right() - 1);
+    let y = y.clamp(viewport.y, viewport.bottom() - 1);
+    let point = ui::Placed::new(app, screen).point_in(node, x, y);
+    if let (Some(selection), Some(point)) = (app.selection.as_mut(), point) {
+        selection.head = point;
+    }
+}
+
 /// Apply streamed updates. At the bottom, the view follows new lines. Scrolled
 /// up, it stays on the lines being read while the reply grows below them.
 fn apply_updates(app: &mut App, screen: Rect, updates: Vec<app::Update>) {
+    keep_view(app, screen, |app| {
+        for update in updates {
+            app.apply(update);
+        }
+    });
+}
+
+/// Make a change that may add or drop lines, keeping a scrolled up view on
+/// the same lines.
+fn keep_view<T>(app: &mut App, screen: Rect, change: impl FnOnce(&mut App) -> T) -> T {
     let held = app.scroll > 0;
     let before = if held { ui::max_scroll(app, screen) } else { 0 };
-    for update in updates {
-        app.apply(update);
-    }
+    let result = change(app);
     if held && app.scroll > 0 {
         let after = ui::max_scroll(app, screen);
         app.scroll = (app.scroll + after).saturating_sub(before).min(after);
     }
+    result
 }
 
 /// Scroll up, stopping at the first line. Without the stop, extra scrolling
@@ -539,6 +863,300 @@ async fn submit_draft(app: &mut App) -> Result<bool> {
 mod tests {
     use super::*;
     use app::{EntryKind, ToolRow};
+
+    fn render(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Feed ops to the chat as the daemon would, shown at once.
+    fn scripted(app: &mut App, reset: bool, ops: Vec<agentd_ui::Op>) {
+        if app.script.chat.is_none() {
+            app.script.ready(agentd_ui::Ready {
+                version: 1,
+                chat: 1,
+                clock: 0,
+            });
+        }
+        app.apply(app::Update::Ui(remote::Remote::Frame(agentd_ui::Frame {
+            seq: 0,
+            at: 0,
+            reset,
+            cancel_ahead: false,
+            ops,
+        })));
+    }
+
+    fn text_element(node: u64, text: &str) -> Vec<agentd_ui::Op> {
+        let mut props = agentd_ui::Props::new();
+        props.insert("text".into(), serde_json::json!(text));
+        vec![
+            agentd_ui::Op::Create {
+                node,
+                kind: "text".into(),
+                props,
+                style: Default::default(),
+            },
+            agentd_ui::Op::Insert {
+                parent: agentd_ui::parts::MAIN,
+                node,
+                index: 1,
+            },
+        ]
+    }
+
+    fn talking() -> App {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, Some("coder".into()));
+        app.connected = true;
+        app.push(EntryKind::User, "hello");
+        app.push(EntryKind::Agent, "Hi! **What** shall we build?");
+        app.push_tool("files.read", "fn main() {}");
+        app
+    }
+
+    #[test]
+    fn chat_looks_the_same_with_only_the_default_view() {
+        let plain = talking();
+        let mut default = talking();
+        scripted(
+            &mut default,
+            true,
+            agentd_ui::Tree::default_chat().snapshot(),
+        );
+        assert!(!default.script.custom());
+        assert_eq!(render(&plain, 90, 24), render(&default, 90, 24));
+
+        // Bindings alone change nothing on screen.
+        scripted(
+            &mut default,
+            false,
+            vec![agentd_ui::Op::Bindings {
+                keys: vec!["ctrl+g".into()],
+            }],
+        );
+        assert_eq!(render(&plain, 90, 24), render(&default, 90, 24));
+
+        let mut panel = talking();
+        scripted(&mut panel, true, agentd_ui::Tree::default_chat().snapshot());
+        scripted(&mut panel, false, text_element(100, "todo panel"));
+        assert!(panel.script.custom());
+        let shown: String = render(&panel, 90, 24)
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            shown.contains("todo panel") && shown.contains("What"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_script_element_sits_at_the_right_of_the_header() {
+        let mut app = talking();
+        app.session_label = Some("bugfix".into());
+        scripted(&mut app, true, agentd_ui::Tree::default_chat().snapshot());
+        let mut ops = text_element(100, "☐ 2/5");
+        ops[1] = agentd_ui::Op::Insert {
+            parent: agentd_ui::parts::HEADER_RIGHT,
+            node: 100,
+            index: 0,
+        };
+        scripted(&mut app, false, ops);
+        let buffer = render(&app, 60, 20);
+        let header: String = (0..60).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(header.starts_with("  ● bugfix"), "{header}");
+        assert!(header.ends_with("☐ 2/5  "), "{header:?}");
+        let area = ratatui::layout::Rect::new(0, 0, 60, 20);
+        assert_eq!(ui::script_hit(&app, area, 55, 0), Some(100));
+    }
+
+    #[tokio::test]
+    async fn a_scrolled_box_moves_with_the_wheel_and_its_text_selects() {
+        let mut app = talking();
+        scripted(&mut app, true, agentd_ui::Tree::default_chat().snapshot());
+        let mut props = agentd_ui::Props::new();
+        props.insert("width".into(), serde_json::json!(20));
+        props.insert("scroll".into(), serde_json::json!(true));
+        let mut ops = vec![
+            agentd_ui::Op::Create {
+                node: 100,
+                kind: "box".into(),
+                props,
+                style: Default::default(),
+            },
+            agentd_ui::Op::Insert {
+                parent: agentd_ui::parts::MAIN,
+                node: 100,
+                index: 1,
+            },
+        ];
+        for n in 0..30u64 {
+            let mut props = agentd_ui::Props::new();
+            props.insert("text".into(), serde_json::json!(format!("line {n}")));
+            ops.push(agentd_ui::Op::Create {
+                node: 101 + n,
+                kind: "text".into(),
+                props,
+                style: Default::default(),
+            });
+            ops.push(agentd_ui::Op::Insert {
+                parent: 100,
+                node: 101 + n,
+                index: n as usize,
+            });
+        }
+        scripted(&mut app, false, ops);
+        let screen = Rect::new(0, 0, 60, 20);
+        app.resized(screen);
+        let row = |app: &App, y: u16| -> String {
+            let buffer = render(app, 60, 20);
+            (40..60)
+                .map(|x| buffer[(x, y)].symbol().to_owned())
+                .collect()
+        };
+        assert!(row(&app, 2).starts_with("line 0"), "{}", row(&app, 2));
+        handle_event(&mut app, mouse(MouseEventKind::ScrollDown, 45, 5), screen)
+            .await
+            .unwrap();
+        assert!(row(&app, 2).starts_with("line 3"), "{}", row(&app, 2));
+        // The conversation did not scroll instead.
+        assert_eq!(app.scroll, 0);
+        for event in [
+            mouse(MouseEventKind::Down(MouseButton::Left), 40, 2),
+            mouse(MouseEventKind::Drag(MouseButton::Left), 45, 3),
+            mouse(MouseEventKind::Up(MouseButton::Left), 45, 3),
+        ] {
+            handle_event(&mut app, event, screen).await.unwrap();
+        }
+        assert_eq!(app.selected_text().as_deref(), Some("line 3\nline 4"));
+        let buffer = render(&app, 60, 20);
+        assert!(
+            buffer[(40, 2)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(
+            !buffer[(50, 2)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn script_notes_and_errors_show_in_the_conversation_not_the_header() {
+        let mut app = talking();
+        scripted(&mut app, true, agentd_ui::Tree::default_chat().snapshot());
+        scripted(
+            &mut app,
+            false,
+            vec![
+                agentd_ui::Op::Note {
+                    text: "Saved".into(),
+                    error: false,
+                },
+                agentd_ui::Op::Note {
+                    text: "A UI script failed. boom".into(),
+                    error: true,
+                },
+            ],
+        );
+        let last = &app.entries[app.entries.len() - 2..];
+        assert!(matches!(last[0].kind, EntryKind::Info) && last[0].text == "Saved");
+        assert!(matches!(last[1].kind, EntryKind::Error) && last[1].text.contains("boom"));
+        let buffer = render(&app, 90, 24);
+        let header: String = (0..90).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(!header.contains("boom"), "{header}");
+        let shown: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(shown.contains("A UI script failed. boom"), "{shown}");
+    }
+
+    #[test]
+    fn script_text_cannot_reach_the_terminal_as_escapes() {
+        let mut app = talking();
+        scripted(&mut app, true, agentd_ui::Tree::default_chat().snapshot());
+        scripted(
+            &mut app,
+            false,
+            text_element(100, "a\x1b[2Jb\x07c\u{9b}31md"),
+        );
+        let buffer = render(&app, 90, 24);
+        let shown: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(!shown.chars().any(|c| c.is_control()), "{shown:?}");
+        assert!(shown.contains('a') && shown.contains("[2Jb"));
+    }
+
+    #[tokio::test]
+    async fn chat_keeps_ctrl_c_and_the_approval_keys_whatever_scripts_bind() {
+        let (out, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = talking();
+        app.script.connect(out);
+        scripted(&mut app, true, agentd_ui::Tree::default_chat().snapshot());
+        let mut ops = text_element(100, "pane");
+        ops[0] = agentd_ui::Op::Create {
+            node: 100,
+            kind: "terminal".into(),
+            props: Default::default(),
+            style: Default::default(),
+        };
+        ops.push(agentd_ui::Op::Bindings {
+            keys: vec!["ctrl+c".into(), "o".into(), "backtab".into()],
+        });
+        scripted(&mut app, false, ops);
+        app.script.focus = Some(100);
+        let screen = Rect::new(0, 0, 90, 24);
+        while sent.try_recv().is_ok() {}
+
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        handle_key(&mut app, ctrl_c, screen).await.unwrap();
+        assert!(app.quit_armed(), "Ctrl+C reached chat");
+        assert!(
+            sent.try_recv().is_err(),
+            "Ctrl+C was not sent to the script"
+        );
+
+        let request: agentd_types::ApprovalRequest = serde_json::from_value(serde_json::json!({
+            "id": 7, "kind": "missing_grant", "action": "shell.run", "tool": null,
+            "requires": [], "missing": [], "reason": "", "caller": {}
+        }))
+        .unwrap();
+        app.apply(app::Update::Approval(Box::new(request)));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('o')), screen)
+            .await
+            .unwrap();
+        assert!(
+            app.approval.is_none(),
+            "the approval key answered the approval"
+        );
+        assert!(sent.try_recv().is_err());
+
+        // The approval window draws over whatever the script shows.
+        let request: agentd_types::ApprovalRequest = serde_json::from_value(serde_json::json!({
+            "id": 8, "kind": "missing_grant", "action": "shell.run", "tool": null,
+            "requires": [], "missing": [], "reason": "", "caller": {}
+        }))
+        .unwrap();
+        app.apply(app::Update::Approval(Box::new(request)));
+        scripted(
+            &mut app,
+            false,
+            vec![agentd_ui::Op::Set {
+                node: agentd_ui::parts::CONVERSATION,
+                key: "visible".into(),
+                value: serde_json::json!(false),
+            }],
+        );
+        let shown: String = render(&app, 90, 24)
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(shown.contains("shell.run"), "{shown}");
+    }
 
     #[tokio::test]
     async fn typing_in_the_browser_filters_and_esc_clears_before_closing() {
@@ -818,6 +1436,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opening_a_chat_shows_it_loading_and_the_newest_open_wins() {
+        let mut app = App::new("http://127.0.0.1:9", 1000, None);
+        app.sessions = vec![serde_json::json!({ "id": "first", "label": "First" })];
+        app.tab = Tab::Sessions;
+        let screen = Rect::new(0, 0, 80, 24);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), screen)
+            .await
+            .unwrap();
+        assert_eq!(app.tab, Tab::Chat, "the browser closes at once");
+        let text: String = render(&app, 80, 24)
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Loading conversation…"), "{text}");
+
+        let first = app.requests[&Request::Open].0;
+        app.submit("/open second").await.unwrap();
+        let second = app.requests[&Request::Open].0;
+        let session = |id: &str| {
+            Ok(app::Loaded::Session(serde_json::json!({
+                "id": id,
+                "turns": [{ "role": "user", "content": format!("hi from {id}") }],
+            })))
+        };
+        app.apply(app::Update::Loaded {
+            request: Request::Open,
+            id: first,
+            result: session("first"),
+        });
+        assert!(app.session.is_none(), "a replaced open is dropped");
+        app.apply(app::Update::Loaded {
+            request: Request::Open,
+            id: second,
+            result: session("second"),
+        });
+        assert_eq!(app.session.as_deref(), Some("second"));
+        assert!(!app.loading(Request::Open));
+        assert_eq!(app.entries[0].text, "hi from second");
+
+        app.open("third");
+        let third = app.requests[&Request::Open].0;
+        app.apply(app::Update::Loaded {
+            request: Request::Open,
+            id: third,
+            result: Err(anyhow!("session not found")),
+        });
+        assert!(!app.loading(Request::Open));
+        assert_eq!(
+            app.entries.last().unwrap().text,
+            "Could not open the chat: session not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrolling_a_long_chat_draws_without_building_it_again() {
+        let mut app = App::new("http://127.0.0.1:7777", 1000, None);
+        let reply = "Some **text**.\n\n```rust\nfn main() {\n    run();\n}\n```\n";
+        for turn in 0..200 {
+            app.push(EntryKind::User, format!("question {turn}"));
+            app.push_tool("git.diff", "line\n".repeat(20));
+            app.push_markdown(EntryKind::Agent, reply);
+        }
+        let screen = Rect::new(0, 0, 100, 40);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+        let builds = || ui::BUILDS.with(std::cell::Cell::get);
+        let before = builds();
+        for _ in 0..10 {
+            handle_event(&mut app, mouse(MouseEventKind::ScrollUp, 10, 10), screen)
+                .await
+                .unwrap();
+        }
+        terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+        assert_eq!(app.scroll, 30);
+        assert_eq!(builds(), before, "scrolling reuses the built conversation");
+
+        // A change to an entry builds it again, and keeps the view in place.
+        let top = ui::max_scroll(&app, screen) - app.scroll;
+        let last = app.entries.len() - 2;
+        keep_view(&mut app, screen, |app| app.entries[last].set_expanded(true));
+        terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+        assert_eq!(builds(), before + 1);
+        assert_eq!(ui::max_scroll(&app, screen) - app.scroll, top);
+    }
+
+    #[tokio::test]
     async fn quitting_takes_two_ctrl_c() {
         let mut app = App::new("http://127.0.0.1:7777", 1000, None);
         let screen = Rect::new(0, 0, 80, 24);
@@ -910,6 +1616,7 @@ mod tests {
         let (mut app, screen, x, y) = chat_with_tool();
         let select = |app: &mut App| {
             app.selection = Some(ui::Selection {
+                region: ui::Region::Conversation,
                 anchor: ui::Point { line: 0, col: 3 },
                 head: ui::Point { line: 0, col: 7 },
             });

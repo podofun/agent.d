@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use unicode_width::UnicodeWidthStr;
 
-use super::app::{App, Tab};
+use super::app::{App, Request, Tab};
 
 mod approval;
 mod browser;
@@ -14,14 +14,24 @@ mod conversation;
 mod highlight;
 mod logo;
 mod markdown;
+mod script;
 mod selection;
 
+#[cfg(test)]
+pub(super) use conversation::BUILDS;
 pub(super) use conversation::conversation_inner;
-pub(super) use conversation::{clickable_at, max_scroll, suggestion_at, toggle_tool, tool_at};
+pub(super) use conversation::{
+    ConversationCache, clickable_at, max_scroll, suggestion_at, toggle_tool, tool_at,
+};
 pub(super) use logo::SPIN as LEAF_SPIN;
+pub(super) use script::{
+    Placed, element_lines, hit as script_hit, point_at as script_point_at,
+    scroll_at as script_scroll_at, scroll_region as script_scroll_region,
+    terminals as script_terminals,
+};
 #[cfg(test)]
 pub(super) use selection::Point;
-pub(super) use selection::{Selection, point_at, selected_text};
+pub(super) use selection::{Region, Selection, point_at, selected_text};
 
 pub(super) const PRIMARY: Color = Color::Rgb(177, 124, 245);
 pub(super) const SECONDARY: Color = Color::Rgb(122, 180, 234);
@@ -40,20 +50,29 @@ pub(super) fn palette() -> markdown::Palette {
 }
 
 pub(super) fn spinner_frame(app: &App) -> &'static str {
-    let tick = app
-        .started_at()
-        .map_or(0, |started| started.elapsed().as_millis() / 120);
+    // Outside a run, such as while a chat loads, it turns with the clock.
+    let millis = match app.started_at() {
+        Some(started) => started.elapsed().as_millis(),
+        None => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis()),
+    };
+    let tick = millis / 120;
     SPINNER[(tick % SPINNER.len() as u128) as usize]
 }
 
 pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
-    let area = frame.area();
-    let rows = screen_rows(area, app);
-    draw_header(frame, app, rows[0]);
-    conversation::draw_conversation(frame, app, rows[1]);
-    conversation::draw_suggestions(frame, app, rows[2]);
-    draw_composer(frame, app, rows[3]);
-    draw_status(frame, app, rows[4]);
+    if app.script.custom() {
+        script::draw(frame, app);
+    } else {
+        let area = frame.area();
+        let rows = screen_rows(area, app);
+        draw_header(frame, app, rows[0], 0);
+        conversation::draw_conversation(frame, app, rows[1]);
+        conversation::draw_suggestions(frame, app, rows[2]);
+        draw_composer(frame, app, rows[3], None);
+        draw_status(frame, app, rows[4]);
+    }
     if app.tab != Tab::Chat {
         browser::draw_browser(frame, app);
     }
@@ -63,6 +82,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
 }
 
 pub(super) fn screen_rows(area: Rect, app: &App) -> [Rect; 5] {
+    if let Some(rows) = script::part_rects(app, area) {
+        return rows;
+    }
     let composer_lines = app
         .input
         .layout(area.width.saturating_sub(6).max(1) as usize)
@@ -93,53 +115,54 @@ pub(super) fn screen_rows(area: Rect, app: &App) -> [Rect; 5] {
     [rows[0], rows[1], rows[2], rows[3], rows[4]]
 }
 
-fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let session = app.session_label.as_deref().unwrap_or("new chat");
-    let mut spans = vec![Span::styled(
-        format!("  {session}"),
-        Style::default().fg(SECONDARY).add_modifier(Modifier::BOLD),
-    )];
+/// One quiet line: a dot that shows the chat's state, the chat's name,
+/// then what is worth knowing right now, in muted text. The last `right`
+/// columns belong to what scripts put there. The row below stays empty.
+fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, right: u16) {
+    if area.height == 0 {
+        return;
+    }
+    // Not offline yet while the first lists load.
+    let offline = !app.connected && !app.loading(Request::Lists);
+    let (dot, dot_color) = if offline {
+        ("●", ERROR)
+    } else if app.pending {
+        (spinner_frame(app), WARNING)
+    } else {
+        ("●", PRIMARY)
+    };
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(dot, Style::default().fg(dot_color)),
+        Span::raw(" "),
+    ];
+    match app.session_label.as_deref() {
+        Some(name) => spans.push(Span::styled(
+            name.to_owned(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        None => spans.push(Span::styled("new chat", Style::default().fg(MUTED))),
+    }
+    let mut notes: Vec<(&str, Color)> = Vec::new();
+    if offline {
+        notes.push(("offline", ERROR));
+    }
     if app.selection.is_some_and(|selection| !selection.is_click()) {
-        spans.push(Span::styled(
-            "  ·  Ctrl+C copies, Esc clears",
-            Style::default().fg(SECONDARY),
-        ));
+        notes.push(("Ctrl+C copies, Esc clears", MUTED));
     } else if app.quit_armed() {
-        spans.push(Span::styled(
-            "  ·  Ctrl+C again to quit",
-            Style::default().fg(WARNING),
-        ));
+        notes.push(("Ctrl+C again to quit", WARNING));
     }
     if app.has_unread() {
-        spans.push(Span::styled("  ·  ↓ new", Style::default().fg(SECONDARY)));
+        notes.push(("↓ new", SECONDARY));
     }
-    if let Some(notice) = &app.notice {
-        let first = notice.lines().next().unwrap_or_default();
-        spans.push(Span::styled(
-            format!("  ·  {first}"),
-            Style::default().fg(MUTED),
-        ));
+    for (note, color) in notes {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(note, Style::default().fg(color)));
     }
-    let offline = Line::styled("  offline  ", Style::default().fg(ERROR));
-    let reserved = if app.connected {
-        0
-    } else {
-        offline.width() as u16
-    };
-    let main = Rect::new(area.x, area.y, area.width.saturating_sub(reserved), 1);
-    frame.render_widget(Paragraph::new(Line::from(spans)), main);
-    if !app.connected && reserved < area.width {
-        frame.render_widget(
-            Paragraph::new(offline),
-            Rect::new(main.right(), area.y, reserved, 1),
-        );
-    }
-    frame.render_widget(
-        Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(MUTED)),
-        Rect::new(area.x, area.y + 1, area.width, 1),
-    );
+    // Two columns keep script elements off the name.
+    let right = if right > 0 { right + 2 } else { 0 };
+    let line = Rect::new(area.x, area.y, area.width.saturating_sub(right), 1);
+    frame.render_widget(Paragraph::new(Line::from(spans)), line);
 }
 
 /// Where the welcome leaf sits on `screen`, or `None` when it is not shown.
@@ -196,7 +219,9 @@ fn draw_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
             1,
         ),
     );
-    let hints: &[&str] = if app.connected {
+    let hints: &[&str] = if !app.connected && app.loading(Request::Lists) {
+        &["Connecting…"]
+    } else if app.connected {
         &[
             "Type a message to start",
             "Ctrl+P picks a runner or resumes a chat",
@@ -305,14 +330,15 @@ pub(super) fn truncate(text: &str, width: usize) -> String {
     out
 }
 
-fn draw_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let border = if !app.connected {
+/// The prompt. A script may colour its border.
+fn draw_composer(frame: &mut Frame<'_>, app: &App, area: Rect, border: Option<Color>) {
+    let border = border.unwrap_or(if !app.connected {
         MUTED
     } else if app.pending {
         WARNING
     } else {
         SECONDARY
-    };
+    });
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
@@ -620,32 +646,49 @@ mod tests {
             let row = |from: usize| screen[from..from + 100].iter().collect::<String>();
             (row(screen.len() - 200), row(screen.len() - 100))
         };
-        assert!(header(&app).starts_with("  new chat"));
+        assert!(header(&app).starts_with("  ● new chat"), "{}", header(&app));
         assert!(!header(&app).contains("review"));
         let (place, mode) = status(&app);
         assert!(place.starts_with("  agent.d main "), "{place}");
         assert!(place.ends_with("review anthropic/claude  "), "{place}");
         assert_eq!(mode.trim_end(), "  Default approval");
         app.session_label = Some("bugfix".into());
-        assert!(header(&app).starts_with("  bugfix"));
+        assert!(header(&app).starts_with("  ● bugfix"));
         app.pending = true;
         app.push(EntryKind::User, "go");
         let busy = rendered(&app, 100, 24);
+        // The dot turns while the agent works.
+        assert!(!header(&app).starts_with("  ●"), "{}", header(&app));
+        assert!(header(&app).contains(" bugfix"));
         // Working shows inline in the conversation, not under the input.
         assert!(busy.contains("working"));
         assert!(!status(&app).0.contains("working"));
         app.approval_mode = Some("classifier");
         assert_eq!(status(&app).1.trim_end(), "  Auto mode");
         assert!(!header(&app).contains("auto"));
+        // Short status shows in the conversation, and errors join it there.
         app.notice = Some("Cancelling…\nmore".into());
-        assert!(header(&app).contains("Cancelling") && !header(&app).contains("more"));
+        let screen = rendered(&app, 100, 24);
+        assert!(!header(&app).contains("Cancelling"));
+        assert!(screen.contains("Cancelling") && !screen.contains("more"));
         app.notice = None;
+        app.fail("Approval connection closed");
+        assert!(!header(&app).contains("Approval connection"));
+        assert!(rendered(&app, 100, 24).contains("Approval connection closed"));
         app.selection = Some(super::Selection {
+            region: super::Region::Conversation,
             anchor: super::Point { line: 0, col: 0 },
             head: super::Point { line: 0, col: 1 },
         });
         assert!(header(&app).contains("Ctrl+C copies, Esc clears"));
         app.connected = false;
-        assert!(rendered(&app, 100, 24).contains("offline"));
+        assert!(header(&app).contains("offline"));
+        // No rule under the header: the row below it is empty.
+        let second: String = rendered(&app, 100, 24)
+            .chars()
+            .skip(100)
+            .take(100)
+            .collect();
+        assert_eq!(second.trim(), "");
     }
 }

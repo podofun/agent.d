@@ -40,6 +40,8 @@ pub struct Shared {
     pub broker: Arc<agentd_approvals::Broker>,
     pub async_handle: tokio::runtime::Handle,
     pub packages_root: PathBuf,
+    /// Chats subscribed to scripted UI. Each runtime installs its scripts.
+    pub ui: Arc<agentd_ui::Hub>,
 }
 
 /// One fully-assembled runtime. Dropping it (after breaking the host's internal
@@ -153,6 +155,11 @@ pub fn build_runtime(cfg: &Config, shared: &Shared) -> Result<BuiltRuntime> {
     // And as the source of hard denials, consulted first by every inline
     // capability check and nested `ctx.call`.
     host.set_denials(executor.clone());
+
+    host.set_ui(shared.ui.clone());
+    shared
+        .ui
+        .set_script(Some(host.ui_script(shared.async_handle.clone())));
 
     let service_handles = executor.start_services();
     let used_paths = used_paths(&host, &cfg.grants_file);

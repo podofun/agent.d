@@ -4,6 +4,7 @@ mod luaerr;
 mod mailer;
 mod sandbox;
 mod scheduler;
+mod ui;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -96,6 +97,15 @@ pub(crate) struct ActiveContext {
     /// Secrets read in this execution, as `(name, value)`, replaced by their
     /// names in any question it raises.
     pub(crate) secrets_read: Vec<(String, String)>,
+    /// Code a person wrote to customize a client (`agentd.ui` handlers):
+    /// no grants, no sandbox and no denials apply to it.
+    pub(crate) unrestricted: bool,
+}
+
+/// Whether the running code is a person's UI code, which nothing restricts.
+pub(crate) fn unrestricted(lua: &Lua) -> bool {
+    lua.app_data_ref::<ActiveContext>()
+        .is_some_and(|active| active.unrestricted)
 }
 
 /// Where `import("name")` resolves installed packages. Set by the daemon.
@@ -455,6 +465,22 @@ impl LuaHost {
         lua.set_app_data(scheduler::AsyncTaskSpawner(tx));
     }
 
+    /// Connect `agentd.ui` to the daemon's chats.
+    pub fn set_ui(&self, hub: Arc<agentd_ui::Hub>) {
+        let lua = self.lua.lock().unwrap();
+        lua.set_app_data(ui::UiLink::new(hub));
+    }
+
+    /// This runtime's scripts, for [`agentd_ui::Hub::set_script`].
+    pub fn ui_script(&self, runtime: tokio::runtime::Handle) -> Arc<dyn agentd_ui::Script> {
+        let frames = ui::frame_index(&self.lua.lock().unwrap());
+        Arc::new(ui::LuaUi {
+            lua: self.lua.clone(),
+            frames,
+            runtime,
+        })
+    }
+
     /// Shared handle to the skill registry populated by `agentd.skill{...}`
     /// and `agentd.skills.load{,_dir}(...)`.
     pub fn skills(&self) -> SkillRegistry {
@@ -745,6 +771,7 @@ fn install_agentd_globals(lua: &Lua, _catalog: &SharedCatalog) -> Result<()> {
     agentd.set("actions", build_collection_table(lua, ListKind::Actions)?)?;
     agentd.set("runners", build_collection_table(lua, ListKind::Runners)?)?;
     agentd.set("services", build_collection_table(lua, ListKind::Services)?)?;
+    ui::install(lua, &agentd)?;
 
     lua.globals().set("agentd", agentd)?;
 
@@ -1189,6 +1216,7 @@ fn compact_policy(lua: &Lua, value: Value) -> mlua::Result<Option<CompactPolicy>
 // ---------- sleep (bare global, yieldable) ----------
 
 fn sleep_binding(lua: &Lua, ms: u64) -> mlua::Result<Value> {
+    ui::frames_guard(lua)?;
     let d = std::time::Duration::from_millis(ms);
     if scheduler::is_in_coroutine(lua) {
         return scheduler::build_marker(lua, scheduler::Op::Sleep(d));
@@ -1293,6 +1321,7 @@ fn register_service(lua: &Lua, args: MultiValue) -> mlua::Result<handles::Handle
 /// async tasks make progress in parallel because IO yields the Lua mutex —
 /// CPU-bound Lua chunks still serialize on the one Lua state, JS-style.
 fn async_spawn(lua: &Lua, func: Function) -> mlua::Result<scheduler::AsyncHandle> {
+    ui::frames_guard(lua)?;
     let thread = lua.create_thread(func)?;
     let state = scheduler::AsyncHandleState::new();
     let spawner = lua
@@ -1841,6 +1870,7 @@ fn state_clear_binding(lua: &Lua, _: MultiValue) -> mlua::Result<()> {
 // coroutine while the executor drives the underlying runner.
 
 fn runner_dispatch_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
+    ui::frames_guard(lua)?;
     let mut it = args.into_iter();
     let name: String = lua.unpack(
         it.next()
@@ -2317,6 +2347,40 @@ pub(crate) fn build_sandbox_policy(grants: &PermissionSet) -> SandboxPolicy {
 
 fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
     let mut req = parse_shell_args(lua, args)?;
+    prepare_exec(lua, &mut req)?;
+
+    if scheduler::is_in_coroutine(lua) {
+        return scheduler::build_marker(lua, scheduler::Op::Shell(req));
+    }
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|e| mlua::Error::external(format!("this call was made outside the daemon runtime ({e}) — this is a bug in agentd, please report it")))?;
+    let result = handle
+        .block_on(shell_exec(req))
+        .map_err(|e| mlua::Error::external(e.to_string()))?;
+    let out = lua.create_table()?;
+    // A killed program has no exit code; `timed_out` says why.
+    if !result.timed_out {
+        out.set("exit_code", result.exit_code)?;
+    }
+    out.set("stdout", result.stdout)?;
+    out.set("stderr", result.stderr)?;
+    out.set("timed_out", result.timed_out)?;
+    Ok(Value::Table(out))
+}
+
+/// The checks every program goes through before it starts: denials, the
+/// grant for its binary (or a question), and the sandbox it runs in.
+pub(crate) fn prepare_exec(lua: &Lua, req: &mut ExecRequest) -> mlua::Result<()> {
+    if unrestricted(lua) {
+        ui::frames_guard(lua)?;
+        if req.cwd.is_none() {
+            req.cwd = lua
+                .app_data_ref::<ActiveContext>()
+                .and_then(|active| active.cwd.clone());
+        }
+        req.sandbox = None;
+        return Ok(());
+    }
     // Per-binary scoping. A bare `shell.exec` grant authorizes any binary
     // (legacy/broad); a scoped `shell.exec:<bin>` (or holder wildcard like
     // `shell.exec:*`) authorizes just that binary. Allow if EITHER is held —
@@ -2377,24 +2441,7 @@ fn shell_exec_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Value> {
     // Must be attached before the request is wrapped into Op::Shell so the
     // scheduler carries the policy through to agentd_shell::exec.
     req.sandbox = Some(policy);
-
-    if scheduler::is_in_coroutine(lua) {
-        return scheduler::build_marker(lua, scheduler::Op::Shell(req));
-    }
-    let handle = tokio::runtime::Handle::try_current()
-        .map_err(|e| mlua::Error::external(format!("this call was made outside the daemon runtime ({e}) — this is a bug in agentd, please report it")))?;
-    let result = handle
-        .block_on(shell_exec(req))
-        .map_err(|e| mlua::Error::external(e.to_string()))?;
-    let out = lua.create_table()?;
-    // A killed program has no exit code; `timed_out` says why.
-    if !result.timed_out {
-        out.set("exit_code", result.exit_code)?;
-    }
-    out.set("stdout", result.stdout)?;
-    out.set("stderr", result.stderr)?;
-    out.set("timed_out", result.timed_out)?;
-    Ok(Value::Table(out))
+    Ok(())
 }
 
 fn parse_shell_args(_lua: &Lua, args: MultiValue) -> mlua::Result<ExecRequest> {
@@ -3154,9 +3201,13 @@ fn redirect_check(lua: &Lua) -> mlua::Result<RedirectCheck> {
         .app_data_ref::<ActiveContext>()
         .ok_or_else(|| mlua::Error::external("the active execution context is not available in this Lua state. This is a bug in agentd, please report it"))?;
     let grants = active.effective_grants.clone();
+    let unrestricted = active.unrestricted;
     drop(active);
     let denied = denials(lua);
     Ok(Arc::new(move |url: &str| {
+        if unrestricted {
+            return Ok(());
+        }
         let host = host_of(url).map_err(|e| e.to_string())?;
         let needed = Permission::new(format!("net:{host}"));
         if denied
@@ -3212,6 +3263,7 @@ fn with_secrets<F, T>(lua: &Lua, f: F) -> mlua::Result<T>
 where
     F: FnOnce(&Arc<dyn SecretStore>) -> mlua::Result<T>,
 {
+    ui::frames_guard(lua)?;
     let h = lua
         .app_data_ref::<SecretsHolder>()
         .ok_or_else(|| mlua::Error::external("the secrets holder is not available in this Lua state — this is a bug in agentd, please report it"))?;
@@ -3232,6 +3284,7 @@ fn with_memory<F, T>(lua: &Lua, f: F) -> mlua::Result<T>
 where
     F: FnOnce(&Arc<dyn MemoryStore>) -> mlua::Result<T>,
 {
+    ui::frames_guard(lua)?;
     let h = lua
         .app_data_ref::<MemoryHolder>()
         .ok_or_else(|| mlua::Error::external("the memory backend holder is not available in this Lua state — this is a bug in agentd, please report it"))?;
@@ -3386,6 +3439,7 @@ fn with_sessions<F, T>(lua: &Lua, f: F) -> mlua::Result<T>
 where
     F: FnOnce(&Arc<dyn SessionStore>) -> mlua::Result<T>,
 {
+    ui::frames_guard(lua)?;
     let h = lua
         .app_data_ref::<SessionsHolder>()
         .ok_or_else(|| mlua::Error::external("the session store holder is not available in this Lua state — this is a bug in agentd, please report it"))?;
@@ -4084,6 +4138,7 @@ fn ws_bytes_table_to_string(lua: &Lua, t: Table) -> mlua::Result<mlua::String> {
 // `tools_pop_chain_binding` pops it, `tools_list_binding` lists action names.
 
 fn tools_resolve_binding(lua: &Lua, args: MultiValue) -> mlua::Result<Function> {
+    ui::frames_guard(lua)?;
     let mut iter = args.into_iter();
     let name: String = match iter.next() {
         Some(v) => lua.unpack(v)?,
@@ -4431,6 +4486,10 @@ const FOLDER_FIX: &str = "A sandbox cannot carve a denied path out of a folder i
 const HOST_FIX: &str = "A sandbox cannot tell a denied host apart from the hosts it lets a command reach, so the command is refused before anything is asked. Grant shell commands only the exact hosts they need";
 
 pub(crate) fn refuse_if_denied(lua: &Lua, req: &Permission) -> mlua::Result<()> {
+    ui::frames_guard(lua)?;
+    if unrestricted(lua) {
+        return Ok(());
+    }
     match denials(lua) {
         Some(d) if is_denied(d.as_ref(), req) => Err(hard_denial(&format!("`{}`", req.as_str()))),
         _ => Ok(()),
@@ -4470,6 +4529,10 @@ fn check_inline(
     detail: Option<serde_json::Value>,
     what: &str,
 ) -> mlua::Result<()> {
+    ui::frames_guard(lua)?;
+    if unrestricted(lua) {
+        return Ok(());
+    }
     refuse_if_denied(lua, req)?;
     let key = pass_key(req, detail.as_ref());
     {

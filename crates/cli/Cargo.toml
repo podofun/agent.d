@@ -12,6 +12,7 @@ agentd-luals.workspace = true
 agentd-packages.workspace = true
 agentd-secrets.workspace = true
 agentd-types.workspace = true
+agentd-ui.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 crossterm = { version = "0.28.1", features = ["event-stream"] }

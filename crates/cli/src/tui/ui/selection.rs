@@ -1,7 +1,8 @@
-//! Mouse selection over the conversation. Points live in conversation line
-//! coordinates, so a selection survives scrolling; only the selectable
-//! column range of each line (never gutters, tool summaries, or the `│ `
-//! prefix) is highlighted or copied.
+//! Mouse selection over the conversation, or over a script element. Points
+//! live in the region's own line coordinates, so a selection survives
+//! scrolling; in the conversation only the selectable column range of each
+//! line (never gutters, tool summaries, or the `│ ` prefix) is highlighted
+//! or copied, and in a script element the text as shown.
 
 use std::ops::Range;
 
@@ -21,8 +22,18 @@ pub(in crate::tui) struct Point {
     pub(in crate::tui) col: usize,
 }
 
+/// What a selection is over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::tui) enum Region {
+    Conversation,
+    /// A script element: a scrolled container, or the outermost element a
+    /// script put on the screen.
+    Element(agentd_ui::NodeId),
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(in crate::tui) struct Selection {
+    pub(in crate::tui) region: Region,
     pub(in crate::tui) anchor: Point,
     pub(in crate::tui) head: Point,
 }
@@ -30,6 +41,15 @@ pub(in crate::tui) struct Selection {
 impl Selection {
     pub(in crate::tui) fn at(point: Point) -> Self {
         Self {
+            region: Region::Conversation,
+            anchor: point,
+            head: point,
+        }
+    }
+
+    pub(in crate::tui) fn in_element(node: agentd_ui::NodeId, point: Point) -> Self {
+        Self {
+            region: Region::Element(node),
             anchor: point,
             head: point,
         }
@@ -40,13 +60,13 @@ impl Selection {
         self.anchor == self.head
     }
 
-    fn ordered(&self) -> (Point, Point) {
+    pub(super) fn ordered(&self) -> (Point, Point) {
         (self.anchor.min(self.head), self.anchor.max(self.head))
     }
 
     /// Selected columns of `line`, or an empty range when the line is
     /// outside the selection. Both end cells are included.
-    fn columns(&self, line: usize) -> Range<usize> {
+    pub(super) fn columns(&self, line: usize) -> Range<usize> {
         let (start, end) = self.ordered();
         if line < start.line || line > end.line {
             return 0..0;
@@ -75,8 +95,11 @@ pub(in crate::tui) fn point_at(app: &App, screen: Rect, x: u16, y: u16) -> Optio
     })
 }
 
-/// The selected text at the conversation width `screen` gives.
+/// The selected text at the width `screen` gives its region.
 pub(in crate::tui) fn selected_text(app: &App, screen: Rect, selection: &Selection) -> String {
+    if selection.region != Region::Conversation {
+        return super::script::selected_text(app, screen, selection);
+    }
     let inner = conversation_inner(screen_rows(screen, app)[1]);
     let conversation = conversation_for(app, inner.width.saturating_sub(1).max(1) as usize);
     text(&conversation, selection)
@@ -122,20 +145,26 @@ fn covers(range: &Range<usize>, col: usize, width: usize) -> bool {
 }
 
 /// Reverse the selected cells of `lines` in place.
+///
+/// `lines` are the conversation's lines from line `first` on.
 pub(super) fn highlight(
     lines: &mut [Line<'static>],
+    first: usize,
     selectable: &[Range<usize>],
     selection: &Selection,
 ) {
     let (start, end) = selection.ordered();
-    for index in start.line..=end.line.min(lines.len().saturating_sub(1)) {
+    for (index, line) in (first..).zip(lines.iter_mut()) {
+        if index < start.line || index > end.line {
+            continue;
+        }
         let range = intersect(selection.columns(index), selectable[index].clone());
         if range.is_empty() {
             continue;
         }
         let mut col = 0;
         let mut spans = Vec::new();
-        for span in lines[index].spans.drain(..) {
+        for span in line.spans.drain(..) {
             let mut run = String::new();
             let mut run_selected = None;
             for grapheme in span.content.graphemes(true) {
@@ -152,7 +181,7 @@ pub(super) fn highlight(
                 spans.push(styled(run, span.style, run_selected));
             }
         }
-        lines[index].spans = spans;
+        line.spans = spans;
     }
 }
 
@@ -183,7 +212,7 @@ mod tests {
         app
     }
 
-    fn conversation(app: &App, width: usize) -> Conversation {
+    fn conversation(app: &App, width: usize) -> std::rc::Rc<Conversation> {
         conversation_for(app, width)
     }
 
@@ -193,6 +222,7 @@ mod tests {
         let conversation = conversation(&app, 60);
         let last = conversation.lines.len() - 1;
         let all = Selection {
+            region: Region::Conversation,
             anchor: Point { line: 0, col: 1 },
             head: Point {
                 line: last,
@@ -249,6 +279,7 @@ mod tests {
     fn highlight_reverses_text_but_never_the_gutter() {
         let mut app = app();
         app.selection = Some(Selection {
+            region: Region::Conversation,
             anchor: Point { line: 0, col: 0 },
             head: Point { line: 0, col: 30 },
         });

@@ -25,6 +25,7 @@ agentd-shell.workspace = true
 agentd-skills.workspace = true
 agentd-trace.workspace = true
 agentd-types.workspace = true
+agentd-ui.workspace = true
 anyhow.workspace = true
 arc-swap = "1.7"
 clap.workspace = true

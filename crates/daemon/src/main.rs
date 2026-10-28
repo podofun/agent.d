@@ -232,12 +232,14 @@ async fn run(cli: Cli, env_secrets: agentd_secrets::EnvStore) -> Result<()> {
         broker: broker.clone(),
         async_handle: tokio::runtime::Handle::current(),
         packages_root,
+        ui: agentd_ui::Hub::new(),
     };
 
     // init.lua may block at top level (await, channel recv, shell). Those
     // bindings call Handle::block_on, which panics inside an async context,
     // so evaluate it on a blocking thread.
     let built = tokio::task::block_in_place(|| build_runtime(&cfg, &shared))?;
+    let ui = shared.ui.clone();
     tracing::debug!(
         init = %cfg.init_file.display(),
         actions = built.host.list().len(),
@@ -290,6 +292,7 @@ async fn run(cli: Cli, env_secrets: agentd_secrets::EnvStore) -> Result<()> {
         interface_tokens: Arc::new(interface_tokens),
         broker,
         webhooks: Arc::new(webhooks),
+        ui,
     };
 
     println!("{}", startup.render());
