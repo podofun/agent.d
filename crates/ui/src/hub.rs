@@ -266,10 +266,14 @@ async fn frame_loop(hub: Arc<Hub>, chat: Arc<Chat>, tx: mpsc::Sender<Frame>) {
         tick.tick().await;
         let now = hub.now();
         let cancel = chat.cancel.swap(false, Ordering::SeqCst);
+        // While the chat still animates, the frames drawn again from now
+        // replace the cancelled ones. When the animation stopped, what the
+        // frames last showed goes back to the document's present value.
+        let animating = hub.script().is_some_and(|s| s.animates(chat.id).is_some());
         let (reset, mut ops) = {
             let mut doc = chat.doc();
             let (reset, mut ops) = doc.take_pending();
-            if cancel && !reset {
+            if cancel && !reset && !animating {
                 ops.extend(doc.current(&touched));
             }
             (reset, ops)
@@ -428,5 +432,18 @@ mod tests {
                 .any(|op| matches!(op, Op::Set { value, .. } if value == "clicked"))
         );
         assert_eq!(*script.events.lock().unwrap(), vec!["click".to_string()]);
+        // Only the click's own change, so the animation does not flash back
+        // to its resting value.
+        assert_eq!(cancel.ops.len(), 1, "{:?}", cancel.ops);
+        let next = loop {
+            let frame = sub.frames.recv().await.unwrap();
+            if !frame.ops.is_empty() {
+                break frame;
+            }
+        };
+        assert!(
+            next.at <= cancel.at + 100,
+            "the animation carries on from the click, not later"
+        );
     }
 }
