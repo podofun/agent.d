@@ -592,6 +592,12 @@ async fn relay_loop(
             Ok(x) => x,
             Err(_) => break,
         };
+        // pf only redirects the child's loopback traffic here. The socket is
+        // dual-stack on every interface, so anything from the LAN is a
+        // stranger asking the relay to connect somewhere on its behalf.
+        if !from_this_host(peer) {
+            continue;
+        }
         let local = match inbound.local_addr() {
             Ok(a) => a,
             Err(_) => continue,
@@ -643,6 +649,13 @@ async fn natlook(broker: &Arc<Broker>, peer: SocketAddr, local: SocketAddr) -> O
 
 /// Serve DNS queries from the child: resolve allowed names, commit IPs to the
 /// set BEFORE answering, NXDOMAIN otherwise. Identical policy to Linux.
+/// Whether a relay peer is on this machine. The relay sockets listen on
+/// every interface (pf needs both loopback families), so this is what keeps
+/// them private to the sandboxed child.
+fn from_this_host(peer: SocketAddr) -> bool {
+    peer.ip().to_canonical().is_loopback()
+}
+
 async fn dns_loop(udp: tokio::net::UdpSocket, host_grants: Vec<Permission>, set: SharedSet) {
     let resolver = crate::dns_pin::SystemResolver;
     let mut buf = [0u8; 1500];
@@ -651,6 +664,9 @@ async fn dns_loop(udp: tokio::net::UdpSocket, host_grants: Vec<Permission>, set:
             Ok(x) => x,
             Err(_) => break,
         };
+        if !from_this_host(src) {
+            continue;
+        }
         let resp =
             handle_dns(&buf[..n], &host_grants, &set, &resolver, PIN_TTL).unwrap_or_default();
         if !resp.is_empty() {
