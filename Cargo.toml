@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/types",
+    "crates/ui",
     "crates/trace",
     "crates/secrets",
     "crates/ai",
@@ -59,6 +60,7 @@ agentd-shell       = { path = "crates/shell" }
 agentd-skills      = { path = "crates/skills" }
 agentd-trace       = { path = "crates/trace" }
 agentd-types       = { path = "crates/types" }
+agentd-ui          = { path = "crates/ui" }
 agentd-cli         = { path = "crates/cli" }
 agentd-codex       = { path = "crates/codex" }
 daemon             = { path = "crates/daemon" }

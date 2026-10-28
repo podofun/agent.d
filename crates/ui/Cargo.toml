@@ -1,0 +1,14 @@
+[package]
+name = "agentd-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros", "io-util"] }
+tracing.workspace = true
+vt100 = "0.15.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "io-util"] }
