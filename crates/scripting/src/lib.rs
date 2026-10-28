@@ -35,7 +35,6 @@ use async_trait::async_trait;
 use mlua::{Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Table, Value};
 use walkdir::WalkDir;
 
-
 #[derive(Debug, Clone, Default)]
 struct ActionMeta {
     tool: Option<String>,
