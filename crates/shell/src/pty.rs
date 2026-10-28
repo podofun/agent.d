@@ -50,8 +50,15 @@ pub fn spawn_pty(req: &ExecRequest, width: u16, height: u16) -> Result<PtyChild,
     let mut cmd = CommandBuilder::new(&req.bin);
     cmd.args(&req.args);
     cmd.env("TERM", "xterm-256color");
-    if let Some(cwd) = &req.cwd {
-        cmd.cwd(cwd);
+    // Without a folder, portable-pty would start in $HOME. Start where
+    // other commands do, in the daemon's own folder.
+    match &req.cwd {
+        Some(cwd) => cmd.cwd(cwd),
+        None => {
+            if let Ok(dir) = std::env::current_dir() {
+                cmd.cwd(dir);
+            }
+        }
     }
     let child = pair
         .slave
