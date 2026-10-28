@@ -341,7 +341,26 @@ async fn shutdown_signal() {
             }
         }
     }
-    #[cfg(not(unix))]
+    // Closing the console window or a system shutdown must drain and revoke
+    // the same way Ctrl+C does; otherwise stamped access and open runs are
+    // left for the next start to recover.
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_close, ctrl_shutdown};
+        match (ctrl_close(), ctrl_shutdown()) {
+            (Ok(mut close), Ok(mut shutdown)) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = close.recv() => {},
+                    _ = shutdown.recv() => {},
+                }
+            }
+            _ => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = tokio::signal::ctrl_c().await;
 }
 
