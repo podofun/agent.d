@@ -20,7 +20,13 @@ pub struct PtyChild {
 pub fn spawn_pty(req: &ExecRequest, width: u16, height: u16) -> Result<PtyChild, ShellError> {
     use std::os::fd::AsRawFd;
 
-    let sandboxed = req.sandbox.as_ref().filter(|p| !p.unrestricted);
+    // A program on a terminal opens its own terminal again, as `/dev/tty`.
+    let policy = req.sandbox.clone().map(|mut p| {
+        p.write_paths
+            .extend(["/dev/tty", "/dev/pts"].map(std::path::PathBuf::from));
+        p
+    });
+    let sandboxed = policy.as_ref().filter(|p| !p.unrestricted);
     if let Some(policy) = sandboxed {
         if !crate::sandbox::is_supported() {
             return Err(ShellError::SandboxUnavailable);
