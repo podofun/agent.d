@@ -23,6 +23,10 @@ impl TraceSink for NullSink {
 }
 
 async fn boot(script: &str) -> String {
+    boot_with_lifecycle(script).await.0
+}
+
+async fn boot_with_lifecycle(script: &str) -> (String, Arc<agentd_api::Lifecycle>) {
     let dir = tempfile::tempdir().unwrap();
     let init = dir.path().join("init.lua");
     std::fs::write(&init, script).unwrap();
@@ -46,8 +50,9 @@ async fn boot(script: &str) -> String {
     ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let lifecycle = Arc::new(agentd_api::Lifecycle::default());
     let state = AppState {
-        lifecycle: Arc::new(agentd_api::Lifecycle::default()),
+        lifecycle: lifecycle.clone(),
         executor: Arc::new(arc_swap::ArcSwap::from(executor)),
         auth_token: None,
         admin_token: None,
@@ -59,7 +64,7 @@ async fn boot(script: &str) -> String {
     tokio::spawn(async move {
         let _ = serve(listener, router(state)).await;
     });
-    format!("ws://{addr}/ws")
+    (format!("ws://{addr}/ws"), lifecycle)
 }
 
 type Socket =
@@ -299,5 +304,32 @@ async fn events_never_make_an_animation_jump_or_blank() {
     assert!(
         times.windows(2).all(|w| w[0] <= w[1]),
         "the animation went back in time: {times:?}"
+    );
+}
+
+/// A chat keeps its UI stream open for as long as it runs. Shutdown must
+/// close it straight away, not wait out the grace period for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_does_not_wait_for_an_open_chat() {
+    let (url, lifecycle) = boot_with_lifecycle(r#"agentd.ui.on("chat", function() end)"#).await;
+    let (mut sock, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    sock.send(Message::Text(
+        json!({
+            "id": 1,
+            "method": "ui.subscribe",
+            "params": { "version": 1, "client": { "kind": "test", "width": 80, "height": 24 } }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(next_json(&mut sock).await["event"], "ui.ready");
+    let started = std::time::Instant::now();
+    lifecycle.drain(Duration::from_secs(30)).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "draining took {:?} with a chat open",
+        started.elapsed()
     );
 }

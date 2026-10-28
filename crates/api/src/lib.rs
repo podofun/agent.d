@@ -491,15 +491,26 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, interface: String
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(64);
     let mut tasks = FuturesUnordered::<BoxFuture<'static, ()>>::new();
     let mut active = HashMap::<u64, Option<tokio::sync::oneshot::Sender<()>>>::new();
+    // UI subscriptions last as long as the chat, so shutdown closes them
+    // instead of waiting for them like real work.
+    let mut ui_streams = std::collections::HashSet::<u64>::new();
     loop {
         if draining && active.is_empty() {
             break;
         }
         tokio::select! {
-            _ = state.lifecycle.stopping(), if !draining => { draining = true; }
+            _ = state.lifecycle.stopping(), if !draining => {
+                draining = true;
+                for id in ui_streams.drain() {
+                    if let Some(Some(cancel)) = active.get_mut(&id).map(Option::take) {
+                        let _ = cancel.send(());
+                    }
+                }
+            }
             Some(out) = rx.recv() => {
                 if let Some(id) = out.finished {
                     active.remove(&id);
+                    ui_streams.remove(&id);
                 }
                 if !matches!(tokio::time::timeout(WRITE_TIMEOUT, socket.send(Message::Text(out.frame.to_string().into()))).await, Ok(Ok(()))) {
                     break;
@@ -555,6 +566,9 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, interface: String
                 let is_runner = req.method == "runners.run";
                 let is_ui = req.method == "ui.subscribe";
                 active.insert(id, (is_runner || is_ui).then_some(cancel_tx));
+                if is_ui {
+                    ui_streams.insert(id);
+                }
                 tasks.push(Box::pin(async move {
                     let response = if is_runner {
                         match serde_json::from_value::<RunParams>(req.params) {
@@ -742,6 +756,8 @@ async fn handle_control_socket(mut socket: WebSocket, state: AppState) {
     let (approver_id, mut rx) = state.broker.subscribe();
     loop {
         tokio::select! {
+            // An approver waits for as long as it likes: shutdown ends it.
+            _ = state.lifecycle.stopping() => break,
             // Server push: a pending approval request to relay to the operator.
             maybe = rx.recv() => {
                 match maybe {
