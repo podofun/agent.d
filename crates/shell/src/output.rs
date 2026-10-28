@@ -78,7 +78,8 @@ mod tests {
 
     #[test]
     fn keeps_everything_under_the_cap() {
-        let c = Capped::read_sync(&b"hello\n"[..]);
+        let mut c = Capped::default();
+        c.push(b"hello\n");
         assert_eq!(c.into_text(), "hello\n");
     }
 
