@@ -29,7 +29,10 @@ async fn boot(script: &str) -> String {
     let host = Arc::new(LuaHost::new().unwrap());
     host.start_async_runtime(tokio::runtime::Handle::current());
     let hub = agentd_ui::Hub::new();
-    host.set_ui(hub.clone(), Arc::new(|_: &str| Default::default()));
+    host.set_ui(
+        hub.clone(),
+        Arc::new(agentd_permissions::PermissionSet::empty),
+    );
     host.load_file(&init).unwrap();
     hub.set_script(Some(host.ui_script(tokio::runtime::Handle::current())));
     std::mem::forget(dir);

@@ -19,16 +19,16 @@ use mlua::{
 
 use crate::{ActiveContext, CtxTable, scheduler};
 
-/// Looks up the grants of an interface, such as `ws`.
-pub type InterfaceGrants = Arc<dyn Fn(&str) -> PermissionSet + Send + Sync>;
+/// The grants UI handlers act with: those of `[tool.ui]`.
+pub type UiGrants = Arc<dyn Fn() -> PermissionSet + Send + Sync>;
 
 /// Set by the daemon: the hub every chat lives in, and the grants a chat's
 /// `ctx` acts with.
 #[derive(Clone, Default)]
-pub(crate) struct UiLink(Option<(Arc<Hub>, InterfaceGrants)>);
+pub(crate) struct UiLink(Option<(Arc<Hub>, UiGrants)>);
 
 impl UiLink {
-    pub(crate) fn new(hub: Arc<Hub>, grants: InterfaceGrants) -> Self {
+    pub(crate) fn new(hub: Arc<Hub>, grants: UiGrants) -> Self {
         Self(Some((hub, grants)))
     }
 }
@@ -144,7 +144,7 @@ fn ctx_table(lua: &Lua) -> mlua::Result<Table> {
 }
 
 /// The `ctx` a chat's handlers act with: its interface, user, session and
-/// folder, and the interface's grants with `{cwd}` set to the folder.
+/// folder, and the grants of `[tool.ui]` with `{cwd}` set to the folder.
 fn chat_context(lua: &Lua, chat: &Chat) -> ActiveContext {
     let info = chat.info();
     let mut caller = Caller::interface(info.interface.as_str())
@@ -156,7 +156,7 @@ fn chat_context(lua: &Lua, chat: &Chat) -> ActiveContext {
     caller.cwd = info.folder.clone();
     let granted = lua
         .app_data_ref::<UiLink>()
-        .and_then(|l| l.0.as_ref().map(|(_, grants)| grants(&info.interface)))
+        .and_then(|l| l.0.as_ref().map(|(_, grants)| grants()))
         .unwrap_or_default();
     let cwd = info.folder.as_ref().map(PathBuf::from).or_else(|| {
         lua.app_data_ref::<crate::WorkspaceRoot>()
@@ -168,8 +168,8 @@ fn chat_context(lua: &Lua, chat: &Chat) -> ActiveContext {
             cwd.as_deref(),
         )),
         call_chain: vec![format!("ui:{}", info.interface)],
-        grant_kind: Some("interface".into()),
-        grant_name: Some(info.interface.clone()),
+        grant_kind: Some("tool".into()),
+        grant_name: Some("ui".into()),
         caller,
         cwd,
         ..Default::default()

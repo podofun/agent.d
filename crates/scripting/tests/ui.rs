@@ -14,7 +14,10 @@ fn start(script: &str) -> (Arc<Hub>, Result<(), String>, LuaHost) {
     let host = LuaHost::new().unwrap();
     host.start_async_runtime(tokio::runtime::Handle::current());
     let hub = Hub::new();
-    host.set_ui(hub.clone(), Arc::new(|_: &str| Default::default()));
+    host.set_ui(
+        hub.clone(),
+        Arc::new(agentd_permissions::PermissionSet::empty),
+    );
     let loaded = host.load_file(&init).map_err(|e| format!("{e:#}"));
     hub.set_script(Some(host.ui_script(tokio::runtime::Handle::current())));
     (hub, loaded, host)

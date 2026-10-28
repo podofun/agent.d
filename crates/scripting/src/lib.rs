@@ -35,7 +35,7 @@ use async_trait::async_trait;
 use mlua::{Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Table, Value};
 use walkdir::WalkDir;
 
-pub use ui::InterfaceGrants;
+pub use ui::UiGrants;
 
 #[derive(Debug, Clone, Default)]
 struct ActionMeta {
@@ -432,8 +432,8 @@ impl LuaHost {
     }
 
     /// Connect `agentd.ui` to the daemon's chats. `grants` gives the grants
-    /// a chat's handlers act with, by interface.
-    pub fn set_ui(&self, hub: Arc<agentd_ui::Hub>, grants: InterfaceGrants) {
+    /// a chat's handlers act with, those of `[tool.ui]`.
+    pub fn set_ui(&self, hub: Arc<agentd_ui::Hub>, grants: UiGrants) {
         let lua = self.lua.lock().unwrap();
         lua.set_app_data(ui::UiLink::new(hub, grants));
     }

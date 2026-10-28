@@ -156,14 +156,14 @@ pub fn build_runtime(cfg: &Config, shared: &Shared) -> Result<BuiltRuntime> {
     // capability check and nested `ctx.call`.
     host.set_denials(executor.clone());
 
-    // `agentd.ui` handlers act with their chat's interface grants. A weak
+    // `agentd.ui` handlers act with the grants of `[tool.ui]`. A weak
     // reference keeps the host from holding its own executor alive.
     let weak = Arc::downgrade(&executor);
     host.set_ui(
         shared.ui.clone(),
-        Arc::new(move |interface: &str| {
+        Arc::new(move || {
             weak.upgrade()
-                .map(|e| e.interface_grants(interface))
+                .map(|e| e.tool_grants("ui"))
                 .unwrap_or_else(agentd_permissions::PermissionSet::empty)
         }),
     );
@@ -197,7 +197,8 @@ fn warn_orphan_tool_grants(reg: &dyn Registry, grants: &GrantsFile) {
             a.strip_prefix(name.as_str())
                 .is_some_and(|r| r.starts_with('.'))
         });
-        if reg.tool_info(name).is_none() && !covers_namespace {
+        // `[tool.ui]` holds what UI scripts may do, with no tool behind it.
+        if reg.tool_info(name).is_none() && !covers_namespace && name != "ui" {
             tracing::warn!(
                 tool = %name,
                 "grants.toml declares `[tool.{name}]` but no tool or action namespace `{name}` is registered in Lua; this grant has no effect"

@@ -498,12 +498,12 @@ impl Executor {
         self.max_runner_turns = turns.max(1);
     }
 
-    /// What `[interface.<name>]` grants, for code acting for that interface.
-    pub fn interface_grants(&self, name: &str) -> PermissionSet {
+    /// What `[tool.<name>]` grants, for code that acts as that tool.
+    pub fn tool_grants(&self, name: &str) -> PermissionSet {
         self.engine
             .load()
             .grants()
-            .interface(name)
+            .tool(name)
             .map(|g| g.granted.clone())
             .unwrap_or_else(PermissionSet::empty)
     }
