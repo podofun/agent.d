@@ -343,6 +343,34 @@ fn webhook_error(status: StatusCode, message: &'static str) -> Response {
     (status, Json(json!({ "ok": false, "error": message }))).into_response()
 }
 
+/// True when a handshake may come from a browser page that is not local.
+/// Browsers always send `Origin` on a WebSocket upgrade and never let a page
+/// add `Authorization`, so a token does not stop a page the user visits from
+/// opening a `--no-auth` daemon. CLI and SDK clients send no `Origin`; a web
+/// client served from this machine carries a loopback one. Anything else is
+/// cross-site WebSocket hijacking.
+fn foreign_origin(headers: &axum::http::HeaderMap) -> bool {
+    let Some(origin) = headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let origin = origin.trim();
+    if origin.eq_ignore_ascii_case("null") {
+        return true;
+    }
+    let Some((_, rest)) = origin.split_once("://") else {
+        return true;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    !host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Constant-time equality so token checks do not leak prefix matches.
 fn token_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
@@ -394,6 +422,9 @@ async fn ws_upgrade(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Response {
+    if foreign_origin(&headers) {
+        return (axum::http::StatusCode::FORBIDDEN, "cross-site websocket refused").into_response();
+    }
     let Some((interface, admin)) = resolve_interface(&state, &headers) else {
         return (axum::http::StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     };
@@ -409,6 +440,9 @@ async fn control_upgrade(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Response {
+    if foreign_origin(&headers) {
+        return (axum::http::StatusCode::FORBIDDEN, "cross-site websocket refused").into_response();
+    }
     if let Some(token) = &state.admin_token {
         let presented = headers
             .get(axum::http::header::AUTHORIZATION)
@@ -1353,6 +1387,37 @@ fn runner_error(id: u64, e: RunnerError) -> WsResponse {
 impl IntoResponse for WsResponse {
     fn into_response(self) -> Response {
         axum::Json(self).into_response()
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::foreign_origin;
+    use axum::http::{HeaderMap, HeaderValue, header::ORIGIN};
+
+    fn with(origin: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(ORIGIN, HeaderValue::from_str(origin).unwrap());
+        h
+    }
+
+    #[test]
+    fn no_origin_is_a_native_client() {
+        assert!(!foreign_origin(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn loopback_origins_pass() {
+        for o in ["http://localhost:5173", "http://127.0.0.1", "https://[::1]:8443", "http://LOCALHOST"] {
+            assert!(!foreign_origin(&with(o)), "{o}");
+        }
+    }
+
+    #[test]
+    fn foreign_and_malformed_origins_fail() {
+        for o in ["https://evil.example", "http://10.0.0.5:80", "null", "garbage", "http://localhost.evil.example"] {
+            assert!(foreign_origin(&with(o)), "{o}");
+        }
     }
 }
 
