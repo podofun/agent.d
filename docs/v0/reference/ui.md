@@ -46,7 +46,7 @@ A chat is one connected client window. Your handlers receive it as `chat`:
 | `chat:on(event, fn)` | Listen for `session`, `entry`, `key` or `resize` on this chat |
 | `chat:show(name)` | Switch to a view |
 | `chat:frames(fps, fn)` | Animate this chat, see [Frames](#frames) |
-| `chat:note(text)` | Show a short note to the user |
+| `chat:note(text)` | Show a short note to the user in the conversation |
 | `chat:entry(key)` | A conversation entry, see [Conversation entries](#conversation-entries) |
 
 `agentd.ui.chats()` lists the chats that are open, and `agentd.ui.on` listens across all of them:
@@ -118,7 +118,8 @@ The screen chat draws by default is itself a view named `chat`, built from eleme
 | Id | What it is |
 |---|---|
 | `chat` | The root, a column |
-| `header` | The line with the chat's name and notices |
+| `header` | The line with the chat's name |
+| `header.right` | An empty row at the right end of the header; add small things here, such as a progress count |
 | `main` | A row that holds the conversation; add panels here |
 | `conversation` | The conversation |
 | `prompt` | Where you type |
@@ -272,7 +273,7 @@ end)
 frames:stop()
 ```
 
-Because frames are drawn ahead of time, a frame function may only change elements that already exist. Anything else, such as `ctx.shell`, `sleep` or creating an element, is an error. When a frame function fails, it stops and the chat shows a note.
+Because frames are drawn ahead of time, a frame function may only change elements that already exist. Anything else, such as `ctx.shell`, `sleep` or creating an element, is an error. When a frame function fails, it stops and the chat shows the error in the conversation.
 
 ## Terminal panes
 
@@ -297,7 +298,7 @@ UI code is code you write to customize your client, so nothing restricts it. Usi
 
 ## Errors and hot reload
 
-When a handler fails, the chat shows a short note and the daemon logs the error; the rest of the UI keeps working. With `agentd --watch`, saving a script clears every chat's UI back to the default view and runs your scripts again. The conversation and the draft stay as they were.
+When a handler fails, the chat shows the error in the conversation and the daemon logs it; the rest of the UI keeps working. With `agentd --watch`, saving a script clears every chat's UI back to the default view and runs your scripts again. The conversation and the draft stay as they were.
 
 ---
 
@@ -367,9 +368,9 @@ Each op has an `op` field:
 | `bindings` | `keys` | The shortcuts scripts bound, such as `ctrl+g` |
 | `entry` | `key`, `decoration` | How to show a conversation entry: `summary`, `hidden`, `style`, `before` and `after` |
 | `screen` | `node`, `screen` | A terminal element's screen: `width`, `height`, `lines` of styled runs, and `cursor` |
-| `note` | `text` | A message to show the user |
+| `note` | `text`, `error` | A message to show the user; `error` is `true` when it reports a failure, such as a script error, and is left out otherwise |
 
-Chat's own parts have the fixed node ids 1 to 6: `chat`, `header`, `main`, `conversation`, `prompt` and `status`. Script elements start at 100. In a terminal screen, a colour like `@3` is an index in the terminal's 256-colour palette.
+Chat's own parts have the fixed node ids 1 to 7: `chat`, `header`, `main`, `conversation`, `prompt`, `status` and `header.right`. Script elements start at 100. In a terminal screen, a colour like `@3` is an index in the terminal's 256-colour palette.
 
 Treat every string as text to draw. Replace control characters before you show them, so a script cannot send escape sequences to the user's terminal.
 

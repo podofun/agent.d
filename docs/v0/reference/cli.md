@@ -88,7 +88,7 @@ Press Ctrl+P to open the browser, a search across your chats, runners, skills, a
 
 Your configuration can add to what chat shows with [`agentd.ui`](/v0/reference/ui): a panel beside the conversation, a summary on a tool row, a shortcut, or a terminal running lazygit. Chat picks these up when it starts, and they change as the scripts change them. Without such scripts, or when the daemon cannot be reached, chat looks as described above.
 
-Click a button, checkbox or list item to use it, and click an input or a terminal pane to type into it. Esc leaves an input, and Ctrl+Q leaves a terminal pane, since the program inside may use Esc itself. Ctrl+C, the approval window and its keys, Shift+Tab and sending with Enter always work as described above, whatever the scripts bind. When a script fails, its error shows as a note in the header and the rest of chat keeps working.
+Click a button, checkbox or list item to use it, and click an input or a terminal pane to type into it. Esc leaves an input, and Ctrl+Q leaves a terminal pane, since the program inside may use Esc itself. Ctrl+C, the approval window and its keys, Shift+Tab and sending with Enter always work as described above, whatever the scripts bind. When a script fails, its error shows in the conversation and the rest of chat keeps working.
 
 ---
 
