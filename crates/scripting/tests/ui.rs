@@ -89,7 +89,7 @@ async fn a_frame_function_may_only_change_the_ui() {
     let mut sub = hub.subscribe(ChatInfo::default());
     let mut seen = Vec::new();
     wait_for(&mut sub, &mut seen, |op| {
-        note_containing(op, "only UI changes are allowed inside ui.frames")
+        note_containing(op, "a frame function can only change properties and styles")
     })
     .await;
     // The well-behaved frame function keeps running.

@@ -76,7 +76,7 @@ fn fail(message: impl Into<String>) -> mlua::Error {
 pub(crate) fn frames_guard(lua: &Lua) -> mlua::Result<()> {
     if lua.app_data_ref::<UiFrames>().is_some_and(|f| f.0) {
         return Err(fail(
-            "only UI changes are allowed inside ui.frames, because frames are drawn ahead of time",
+            "a frame function can only change properties and styles, so move this call out of it",
         ));
     }
     Ok(())
@@ -559,7 +559,7 @@ fn create(lua: &Lua, chat_id: ChatId, kind: &str, props: Option<Table>) -> mlua:
 fn frames_guard_for_structure(lua: &Lua) -> mlua::Result<()> {
     if lua.app_data_ref::<UiFrames>().is_some_and(|f| f.0) {
         return Err(fail(
-            "ui.frames functions may change elements but not create them, build them beforehand",
+            "a frame function cannot create elements, so create them before you start the animation",
         ));
     }
     Ok(())
@@ -1383,7 +1383,7 @@ fn render_frames(lua: &Lua, chat: &Arc<Chat>, t_ms: u64) -> Vec<Op> {
             thread.resume::<MultiValue>((t, ChatUd(chat.id)))?;
             if thread.status() == ThreadStatus::Resumable {
                 return Err(fail(
-                    "only UI changes are allowed inside ui.frames, because frames are drawn ahead of time",
+                    "a frame function can only change properties and styles, so move this call out of it",
                 ));
             }
             Ok(())

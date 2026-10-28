@@ -271,11 +271,13 @@ async fn frame_loop(hub: Arc<Hub>, chat: Arc<Chat>, tx: mpsc::Sender<Frame>) {
     loop {
         tick.tick().await;
         let now = hub.now();
-        let cancel = chat.cancel.swap(false, Ordering::SeqCst);
         // While the chat still animates, the frames drawn again from now
         // replace the cancelled ones. When the animation stopped, what the
-        // frames last showed goes back to the document's present value.
+        // frames last showed goes back to the document's present value, and
+        // frames already sent for later are dropped.
         let animating = hub.script().is_some_and(|s| s.animates(chat.id).is_some());
+        let stopped = !animating && !touched.is_empty();
+        let cancel = chat.cancel.swap(false, Ordering::SeqCst) || stopped;
         let (reset, mut ops) = {
             let mut doc = chat.doc();
             let (reset, mut ops) = doc.take_pending();
@@ -378,6 +380,7 @@ mod tests {
     struct Blink {
         node: NodeId,
         events: Mutex<Vec<String>>,
+        running: std::sync::atomic::AtomicBool,
     }
 
     impl Script for Blink {
@@ -395,7 +398,7 @@ mod tests {
         fn session(&self, _: Arc<Chat>) {}
         fn entry(&self, _: Arc<Chat>, _: EntryInfo) {}
         fn animates(&self, _: ChatId) -> Option<u32> {
-            Some(20)
+            self.running.load(Ordering::SeqCst).then_some(20)
         }
         fn render(&self, chat: &Arc<Chat>, t: u64) -> Vec<Op> {
             let mut doc = chat.doc();
@@ -411,6 +414,7 @@ mod tests {
         let script = Arc::new(Blink {
             node: parts::FIRST_FREE,
             events: Mutex::new(Vec::new()),
+            running: true.into(),
         });
         hub.set_script(Some(script.clone()));
         let mut sub = hub.subscribe(ChatInfo::default());
@@ -459,6 +463,45 @@ mod tests {
             "the animation carries on with the next frame after the click: {} after {}",
             next.at,
             cancel.at
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_an_animation_puts_back_what_it_changed() {
+        let hub = Hub::new();
+        let script = Arc::new(Blink {
+            node: parts::FIRST_FREE,
+            events: Mutex::new(Vec::new()),
+            running: true.into(),
+        });
+        hub.set_script(Some(script.clone()));
+        let mut sub = hub.subscribe(ChatInfo::default());
+        let mut ahead = 0;
+        while ahead < 2 {
+            let frame = sub.frames.recv().await.unwrap();
+            if frame.at > hub.now() {
+                ahead += 1;
+            }
+        }
+
+        script.running.store(false, Ordering::SeqCst);
+        let stopped = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = sub.frames.recv().await.unwrap();
+                if frame.cancel_ahead {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("stopping sends a frame that drops what was drawn for later");
+        assert!(
+            stopped.ops.iter().any(|op| matches!(
+                op,
+                Op::Style { node, key, value } if *node == parts::FIRST_FREE && key == "fg" && value.is_null()
+            )),
+            "{:?}",
+            stopped.ops
         );
     }
 }
