@@ -65,11 +65,11 @@ The document creates elements. Each core element has a method of its own, and `d
 
 | Element | What it shows | Main properties |
 |---|---|---|
-| `box` | A row or column of other elements | `direction`, `padding`, `gap` |
+| `box` | A row or column of other elements | `direction`, `padding`, `gap`, `scroll` |
 | `text` | Text, wrapped to its width | `text` |
 | `button` | Something to click, drawn as `[ Label ]` in the terminal | `label` |
 | `input` | A one-line text field | `value`, `placeholder` |
-| `list` | A column of items, one of them selected | `selected`, or `items` and `render` |
+| `list` | A column of items, one of them selected | `selected`, `scroll`, or `items` and `render` |
 | `checkbox` | A box to tick | `label`, `checked` |
 | `terminal` | A program's screen, see [Terminal panes](#terminal-panes) | `name` |
 | `spacer` | Empty space that grows | |
@@ -118,7 +118,7 @@ The screen chat draws by default is itself a view named `chat`, built from eleme
 | Id | What it is |
 |---|---|
 | `chat` | The root, a column |
-| `header` | The line with the chat's name |
+| `header` | The line with the chat's name and state |
 | `header.right` | An empty row at the right end of the header; add small things here, such as a progress count |
 | `main` | A row that holds the conversation; add panels here |
 | `conversation` | The conversation |
@@ -139,6 +139,8 @@ A `box` lays its children out in a column, or in a row with `direction = "row"`.
 | nothing | What the content needs |
 
 `width` sizes an element across a row and `height` down a column. Across the other direction, an element stretches to fill its parent unless it has a size. `padding` adds space inside a box and `gap` adds space between its children, both in cells. Spacers and terminals fill the space they are given when they have no size.
+
+A box or list with `scroll = true` holds more than fits in it: its children take the height they need, and the client shows a window onto them that the mouse wheel moves. Give it a `height`, such as `"fill"`, so the window has a size. Text in script elements selects with the mouse and copies with Ctrl+C, just as the conversation does.
 
 ## Style
 
